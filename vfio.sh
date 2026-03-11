@@ -144,7 +144,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--reset] [--disable-bootlog] [--install-usb-bt-mitigation]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--install-usb-bt-mitigation]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -155,6 +155,8 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--se
   --health-check    Audit the running kernel and logs for VFIO-friendliness (no changes made) and exit.
   --health-check-previous
                      Audit the PREVIOUS boot's kernel logs for VFIO-friendliness (no changes made) and exit.
+  --usb-health-check
+                   Audit current and previous boot kernel logs for USB/xHCI crash signatures and print optional stability mitigation guidance.
   --reset           Reset/remove VFIO passthrough settings installed by this script (systemd/modprobe/grub/initramfs/user units).
   --disable-bootlog Disable only the optional VFIO boot log dumper service/unit, keeping the rest of the VFIO setup intact.
   --install-usb-bt-mitigation
@@ -192,6 +194,9 @@ parse_args() {
         ;;
       --health-check-all)
         MODE="health-check-all"
+        ;;
+      --usb-health-check)
+        MODE="usb-health-check"
         ;;
       --reset)
         MODE="reset"
@@ -1060,6 +1065,126 @@ health_check_all() {
       ;;
   esac
   return "$worst"
+}
+usb_health_check() {
+  hdr "USB/xHCI Stability Health Audit"
+  note "This audit scans kernel logs for USB host-controller crash signatures and common instability markers."
+
+  local worst=0
+  local inspected=0
+  local -a labels=("current boot" "previous boot")
+  local -a boot_opts=("-b" "-b -1")
+  local i label boot_opt log_data
+  local crash_count timeout_count enum_err_count disconnect_count netdev_watchdog_count score
+
+  for i in "${!labels[@]}"; do
+    label="${labels[$i]}"
+    boot_opt="${boot_opts[$i]}"
+    log_data=""
+
+    if have_cmd journalctl; then
+      if [[ "$boot_opt" == "-b -1" ]]; then
+        log_data="$(journalctl -k -b -1 --no-pager 2>/dev/null || true)"
+      else
+        log_data="$(journalctl -k -b --no-pager 2>/dev/null || true)"
+      fi
+    elif [[ "$boot_opt" == "-b" ]] && have_cmd dmesg; then
+      # dmesg only covers the current boot.
+      log_data="$(dmesg 2>/dev/null || true)"
+    fi
+
+    if [[ -z "$log_data" ]]; then
+      note "No kernel log data available for ${label}."
+      continue
+    fi
+
+    inspected=$((inspected + 1))
+
+    crash_count="$(awk 'BEGIN{IGNORECASE=1} /xHCI host controller not responding|HC died; cleaning up|host controller halted/ {c++} END{print c+0}' <<<"$log_data")"
+    timeout_count="$(awk 'BEGIN{IGNORECASE=1} /tx timeout|Read reg16 failed|command 0x[0-9a-f]+ tx timeout/ {c++} END{print c+0}' <<<"$log_data")"
+    enum_err_count="$(awk 'BEGIN{IGNORECASE=1} /unable to enumerate USB device|device descriptor read\/64|can.t set config|can.t set address|over-current/ {c++} END{print c+0}' <<<"$log_data")"
+    disconnect_count="$(awk 'BEGIN{IGNORECASE=1} /USB disconnect, device number/ {c++} END{print c+0}' <<<"$log_data")"
+    netdev_watchdog_count="$(awk 'BEGIN{IGNORECASE=1} /NETDEV WATCHDOG/ {c++} END{print c+0}' <<<"$log_data")"
+
+    score=0
+    if (( crash_count > 0 )); then
+      score=2
+    elif (( timeout_count > 0 || enum_err_count > 0 || netdev_watchdog_count > 0 || disconnect_count >= 8 )); then
+      score=1
+    fi
+
+    if (( score > worst )); then
+      worst=$score
+    fi
+
+    say
+    say "-- ${label} --"
+    print_kv "xHCI fatal markers" "$crash_count"
+    print_kv "USB/BT timeout markers" "$timeout_count"
+    print_kv "USB enumeration errors" "$enum_err_count"
+    print_kv "USB disconnect events" "$disconnect_count"
+    print_kv "NETDEV WATCHDOG markers" "$netdev_watchdog_count"
+
+    if (( score == 2 )); then
+      if (( ENABLE_COLOR )); then
+        say "${C_RED}CRITICAL${C_RESET}: USB host-controller crash markers were detected in ${label}."
+      else
+        say "CRITICAL: USB host-controller crash markers were detected in ${label}."
+      fi
+    elif (( score == 1 )); then
+      if (( ENABLE_COLOR )); then
+        say "${C_YELLOW}WARN${C_RESET}: USB instability markers were detected in ${label}."
+      else
+        say "WARN: USB instability markers were detected in ${label}."
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}OK${C_RESET}: No obvious USB/xHCI crash markers detected in ${label}."
+      else
+        say "OK: No obvious USB/xHCI crash markers detected in ${label}."
+      fi
+    fi
+
+    if (( score > 0 )); then
+      say "Key matching log lines:"
+      awk -v max=20 'BEGIN{IGNORECASE=1; n=0} /xHCI host controller not responding|HC died; cleaning up|host controller halted|USB disconnect, device number|tx timeout|NETDEV WATCHDOG|unable to enumerate USB device|device descriptor read\/64|Read reg16 failed|can.t set config|can.t set address|over-current|reset (high-speed|SuperSpeed) USB device/ {print "  " $0; n++; if (n>=max) exit}' <<<"$log_data"
+    fi
+  done
+
+  if (( inspected == 0 )); then
+    say "No usable kernel log source found (journalctl/dmesg unavailable)."
+    return 1
+  fi
+
+  say
+  if (( worst == 2 )); then
+    if (( ENABLE_COLOR )); then
+      say "${C_RED}✖ USB HEALTH: FAIL${C_RESET} (controller crash signatures detected)"
+    else
+      say "USB HEALTH: FAIL (controller crash signatures detected)"
+    fi
+    note "Optional mitigation to test:"
+    note "  usbcore.autosuspend=-1 pcie_aspm=off"
+    note "These are optional stability workarounds. Trade-off: higher idle power usage."
+    return 2
+  elif (( worst == 1 )); then
+    if (( ENABLE_COLOR )); then
+      say "${C_YELLOW}⚠ USB HEALTH: WARN${C_RESET} (instability markers detected)"
+    else
+      say "USB HEALTH: WARN (instability markers detected)"
+    fi
+    note "Optional mitigation to test:"
+    note "  usbcore.autosuspend=-1 pcie_aspm=off"
+    note "These are optional stability workarounds. Trade-off: higher idle power usage."
+    return 1
+  fi
+
+  if (( ENABLE_COLOR )); then
+    say "${C_GREEN}✔ USB HEALTH: PASS${C_RESET} (no obvious crash markers detected)"
+  else
+    say "USB HEALTH: PASS (no obvious crash markers detected)"
+  fi
+  return 0
 }
 
 iommu_enabled_or_die() {
@@ -2486,6 +2611,19 @@ systemd_boot_add_kernel_params() {
     for p in "${params_to_add[@]}"; do
       new_cmdline="$(add_param_once "$new_cmdline" "$p")"
     done
+    # Optional: USB/xHCI stability workaround for hosts that can freeze or
+    # spam disconnects due to USB runtime PM / PCIe ASPM interactions.
+    say
+    hdr "USB/xHCI power-management stability (optional)"
+    note "If your host shows xHCI hangs, USB disconnect storms, or freezes under USB load, this optional workaround can help."
+    note "It adds: usbcore.autosuspend=-1 pcie_aspm=off"
+    note "Why optional: it can increase idle power usage and is only needed on affected systems."
+    if prompt_yn "Add usbcore.autosuspend=-1 and pcie_aspm=off to /etc/kernel/cmdline? (optional workaround)" N "USB/xHCI stability"; then
+      new_cmdline="$(add_param_once "$new_cmdline" "usbcore.autosuspend=-1")"
+      new_cmdline="$(add_param_once "$new_cmdline" "pcie_aspm=off")"
+    else
+      note "Skipping USB/xHCI power workaround parameters."
+    fi
 
     # Optional: boot framebuffer / Boot VGA mitigation. On many systems the
     # EFI/simple framebuffer can "pin" the guest GPU memory and prevent
@@ -2711,6 +2849,19 @@ systemd_boot_add_kernel_params() {
   for p in "${params_to_add[@]}"; do
     new_opts="$(add_param_once "$new_opts" "$p")"
   done
+
+  # Optional: USB/xHCI stability workaround for the selected live entry.
+  say
+  hdr "USB/xHCI power-management stability (optional)"
+  note "If your host can freeze or spam USB disconnects because of xHCI/USB power transitions, this optional workaround can help."
+  note "It adds: usbcore.autosuspend=-1 pcie_aspm=off"
+  note "Trade-off: increased idle power usage."
+  if prompt_yn "Add usbcore.autosuspend=-1 and pcie_aspm=off to this boot entry? (optional workaround)" N "USB/xHCI stability (systemd-boot)"; then
+    new_opts="$(add_param_once "$new_opts" "usbcore.autosuspend=-1")"
+    new_opts="$(add_param_once "$new_opts" "pcie_aspm=off")"
+  else
+    note "Skipping USB/xHCI power workaround parameters for this entry."
+  fi
   
   # If the user chose verbose boot in the persistence step, mirror that
   # here so the CURRENT entry immediately shows logs instead of splash.
@@ -2750,6 +2901,8 @@ print_manual_iommu_instructions() {
   say "Other boot loaders (for example rEFInd or custom UEFI stubs) are NOT auto-edited by this script."
   say "If you use one of those, you must edit your kernel parameters manually. Add these parameters and then reboot:"
   say "  $param iommu=pt"
+  say "Optional stability workaround for USB/xHCI crashes/freezes (only if needed):"
+  say "  usbcore.autosuspend=-1 pcie_aspm=off"
   say "Advanced (usually NOT recommended): pcie_acs_override=downstream,multifunction"
   say "  - Only consider this if your IOMMU groups are not isolated."
   say "  - It can reduce PCIe isolation and may cause instability on some systems."
@@ -2789,6 +2942,19 @@ grub_add_kernel_params() {
   for p in "${params_to_add[@]}"; do
     new="$(add_param_once "$new" "$p")"
   done
+
+  # Optional USB/xHCI power-management workaround.
+  say
+  hdr "USB/xHCI power-management stability (optional)"
+  note "If your host sometimes freezes or logs xHCI/USB disconnect storms, this optional workaround can improve stability."
+  note "It adds: usbcore.autosuspend=-1 pcie_aspm=off"
+  note "Why optional: it can increase idle power usage and is not needed on all systems."
+  if prompt_yn "Add usbcore.autosuspend=-1 and pcie_aspm=off to GRUB kernel parameters? (optional workaround)" N "USB/xHCI stability (GRUB)"; then
+    new="$(add_param_once "$new" "usbcore.autosuspend=-1")"
+    new="$(add_param_once "$new" "pcie_aspm=off")"
+  else
+    note "Leaving USB/xHCI power-management parameters unchanged."
+  fi
 
   # Optional: boot framebuffer / Boot VGA mitigation for GRUB systems.
   # This mirrors the openSUSE /etc/kernel/cmdline behavior: we can
@@ -4145,7 +4311,7 @@ reset_vfio_all() {
   # Remove GRUB kernel parameters added by this script (classic GRUB only).
   # On GRUB2-BLS/systemd-boot setups, we instead operate on /etc/kernel/cmdline.
   if [[ "$reset_bl" == "grub" && -f /etc/default/grub ]]; then
-    if prompt_yn "Also remove VFIO-related kernel params from /etc/default/grub (IOMMU, ACS override, rd.driver.pre, SELinux/AppArmor, verbosity, multi-user.target)?" Y "Reset: boot options"; then
+    if prompt_yn "Also remove VFIO-related kernel params from /etc/default/grub (IOMMU, ACS override, USB/xHCI workarounds, rd.driver.pre, SELinux/AppArmor, verbosity, multi-user.target)?" Y "Reset: boot options"; then
       backup_file /etc/default/grub
 
       local key current new
@@ -4158,6 +4324,9 @@ reset_vfio_all() {
       new="$(remove_param_all "$new" "intel_iommu=on")"
       new="$(remove_param_all "$new" "iommu=pt")"
       new="$(remove_param_all "$new" "pcie_acs_override=downstream,multifunction")"
+      # Optional USB/xHCI stability workarounds
+      new="$(remove_param_all "$new" "usbcore.autosuspend=-1")"
+      new="$(remove_param_all "$new" "pcie_aspm=off")"
       # Initramfs / VFIO ordering
       new="$(remove_param_all "$new" "rd.driver.pre=vfio-pci")"
       # LSM knobs we may have added
@@ -4189,7 +4358,7 @@ reset_vfio_all() {
   # remove VFIO/IOMMU params from /etc/kernel/cmdline so future kernel
   # entries stop inheriting them. This path is also used for GRUB2-BLS.
   if is_opensuse_like && [[ -f /etc/kernel/cmdline ]]; then
-    if prompt_yn "Also remove VFIO-related kernel params from /etc/kernel/cmdline (IOMMU, ACS override, rd.driver.pre, SELinux/AppArmor, verbosity, multi-user.target)?" Y "Reset: boot options (persistence)"; then
+    if prompt_yn "Also remove VFIO-related kernel params from /etc/kernel/cmdline (IOMMU, ACS override, USB/xHCI workarounds, rd.driver.pre, SELinux/AppArmor, verbosity, multi-user.target)?" Y "Reset: boot options (persistence)"; then
       backup_file /etc/kernel/cmdline
       local kcur knew
       kcur="$(cat /etc/kernel/cmdline 2>/dev/null || true)"
@@ -4199,6 +4368,9 @@ reset_vfio_all() {
       knew="$(remove_param_all "$knew" "intel_iommu=on")"
       knew="$(remove_param_all "$knew" "iommu=pt")"
       knew="$(remove_param_all "$knew" "pcie_acs_override=downstream,multifunction")"
+      # Optional USB/xHCI stability workarounds
+      knew="$(remove_param_all "$knew" "usbcore.autosuspend=-1")"
+      knew="$(remove_param_all "$knew" "pcie_aspm=off")"
       # Initramfs / VFIO ordering
       knew="$(remove_param_all "$knew" "rd.driver.pre=vfio-pci")"
       # LSM knobs we may have added
@@ -5106,7 +5278,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "install-usb-bt-mitigation" ]]; then
+  if [[ "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
     need_cmd modprobe
   fi
 
@@ -5165,6 +5337,11 @@ main() {
 
   if [[ "$MODE" == "health-check-all" ]]; then
     health_check_all
+    exit $?
+  fi
+
+  if [[ "$MODE" == "usb-health-check" ]]; then
+    usb_health_check
     exit $?
   fi
 

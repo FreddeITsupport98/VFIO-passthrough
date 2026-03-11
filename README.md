@@ -19,6 +19,12 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Added a host VM internet precheck in `--detect` and `--verify` for libvirt/virt-manager NAT networking.
 - The precheck now warns when `net.ipv4.ip_forward=0` (common cause of guest DHCP-without-internet) and prints temporary and persistent fix steps.
 - Added a hint for missing `virbr0` with quick `virsh -c qemu:///system net-start/net-autostart default` guidance.
+- Added an optional USB/xHCI stability prompt in boot-parameter flows (GRUB, openSUSE `/etc/kernel/cmdline`, and non-openSUSE systemd-boot entries) to append:
+  - `usbcore.autosuspend=-1`
+  - `pcie_aspm=off`
+- Added explanation in the wizard that these are optional workarounds for hosts affected by xHCI freezes/disconnect storms, with a power-usage tradeoff.
+- Updated `--reset` boot-option cleanup to also remove `usbcore.autosuspend=-1` and `pcie_aspm=off` when present.
+- Added a new read-only `--usb-health-check` mode that scans current/previous boot kernel logs for USB/xHCI crash signatures and prints optional mitigation guidance.
 
 ---
 
@@ -139,7 +145,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--verify] [--detect] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--reset] [--disable-bootlog]
+./vfio.sh [--debug] [--dry-run] [--verify] [--detect] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog]
 ```
 
 ### Common flags
@@ -178,6 +184,17 @@ The script supports several modes controlled by flags. By default, without any f
     - 0 – all GPUs reported PASS.
     - 1 – at least one GPU reported WARN, none reported FAIL.
     - 2 – at least one GPU reported FAIL (vfio-pci errors in logs for some device).
+
+- `--usb-health-check`
+  - Audits **current and previous boot** kernel logs for USB/xHCI instability signals, including host-controller death, timeout markers, repeated USB disconnect storms, and USB enumeration failures.
+  - Prints key matching log lines and a summary grade:
+    - `USB HEALTH: PASS` (exit 0)
+    - `USB HEALTH: WARN` (exit 1)
+    - `USB HEALTH: FAIL` (exit 2)
+  - When WARN/FAIL markers are detected, it recommends testing these optional kernel parameters:
+    - `usbcore.autosuspend=-1`
+    - `pcie_aspm=off`
+  - Tradeoff reminder is included: improved stability on affected systems vs higher idle power usage.
 
 - `--verify`
   - Does **not** change anything.

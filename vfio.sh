@@ -2483,13 +2483,38 @@ detect_bootloader() {
 
 # Return 0 if this looks like an openSUSE-like system (used to gate /etc/kernel/cmdline edits).
 is_opensuse_like() {
-  if [[ -r /etc/os-release ]]; then
-    # Match ID=opensuse* or ID_LIKE containing opensuse
-    if grep -qiE '^ID=.?opensuse' /etc/os-release || \
-       grep -qiE '^ID_LIKE=.*opensuse' /etc/os-release; then
+  # Parse /etc/os-release using key/value semantics instead of loose grep
+  # matching so we avoid accidental substring hits and quoting edge cases.
+  [[ -r /etc/os-release ]] || return 1
+
+  local os_id="" os_like="" tok
+  while IFS='=' read -r k v; do
+    [[ -n "${k:-}" ]] || continue
+    case "$k" in
+      ID)
+        v="${v%\"}"
+        v="${v#\"}"
+        os_id="$v"
+        ;;
+      ID_LIKE)
+        v="${v%\"}"
+        v="${v#\"}"
+        os_like="$v"
+        ;;
+    esac
+  done </etc/os-release
+
+  # Match only explicit openSUSE-family identifiers:
+  # - ID starts with opensuse (e.g. opensuse-tumbleweed, opensuse-leap)
+  # - OR any whitespace-separated ID_LIKE token starts with opensuse
+  if [[ "${os_id,,}" == opensuse* ]]; then
+    return 0
+  fi
+  for tok in $os_like; do
+    if [[ "${tok,,}" == opensuse* ]]; then
       return 0
     fi
-  fi
+  done
   return 1
 }
 

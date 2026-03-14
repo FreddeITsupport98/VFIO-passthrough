@@ -16,6 +16,8 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Hardened openSUSE detection logic in `vfio.sh` so openSUSE-specific behavior is only enabled when `/etc/os-release` explicitly indicates openSUSE family (`ID=opensuse*` or `ID_LIKE` token `opensuse*`).
+- This reduces the chance of non-openSUSE distributions accidentally entering openSUSE-specific paths.
 - Added a host VM internet precheck in `--detect` and `--verify` for libvirt/virt-manager NAT networking.
 - The precheck now warns when `net.ipv4.ip_forward=0` (common cause of guest DHCP-without-internet) and prints temporary and persistent fix steps.
 - Added a hint for missing `virbr0` with quick `virsh -c qemu:///system net-start/net-autostart default` guidance.

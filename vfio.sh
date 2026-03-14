@@ -253,12 +253,34 @@ install_vendor_reset_pkg() {
   fi
 
   if have_cmd apt-get; then
-    if (( use_sudo )); then
-      run sudo apt-get -y install vendor-reset-dkms || run sudo apt-get -y install vendor-reset
-    else
-      run apt-get -y install vendor-reset-dkms || run apt-get -y install vendor-reset
+    local -a candidates=(vendor-reset-dkms vendor-reset)
+    if have_cmd apt-cache; then
+      local p
+      while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        candidates+=("$p")
+      done < <(apt-cache search -n '^vendor[-]reset' 2>/dev/null | awk '{print $1}')
     fi
-    return $?
+
+    local tried=""
+    local pkg
+    for pkg in "${candidates[@]}"; do
+      [[ -n "$pkg" ]] || continue
+      if grep -Eq "(^|[[:space:]])${pkg}([[:space:]]|$)" <<<"$tried"; then
+        continue
+      fi
+      tried="${tried:+$tried }$pkg"
+      if (( use_sudo )); then
+        if run sudo apt-get -y install "$pkg"; then
+          return 0
+        fi
+      else
+        if run apt-get -y install "$pkg"; then
+          return 0
+        fi
+      fi
+    done
+    return 1
   fi
   if have_cmd dnf; then
     if (( use_sudo )); then
@@ -285,6 +307,55 @@ install_vendor_reset_pkg() {
     return $?
   fi
   return 1
+}
+
+install_vendor_reset_dkms_from_source() {
+  # Optional fallback for apt-based systems where vendor-reset packages are
+  # unavailable in enabled repositories.
+  have_cmd apt-get || return 1
+  have_cmd git || return 1
+  have_cmd dkms || return 1
+
+  local use_sudo=0
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+
+  local krel headers_pkg
+  krel="$(uname -r)"
+  headers_pkg="linux-headers-$krel"
+  if (( use_sudo )); then
+    run sudo apt-get -y install "$headers_pkg" || true
+  else
+    run apt-get -y install "$headers_pkg" || true
+  fi
+
+  local tmp src
+  tmp="$(mktemp -d /tmp/vendor-reset-dkms.XXXXXX)"
+  src="$tmp/vendor-reset"
+
+  if ! run git clone --depth 1 https://github.com/gnif/vendor-reset "$src"; then
+    [[ -d "$tmp" ]] && run rm -rf "$tmp" || true
+    return 1
+  fi
+  [[ -f "$src/dkms.conf" ]] || { [[ -d "$tmp" ]] && run rm -rf "$tmp" || true; return 1; }
+
+  local pkg_name pkg_ver
+  pkg_name="$(awk -F= '/^PACKAGE_NAME=/{gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$src/dkms.conf")"
+  pkg_ver="$(awk -F= '/^PACKAGE_VERSION=/{gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$src/dkms.conf")"
+  [[ -n "$pkg_name" && -n "$pkg_ver" ]] || { [[ -d "$tmp" ]] && run rm -rf "$tmp" || true; return 1; }
+
+  if (( use_sudo )); then
+    run sudo dkms remove "$pkg_name/$pkg_ver" --all 2>/dev/null || true
+    run sudo dkms add "$src"
+    run sudo dkms install "$pkg_name/$pkg_ver"
+  else
+    run dkms remove "$pkg_name/$pkg_ver" --all 2>/dev/null || true
+    run dkms add "$src"
+    run dkms install "$pkg_name/$pkg_ver"
+  fi
+
+  [[ -d "$tmp" ]] && run rm -rf "$tmp" || true
 }
 
 maybe_offer_detect_vendor_reset_install() {
@@ -322,7 +393,37 @@ maybe_offer_detect_vendor_reset_install() {
     fi
   else
     note "Automatic vendor-reset install from detect mode failed."
-    note "Install it manually, then re-run --detect."
+    if have_cmd apt-get; then
+      note "Package not found in enabled apt repositories. Optional fallback: build DKMS module from upstream source."
+      if prompt_yn "Try source-based DKMS install for vendor-reset now? (advanced)" N "AMD reset mitigation"; then
+        if confirm_phrase "This will clone/build a kernel module from source now." "BUILD VENDOR RESET"; then
+          if install_vendor_reset_dkms_from_source; then
+            if have_cmd modprobe; then
+              if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+                run sudo modprobe vendor_reset 2>/dev/null || true
+              else
+                run modprobe vendor_reset 2>/dev/null || true
+              fi
+            fi
+            if vendor_reset_is_present; then
+              say "Installed vendor-reset from source (DKMS) in detect mode."
+            else
+              note "Source DKMS install completed, but module is not yet detected for this kernel."
+              note "Reboot, then re-run --detect."
+            fi
+          else
+            note "Source-based DKMS install failed."
+            note "Install it manually, then re-run --detect."
+          fi
+        else
+          note "Skipping source-based install (confirmation phrase not provided)."
+        fi
+      else
+        note "Skipping source-based install."
+      fi
+    else
+      note "Install it manually, then re-run --detect."
+    fi
   fi
   DRY_RUN="$prev_dry"
 }

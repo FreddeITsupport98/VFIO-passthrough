@@ -25,6 +25,7 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Added a `--detect`/`--verify` report signal `LightDM/AccountsService` that explicitly shows whether LightDM is detected and whether `org.freedesktop.Accounts` is available.
 - In `--detect`, when `LightDM/AccountsService` is WARN, the script now offers an interactive remediation action to install `accountsservice` immediately (with explicit confirmation).
 - In `--detect`, when AMD GPUs are detected and `vendor-reset` is missing, the script now offers an interactive remediation action to install `vendor-reset` immediately (with explicit confirmation).
+- Improved `--detect` vendor-reset remediation on apt-based systems: it now tries discovered apt package names (not only fixed names), and if unavailable, offers an explicit opt-in source DKMS fallback flow.
 - Added a host VM internet precheck in `--detect` and `--verify` for libvirt/virt-manager NAT networking.
 - The precheck now warns when `net.ipv4.ip_forward=0` (common cause of guest DHCP-without-internet) and prints temporary and persistent fix steps.
 - Added a hint for missing `virbr0` with quick `virsh -c qemu:///system net-start/net-autostart default` guidance.

@@ -11,6 +11,9 @@
 - Added `LightDM/AccountsService` status output to `--detect` and `--verify` reports so display-manager dependency health is visible before reboot.
 - In `--detect`, when LightDM is present and AccountsService is missing, added an interactive remediation offer that can install `accountsservice` immediately after explicit confirmation.
 - In `--detect`, when AMD GPUs are present and `vendor-reset` is missing, added an interactive remediation offer that can install `vendor-reset` immediately after explicit confirmation.
+- Improved apt-based `vendor-reset` remediation in `--detect`:
+  - tries discovered apt package names (via `apt-cache search`) instead of only two fixed package names.
+  - when no package is available, offers an explicit opt-in fallback to clone/build/install `vendor-reset` via DKMS from source.
 - Added optional USB/xHCI stability kernel-parameter prompts in `vfio.sh` for:
   - GRUB path (`grub_add_kernel_params`)
   - openSUSE `/etc/kernel/cmdline` persistence path (`systemd_boot_add_kernel_params`)

@@ -2,6 +2,8 @@
 ## Unreleased
 - Hardened `is_opensuse_like()` distro detection in `vfio.sh` by parsing `/etc/os-release` key/value pairs directly.
 - openSUSE-specific code paths now trigger only when `ID` starts with `opensuse` or an `ID_LIKE` token starts with `opensuse`, reducing accidental matches on non-openSUSE systems.
+- Added explicit openSUSE gating diagnostics to `--detect`: the report now prints `openSUSE-like detection` with `yes/no` and the exact reason (`ID` or `ID_LIKE` token match).
+- Relaxed startup dependency checks for `--verify`: it no longer requires `modprobe`, allowing read-only verification to run in minimal environments.
 - Added optional USB/xHCI stability kernel-parameter prompts in `vfio.sh` for:
   - GRUB path (`grub_add_kernel_params`)
   - openSUSE `/etc/kernel/cmdline` persistence path (`systemd_boot_add_kernel_params`)

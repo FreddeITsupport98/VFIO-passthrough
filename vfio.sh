@@ -1401,10 +1401,12 @@ detect_existing_vfio_report() {
     print_kv "Kernel" "${C_GREEN}$(uname -r)${C_RESET}"
     print_kv "Current cmdline" "${C_DIM}$(cat /proc/cmdline 2>/dev/null || true)${C_RESET}"
     print_kv "Bootloader" "${C_GREEN}$(detect_bootloader)${C_RESET}"
+    print_kv "openSUSE-like detection" "${C_GREEN}$(opensuse_like_detection_reason)${C_RESET}"
   else
     print_kv "Kernel" "$(uname -r)"
     print_kv "Current cmdline" "$(cat /proc/cmdline 2>/dev/null || true)"
     print_kv "Bootloader" "$(detect_bootloader)"
+    print_kv "openSUSE-like detection" "$(opensuse_like_detection_reason)"
   fi
 
   # Health check
@@ -2481,41 +2483,61 @@ detect_bootloader() {
   echo "unknown"
 }
 
-# Return 0 if this looks like an openSUSE-like system (used to gate /etc/kernel/cmdline edits).
-is_opensuse_like() {
-  # Parse /etc/os-release using key/value semantics instead of loose grep
-  # matching so we avoid accidental substring hits and quoting edge cases.
-  [[ -r /etc/os-release ]] || return 1
+# Read /etc/os-release fields used by distro gating. Emits:
+#   <id>\t<id_like>
+# (Both values may be empty when unknown.)
+os_release_id_and_like() {
+  local os_id="" os_like=""
+  if [[ -r /etc/os-release ]]; then
+    local k v
+    while IFS='=' read -r k v; do
+      [[ -n "${k:-}" ]] || continue
+      case "$k" in
+        ID)
+          v="${v%\"}"
+          v="${v#\"}"
+          os_id="$v"
+          ;;
+        ID_LIKE)
+          v="${v%\"}"
+          v="${v#\"}"
+          os_like="$v"
+          ;;
+      esac
+    done </etc/os-release
+  fi
+  printf '%s\t%s\n' "$os_id" "$os_like"
+}
 
-  local os_id="" os_like="" tok
-  while IFS='=' read -r k v; do
-    [[ -n "${k:-}" ]] || continue
-    case "$k" in
-      ID)
-        v="${v%\"}"
-        v="${v#\"}"
-        os_id="$v"
-        ;;
-      ID_LIKE)
-        v="${v%\"}"
-        v="${v#\"}"
-        os_like="$v"
-        ;;
-    esac
-  done </etc/os-release
+# Diagnostic string for openSUSE-family detection used by --detect.
+# Example outputs:
+#   yes (ID=opensuse-tumbleweed matched opensuse*)
+#   yes (ID_LIKE token opensuse matched opensuse*)
+#   no (ID=sparky; ID_LIKE=debian)
+opensuse_like_detection_reason() {
+  local pair os_id os_like tok
+  pair="$(os_release_id_and_like)"
+  os_id="${pair%%$'\t'*}"
+  os_like="${pair#*$'\t'}"
+  [[ "$os_like" == "$pair" ]] && os_like=""
 
-  # Match only explicit openSUSE-family identifiers:
-  # - ID starts with opensuse (e.g. opensuse-tumbleweed, opensuse-leap)
-  # - OR any whitespace-separated ID_LIKE token starts with opensuse
   if [[ "${os_id,,}" == opensuse* ]]; then
+    printf 'yes (ID=%s matched opensuse*)\n' "${os_id:-<empty>}"
     return 0
   fi
   for tok in $os_like; do
     if [[ "${tok,,}" == opensuse* ]]; then
+      printf 'yes (ID_LIKE token %s matched opensuse*)\n' "$tok"
       return 0
     fi
   done
+  printf 'no (ID=%s; ID_LIKE=%s)\n' "${os_id:-<empty>}" "${os_like:-<empty>}"
   return 1
+}
+
+# Return 0 if this looks like an openSUSE-like system (used to gate /etc/kernel/cmdline edits).
+is_opensuse_like() {
+  opensuse_like_detection_reason >/dev/null
 }
 
 # Locate the systemd-boot / BLS entries directory (if any).
@@ -5303,7 +5325,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
     need_cmd modprobe
   fi
 

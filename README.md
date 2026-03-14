@@ -18,6 +18,8 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 ## Unreleased
 - Hardened openSUSE detection logic in `vfio.sh` so openSUSE-specific behavior is only enabled when `/etc/os-release` explicitly indicates openSUSE family (`ID=opensuse*` or `ID_LIKE` token `opensuse*`).
 - This reduces the chance of non-openSUSE distributions accidentally entering openSUSE-specific paths.
+- Improved `--detect` output with a new `openSUSE-like detection` line that shows `yes/no` and the exact match reason (`ID` or `ID_LIKE` token), making distro-gating decisions transparent during troubleshooting.
+- Updated `--verify` mode startup checks so it no longer hard-requires `modprobe`; this keeps verification usable in minimal/read-only environments while still showing distro-gating diagnostics.
 - Added a host VM internet precheck in `--detect` and `--verify` for libvirt/virt-manager NAT networking.
 - The precheck now warns when `net.ipv4.ip_forward=0` (common cause of guest DHCP-without-internet) and prints temporary and persistent fix steps.
 - Added a hint for missing `virbr0` with quick `virsh -c qemu:///system net-start/net-autostart default` guidance.

@@ -295,6 +295,99 @@ maybe_offer_detect_stale_user_audio_unit_cleanup() {
 
   DRY_RUN="$prev_dry"
 }
+
+list_user_audio_units_missing_condition_guard() {
+  # Emit TSV: user<TAB>unit_path for vfio audio user units missing
+  # ConditionPathExists guard.
+  local d user unit guard
+  guard="ConditionPathExists=$AUDIO_SCRIPT"
+  for d in /home/*; do
+    [[ -d "$d" ]] || continue
+    user="$(basename "$d")"
+    unit="$d/.config/systemd/user/vfio-set-host-audio.service"
+    [[ -f "$unit" ]] || continue
+    grep -Fq "$guard" "$unit" 2>/dev/null && continue
+    printf '%s\t%s\n' "$user" "$unit"
+  done
+}
+
+repair_user_audio_unit_condition_guard() {
+  local user="$1" unit="$2"
+  [[ -n "$unit" && -f "$unit" ]] || return 1
+
+  local guard tmp mode owner group uid
+  guard="ConditionPathExists=$AUDIO_SCRIPT"
+  tmp="$(mktemp)"
+
+  awk -v guard="$guard" '
+    BEGIN { inserted=0; had_guard=0 }
+    {
+      if ($0 == guard) {
+        had_guard=1
+      }
+      print
+      if ($0 ~ /^After=pipewire\.service wireplumber\.service$/ && !inserted && !had_guard) {
+        print guard
+        inserted=1
+      }
+    }
+    END {
+      if (!inserted && !had_guard) {
+        print guard
+      }
+    }
+  ' "$unit" >"$tmp"
+
+  mode="$(stat -c '%a' "$unit" 2>/dev/null || echo 644)"
+  owner="$(stat -c '%u' "$unit" 2>/dev/null || id -u)"
+  group="$(stat -c '%g' "$unit" 2>/dev/null || id -g)"
+  run install -o "$owner" -g "$group" -m "$mode" "$tmp" "$unit"
+  run rm -f "$tmp"
+
+  if have_cmd runuser; then
+    uid="$(id -u "$user" 2>/dev/null || true)"
+    if [[ -n "$uid" ]]; then
+      runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user daemon-reload >/dev/null 2>&1 || true
+      runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user reset-failed vfio-set-host-audio.service >/dev/null 2>&1 || true
+    fi
+  fi
+  return 0
+}
+
+maybe_offer_detect_user_audio_unit_guard_repair() {
+  [[ "${MODE:-}" == "detect" ]] || return 0
+
+  local missing_guard
+  missing_guard="$(list_user_audio_units_missing_condition_guard || true)"
+  [[ -n "$missing_guard" ]] || return 0
+
+  say
+  hdr "Detect action (optional): repair legacy user audio unit guard"
+  note "Found vfio-set-host-audio user unit(s) missing ConditionPathExists guard."
+  note "This can fail user session startup after restore/rollback when helper script is absent."
+  printf '%s\n' "$missing_guard" | awk -F'\t' '{print "  - user=" $1 " unit=" $2}'
+
+  if ! prompt_yn "Repair these user unit(s) now (add ConditionPathExists guard)?" Y "User audio unit repair"; then
+    return 0
+  fi
+  if ! confirm_phrase "This will edit user service files now." "REPAIR AUDIO UNIT"; then
+    note "Skipping unit repair (confirmation phrase not provided)."
+    return 0
+  fi
+
+  local prev_dry="${DRY_RUN:-0}"
+  DRY_RUN=0
+
+  local user unit
+  while IFS=$'\t' read -r user unit; do
+    [[ -n "$unit" ]] || continue
+    [[ -f "$unit" ]] || continue
+    repair_user_audio_unit_condition_guard "$user" "$unit" || true
+    say "Repaired user unit for '$user': $unit"
+  done <<<"$missing_guard"
+
+  DRY_RUN="$prev_dry"
+}
 host_has_amd_gpu() {
   have_cmd lspci || return 1
   lspci -n 2>/dev/null | grep -q '1002:'
@@ -1899,6 +1992,7 @@ detect_existing_vfio_report() {
 
   # In detect mode, offer immediate remediation interactively.
   maybe_offer_detect_accountsservice_install
+  maybe_offer_detect_user_audio_unit_guard_repair
   maybe_offer_detect_stale_user_audio_unit_cleanup
   # Health check
   say
@@ -3942,6 +4036,7 @@ install_user_audio_unit() {
 [Unit]
 Description=Set default audio sink (helps keep host audio stable with VFIO)
 After=pipewire.service wireplumber.service
+ConditionPathExists=$AUDIO_SCRIPT
 
 [Service]
 Type=oneshot

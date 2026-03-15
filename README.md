@@ -26,6 +26,8 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - In `--detect`, when `LightDM/AccountsService` is WARN, the script now offers an interactive remediation action to install `accountsservice` immediately (with explicit confirmation).
 - Hardened `accountsservice` presence detection so a standalone DBus service file no longer suppresses remediation prompts when the actual daemon/service backend is missing.
 - Added `--detect` remediation for stale user audio units: if `~/.config/systemd/user/vfio-set-host-audio.service` exists but `/usr/local/bin/vfio-set-host-audio.sh` is missing, the script now offers an interactive cleanup action.
+- Hardened generated user unit `~/.config/systemd/user/vfio-set-host-audio.service` with `ConditionPathExists=/usr/local/bin/vfio-set-host-audio.sh` so restore/rollback scenarios skip the unit instead of failing the user session with `203/EXEC`.
+- Added `--detect` remediation to repair legacy `vfio-set-host-audio.service` user units that were created before the guard existed (adds `ConditionPathExists` in place).
 - In `--detect`, when AMD GPUs are detected and `vendor-reset` is missing, the script now offers an interactive remediation action to install `vendor-reset` immediately (with explicit confirmation).
 - Improved `--detect` vendor-reset remediation on apt-based systems: it now tries discovered apt package names (not only fixed names), and if unavailable, offers an explicit opt-in source DKMS fallback flow.
 - Refined `vendor-reset` recommendation/offer scope: the script now uses observed AMD reset-failure signatures from recent kernel logs (VFIO/FLR/D3 timeout/failure markers) instead of static GPU-family matching.

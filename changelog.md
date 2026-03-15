@@ -12,6 +12,8 @@
 - In `--detect`, when LightDM is present and AccountsService is missing, added an interactive remediation offer that can install `accountsservice` immediately after explicit confirmation.
 - Fixed `accountsservice` detection false-positive path: a standalone DBus service file no longer counts as installed unless an actual daemon/service backend is present.
 - Added `--detect` remediation for stale `vfio-set-host-audio.service` user units when `/usr/local/bin/vfio-set-host-audio.sh` is missing, including optional interactive cleanup.
+- Hardened generated user unit `vfio-set-host-audio.service` with `ConditionPathExists=/usr/local/bin/vfio-set-host-audio.sh` to avoid user-session `203/EXEC` failures after snapshot restore/rollback.
+- Added a new `--detect` repair action for legacy `vfio-set-host-audio.service` user units missing the `ConditionPathExists` guard.
 - In `--detect`, when AMD GPUs are present and `vendor-reset` is missing, added an interactive remediation offer that can install `vendor-reset` immediately after explicit confirmation.
 - Improved apt-based `vendor-reset` remediation in `--detect`:
   - tries discovered apt package names (via `apt-cache search`) instead of only two fixed package names.

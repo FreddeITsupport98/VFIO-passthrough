@@ -388,6 +388,34 @@ maybe_offer_detect_user_audio_unit_guard_repair() {
 
   DRY_RUN="$prev_dry"
 }
+
+auto_repair_legacy_user_audio_unit_guards() {
+  # Non-interactive self-heal for normal install flow:
+  # ensure legacy user audio units have ConditionPathExists guard.
+  [[ "${MODE:-install}" == "install" ]] || return 0
+
+  local missing_guard
+  missing_guard="$(list_user_audio_units_missing_condition_guard || true)"
+  [[ -n "$missing_guard" ]] || return 0
+
+  say
+  hdr "Install self-heal: legacy user audio unit guard"
+  note "Found legacy vfio-set-host-audio user unit(s) missing ConditionPathExists guard."
+  note "Applying automatic repair to reduce user-session failures after restore/rollback."
+
+  local prev_dry="${DRY_RUN:-0}"
+  DRY_RUN=0
+
+  local user unit
+  while IFS=$'\t' read -r user unit; do
+    [[ -n "$unit" ]] || continue
+    [[ -f "$unit" ]] || continue
+    repair_user_audio_unit_condition_guard "$user" "$unit" || true
+    say "Auto-repaired user unit for '$user': $unit"
+  done <<<"$missing_guard"
+
+  DRY_RUN="$prev_dry"
+}
 host_has_amd_gpu() {
   have_cmd lspci || return 1
   lspci -n 2>/dev/null | grep -q '1002:'
@@ -5566,6 +5594,10 @@ apply_configuration() {
   # Display manager guardrail: avoid LightDM boot loops when AccountsService
   # is missing (observed as org.freedesktop.Accounts DBus errors + start-limit-hit).
   lightdm_accountsservice_preflight
+
+  # Self-heal legacy user audio units that were created before the
+  # ConditionPathExists guard was introduced.
+  auto_repair_legacy_user_audio_unit_guards
 
   # Optional: if running under KDE Plasma, offer to set Plasma Wayland as the
   # default login session for SDDM so the desktop matches these VFIO-friendly

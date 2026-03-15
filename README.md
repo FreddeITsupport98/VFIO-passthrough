@@ -16,6 +16,25 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Added `--boot-remove` as an alias for `--disable-bootlog` (same behavior, additive naming convenience).
+- Added machine-readable `--detect --json` mode for tooling/UI integrations:
+  - prints JSON only,
+  - disables interactive detect remediation prompts during JSON output,
+  - includes stable tri-state status fields (`WORKS`, `NOT_WORK`, `NOT_PRESENT`) for display manager and graphics stack health.
+- Added display-manager-aware dependency preflight in install flow:
+  - LightDM keeps AccountsService and fallback checks.
+  - SDDM/GDM/LXDM/XDM are recognized as supported without LightDM-specific fallback prompts.
+- Added new `--detect` status lines for desktop graphics stack visibility:
+  - `Graphics stack (Xorg)` with tri-state output: `WORKS` / `NOT WORK` / `NOT PRESENT`
+  - `Graphics stack (Wayland)` with tri-state output: `WORKS` / `NOT WORK` / `NOT PRESENT`
+  - status values are color-coded (green/red/yellow) when color is enabled.
+- Added `--detect` display-manager readiness output:
+  - `Display manager` (detected name or not present)
+  - `Display manager health` (`WORKS` / `NOT WORK` / `NOT PRESENT`), including explicit LightDM + missing AccountsService context.
+- Added Boot-VGA safety behavior in `vfio.sh` generation paths:
+  - The generated bind helper now skips binding when selected `GUEST_GPU_BDF` is currently `boot_vga=1`, unless explicitly overridden with `VFIO_ALLOW_BOOT_VGA=1`.
+  - Kernel-parameter generation now avoids forcing `vfio-pci.ids=...` when the selected guest GPU is currently Boot VGA on the host.
+- This protects host graphical boot (LightDM/Xorg) from early vfio takeover of the active display adapter while keeping an explicit advanced override path.
 - Hardened openSUSE detection logic in `vfio.sh` so openSUSE-specific behavior is only enabled when `/etc/os-release` explicitly indicates openSUSE family (`ID=opensuse*` or `ID_LIKE` token `opensuse*`).
 - This reduces the chance of non-openSUSE distributions accidentally entering openSUSE-specific paths.
 - Improved `--detect` output with a new `openSUSE-like detection` line that shows `yes/no` and the exact match reason (`ID` or `ID_LIKE` token), making distro-gating decisions transparent during troubleshooting.
@@ -162,7 +181,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--verify] [--detect] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog]
+./vfio.sh [--debug] [--dry-run] [--verify] [--detect] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove]
 ```
 
 ### Common flags
@@ -175,6 +194,10 @@ The script supports several modes controlled by flags. By default, without any f
   - Prevents any persistent changes (no files written, no systemctl enable, etc.).
   - Most commands are only printed/logged.
   - Automatically implied by `--verify`, `--detect`, and `--self-test`.
+
+- `--json`
+  - Valid with `--detect` to output machine-readable JSON only.
+  - In JSON mode, detect remediation prompts are skipped to keep output non-interactive and parser-safe.
 
 ### Operational modes
 
@@ -236,6 +259,10 @@ The script supports several modes controlled by flags. By default, without any f
   - The report is **color‑aware** when ANSI colors are available:
     - Section headers use cyan, good resources and paths use green, and problems or missing pieces show up as yellow/red.
     - GPU and audio BDFs are highlighted in green so you can quickly spot which device is which.
+  - With `--json`, outputs machine-readable JSON with stable tri-state values:
+    - `display_manager_health`: `WORKS` / `NOT_WORK` / `NOT_PRESENT`
+    - `graphics_stack_xorg`: `WORKS` / `NOT_WORK` / `NOT_PRESENT`
+    - `graphics_stack_wayland`: `WORKS` / `NOT_WORK` / `NOT_PRESENT`
 
 - `--self-test`
   - Runs a small self test suite:
@@ -266,6 +293,10 @@ The script supports several modes controlled by flags. By default, without any f
   - Helper that disables and removes the optional `vfio-dump-boot-log.service` boot log dumper unit and its helper script.
   - Leaves all VFIO bindings, core config files, and kernel parameters intact.
   - Useful once your setup is stable and you no longer want the boot log dumper to run (existing logs under `~/Desktop/vfio-boot-logs/` are not deleted).
+
+- `--boot-remove`
+  - Alias of `--disable-bootlog`.
+  - Same behavior, provided as an additive convenience flag name.
 
 ---
 

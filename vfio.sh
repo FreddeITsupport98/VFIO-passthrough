@@ -36,6 +36,7 @@ LIGHTDM_FALLBACK_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-greeter-fallback.conf
 
 DEBUG=0
 DRY_RUN=0
+JSON_OUTPUT=0
 MODE="install"   # install | verify
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 
@@ -99,22 +100,148 @@ run() {
   "$@"
 }
 
-lightdm_is_present() {
-  # Detect LightDM as the active/installed display manager.
-  if have_cmd lightdm || [[ -d /etc/lightdm ]]; then
-    return 0
+detect_display_manager() {
+  # Return one of: lightdm | sddm | gdm | lxdm | xdm | none
+  # Prefer the active display-manager.service symlink when present.
+  local dm_link base
+  if [[ -L /etc/systemd/system/display-manager.service ]]; then
+    dm_link="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)"
+    base="$(basename "$dm_link")"
+    case "$base" in
+      lightdm.service) echo "lightdm"; return 0;;
+      sddm.service) echo "sddm"; return 0;;
+      gdm.service|gdm3.service) echo "gdm"; return 0;;
+      lxdm.service) echo "lxdm"; return 0;;
+      xdm.service) echo "xdm"; return 0;;
+    esac
+    case "$dm_link" in
+      *lightdm*) echo "lightdm"; return 0;;
+      *sddm*) echo "sddm"; return 0;;
+      *gdm*) echo "gdm"; return 0;;
+      *lxdm*) echo "lxdm"; return 0;;
+      *xdm*) echo "xdm"; return 0;;
+    esac
   fi
+
+  # Fall back to installed unit files / config presence.
   if have_cmd systemctl; then
-    if systemctl list-unit-files 2>/dev/null | grep -q '^lightdm\.service'; then
-      return 0
-    fi
-    if [[ -L /etc/systemd/system/display-manager.service ]]; then
-      if readlink -f /etc/systemd/system/display-manager.service 2>/dev/null | grep -q 'lightdm'; then
-        return 0
-      fi
-    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^lightdm\.service'; then echo "lightdm"; return 0; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^sddm\.service'; then echo "sddm"; return 0; fi
+    if systemctl list-unit-files 2>/dev/null | grep -Eq '^gdm(3)?\.service'; then echo "gdm"; return 0; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^lxdm\.service'; then echo "lxdm"; return 0; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^xdm\.service'; then echo "xdm"; return 0; fi
   fi
+
+  if have_cmd lightdm || [[ -d /etc/lightdm ]]; then echo "lightdm"; return 0; fi
+  if have_cmd sddm || [[ -d /etc/sddm.conf.d || -f /etc/sddm.conf ]]; then echo "sddm"; return 0; fi
+  if have_cmd gdm || have_cmd gdm3 || [[ -d /etc/gdm || -d /etc/gdm3 ]]; then echo "gdm"; return 0; fi
+  if have_cmd lxdm || [[ -d /etc/lxdm ]]; then echo "lxdm"; return 0; fi
+  if have_cmd xdm || [[ -f /etc/X11/xdm/xdm-config ]]; then echo "xdm"; return 0; fi
+
+  echo "none"
   return 1
+}
+
+lightdm_is_present() {
+  [[ "$(detect_display_manager 2>/dev/null || true)" == "lightdm" ]]
+}
+
+display_manager_dependency_status() {
+  # Tri-state status for display-manager dependency readiness:
+  # WORKS | NOT_WORK | NOT_PRESENT
+  local dm="${1:-none}"
+  case "$dm" in
+    lightdm)
+      if accountsservice_is_present; then
+        echo "WORKS"
+      else
+        echo "NOT_WORK"
+      fi
+      ;;
+    sddm|gdm|lxdm|xdm)
+      echo "WORKS"
+      ;;
+    none|"")
+      echo "NOT_PRESENT"
+      ;;
+    *)
+      echo "WORKS"
+      ;;
+  esac
+}
+
+xorg_stack_status() {
+  # WORKS if both Xorg server and X11 session files are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_server=0 has_sessions=0
+  if have_cmd Xorg || [[ -x /usr/bin/Xorg || -x /usr/libexec/Xorg || -x /usr/bin/X ]]; then
+    has_server=1
+  fi
+  if compgen -G "/usr/share/xsessions/*.desktop" >/dev/null 2>&1; then
+    has_sessions=1
+  fi
+
+  if (( has_server && has_sessions )); then
+    echo "WORKS"
+  elif (( ! has_server && ! has_sessions )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+
+wayland_stack_status() {
+  # WORKS if Wayland session files and at least one common Wayland
+  # compositor/session launcher are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_sessions=0 has_runtime=0
+  if compgen -G "/usr/share/wayland-sessions/*.desktop" >/dev/null 2>&1; then
+    has_sessions=1
+  fi
+  if have_cmd gnome-shell || have_cmd kwin_wayland || have_cmd startplasma-wayland || have_cmd weston || have_cmd sway || have_cmd hyprland || have_cmd wayfire || have_cmd labwc; then
+    has_runtime=1
+  fi
+
+  if (( has_sessions && has_runtime )); then
+    echo "WORKS"
+  elif (( ! has_sessions && ! has_runtime )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+
+format_tri_state_status() {
+  # Render WORKS / NOT WORK / NOT PRESENT with color when enabled.
+  local status="$1"
+  case "$status" in
+    WORKS)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_GREEN}WORKS${C_RESET}"
+      else
+        printf '%s' "WORKS"
+      fi
+      ;;
+    NOT_WORK)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_RED}NOT WORK${C_RESET}"
+      else
+        printf '%s' "NOT WORK"
+      fi
+      ;;
+    NOT_PRESENT)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_YELLOW}NOT PRESENT${C_RESET}"
+      else
+        printf '%s' "NOT PRESENT"
+      fi
+      ;;
+    *)
+      printf '%s' "$status"
+      ;;
+  esac
 }
 
 accountsservice_is_present() {
@@ -689,6 +816,32 @@ lightdm_accountsservice_preflight() {
   fi
 }
 
+display_manager_dependency_preflight() {
+  # Display-manager guardrail:
+  # - LightDM gets explicit AccountsService + fallback checks.
+  # - SDDM/GDM/LXDM/XDM are treated as supported without LightDM-specific fallback.
+  local dm
+  dm="$(detect_display_manager 2>/dev/null || true)"
+  [[ -n "$dm" ]] || dm="none"
+
+  case "$dm" in
+    lightdm)
+      lightdm_accountsservice_preflight
+      ;;
+    sddm|gdm|lxdm|xdm)
+      say
+      hdr "Display manager dependency preflight"
+      note "Detected ${dm}; no LightDM-specific AccountsService fallback is required."
+      ;;
+    none)
+      note "No display manager detected; skipping display-manager dependency preflight."
+      ;;
+    *)
+      note "Detected display manager '${dm}'; no specific dependency preflight is implemented for it."
+      ;;
+  esac
+}
+
 prompt_yn() {
   # prompt_yn "Question" default(Y/N) [title]
   local q="$1"; local def="${2:-Y}"; local title="${3:-Confirmation}"; local ans
@@ -735,13 +888,14 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--install-usb-bt-mitigation]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
   --no-tui          Force plain-text prompts even if whiptail is installed.
   --verify          Do not change anything; validate an existing setup (reads $CONF_FILE).
   --detect          Print a detailed report of existing VFIO/passthrough configuration and exit.
+  --json            With --detect, print machine-readable JSON only (tri-state values: WORKS / NOT_WORK / NOT_PRESENT).
   --self-test       Run automated checks for common issues (awk compatibility, PipeWire access) and exit.
   --health-check    Audit the running kernel and logs for VFIO-friendliness (no changes made) and exit.
   --health-check-previous
@@ -750,6 +904,7 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--se
                    Audit current and previous boot kernel logs for USB/xHCI crash signatures and print optional stability mitigation guidance.
   --reset           Reset/remove VFIO passthrough settings installed by this script (systemd/modprobe/grub/initramfs/user units).
   --disable-bootlog Disable only the optional VFIO boot log dumper service/unit, keeping the rest of the VFIO setup intact.
+  --boot-remove     Alias of --disable-bootlog.
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev). This detaches USB Bluetooth adapters from btusb on the host but keeps them available for VM passthrough.
 EOF
@@ -774,6 +929,9 @@ parse_args() {
       --detect)
         MODE="detect"
         ;;
+      --json)
+        JSON_OUTPUT=1
+        ;;
       --self-test)
         MODE="self-test"
         ;;
@@ -795,6 +953,9 @@ parse_args() {
       --disable-bootlog)
         MODE="disable-bootlog"
         ;;
+      --boot-remove)
+        MODE="disable-bootlog"
+        ;;
       --install-usb-bt-mitigation)
         MODE="install-usb-bt-mitigation"
         ;;
@@ -812,6 +973,10 @@ parse_args() {
   # verify/detect/self-test implies dry-run
   if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "self-test" ]]; then
     DRY_RUN=1
+  fi
+
+  if (( JSON_OUTPUT )) && [[ "$MODE" != "detect" ]]; then
+    die "--json is currently supported only with --detect"
   fi
 }
 
@@ -1980,42 +2145,81 @@ self_test() {
 }
 
 detect_existing_vfio_report() {
+  # Basic host state
+  local dm_name dm_dep_status xorg_status wayland_status
+  dm_name="$(detect_display_manager 2>/dev/null || true)"
+  [[ -n "$dm_name" ]] || dm_name="none"
+  dm_dep_status="$(display_manager_dependency_status "$dm_name")"
+  xorg_status="$(xorg_stack_status)"
+  wayland_status="$(wayland_stack_status)"
+
+  if (( JSON_OUTPUT )); then
+    local opensuse_like_json accountsservice_present_json hc status
+    opensuse_like_json=false
+    accountsservice_present_json=false
+    if opensuse_like_detection_reason >/dev/null 2>&1; then
+      opensuse_like_json=true
+    fi
+    if accountsservice_is_present; then
+      accountsservice_present_json=true
+    fi
+    hc="$(vfio_config_health)"
+    status="$(printf '%s\n' "$hc" | awk -F= '/^STATUS=/{print $2; exit}')"
+    status="${status:-UNKNOWN}"
+
+    printf '{\n'
+    printf '  "mode": "detect",\n'
+    printf '  "bootloader": "%s",\n' "$(detect_bootloader)"
+    printf '  "opensuse_like": %s,\n' "$opensuse_like_json"
+    printf '  "display_manager": "%s",\n' "$dm_name"
+    printf '  "display_manager_health": "%s",\n' "$dm_dep_status"
+    printf '  "graphics_stack_xorg": "%s",\n' "$xorg_status"
+    printf '  "graphics_stack_wayland": "%s",\n' "$wayland_status"
+    printf '  "accountsservice_present": %s,\n' "$accountsservice_present_json"
+    printf '  "vfio_health": "%s"\n' "$status"
+    printf '}\n'
+    return 0
+  fi
   say
   if (( ENABLE_COLOR )); then
     say "${C_CYAN}${C_BOLD}==== Existing VFIO / Passthrough Detection Report ==== ${C_RESET}"
   else
     say "==== Existing VFIO / Passthrough Detection Report ===="
   fi
-
-  # Basic host state
   if (( ENABLE_COLOR )); then
     print_kv "Kernel" "${C_GREEN}$(uname -r)${C_RESET}"
     print_kv "Current cmdline" "${C_DIM}$(cat /proc/cmdline 2>/dev/null || true)${C_RESET}"
     print_kv "Bootloader" "${C_GREEN}$(detect_bootloader)${C_RESET}"
     print_kv "openSUSE-like detection" "${C_GREEN}$(opensuse_like_detection_reason)${C_RESET}"
-    if lightdm_is_present; then
-      if accountsservice_is_present; then
-        print_kv "LightDM/AccountsService" "${C_GREEN}OK (LightDM detected; org.freedesktop.Accounts available)${C_RESET}"
-      else
-        print_kv "LightDM/AccountsService" "${C_YELLOW}WARN (LightDM detected; org.freedesktop.Accounts missing)${C_RESET}"
-      fi
+    if [[ "$dm_name" == "none" ]]; then
+      print_kv "Display manager" "${C_YELLOW}NOT PRESENT${C_RESET} (none detected)"
     else
-      print_kv "LightDM/AccountsService" "${C_DIM}N/A (LightDM not detected)${C_RESET}"
+      print_kv "Display manager" "${C_GREEN}${dm_name}${C_RESET}"
     fi
+    if [[ "$dm_name" == "lightdm" && "$dm_dep_status" == "NOT_WORK" ]]; then
+      print_kv "Display manager health" "$(format_tri_state_status "$dm_dep_status") (LightDM detected; AccountsService missing)"
+    else
+      print_kv "Display manager health" "$(format_tri_state_status "$dm_dep_status")"
+    fi
+    print_kv "Graphics stack (Xorg)" "$(format_tri_state_status "$xorg_status")"
+    print_kv "Graphics stack (Wayland)" "$(format_tri_state_status "$wayland_status")"
   else
     print_kv "Kernel" "$(uname -r)"
     print_kv "Current cmdline" "$(cat /proc/cmdline 2>/dev/null || true)"
     print_kv "Bootloader" "$(detect_bootloader)"
     print_kv "openSUSE-like detection" "$(opensuse_like_detection_reason)"
-    if lightdm_is_present; then
-      if accountsservice_is_present; then
-        print_kv "LightDM/AccountsService" "OK (LightDM detected; org.freedesktop.Accounts available)"
-      else
-        print_kv "LightDM/AccountsService" "WARN (LightDM detected; org.freedesktop.Accounts missing)"
-      fi
+    if [[ "$dm_name" == "none" ]]; then
+      print_kv "Display manager" "NOT PRESENT (none detected)"
     else
-      print_kv "LightDM/AccountsService" "N/A (LightDM not detected)"
+      print_kv "Display manager" "$dm_name"
     fi
+    if [[ "$dm_name" == "lightdm" && "$dm_dep_status" == "NOT_WORK" ]]; then
+      print_kv "Display manager health" "$(format_tri_state_status "$dm_dep_status") (LightDM detected; AccountsService missing)"
+    else
+      print_kv "Display manager health" "$(format_tri_state_status "$dm_dep_status")"
+    fi
+    print_kv "Graphics stack (Xorg)" "$(format_tri_state_status "$xorg_status")"
+    print_kv "Graphics stack (Wayland)" "$(format_tri_state_status "$wayland_status")"
   fi
 
   # In detect mode, offer immediate remediation interactively.
@@ -3270,8 +3474,18 @@ systemd_boot_add_kernel_params() {
     fi
     # If we know the exact vfio-pci.ids value for the selected guest GPU,
     # persist it into /etc/kernel/cmdline as well.
+    # Safety: avoid forcing early vfio binding when selected guest GPU is
+    # currently Boot VGA, because that can break host display-manager boot.
     if [[ -n "${CTX[guest_vfio_ids]:-}" ]]; then
-      params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
+      local guest_boot_vga="0"
+      if [[ -n "${CTX[guest_gpu]:-}" && -f "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" ]]; then
+        guest_boot_vga="$(cat "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" 2>/dev/null || echo 0)"
+      fi
+      if [[ "$guest_boot_vga" == "1" ]]; then
+        note "Skipping vfio-pci.ids for ${CTX[guest_gpu]} because it is Boot VGA on this host."
+      else
+        params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
+      fi
     fi
     local new_cmdline="$cmdline_content"
     
@@ -3588,8 +3802,18 @@ grub_add_kernel_params() {
   fi
   # If we know vfio-pci.ids for the selected guest GPU, also place it on
   # the GRUB cmdline so vfio-pci can bind in the initramfs.
+  # Safety: skip this when selected guest GPU is currently Boot VGA, because
+  # forcing early vfio-pci binding can break host graphical boot.
   if [[ -n "${CTX[guest_vfio_ids]:-}" ]]; then
-    params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
+    local guest_boot_vga="0"
+    if [[ -n "${CTX[guest_gpu]:-}" && -f "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" ]]; then
+      guest_boot_vga="$(cat "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" 2>/dev/null || echo 0)"
+    fi
+    if [[ "$guest_boot_vga" == "1" ]]; then
+      note "Skipping vfio-pci.ids for ${CTX[guest_gpu]} because it is Boot VGA on this host."
+    else
+      params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
+    fi
   fi
 
   if [[ ! -f /etc/default/grub ]]; then
@@ -3867,6 +4091,17 @@ die() {
 
 # Basic sanity: ensure sysfs entries exist.
 [[ -d "/sys/bus/pci/devices/$GUEST_GPU_BDF" ]] || die "Guest GPU not present in sysfs: $GUEST_GPU_BDF"
+
+# Fail-safe: do not steal the active Boot VGA GPU during normal host boot.
+# This prevents LightDM/Xorg failures if the selected guest GPU is also the
+# host display adapter. Set VFIO_ALLOW_BOOT_VGA=1 to force binding.
+if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
+  if [[ "$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)" == "1" ]] && [[ "${VFIO_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
+    say "WARN: $GUEST_GPU_BDF is Boot VGA; skipping vfio-pci bind to keep host graphics alive."
+    say "INFO: export VFIO_ALLOW_BOOT_VGA=1 to force binding when intentionally running headless."
+    exit 0
+  fi
+fi
 
 modprobe vfio
 modprobe vfio-pci
@@ -5591,9 +5826,10 @@ apply_configuration() {
     assert_pci_bdf_exists "$host_audio_bdfs_csv"
   fi
 
-  # Display manager guardrail: avoid LightDM boot loops when AccountsService
-  # is missing (observed as org.freedesktop.Accounts DBus errors + start-limit-hit).
-  lightdm_accountsservice_preflight
+  # Display-manager guardrail:
+  # - LightDM: enforce AccountsService/fallback check
+  # - SDDM/GDM/LXDM/XDM: recognized and treated as supported
+  display_manager_dependency_preflight
 
   # Self-heal legacy user audio units that were created before the
   # ConditionPathExists guard was introduced.

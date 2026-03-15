@@ -1,5 +1,27 @@
 # Changelog
 ## Unreleased
+- Added `--boot-remove` as an additive alias for `--disable-bootlog` to remove the optional VFIO boot-log dumper.
+- Added machine-readable `--detect --json` mode:
+  - emits JSON only (no interactive detect remediation prompts),
+  - includes tri-state values for `display_manager_health`, `graphics_stack_xorg`, and `graphics_stack_wayland`,
+  - tri-state values are stable: `WORKS`, `NOT_WORK`, `NOT_PRESENT`.
+- Added display-manager-aware dependency preflight in install flow:
+  - `lightdm`: keeps existing AccountsService + fallback handling.
+  - `sddm`, `gdm`, `lxdm`, `xdm`: treated as supported without LightDM-specific fallback prompts.
+  - unknown/none: explicitly reported and skipped safely.
+- Extended `--detect` report with graphics stack tri-state output:
+  - `Graphics stack (Xorg)`: `WORKS` / `NOT WORK` / `NOT PRESENT`
+  - `Graphics stack (Wayland)`: `WORKS` / `NOT WORK` / `NOT PRESENT`
+  - statuses are color-coded (green/red/yellow) when color output is enabled.
+- Extended `--detect` report with display-manager readiness lines:
+  - `Display manager` (detected DM or not present)
+  - `Display manager health` (`WORKS` / `NOT WORK` / `NOT PRESENT`)
+  - includes explicit LightDM + AccountsService missing context when applicable.
+- Added a Boot-VGA safety guard to the generated `/usr/local/sbin/vfio-bind-selected-gpu.sh`:
+  - if the selected guest GPU is currently marked `boot_vga=1`, the script now skips binding by default to prevent host display-manager lockups.
+  - explicit override is available with `VFIO_ALLOW_BOOT_VGA=1` for intentional headless/advanced workflows.
+- Updated boot-parameter generation to avoid forcing `vfio-pci.ids=...` when the selected guest GPU is currently Boot VGA on the host.
+- This reduces LightDM/Xorg startup failures caused by early vfio binding of the active host display adapter.
 - Hardened `is_opensuse_like()` distro detection in `vfio.sh` by parsing `/etc/os-release` key/value pairs directly.
 - openSUSE-specific code paths now trigger only when `ID` starts with `opensuse` or an `ID_LIKE` token starts with `opensuse`, reducing accidental matches on non-openSUSE systems.
 - Added explicit openSUSE gating diagnostics to `--detect`: the report now prints `openSUSE-like detection` with `yes/no` and the exact reason (`ID` or `ID_LIKE` token match).

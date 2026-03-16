@@ -43,6 +43,10 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Added a dedicated regression suite under `regression/`:
   - `regression/script.sh` as the unified runner (with auto-`chmod +x`, `bash -n`, optional `shellcheck`, and regression execution),
   - `regression/openbox-monitor-regression.sh` covering parser behavior, monitor activation calls, and additive/idempotent autostart hook behavior.
+- Added `regression/boot-vga-policy-regression.sh` for Boot-VGA host-assisted policy coverage:
+  - validates `write_conf()` writes `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU` from computed host-assisted default logic,
+  - validates `vfio_config_health()` warns when host-assisted Boot-VGA conditions are true but the config flag is disabled,
+  - validates the warning clears when `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1`.
 - Added Openbox parser smoke coverage in `--self-test` via `openbox_connected_outputs_from_xrandr_query`.
 - Added `--boot-remove` as an alias for `--disable-bootlog` (same behavior, additive naming convenience).
 - Added machine-readable `--detect --json` mode for tooling/UI integrations:

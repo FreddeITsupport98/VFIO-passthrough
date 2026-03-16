@@ -24,6 +24,9 @@
 - Added new additive regression assets under `regression/`:
   - `regression/script.sh` unified runner (`bash -n`, optional `shellcheck`, regression execution, and auto-`chmod +x` for discovered scripts),
   - `regression/openbox-monitor-regression.sh` checks parser output, monitor activation call behavior, and idempotent additive autostart hook management.
+- Added `regression/boot-vga-policy-regression.sh` to cover Boot-VGA host-assisted policy behavior:
+  - verifies `write_conf()` persists computed `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU` defaults,
+  - verifies `vfio_config_health()` emits the Boot-VGA host-assisted warning only when config is misaligned.
 - Added Openbox parser smoke coverage to `--self-test`.
 - Added `--boot-remove` as an additive alias for `--disable-bootlog` to remove the optional VFIO boot-log dumper.
 - Added machine-readable `--detect --json` mode:

@@ -84,6 +84,7 @@ assert_eq "activation runs --auto for all connected outputs" "DP-1,HDMI-1" "${ac
 # Test 3: autostart hook is additive + idempotent and removable.
 OPENBOX_MONITOR_SCRIPT="${tmp_dir}/vfio-openbox-activate-monitors.sh"
 OPENBOX_AUTOSTART_FILE="${tmp_dir}/openbox/autostart"
+# shellcheck disable=SC2034
 DRY_RUN=0
 mkdir -p "$(dirname "$OPENBOX_AUTOSTART_FILE")"
 cat >"$OPENBOX_MONITOR_SCRIPT" <<'EOF'

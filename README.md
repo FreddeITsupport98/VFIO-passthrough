@@ -16,6 +16,11 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Added GitHub Actions CI regression automation:
+  - new workflow at `.github/workflows/regression.yml`,
+  - runs on both `push` and `pull_request`,
+  - executes `regression/script.sh` (including syntax checks, optional shellcheck, and regression tests).
+- Improved `regression/script.sh` to auto-discover and run all `regression/*-regression.sh` scripts in sorted order, so newly added regression scripts are picked up automatically.
 - Added Openbox monitor auto-activation integration:
   - installs `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
   - additively manages `/etc/xdg/openbox/autostart` using marker blocks,

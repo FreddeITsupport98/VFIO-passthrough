@@ -2,6 +2,10 @@
 ## Unreleased
 - Added GitHub Actions CI workflow `.github/workflows/regression.yml` to run `regression/script.sh` automatically on both `push` and `pull_request`.
 - Improved `regression/script.sh` to auto-discover all `regression/*-regression.sh` scripts, run syntax checks for discovered regression scripts, and execute each regression script automatically in sorted order.
+- Improved `regression/script.sh` master-entrypoint coverage:
+  - recursive auto-`chmod +x` for `regression/**/*.sh`,
+  - recursive bash syntax checks for regression shell scripts,
+  - keeps a single-run workflow where only the master runner is needed.
 - Added Openbox monitor auto-activation integration in `vfio.sh`:
   - new helper installer for `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
   - additive marker-based hook management for `/etc/xdg/openbox/autostart`,

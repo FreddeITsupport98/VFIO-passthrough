@@ -21,6 +21,10 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - runs on both `push` and `pull_request`,
   - executes `regression/script.sh` (including syntax checks, optional shellcheck, and regression tests).
 - Improved `regression/script.sh` to auto-discover and run all `regression/*-regression.sh` scripts in sorted order, so newly added regression scripts are picked up automatically.
+- Improved `regression/script.sh` master-entrypoint behavior for future regressions:
+  - auto-`chmod +x` now applies to all `regression/**/*.sh` scripts recursively,
+  - bash syntax checks now cover all regression shell scripts recursively,
+  - only the master runner needs to be executed to apply these checks and run discovered regression tests.
 - Added Openbox monitor auto-activation integration:
   - installs `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
   - additively manages `/etc/xdg/openbox/autostart` using marker blocks,

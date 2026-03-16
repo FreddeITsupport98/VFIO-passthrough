@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 exit_code=0
 REGRESSION_SCRIPTS=()
+REGRESSION_SHELL_SCRIPTS=()
 
 run_step() {
   local name="$1"
@@ -23,33 +24,44 @@ auto_chmod_scripts() {
   local script
   while IFS= read -r -d '' script; do
     chmod +x "$script" 2>/dev/null || true
-  done < <(find "$PROJECT_ROOT/regression" -maxdepth 1 -type f -name '*.sh' -print0)
+  done < <(find "$PROJECT_ROOT/regression" -type f -name '*.sh' -print0)
   chmod +x "$PROJECT_ROOT/vfio.sh" 2>/dev/null || true
 }
 
 discover_regression_scripts() {
   mapfile -d '' -t REGRESSION_SCRIPTS < <(
-    find "$PROJECT_ROOT/regression" -maxdepth 1 -type f -name '*-regression.sh' -print0 | sort -z
+    find "$PROJECT_ROOT/regression" -type f -name '*-regression.sh' -print0 | sort -z
+  )
+}
+
+discover_regression_shell_scripts() {
+  mapfile -d '' -t REGRESSION_SHELL_SCRIPTS < <(
+    find "$PROJECT_ROOT/regression" -type f -name '*.sh' ! -path "$PROJECT_ROOT/regression/script.sh" -print0 | sort -z
   )
 }
 
 printf 'Regression runner root: %s\n' "$PROJECT_ROOT"
 auto_chmod_scripts
 discover_regression_scripts
+discover_regression_shell_scripts
 
 run_step "Bash syntax check (vfio.sh)" bash -n "$PROJECT_ROOT/vfio.sh"
 run_step "Bash syntax check (regression/script.sh)" bash -n "$PROJECT_ROOT/regression/script.sh"
-
+if (( ${#REGRESSION_SHELL_SCRIPTS[@]} > 0 )); then
+  run_step "Bash syntax check (all regression shell scripts)" bash -n "${REGRESSION_SHELL_SCRIPTS[@]}"
+else
+  printf '\n[WARN] No additional shell scripts found under regression/.\n'
+fi
 if (( ${#REGRESSION_SCRIPTS[@]} > 0 )); then
   run_step "Bash syntax check (discovered regression scripts)" bash -n "${REGRESSION_SCRIPTS[@]}"
 else
-  printf '\n[WARN] No *-regression.sh files found under regression/.\n'
+  printf '\n[WARN] No *-regression.sh scripts found under regression/.\n'
 fi
 
 if command -v shellcheck >/dev/null 2>&1; then
-  if (( ${#REGRESSION_SCRIPTS[@]} > 0 )); then
+  if (( ${#REGRESSION_SHELL_SCRIPTS[@]} > 0 )); then
     run_step "Shellcheck (vfio.sh + regression scripts)" \
-      shellcheck "$PROJECT_ROOT/vfio.sh" "$PROJECT_ROOT/regression/script.sh" "${REGRESSION_SCRIPTS[@]}"
+      shellcheck "$PROJECT_ROOT/vfio.sh" "$PROJECT_ROOT/regression/script.sh" "${REGRESSION_SHELL_SCRIPTS[@]}"
   else
     run_step "Shellcheck (vfio.sh + regression/script.sh)" \
       shellcheck "$PROJECT_ROOT/vfio.sh" "$PROJECT_ROOT/regression/script.sh"

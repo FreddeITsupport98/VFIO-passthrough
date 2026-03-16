@@ -4378,19 +4378,28 @@ if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
   guest_boot_vga="$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
   if [[ "$guest_boot_vga" == "1" ]] && [[ "${VFIO_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
     allow_boot_vga_bind=0
+    host_assisted_boot_vga_bind=0
     if [[ -n "${HOST_GPU_BDF:-}" ]] && [[ "$HOST_GPU_BDF" != "$GUEST_GPU_BDF" ]] && [[ -f "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" ]]; then
       host_boot_vga="$(cat "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" 2>/dev/null || echo 1)"
       if [[ "$host_boot_vga" == "0" ]]; then
-        allow_boot_vga_bind=1
+        host_assisted_boot_vga_bind=1
+        if [[ "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" == "1" ]]; then
+          allow_boot_vga_bind=1
+        fi
       fi
     fi
 
     if [[ "$allow_boot_vga_bind" == "1" ]]; then
-      say "WARN: $GUEST_GPU_BDF is Boot VGA, but HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0; proceeding with vfio bind."
+      say "WARN: $GUEST_GPU_BDF is Boot VGA, and HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
+      say "WARN: VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 is set; proceeding with host-assisted vfio bind."
       say "INFO: Set VFIO_ALLOW_BOOT_VGA=1 to force this behavior without host GPU checks."
     else
       say "WARN: $GUEST_GPU_BDF is Boot VGA; skipping vfio-pci bind to keep host graphics alive."
-      say "INFO: Set HOST_GPU_BDF to a different GPU (boot_vga=0) or set VFIO_ALLOW_BOOT_VGA=1 to force binding."
+      if [[ "$host_assisted_boot_vga_bind" == "1" ]]; then
+        say "INFO: HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0. Set VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 to allow host-assisted Boot VGA binding."
+      else
+        say "INFO: Set HOST_GPU_BDF to a different GPU (boot_vga=0) or set VFIO_ALLOW_BOOT_VGA=1 to force binding."
+      fi
       exit 0
     fi
   fi

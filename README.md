@@ -25,6 +25,9 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - auto-`chmod +x` now applies to all `regression/**/*.sh` scripts recursively,
   - bash syntax checks now cover all regression shell scripts recursively,
   - only the master runner needs to be executed to apply these checks and run discovered regression tests.
+- Restored strict Boot-VGA bind safety in generated `/usr/local/sbin/vfio-bind-selected-gpu.sh`:
+  - host-assisted Boot-VGA binding now requires explicit opt-in with `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1`,
+  - default behavior skips Boot-VGA guest binding unless explicitly forced (`VFIO_ALLOW_BOOT_VGA=1`) or host-assisted opt-in is set.
 - Added Openbox monitor auto-activation integration:
   - installs `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
   - additively manages `/etc/xdg/openbox/autostart` using marker blocks,

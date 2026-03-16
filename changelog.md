@@ -1,5 +1,16 @@
 # Changelog
 ## Unreleased
+- Added Openbox monitor auto-activation integration in `vfio.sh`:
+  - new helper installer for `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
+  - additive marker-based hook management for `/etc/xdg/openbox/autostart`,
+  - monitor activation logic enables all currently connected outputs via `xrandr --output <name> --auto`.
+- Added reset and rollback cleanup coverage for Openbox monitor integration:
+  - `--reset` now removes the Openbox helper script and strips the managed Openbox autostart block,
+  - generated rollback scripts now restore Openbox files from backup when present, otherwise remove only the managed marker block.
+- Added new additive regression assets under `regression/`:
+  - `regression/script.sh` unified runner (`bash -n`, optional `shellcheck`, regression execution, and auto-`chmod +x` for discovered scripts),
+  - `regression/openbox-monitor-regression.sh` checks parser output, monitor activation call behavior, and idempotent additive autostart hook management.
+- Added Openbox parser smoke coverage to `--self-test`.
 - Added `--boot-remove` as an additive alias for `--disable-bootlog` to remove the optional VFIO boot-log dumper.
 - Added machine-readable `--detect --json` mode:
   - emits JSON only (no interactive detect remediation prompts),

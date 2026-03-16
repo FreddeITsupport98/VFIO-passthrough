@@ -23,6 +23,8 @@ SCRIPT_NAME="$(basename "$0")"
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
 AUDIO_SCRIPT="/usr/local/bin/vfio-set-host-audio.sh"
+OPENBOX_MONITOR_SCRIPT="/usr/local/bin/vfio-openbox-activate-monitors.sh"
+OPENBOX_AUTOSTART_FILE="/etc/xdg/openbox/autostart"
 SYSTEMD_UNIT="/etc/systemd/system/vfio-bind-selected-gpu.service"
 MODULES_LOAD="/etc/modules-load.d/vfio.conf"
 BLACKLIST_FILE="/etc/modprobe.d/vfio-optional-blacklist.conf"
@@ -276,6 +278,31 @@ openbox_stack_status() {
   else
     echo "NOT_WORK"
   fi
+}
+openbox_connected_outputs_from_xrandr_query() {
+  # Read xrandr --query output from stdin and print output names that are
+  # currently connected.
+  awk '$2 == "connected" { print $1 }'
+}
+openbox_activate_all_connected_monitors() {
+  # Enable all currently connected outputs via xrandr.
+  # Accept an optional xrandr binary path for regression testing.
+  local xrandr_bin="${1:-xrandr}"
+  command -v "$xrandr_bin" >/dev/null 2>&1 || return 0
+  [[ -n "${DISPLAY:-}" ]] || return 0
+
+  local query
+  query="$("$xrandr_bin" --query 2>/dev/null || true)"
+  [[ -n "$query" ]] || return 0
+
+  local -a outputs=()
+  mapfile -t outputs < <(printf '%s\n' "$query" | openbox_connected_outputs_from_xrandr_query)
+  (( ${#outputs[@]} > 0 )) || return 0
+
+  local output
+  for output in "${outputs[@]}"; do
+    "$xrandr_bin" --output "$output" --auto >/dev/null 2>&1 || true
+  done
 }
 i3_stack_status() {
   # WORKS if i3 binary and an X session entry are present.
@@ -2336,6 +2363,17 @@ self_test() {
   local count
   count="$(gpu_discover_all_sysfs | wc -l | tr -d ' ')"
   print_kv "GPU discovery" "Found ${count} GPU(s)"
+
+  # Openbox monitor parser regression smoke check
+  local openbox_parser_sample openbox_parser_out
+  openbox_parser_sample=$'Screen 0: minimum 8 x 8, current 4480 x 1440, maximum 32767 x 32767\nHDMI-1 connected primary 2560x1440+0+0\nDP-1 connected 1920x1080+2560+0\nDP-2 disconnected\n'
+  openbox_parser_out="$(printf '%s\n' "$openbox_parser_sample" | openbox_connected_outputs_from_xrandr_query | paste -sd',' -)"
+  if [[ "$openbox_parser_out" == "HDMI-1,DP-1" ]]; then
+    print_kv "Openbox monitor parser" "OK"
+  else
+    print_kv "Openbox monitor parser" "FAIL (got: ${openbox_parser_out:-<empty>})"
+    fail=1
+  fi
 
   # CPU virtualization + Secure Boot checks (non-fatal)
   check_cpu_features
@@ -4578,6 +4616,129 @@ EOF
   note "User audio unit installed at: $unit_path"
   note "If it isn't enabled automatically, run after login: systemctl --user enable --now vfio-set-host-audio.service"
 }
+install_openbox_monitor_script() {
+  backup_file "$OPENBOX_MONITOR_SCRIPT"
+
+  write_file_atomic "$OPENBOX_MONITOR_SCRIPT" 0755 "root:root" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+openbox_connected_outputs_from_xrandr_query() {
+  awk '$2 == "connected" { print $1 }'
+}
+
+openbox_activate_all_connected_monitors() {
+  command -v xrandr >/dev/null 2>&1 || return 0
+  [[ -n "${DISPLAY:-}" ]] || return 0
+
+  local query
+  query="$(xrandr --query 2>/dev/null || true)"
+  [[ -n "$query" ]] || return 0
+
+  local -a outputs=()
+  mapfile -t outputs < <(printf '%s\n' "$query" | openbox_connected_outputs_from_xrandr_query)
+  (( ${#outputs[@]} > 0 )) || return 0
+
+  local output
+  for output in "${outputs[@]}"; do
+    xrandr --output "$output" --auto >/dev/null 2>&1 || true
+  done
+}
+
+openbox_activate_all_connected_monitors
+EOF
+}
+install_openbox_autostart_hook() {
+  local autostart_file="$OPENBOX_AUTOSTART_FILE"
+  local autostart_dir
+  autostart_dir="$(dirname "$autostart_file")"
+  local marker_begin="# BEGIN VFIO OPENBOX MONITOR AUTO-ACTIVATE"
+  local marker_end="# END VFIO OPENBOX MONITOR AUTO-ACTIVATE"
+
+  if [[ "$(openbox_stack_status)" == "NOT_PRESENT" && ! -d "$autostart_dir" ]]; then
+    note "Openbox stack not detected and $autostart_dir is missing; skipping Openbox monitor hook."
+    return 0
+  fi
+
+  if (( ! DRY_RUN )); then
+    mkdir -p "$autostart_dir"
+  fi
+
+  backup_file "$autostart_file"
+
+  local tmp mode owner group
+  tmp="$(mktemp)"
+  if [[ -f "$autostart_file" ]]; then
+    awk -v begin="$marker_begin" -v end="$marker_end" '
+      $0 == begin { skip=1; next }
+      $0 == end { skip=0; next }
+      !skip { print }
+    ' "$autostart_file" >"$tmp"
+    mode="$(stat -c '%a' "$autostart_file" 2>/dev/null || echo 644)"
+    owner="$(stat -c '%u' "$autostart_file" 2>/dev/null || id -u)"
+    group="$(stat -c '%g' "$autostart_file" 2>/dev/null || id -g)"
+  else
+    : >"$tmp"
+    mode=644
+    owner=0
+    group=0
+  fi
+
+  {
+    if [[ -s "$tmp" ]]; then
+      cat "$tmp"
+      printf '\n'
+    fi
+    cat <<EOF
+$marker_begin
+if [ -x "$OPENBOX_MONITOR_SCRIPT" ]; then
+  "$OPENBOX_MONITOR_SCRIPT" >/dev/null 2>&1 &
+fi
+$marker_end
+EOF
+  } >"${tmp}.new"
+  mv "${tmp}.new" "$tmp"
+
+  if (( DRY_RUN )); then
+    rm -f "$tmp" || true
+    return 0
+  fi
+
+  install -o "$owner" -g "$group" -m "$mode" "$tmp" "$autostart_file"
+  rm -f "$tmp" || true
+  note "Openbox monitor hook ensured at: $autostart_file"
+}
+remove_openbox_autostart_hook() {
+  local autostart_file="$OPENBOX_AUTOSTART_FILE"
+  local marker_begin="# BEGIN VFIO OPENBOX MONITOR AUTO-ACTIVATE"
+  local marker_end="# END VFIO OPENBOX MONITOR AUTO-ACTIVATE"
+  [[ -f "$autostart_file" ]] || return 0
+
+  backup_file "$autostart_file"
+
+  local tmp mode owner group
+  tmp="$(mktemp)"
+  awk -v begin="$marker_begin" -v end="$marker_end" '
+    $0 == begin { skip=1; next }
+    $0 == end { skip=0; next }
+    !skip { print }
+  ' "$autostart_file" >"$tmp"
+  mode="$(stat -c '%a' "$autostart_file" 2>/dev/null || echo 644)"
+  owner="$(stat -c '%u' "$autostart_file" 2>/dev/null || id -u)"
+  group="$(stat -c '%g' "$autostart_file" 2>/dev/null || id -g)"
+
+  if (( DRY_RUN )); then
+    rm -f "$tmp" || true
+    return 0
+  fi
+
+  install -o "$owner" -g "$group" -m "$mode" "$tmp" "$autostart_file"
+  rm -f "$tmp" || true
+}
+install_openbox_monitor_activation() {
+  install_openbox_monitor_script
+  install_openbox_autostart_hook
+}
 
 install_udev_isolation() {
   local gpu_bdf="$1"
@@ -5266,6 +5427,7 @@ generate_rollback_script() {
     "$SOFTDEP_FILE"
     "$BIND_SCRIPT"
     "$AUDIO_SCRIPT"
+    "$OPENBOX_MONITOR_SCRIPT"
     "$SYSTEMD_UNIT"
     "$UDEV_ISOLATION_RULE"
     "$USB_BT_SCRIPT"
@@ -5299,6 +5461,20 @@ fi
 
 # Restore or remove managed files
 ${rr}
+
+# Remove VFIO Openbox autostart marker block if backup is unavailable.
+if [ -f '${OPENBOX_AUTOSTART_FILE}.bak.${RUN_TS}' ]; then
+  cp -a '${OPENBOX_AUTOSTART_FILE}.bak.${RUN_TS}' '${OPENBOX_AUTOSTART_FILE}'
+elif [ -f '${OPENBOX_AUTOSTART_FILE}' ]; then
+  _vfio_tmp_autostart="\$(mktemp)"
+  awk '
+    \$0 == \"# BEGIN VFIO OPENBOX MONITOR AUTO-ACTIVATE\" { skip=1; next }
+    \$0 == \"# END VFIO OPENBOX MONITOR AUTO-ACTIVATE\" { skip=0; next }
+    !skip { print }
+  ' '${OPENBOX_AUTOSTART_FILE}' >"\$_vfio_tmp_autostart" || true
+  cat "\$_vfio_tmp_autostart" >'${OPENBOX_AUTOSTART_FILE}' || true
+  rm -f "\$_vfio_tmp_autostart" || true
+fi
 
 # Rebuild boot config (best-effort)
 if command -v update-grub >/dev/null 2>&1; then
@@ -5435,12 +5611,15 @@ reset_vfio_all() {
   local bootlog_bin="/home/${SUDO_USER:-root}/.local/bin/vfio-dump-boot-log.sh"
 
   run rm -f "$SYSTEMD_UNIT" "$BIND_SCRIPT" "$AUDIO_SCRIPT" \
+           "$OPENBOX_MONITOR_SCRIPT" \
            "$CONF_FILE" "$MODULES_LOAD" "$BLACKLIST_FILE" \
            "$SOFTDEP_FILE" "$DRACUT_VFIO_CONF" \
            "$UDEV_ISOLATION_RULE" \
            "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" \
            "$LIGHTDM_FALLBACK_CONF" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
+
+  remove_openbox_autostart_hook
 
   if have_cmd udevadm; then
     run udevadm control --reload-rules 2>/dev/null || true
@@ -6105,6 +6284,21 @@ apply_configuration() {
       set_plasma_wayland_default_session
     fi
   fi
+  local openbox_runtime_status
+  openbox_runtime_status="$(openbox_stack_status)"
+  if [[ "$openbox_runtime_status" == "WORKS" || -d /etc/xdg/openbox ]]; then
+    say
+    hdr "Openbox monitor activation"
+    note "Openbox integration can auto-detect connected monitors and activate all of them at session startup."
+    note "This installs $OPENBOX_MONITOR_SCRIPT and additively updates $OPENBOX_AUTOSTART_FILE."
+    if prompt_yn "Install/refresh Openbox auto-activate-all-monitors helper?" Y "Openbox monitor activation"; then
+      install_openbox_monitor_activation
+    else
+      note "Skipping Openbox monitor activation helper."
+    fi
+  else
+    note "Openbox stack not detected; skipping Openbox monitor activation integration."
+  fi
   if [[ -n "$guest_audio_csv" ]]; then
     local IFS=',' dev
     for dev in $guest_audio_csv; do
@@ -6567,4 +6761,6 @@ main() {
   apply_configuration
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

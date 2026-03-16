@@ -16,6 +16,17 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Added Openbox monitor auto-activation integration:
+  - installs `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
+  - additively manages `/etc/xdg/openbox/autostart` using marker blocks,
+  - enables all currently connected outputs in Openbox sessions with `xrandr --output <name> --auto`.
+- Added Openbox cleanup integration in reset/rollback paths:
+  - `--reset` now removes the Openbox monitor helper and strips the managed marker block from Openbox autostart,
+  - generated rollback scripts now restore Openbox files from backups when available, otherwise remove only the managed marker block.
+- Added a dedicated regression suite under `regression/`:
+  - `regression/script.sh` as the unified runner (with auto-`chmod +x`, `bash -n`, optional `shellcheck`, and regression execution),
+  - `regression/openbox-monitor-regression.sh` covering parser behavior, monitor activation calls, and additive/idempotent autostart hook behavior.
+- Added Openbox parser smoke coverage in `--self-test` via `openbox_connected_outputs_from_xrandr_query`.
 - Added `--boot-remove` as an alias for `--disable-bootlog` (same behavior, additive naming convenience).
 - Added machine-readable `--detect --json` mode for tooling/UI integrations:
   - prints JSON only,
@@ -135,6 +146,10 @@ The script uses the following paths on the host:
   - `/usr/local/sbin/vfio-usb-bluetooth.sh` – helper to detach USB Bluetooth adapters from the host `btusb` driver (stops reset-spam while keeping the device available for VM USB passthrough).
   - `/etc/systemd/system/vfio-disable-usb-bluetooth.service` – optional system service that runs the helper at boot.
   - `/etc/udev/rules.d/99-vfio-disable-usb-bluetooth.rules` – optional udev rule that triggers the systemd service when a USB Bluetooth interface appears.
+
+- **Openbox monitor auto-activation (optional)**
+  - `/usr/local/bin/vfio-openbox-activate-monitors.sh` – helper that detects currently connected displays and enables them with `xrandr`.
+  - `/etc/xdg/openbox/autostart` – additively updated with a managed marker block that starts the helper in Openbox sessions.
 
 - **Backups and rollback**
   - `*.bak.<timestamp>` – backups of files the script edits (e.g. `/etc/default/grub.bak.20250101-120000`).
@@ -295,6 +310,7 @@ The script supports several modes controlled by flags. By default, without any f
     - Verifies `/dev/tty` access (important for menus under `sudo`).
     - Optionally checks `wpctl` connectivity to PipeWire.
     - Counts discovered GPUs.
+    - Includes an Openbox monitor parser smoke test.
   - Intended to catch environment regressions early.
 
 - `--reset`

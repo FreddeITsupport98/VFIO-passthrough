@@ -192,15 +192,28 @@ xorg_stack_status() {
 }
 
 wayland_stack_status() {
-  # WORKS if Wayland session files and at least one common Wayland
-  # compositor/session launcher are present.
+  # WORKS if Wayland session files are present and at least one session
+  # Exec target resolves to an installed command/binary.
+  # Fallback: common compositor/launcher command detection.
   # NOT_PRESENT if neither is present.
   # NOT_WORK for partial/incomplete state.
   local has_sessions=0 has_runtime=0
+  local f exec_line exec_cmd exec_base
   if compgen -G "/usr/share/wayland-sessions/*.desktop" >/dev/null 2>&1; then
     has_sessions=1
+    for f in /usr/share/wayland-sessions/*.desktop; do
+      [[ -f "$f" ]] || continue
+      exec_line="$(grep -m1 -E '^Exec=' "$f" 2>/dev/null || true)"
+      exec_line="${exec_line#Exec=}"
+      exec_cmd="$(printf '%s\n' "$exec_line" | sed -E 's/[[:space:]]+--.*$//; s/[[:space:]].*$//; s/%[fFuUdDnNickvm]//g' | tr -d '"' | head -n1)"
+      exec_base="$(basename "${exec_cmd:-}")"
+      if [[ -n "$exec_cmd" ]] && { command -v "$exec_cmd" >/dev/null 2>&1 || command -v "$exec_base" >/dev/null 2>&1 || [[ -x "$exec_cmd" ]]; }; then
+        has_runtime=1
+        break
+      fi
+    done
   fi
-  if have_cmd gnome-shell || have_cmd kwin_wayland || have_cmd startplasma-wayland || have_cmd weston || have_cmd sway || have_cmd hyprland || have_cmd wayfire || have_cmd labwc; then
+  if have_cmd gnome-shell || have_cmd kwin_wayland || have_cmd startplasma-wayland || have_cmd weston || have_cmd sway || have_cmd hyprland || have_cmd wayfire || have_cmd labwc || have_cmd river || have_cmd niri || have_cmd cage || have_cmd hikari || have_cmd qtile; then
     has_runtime=1
   fi
 
@@ -212,7 +225,180 @@ wayland_stack_status() {
     echo "NOT_WORK"
   fi
 }
+x11_wayland_support_status() {
+  # Overall graphics protocol support gate for this helper.
+  # WORKS: at least one of X11(Xorg) or Wayland stacks is WORKS.
+  # NOT_PRESENT: both stacks are NOT_PRESENT.
+  # NOT_WORK: partial/broken state where neither stack is WORKS.
+  local xorg_status="$1"
+  local wayland_status="$2"
+  if [[ "$xorg_status" == "WORKS" || "$wayland_status" == "WORKS" ]]; then
+    echo "WORKS"
+  elif [[ "$xorg_status" == "NOT_PRESENT" && "$wayland_status" == "NOT_PRESENT" ]]; then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+x11_wayland_supported_mode() {
+  # Return BOTH | X11 | WAYLAND | NONE | PARTIAL
+  local xorg_status="$1"
+  local wayland_status="$2"
+  if [[ "$xorg_status" == "WORKS" && "$wayland_status" == "WORKS" ]]; then
+    echo "BOTH"
+  elif [[ "$xorg_status" == "WORKS" ]]; then
+    echo "X11"
+  elif [[ "$wayland_status" == "WORKS" ]]; then
+    echo "WAYLAND"
+  elif [[ "$xorg_status" == "NOT_PRESENT" && "$wayland_status" == "NOT_PRESENT" ]]; then
+    echo "NONE"
+  else
+    echo "PARTIAL"
+  fi
+}
 
+openbox_stack_status() {
+  # WORKS if Openbox binary and an X session entry are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_openbox=0 has_session=0
+  if have_cmd openbox || [[ -x /usr/bin/openbox || -x /usr/local/bin/openbox ]]; then
+    has_openbox=1
+  fi
+  if compgen -G "/usr/share/xsessions/openbox*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*openbox*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_openbox && has_session )); then
+    echo "WORKS"
+  elif (( ! has_openbox && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+i3_stack_status() {
+  # WORKS if i3 binary and an X session entry are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_i3=0 has_session=0
+  if have_cmd i3 || have_cmd i3wm || [[ -x /usr/bin/i3 || -x /usr/local/bin/i3 ]]; then
+    has_i3=1
+  fi
+  if compgen -G "/usr/share/xsessions/i3*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*i3*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_i3 && has_session )); then
+    echo "WORKS"
+  elif (( ! has_i3 && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+bspwm_stack_status() {
+  # WORKS if bspwm binary and an X session entry are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_bspwm=0 has_session=0
+  if have_cmd bspwm || [[ -x /usr/bin/bspwm || -x /usr/local/bin/bspwm ]]; then
+    has_bspwm=1
+  fi
+  if compgen -G "/usr/share/xsessions/bspwm*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*bspwm*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_bspwm && has_session )); then
+    echo "WORKS"
+  elif (( ! has_bspwm && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+awesome_stack_status() {
+  # WORKS if awesome binary and an X session entry are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_awesome=0 has_session=0
+  if have_cmd awesome || [[ -x /usr/bin/awesome || -x /usr/local/bin/awesome ]]; then
+    has_awesome=1
+  fi
+  if compgen -G "/usr/share/xsessions/awesome*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*awesome*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_awesome && has_session )); then
+    echo "WORKS"
+  elif (( ! has_awesome && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+dwm_stack_status() {
+  # WORKS if dwm binary and an X session entry are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_dwm=0 has_session=0
+  if have_cmd dwm || [[ -x /usr/bin/dwm || -x /usr/local/bin/dwm ]]; then
+    has_dwm=1
+  fi
+  if compgen -G "/usr/share/xsessions/dwm*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*dwm*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_dwm && has_session )); then
+    echo "WORKS"
+  elif (( ! has_dwm && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+qtile_stack_status() {
+  # WORKS if qtile binary and an X session entry are present.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_qtile=0 has_session=0
+  if have_cmd qtile || [[ -x /usr/bin/qtile || -x /usr/local/bin/qtile ]]; then
+    has_qtile=1
+  fi
+  if compgen -G "/usr/share/xsessions/qtile*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*qtile*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_qtile && has_session )); then
+    echo "WORKS"
+  elif (( ! has_qtile && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
+xfwm4_stack_status() {
+  # WORKS if xfwm4 binary and an X session entry are present.
+  # NOTE: xfwm4 usually ships with XFCE session files (xfce*.desktop),
+  # not necessarily xfwm4.desktop.
+  # NOT_PRESENT if neither is present.
+  # NOT_WORK for partial/incomplete state.
+  local has_xfwm4=0 has_session=0
+  if have_cmd xfwm4 || [[ -x /usr/bin/xfwm4 || -x /usr/local/bin/xfwm4 ]]; then
+    has_xfwm4=1
+  fi
+  if compgen -G "/usr/share/xsessions/xfwm4*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/xfce*.desktop" >/dev/null 2>&1 || compgen -G "/usr/share/xsessions/*xfce*.desktop" >/dev/null 2>&1; then
+    has_session=1
+  fi
+
+  if (( has_xfwm4 && has_session )); then
+    echo "WORKS"
+  elif (( ! has_xfwm4 && ! has_session )); then
+    echo "NOT_PRESENT"
+  else
+    echo "NOT_WORK"
+  fi
+}
 format_tri_state_status() {
   # Render WORKS / NOT WORK / NOT PRESENT with color when enabled.
   local status="$1"
@@ -840,6 +1026,25 @@ display_manager_dependency_preflight() {
       note "Detected display manager '${dm}'; no specific dependency preflight is implemented for it."
       ;;
   esac
+}
+graphics_protocol_preflight() {
+  # This helper officially supports only X11(Xorg) and Wayland desktop stacks.
+  # At least one stack must be fully WORKS for install mode.
+  local xorg_status wayland_status support mode
+  xorg_status="$(xorg_stack_status)"
+  wayland_status="$(wayland_stack_status)"
+  support="$(x11_wayland_support_status "$xorg_status" "$wayland_status")"
+  mode="$(x11_wayland_supported_mode "$xorg_status" "$wayland_status")"
+
+  say
+  hdr "Graphics protocol preflight (X11/Wayland)"
+  note "X11 (Xorg): $(format_tri_state_status "$xorg_status")"
+  note "Wayland: $(format_tri_state_status "$wayland_status")"
+  note "Supported protocol mode: $mode"
+
+  if [[ "$support" != "WORKS" ]]; then
+    die "Unsupported desktop stack state. This helper supports only X11 (Xorg) and Wayland, and requires at least one of them to be WORKS."
+  fi
 }
 
 prompt_yn() {
@@ -2146,12 +2351,21 @@ self_test() {
 
 detect_existing_vfio_report() {
   # Basic host state
-  local dm_name dm_dep_status xorg_status wayland_status
+  local dm_name dm_dep_status xorg_status wayland_status graphics_protocol_support graphics_protocol_mode openbox_status i3_status bspwm_status awesome_status dwm_status qtile_status xfwm4_status
   dm_name="$(detect_display_manager 2>/dev/null || true)"
   [[ -n "$dm_name" ]] || dm_name="none"
   dm_dep_status="$(display_manager_dependency_status "$dm_name")"
   xorg_status="$(xorg_stack_status)"
   wayland_status="$(wayland_stack_status)"
+  graphics_protocol_support="$(x11_wayland_support_status "$xorg_status" "$wayland_status")"
+  graphics_protocol_mode="$(x11_wayland_supported_mode "$xorg_status" "$wayland_status")"
+  openbox_status="$(openbox_stack_status)"
+  i3_status="$(i3_stack_status)"
+  bspwm_status="$(bspwm_stack_status)"
+  awesome_status="$(awesome_stack_status)"
+  dwm_status="$(dwm_stack_status)"
+  qtile_status="$(qtile_stack_status)"
+  xfwm4_status="$(xfwm4_stack_status)"
 
   if (( JSON_OUTPUT )); then
     local opensuse_like_json accountsservice_present_json hc status
@@ -2168,15 +2382,24 @@ detect_existing_vfio_report() {
     status="${status:-UNKNOWN}"
 
     printf '{\n'
-    printf '  "mode": "detect",\n'
-    printf '  "bootloader": "%s",\n' "$(detect_bootloader)"
-    printf '  "opensuse_like": %s,\n' "$opensuse_like_json"
-    printf '  "display_manager": "%s",\n' "$dm_name"
-    printf '  "display_manager_health": "%s",\n' "$dm_dep_status"
-    printf '  "graphics_stack_xorg": "%s",\n' "$xorg_status"
-    printf '  "graphics_stack_wayland": "%s",\n' "$wayland_status"
-    printf '  "accountsservice_present": %s,\n' "$accountsservice_present_json"
-    printf '  "vfio_health": "%s"\n' "$status"
+    printf '  \"mode\": \"detect\",\n'
+    printf '  \"bootloader\": \"%s\",\n' "$(detect_bootloader)"
+    printf '  \"opensuse_like\": %s,\n' "$opensuse_like_json"
+    printf '  \"display_manager\": \"%s\",\n' "$dm_name"
+    printf '  \"display_manager_health\": \"%s\",\n' "$dm_dep_status"
+    printf '  \"graphics_stack_xorg\": \"%s\",\n' "$xorg_status"
+    printf '  \"graphics_stack_wayland\": \"%s\",\n' "$wayland_status"
+    printf '  \"graphics_protocol_support\": \"%s\",\n' "$graphics_protocol_support"
+    printf '  \"graphics_protocol_mode\": \"%s\",\n' "$graphics_protocol_mode"
+    printf '  \"window_manager_openbox\": \"%s\",\n' "$openbox_status"
+    printf '  \"window_manager_i3\": \"%s\",\n' "$i3_status"
+    printf '  \"window_manager_bspwm\": \"%s\",\n' "$bspwm_status"
+    printf '  \"window_manager_awesome\": \"%s\",\n' "$awesome_status"
+    printf '  \"window_manager_dwm\": \"%s\",\n' "$dwm_status"
+    printf '  \"window_manager_qtile\": \"%s\",\n' "$qtile_status"
+    printf '  \"window_manager_xfwm4\": \"%s\",\n' "$xfwm4_status"
+    printf '  \"accountsservice_present\": %s,\n' "$accountsservice_present_json"
+    printf '  \"vfio_health\": \"%s\"\n' "$status"
     printf '}\n'
     return 0
   fi
@@ -2203,6 +2426,15 @@ detect_existing_vfio_report() {
     fi
     print_kv "Graphics stack (Xorg)" "$(format_tri_state_status "$xorg_status")"
     print_kv "Graphics stack (Wayland)" "$(format_tri_state_status "$wayland_status")"
+    print_kv "Graphics protocol support" "$(format_tri_state_status "$graphics_protocol_support")"
+    print_kv "Graphics protocol mode" "$graphics_protocol_mode"
+    print_kv "Window manager (Openbox)" "$(format_tri_state_status "$openbox_status")"
+    print_kv "Window manager (i3)" "$(format_tri_state_status "$i3_status")"
+    print_kv "Window manager (bspwm)" "$(format_tri_state_status "$bspwm_status")"
+    print_kv "Window manager (awesome)" "$(format_tri_state_status "$awesome_status")"
+    print_kv "Window manager (dwm)" "$(format_tri_state_status "$dwm_status")"
+    print_kv "Window manager (qtile)" "$(format_tri_state_status "$qtile_status")"
+    print_kv "Window manager (xfwm4)" "$(format_tri_state_status "$xfwm4_status")"
   else
     print_kv "Kernel" "$(uname -r)"
     print_kv "Current cmdline" "$(cat /proc/cmdline 2>/dev/null || true)"
@@ -2220,6 +2452,15 @@ detect_existing_vfio_report() {
     fi
     print_kv "Graphics stack (Xorg)" "$(format_tri_state_status "$xorg_status")"
     print_kv "Graphics stack (Wayland)" "$(format_tri_state_status "$wayland_status")"
+    print_kv "Graphics protocol support" "$(format_tri_state_status "$graphics_protocol_support")"
+    print_kv "Graphics protocol mode" "$graphics_protocol_mode"
+    print_kv "Window manager (Openbox)" "$(format_tri_state_status "$openbox_status")"
+    print_kv "Window manager (i3)" "$(format_tri_state_status "$i3_status")"
+    print_kv "Window manager (bspwm)" "$(format_tri_state_status "$bspwm_status")"
+    print_kv "Window manager (awesome)" "$(format_tri_state_status "$awesome_status")"
+    print_kv "Window manager (dwm)" "$(format_tri_state_status "$dwm_status")"
+    print_kv "Window manager (qtile)" "$(format_tri_state_status "$qtile_status")"
+    print_kv "Window manager (xfwm4)" "$(format_tri_state_status "$xfwm4_status")"
   fi
 
   # In detect mode, offer immediate remediation interactively.
@@ -5844,6 +6085,10 @@ apply_configuration() {
   # - LightDM: enforce AccountsService/fallback check
   # - SDDM/GDM/LXDM/XDM: recognized and treated as supported
   display_manager_dependency_preflight
+  # Graphics protocol guardrail:
+  # This helper supports only X11(Xorg)/Wayland and requires at least
+  # one stack in WORKS state before installation proceeds.
+  graphics_protocol_preflight
 
   # Self-heal legacy user audio units that were created before the
   # ConditionPathExists guard was introduced.

@@ -13,10 +13,25 @@
   - `Graphics stack (Xorg)`: `WORKS` / `NOT WORK` / `NOT PRESENT`
   - `Graphics stack (Wayland)`: `WORKS` / `NOT WORK` / `NOT PRESENT`
   - statuses are color-coded (green/red/yellow) when color output is enabled.
+- Added explicit graphics protocol support gate for X11/Wayland in install flow:
+  - new `graphics_protocol_preflight` now requires at least one of X11(Xorg) or Wayland to be `WORKS` before installation continues.
+- Extended `--detect`/`--verify` reporting with protocol-level fields:
+  - `Graphics protocol support`: `WORKS` / `NOT WORK` / `NOT PRESENT`
+  - `Graphics protocol mode`: `BOTH` / `X11` / `WAYLAND` / `NONE` / `PARTIAL`
+  - `--detect --json` now emits `graphics_protocol_support` and `graphics_protocol_mode`.
 - Extended `--detect` report with display-manager readiness lines:
   - `Display manager` (detected DM or not present)
   - `Display manager health` (`WORKS` / `NOT WORK` / `NOT PRESENT`)
   - includes explicit LightDM + AccountsService missing context when applicable.
+- Added Openbox-aware status reporting to `--detect`/`--verify`:
+  - new `Window manager (Openbox)` tri-state line (`WORKS` / `NOT WORK` / `NOT PRESENT`).
+  - `--detect --json` now emits `window_manager_openbox` using the same stable tri-state values.
+- Added additive window-manager coverage in `--detect`/`--verify`:
+  - new tri-state lines for `Window manager (i3)`, `Window manager (bspwm)`, and `Window manager (awesome)`.
+  - `--detect --json` now emits `window_manager_i3`, `window_manager_bspwm`, and `window_manager_awesome` with stable tri-state values.
+- Added further additive window-manager coverage in `--detect`/`--verify`:
+  - new tri-state lines for `Window manager (dwm)`, `Window manager (qtile)`, and `Window manager (xfwm4)`.
+  - `--detect --json` now emits `window_manager_dwm`, `window_manager_qtile`, and `window_manager_xfwm4` with stable tri-state values.
 - Added a Boot-VGA safety guard to the generated `/usr/local/sbin/vfio-bind-selected-gpu.sh`:
   - if the selected guest GPU is currently marked `boot_vga=1`, the script now skips binding by default to prevent host display-manager lockups.
   - explicit override is available with `VFIO_ALLOW_BOOT_VGA=1` for intentional headless/advanced workflows.

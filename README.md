@@ -28,9 +28,30 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - `Graphics stack (Xorg)` with tri-state output: `WORKS` / `NOT WORK` / `NOT PRESENT`
   - `Graphics stack (Wayland)` with tri-state output: `WORKS` / `NOT WORK` / `NOT PRESENT`
   - status values are color-coded (green/red/yellow) when color is enabled.
+- Added explicit graphics protocol support modeling for X11/Wayland:
+  - install flow now runs `graphics_protocol_preflight` and requires at least one of X11(Xorg) or Wayland to be `WORKS`,
+  - `--detect`/`--verify` now report `Graphics protocol support` (`WORKS` / `NOT WORK` / `NOT PRESENT`) and `Graphics protocol mode` (`BOTH` / `X11` / `WAYLAND` / `NONE` / `PARTIAL`),
+  - `--detect --json` now emits `graphics_protocol_support` and `graphics_protocol_mode`.
 - Added `--detect` display-manager readiness output:
   - `Display manager` (detected name or not present)
   - `Display manager health` (`WORKS` / `NOT WORK` / `NOT PRESENT`), including explicit LightDM + missing AccountsService context.
+- Added Openbox-aware desktop detection in `--detect`/`--verify`:
+  - new `Window manager (Openbox)` status line with tri-state output: `WORKS` / `NOT WORK` / `NOT PRESENT`.
+  - `--detect --json` now includes `window_manager_openbox` with the same stable tri-state values.
+- Added additional window-manager tri-state detection in `--detect`/`--verify`:
+  - `Window manager (i3)`, `Window manager (bspwm)`, `Window manager (awesome)`.
+  - each line uses the same stable states: `WORKS` / `NOT WORK` / `NOT PRESENT`.
+  - `--detect --json` now also emits:
+    - `window_manager_i3`
+    - `window_manager_bspwm`
+    - `window_manager_awesome`
+- Added further additive window-manager tri-state detection in `--detect`/`--verify`:
+  - `Window manager (dwm)`, `Window manager (qtile)`, `Window manager (xfwm4)`.
+  - each line uses the same stable states: `WORKS` / `NOT WORK` / `NOT PRESENT`.
+  - `--detect --json` now also emits:
+    - `window_manager_dwm`
+    - `window_manager_qtile`
+    - `window_manager_xfwm4`
 - Added Boot-VGA safety behavior in `vfio.sh` generation paths:
   - The generated bind helper now skips binding when selected `GUEST_GPU_BDF` is currently `boot_vga=1`, unless explicitly overridden with `VFIO_ALLOW_BOOT_VGA=1`.
   - Kernel-parameter generation now avoids forcing `vfio-pci.ids=...` when the selected guest GPU is currently Boot VGA on the host.

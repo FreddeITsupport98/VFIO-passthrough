@@ -1314,6 +1314,41 @@ bdf_driver_name() {
   basename "$(readlink -f "$sys")"
 }
 
+pci_boot_vga_flag() {
+  # Returns:
+  #   1 / 0 when boot_vga is available for this PCI BDF
+  #   unknown when sysfs does not expose boot_vga for this device
+  local bdf="$1"
+  local f="/sys/bus/pci/devices/$bdf/boot_vga"
+  if [[ -f "$f" ]]; then
+    cat "$f" 2>/dev/null || echo "unknown"
+    return 0
+  fi
+  echo "unknown"
+  return 0
+}
+
+host_assisted_boot_vga_policy_default() {
+  # Auto-enable host-assisted Boot-VGA bind only when:
+  # - guest GPU is Boot VGA (1)
+  # - host GPU is a different adapter with boot_vga=0
+  local host_gpu="$1"
+  local guest_gpu="$2"
+  [[ -n "$host_gpu" && -n "$guest_gpu" ]] || { echo "0"; return 0; }
+  [[ "$host_gpu" != "$guest_gpu" ]] || { echo "0"; return 0; }
+
+  local host_boot_vga guest_boot_vga
+  host_boot_vga="$(pci_boot_vga_flag "$host_gpu")"
+  guest_boot_vga="$(pci_boot_vga_flag "$guest_gpu")"
+
+  if [[ "$guest_boot_vga" == "1" && "$host_boot_vga" == "0" ]]; then
+    echo "1"
+    return 0
+  fi
+  echo "0"
+  return 0
+}
+
 drm_card_for_bdf() {
   # Print matching /dev/dri/cardX for a given BDF.
   local bdf="$1" card
@@ -2300,7 +2335,14 @@ vfio_config_health() {
     # Runtime binding mismatch hints
     if [[ -n "${GUEST_GPU_BDF:-}" ]]; then
       if [[ "$(bdf_driver_name "$GUEST_GPU_BDF")" != "vfio-pci" ]] && is_service_enabled vfio-bind-selected-gpu.service; then
-        add_reason WARN "Service is enabled but guest GPU is not currently bound to vfio-pci (likely needs reboot): $GUEST_GPU_BDF"
+        add_reason WARN "Service is enabled but guest GPU is not currently bound to vfio-pci (likely needs reboot or Boot-VGA safety policy skipped binding): $GUEST_GPU_BDF"
+      fi
+      if [[ -n "${HOST_GPU_BDF:-}" ]]; then
+        local host_assisted_default
+        host_assisted_default="$(host_assisted_boot_vga_policy_default "$HOST_GPU_BDF" "$GUEST_GPU_BDF")"
+        if [[ "$host_assisted_default" == "1" && "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" != "1" ]]; then
+          add_reason WARN "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 in $CONF_FILE to allow safe host-assisted binding."
+        fi
       fi
     fi
     if [[ -n "${HOST_AUDIO_BDFS_CSV:-}" ]]; then
@@ -3144,6 +3186,9 @@ write_conf() {
   local guest_gpu="$4"
   local guest_audio_bdfs_csv="$5"
   local guest_vendor="$6"
+  local boot_vga_host_assisted_default="0"
+
+  boot_vga_host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
 
   backup_file "$CONF_FILE"
 
@@ -3161,6 +3206,10 @@ write_conf() {
 #     find /sys/kernel/iommu_groups -type l | grep <BDF>
 
 HOST_GPU_BDF="$host_gpu"
+# Boot-VGA safety policy:
+# - 1 allows host-assisted binding when guest GPU is Boot VGA AND host GPU is a different adapter with boot_vga=0.
+# - 0 keeps Boot-VGA skip behavior unless fully forced via VFIO_ALLOW_BOOT_VGA=1.
+VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="$boot_vga_host_assisted_default"
 HOST_AUDIO_BDFS_CSV="$host_audio_bdfs_csv"
 HOST_AUDIO_NODE_NAME="$host_audio_node_name"
 

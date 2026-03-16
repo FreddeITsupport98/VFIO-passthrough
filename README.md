@@ -28,6 +28,11 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Restored strict Boot-VGA bind safety in generated `/usr/local/sbin/vfio-bind-selected-gpu.sh`:
   - host-assisted Boot-VGA binding now requires explicit opt-in with `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1`,
   - default behavior skips Boot-VGA guest binding unless explicitly forced (`VFIO_ALLOW_BOOT_VGA=1`) or host-assisted opt-in is set.
+- Improved Boot-VGA host-assisted automation in `vfio.sh` config generation:
+  - `write_conf()` now auto-computes `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU` based on detected topology (`guest boot_vga=1` + different `host boot_vga=0`),
+  - this removes the need for manual config edits in the common dual-GPU host-assisted layout after reinstall/rollback.
+- Improved `--verify`/`--detect` health diagnostics for Boot-VGA mismatch cases:
+  - runtime health now warns explicitly when host-assisted Boot-VGA binding conditions are met but `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU` is not enabled in config.
 - Added Openbox monitor auto-activation integration:
   - installs `/usr/local/bin/vfio-openbox-activate-monitors.sh`,
   - additively manages `/etc/xdg/openbox/autostart` using marker blocks,

@@ -3974,6 +3974,7 @@ systemd_boot_add_kernel_params() {
       new_cmdline="$(remove_param_all "$new_cmdline" "quiet")"
       new_cmdline="$(remove_param_all "$new_cmdline" "splash=silent")"
       new_cmdline="$(remove_param_all "$new_cmdline" "splash")"
+      new_cmdline="$(remove_param_all "$new_cmdline" "rhgb")"
       new_cmdline="$(add_param_once "$new_cmdline" "systemd.show_status=1")"
       new_cmdline="$(add_param_once "$new_cmdline" "loglevel=7")"
       # Stronger Plymouth disable (initramfs + userspace).
@@ -4146,6 +4147,7 @@ systemd_boot_add_kernel_params() {
     new_opts="$(remove_param_all "$new_opts" "quiet")"
     new_opts="$(remove_param_all "$new_opts" "splash=silent")"
     new_opts="$(remove_param_all "$new_opts" "splash")"
+    new_opts="$(remove_param_all "$new_opts" "rhgb")"
     new_opts="$(add_param_once "$new_opts" "systemd.show_status=1")"
     new_opts="$(add_param_once "$new_opts" "loglevel=7")"
     new_opts="$(add_param_once "$new_opts" "rd.plymouth=0")"
@@ -4303,6 +4305,7 @@ grub_add_kernel_params() {
     new="$(remove_param_all "$new" "quiet")"
     new="$(remove_param_all "$new" "splash=silent")"
     new="$(remove_param_all "$new" "splash")"
+    new="$(remove_param_all "$new" "rhgb")"
     new="$(add_param_once "$new" "systemd.show_status=1")"
     new="$(add_param_once "$new" "loglevel=7")"
     # Stronger Plymouth disable (initramfs + userspace).
@@ -5817,6 +5820,7 @@ reset_vfio_all() {
       new="$(remove_param_all "$new" "plymouth.enable=0")"
       new="$(remove_param_all "$new" "splash=silent")"
       new="$(remove_param_all "$new" "splash")"
+      new="$(remove_param_all "$new" "rhgb")"
       new="$(remove_param_all "$new" "systemd.unit=multi-user.target")"
       # Framebuffer / sysfb related tweaks
       new="$(remove_param_all "$new" "video=efifb:off")"
@@ -5861,6 +5865,7 @@ reset_vfio_all() {
       knew="$(remove_param_all "$knew" "plymouth.enable=0")"
       knew="$(remove_param_all "$knew" "splash=silent")"
       knew="$(remove_param_all "$knew" "splash")"
+      knew="$(remove_param_all "$knew" "rhgb")"
       knew="$(remove_param_all "$knew" "systemd.unit=multi-user.target")"
       # Framebuffer / sysfb related tweaks
       knew="$(remove_param_all "$knew" "video=efifb:off")"

@@ -11,12 +11,16 @@
   - GRUB cmdline updates,
   - systemd-boot current-entry updates,
   - openSUSE `/etc/kernel/cmdline` persistence updates.
+- Expanded splash/verbosity cleanup behavior to include `rhgb`:
+  - verbose boot enable flows now remove `rhgb` alongside `quiet`/`splash*`,
+  - `--reset` boot-option cleanup now removes `rhgb` from both GRUB and openSUSE `/etc/kernel/cmdline` persistence paths.
 - Added `regression/custom-kernel-params-regression.sh` with additive coverage for:
   - dedup token behavior via `add_param_once`,
   - no-change behavior when custom-parameter prompt is declined,
   - helper UI redirection checks guarding against stdout contamination,
   - GRUB/systemd-boot/openSUSE persistence call-site wiring,
-  - preview-helper behavior and preview call-site wiring for all boot-option update paths.
+  - preview-helper behavior and preview call-site wiring for all boot-option update paths,
+  - `rhgb` reset-cleanup wiring checks.
 - Added GitHub Actions CI workflow `.github/workflows/regression.yml` to run `regression/script.sh` automatically on both `push` and `pull_request`.
 - Improved `regression/script.sh` to auto-discover all `regression/*-regression.sh` scripts, run syntax checks for discovered regression scripts, and execute each regression script automatically in sorted order.
 - Improved `regression/script.sh` master-entrypoint coverage:

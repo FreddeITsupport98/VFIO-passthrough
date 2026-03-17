@@ -27,12 +27,16 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - GRUB cmdline updates,
   - systemd-boot current-entry updates,
   - openSUSE `/etc/kernel/cmdline` persistence updates.
+- Expanded splash/verbosity cleanup handling to also include the `rhgb` splash token:
+  - verbose boot enable paths now remove `rhgb` in addition to `quiet`/`splash*`,
+  - `--reset` boot-option cleanup now removes `rhgb` from both GRUB and openSUSE `/etc/kernel/cmdline` persistence paths.
 - Added `regression/custom-kernel-params-regression.sh` with additive coverage for:
   - token dedup behavior (`add_param_once`),
   - no-change return path when custom-parameter prompt is declined,
   - helper UI redirection checks to prevent stdout contamination,
   - GRUB/systemd-boot/openSUSE persistence call-site wiring,
-  - preview-helper behavior and preview call-site wiring in all boot-option paths.
+  - preview-helper behavior and preview call-site wiring in all boot-option paths,
+  - `rhgb` reset-cleanup wiring checks.
 - Added GitHub Actions CI regression automation:
   - new workflow at `.github/workflows/regression.yml`,
   - runs on both `push` and `pull_request`,

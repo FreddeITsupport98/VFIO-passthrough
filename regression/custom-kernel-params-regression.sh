@@ -123,6 +123,14 @@ assert_contains_file \
   "preview_cmdline_change_interactive \"\$current\" \"\$new\" \"GRUB kernel cmdline\"" \
   "$VFIO_SCRIPT"
 assert_contains_file \
+  "GRUB reset cleanup removes rhgb token" \
+  "new=\"\$(remove_param_all \"\$new\" \"rhgb\")\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE persistence reset cleanup removes rhgb token" \
+  "knew=\"\$(remove_param_all \"\$knew\" \"rhgb\")\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
   "openSUSE persistence flow calls custom-kernel helper" \
   "add_custom_kernel_params_interactive \"\$new_cmdline\" \"/etc/kernel/cmdline (persistence)\"" \
   "$VFIO_SCRIPT"

@@ -92,6 +92,10 @@
 - Updated Boot-VGA kernel-parameter handling in install flows to add selected guest `vfio-pci.ids=...` by default and use an automatic fallback path:
   - when Boot-VGA is detected and VFIO risk/failure markers are present in the same run, the script now removes that `vfio-pci.ids=...` token from the proposed cmdline before write.
   - this keeps behavior additive-first while preserving safer fallback when failure signals are detected.
+- Added shared temporary-directory cleanup helper `cleanup_tmp_dir_best_effort()` and refactored source-based `vendor-reset` DKMS install cleanup branches to use it consistently.
+- Extended `regression/custom-kernel-params-regression.sh` with runtime Boot-VGA fallback behavior coverage for `append_guest_vfio_ids_with_detect_fallback()`:
+  - validates add-first append behavior when risk markers are absent,
+  - validates risk-triggered fallback removal of `vfio-pci.ids=...` and `CTX[guest_vfio_ids_fallback]=1` marker updates.
 - Hardened `is_opensuse_like()` distro detection in `vfio.sh` by parsing `/etc/os-release` key/value pairs directly.
 - openSUSE-specific code paths now trigger only when `ID` starts with `opensuse` or an `ID_LIKE` token starts with `opensuse`, reducing accidental matches on non-openSUSE systems.
 - Added explicit openSUSE gating diagnostics to `--detect`: the report now prints `openSUSE-like detection` with `yes/no` and the exact reason (`ID` or `ID_LIKE` token match).

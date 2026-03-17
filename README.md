@@ -111,6 +111,10 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Updated Boot-VGA kernel-parameter behavior to be additive with fallback:
   - install boot-option flows now attempt to add selected guest `vfio-pci.ids=...` even when that guest is currently Boot VGA,
   - when the same run detects VFIO risk/failure markers, an automatic fallback removes that `vfio-pci.ids=...` token for safer boot behavior.
+- Added a shared best-effort temporary-directory cleanup helper (`cleanup_tmp_dir_best_effort`) and wired it into the source-based `vendor-reset` DKMS install path to keep cleanup behavior consistent and easier to maintain.
+- Extended `regression/custom-kernel-params-regression.sh` with a runtime behavior check for `append_guest_vfio_ids_with_detect_fallback()`:
+  - verifies add-first behavior appends `vfio-pci.ids=...` when no risk marker is present,
+  - verifies risk-marker fallback removes `vfio-pci.ids=...` and sets `CTX[guest_vfio_ids_fallback]=1`.
 - This protects host graphical boot (LightDM/Xorg) from early vfio takeover of the active display adapter while keeping an explicit advanced override path.
 - Tightened Boot-VGA runtime policy to be safe by default after real-world black-screen regressions:
   - automatic host-GPU-assisted Boot-VGA binding now requires explicit opt-in via `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1`.

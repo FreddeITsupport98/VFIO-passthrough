@@ -113,7 +113,75 @@ assert_eq \
   "preview_cmdline_change_interactive decline path returns non-zero" \
   "1" \
   "$preview_rc"
+# Test 5: Boot-VGA helper behavior stays additive-first and falls back when risk is detected.
+first_boot_vga_probe_bdf() {
+  local f
+  for f in /sys/bus/pci/devices/*/boot_vga; do
+    [[ -f "$f" ]] || continue
+    basename "$(dirname "$f")"
+    return 0
+  done
+  return 1
+}
 
+simulated_boot_vga_bdf="$(first_boot_vga_probe_bdf || true)"
+if [[ -z "$simulated_boot_vga_bdf" ]]; then
+  printf 'FAIL: no PCI boot_vga probe path found under /sys/bus/pci/devices/*/boot_vga\n' >&2
+  fail=1
+else
+  simulated_boot_vga_path="/sys/bus/pci/devices/$simulated_boot_vga_bdf/boot_vga"
+  shim_dir="$tmp_dir/shim-bin"
+  mkdir -p "$shim_dir"
+  cat_bin="$(command -v cat)"
+  cat >"$shim_dir/cat" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "$simulated_boot_vga_path" ]]; then
+  printf '1\n'
+  exit 0
+fi
+exec "$cat_bin" "\$@"
+EOF
+  chmod +x "$shim_dir/cat"
+
+  old_path="$PATH"
+  PATH="$shim_dir:$PATH"
+
+  CTX["guest_vfio_ids"]="10de:1b80,10de:10f0"
+  CTX["guest_gpu"]="$simulated_boot_vga_bdf"
+  CTX["kernel_vfio_risk"]=0
+  CTX["kernel_vfio_log_error"]=0
+  CTX["guest_vfio_ids_fallback"]=0
+
+  append_guest_vfio_ids_with_detect_fallback "quiet iommu=pt" "custom-regression target" >"$tmp_dir/boot-vga-add.stdout" 2>"$tmp_dir/boot-vga-add.stderr"
+  add_only_result="$(cat "$tmp_dir/boot-vga-add.stdout")"
+  assert_eq \
+    "Boot-VGA helper add-first path appends vfio-pci.ids when no risk is detected" \
+    "quiet iommu=pt vfio-pci.ids=10de:1b80,10de:10f0" \
+    "$add_only_result"
+  assert_eq \
+    "Boot-VGA helper keeps fallback marker unset when no risk is detected" \
+    "0" \
+    "${CTX[guest_vfio_ids_fallback]:-0}"
+
+  CTX["kernel_vfio_risk"]=1
+  CTX["kernel_vfio_log_error"]=0
+  CTX["guest_vfio_ids_fallback"]=0
+
+  append_guest_vfio_ids_with_detect_fallback "quiet iommu=pt" "custom-regression target" >"$tmp_dir/boot-vga-fallback.stdout" 2>"$tmp_dir/boot-vga-fallback.stderr"
+  fallback_result="$(cat "$tmp_dir/boot-vga-fallback.stdout")"
+  assert_eq \
+    "Boot-VGA helper fallback removes vfio-pci.ids when risk is detected" \
+    "quiet iommu=pt" \
+    "$fallback_result"
+  assert_eq \
+    "Boot-VGA helper sets fallback marker when risk-triggered removal occurs" \
+    "1" \
+    "${CTX[guest_vfio_ids_fallback]:-0}"
+
+  PATH="$old_path"
+fi
+
+# Test 6: call-site wiring coverage for all boot-option flows.
 # Test 5: call-site wiring coverage for all boot-option flows.
 assert_contains_file \
   "preview helper function exists" \

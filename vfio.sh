@@ -873,6 +873,13 @@ install_vendor_reset_pkg() {
   return 1
 }
 
+cleanup_tmp_dir_best_effort() {
+  local tmp_dir="${1:-}"
+  if [[ -n "$tmp_dir" && -d "$tmp_dir" ]]; then
+    run rm -rf "$tmp_dir" || true
+  fi
+  return 0
+}
 install_vendor_reset_dkms_from_source() {
   # Optional fallback for apt-based systems where vendor-reset packages are
   # unavailable in enabled repositories.
@@ -899,15 +906,11 @@ install_vendor_reset_dkms_from_source() {
   src="$tmp/vendor-reset"
 
   if ! run git clone --depth 1 https://github.com/gnif/vendor-reset "$src"; then
-    if [[ -d "$tmp" ]]; then
-      run rm -rf "$tmp" || true
-    fi
+    cleanup_tmp_dir_best_effort "$tmp"
     return 1
   fi
   if [[ ! -f "$src/dkms.conf" ]]; then
-    if [[ -d "$tmp" ]]; then
-      run rm -rf "$tmp" || true
-    fi
+    cleanup_tmp_dir_best_effort "$tmp"
     return 1
   fi
 
@@ -915,9 +918,7 @@ install_vendor_reset_dkms_from_source() {
   pkg_name="$(awk -F= '/^PACKAGE_NAME=/{gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$src/dkms.conf")"
   pkg_ver="$(awk -F= '/^PACKAGE_VERSION=/{gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$src/dkms.conf")"
   if [[ -z "$pkg_name" || -z "$pkg_ver" ]]; then
-    if [[ -d "$tmp" ]]; then
-      run rm -rf "$tmp" || true
-    fi
+    cleanup_tmp_dir_best_effort "$tmp"
     return 1
   fi
 
@@ -931,9 +932,7 @@ install_vendor_reset_dkms_from_source() {
     run dkms install "$pkg_name/$pkg_ver"
   fi
 
-  if [[ -d "$tmp" ]]; then
-    run rm -rf "$tmp" || true
-  fi
+  cleanup_tmp_dir_best_effort "$tmp"
 }
 
 maybe_offer_detect_vendor_reset_install() {

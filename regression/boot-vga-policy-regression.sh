@@ -96,7 +96,7 @@ write_file_atomic() {
 }
 
 # Test 1: write_conf auto-default writes VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 when helper says host-assisted path is safe.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317
 host_assisted_boot_vga_policy_default() { echo "1"; }
 write_conf "$host_bdf" "" "" "$guest_bdf" "" "1002"
 assert_contains \
@@ -105,7 +105,7 @@ assert_contains \
   "$(cat "$CONF_FILE")"
 
 # Test 2: write_conf writes 0 when host-assisted default says disabled.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2329,SC2317
 host_assisted_boot_vga_policy_default() { echo "0"; }
 write_conf "$host_bdf" "" "" "$guest_bdf" "" "1002"
 assert_contains \

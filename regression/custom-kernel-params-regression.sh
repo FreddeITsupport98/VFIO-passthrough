@@ -44,6 +44,15 @@ assert_contains_file() {
     fail=1
   fi
 }
+assert_not_contains_file() {
+  local name="$1" pattern="$2" file="$3"
+  if grep -Fq -- "$pattern" "$file"; then
+    printf 'FAIL: %s (unexpected pattern found: %s)\n' "$name" "$pattern" >&2
+    fail=1
+  else
+    printf 'PASS: %s\n' "$name"
+  fi
+}
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -141,6 +150,34 @@ assert_contains_file \
 assert_contains_file \
   "GRUB flow calls custom-kernel helper" \
   "add_custom_kernel_params_interactive \"\$new\" \"GRUB cmdline\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Boot-VGA vfio ids helper function exists" \
+  "append_guest_vfio_ids_with_detect_fallback()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Boot-VGA helper checks VFIO risk markers" \
+  "if [[ \"\${CTX[kernel_vfio_risk]:-0}\" == \"1\" || \"\${CTX[kernel_vfio_log_error]:-0}\" == \"1\" ]]; then" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Boot-VGA helper fallback removes vfio-pci.ids on detected risk" \
+  "updated=\"\$(remove_param_all \"\$updated\" \"vfio-pci.ids=\$guest_ids\")\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE persistence flow uses Boot-VGA helper for vfio-pci.ids" \
+  "append_guest_vfio_ids_with_detect_fallback \"\$new_cmdline\" \"/etc/kernel/cmdline (persistence)\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "systemd-boot flow uses Boot-VGA helper for vfio-pci.ids" \
+  "append_guest_vfio_ids_with_detect_fallback \"\$new_opts\" \"systemd-boot entry options\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "GRUB flow uses Boot-VGA helper for vfio-pci.ids" \
+  "append_guest_vfio_ids_with_detect_fallback \"\$new\" \"GRUB kernel cmdline\"" \
+  "$VFIO_SCRIPT"
+assert_not_contains_file \
+  "legacy Boot-VGA hard-skip message removed" \
+  "Skipping vfio-pci.ids for" \
   "$VFIO_SCRIPT"
 
 if (( fail != 0 )); then

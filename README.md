@@ -108,6 +108,9 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Added Boot-VGA safety behavior in `vfio.sh` generation paths:
   - The generated bind helper now skips binding when selected `GUEST_GPU_BDF` is currently `boot_vga=1`, unless explicitly overridden with `VFIO_ALLOW_BOOT_VGA=1`.
   - Kernel-parameter generation now avoids forcing `vfio-pci.ids=...` when the selected guest GPU is currently Boot VGA on the host.
+- Updated Boot-VGA kernel-parameter behavior to be additive with fallback:
+  - install boot-option flows now attempt to add selected guest `vfio-pci.ids=...` even when that guest is currently Boot VGA,
+  - when the same run detects VFIO risk/failure markers, an automatic fallback removes that `vfio-pci.ids=...` token for safer boot behavior.
 - This protects host graphical boot (LightDM/Xorg) from early vfio takeover of the active display adapter while keeping an explicit advanced override path.
 - Tightened Boot-VGA runtime policy to be safe by default after real-world black-screen regressions:
   - automatic host-GPU-assisted Boot-VGA binding now requires explicit opt-in via `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1`.

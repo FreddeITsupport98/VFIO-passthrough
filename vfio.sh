@@ -899,15 +899,27 @@ install_vendor_reset_dkms_from_source() {
   src="$tmp/vendor-reset"
 
   if ! run git clone --depth 1 https://github.com/gnif/vendor-reset "$src"; then
-    [[ -d "$tmp" ]] && run rm -rf "$tmp" || true
+    if [[ -d "$tmp" ]]; then
+      run rm -rf "$tmp" || true
+    fi
     return 1
   fi
-  [[ -f "$src/dkms.conf" ]] || { [[ -d "$tmp" ]] && run rm -rf "$tmp" || true; return 1; }
+  if [[ ! -f "$src/dkms.conf" ]]; then
+    if [[ -d "$tmp" ]]; then
+      run rm -rf "$tmp" || true
+    fi
+    return 1
+  fi
 
   local pkg_name pkg_ver
   pkg_name="$(awk -F= '/^PACKAGE_NAME=/{gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$src/dkms.conf")"
   pkg_ver="$(awk -F= '/^PACKAGE_VERSION=/{gsub(/[[:space:]"]/, "", $2); print $2; exit}' "$src/dkms.conf")"
-  [[ -n "$pkg_name" && -n "$pkg_ver" ]] || { [[ -d "$tmp" ]] && run rm -rf "$tmp" || true; return 1; }
+  if [[ -z "$pkg_name" || -z "$pkg_ver" ]]; then
+    if [[ -d "$tmp" ]]; then
+      run rm -rf "$tmp" || true
+    fi
+    return 1
+  fi
 
   if (( use_sudo )); then
     run sudo dkms remove "$pkg_name/$pkg_ver" --all 2>/dev/null || true
@@ -919,7 +931,9 @@ install_vendor_reset_dkms_from_source() {
     run dkms install "$pkg_name/$pkg_ver"
   fi
 
-  [[ -d "$tmp" ]] && run rm -rf "$tmp" || true
+  if [[ -d "$tmp" ]]; then
+    run rm -rf "$tmp" || true
+  fi
 }
 
 maybe_offer_detect_vendor_reset_install() {
@@ -3559,6 +3573,48 @@ preview_cmdline_change_interactive() {
   note "Skipped ${target} update by user choice."
   return 1
 }
+append_guest_vfio_ids_with_detect_fallback() {
+  # append_guest_vfio_ids_with_detect_fallback "<current_cmdline>" "<target_label>"
+  # Always attempts to add vfio-pci.ids for the selected guest GPU.
+  # If the selected guest is Boot VGA AND VFIO risk/failure markers were
+  # detected in this run, it falls back by removing vfio-pci.ids again.
+  local current="$1"
+  local target="$2"
+  local updated="$current"
+  local out guest_ids guest_boot_vga="0" risk_detected=0
+  out="/dev/stderr"
+  if [[ -r /dev/tty && -w /dev/tty ]]; then
+    out="/dev/tty"
+  fi
+
+  guest_ids="${CTX[guest_vfio_ids]:-}"
+  [[ -n "$guest_ids" ]] || {
+    printf '%s\n' "$updated"
+    return 0
+  }
+
+  updated="$(add_param_once "$updated" "vfio-pci.ids=$guest_ids")"
+
+  if [[ -n "${CTX[guest_gpu]:-}" && -f "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" ]]; then
+    guest_boot_vga="$(cat "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" 2>/dev/null || echo 0)"
+  fi
+
+  if [[ "${CTX[kernel_vfio_risk]:-0}" == "1" || "${CTX[kernel_vfio_log_error]:-0}" == "1" ]]; then
+    risk_detected=1
+  fi
+
+  if [[ "$guest_boot_vga" == "1" ]]; then
+    note "Boot VGA guest detected (${CTX[guest_gpu]:-unknown}); adding vfio-pci.ids in ${target} with automatic risk fallback enabled." >"$out"
+    if (( risk_detected )); then
+      note "Detected VFIO risk/failure markers in this run; fallback applied in ${target} by removing vfio-pci.ids for safer boot behavior." >"$out"
+      updated="$(remove_param_all "$updated" "vfio-pci.ids=$guest_ids")"
+      CTX[guest_vfio_ids_fallback]=1
+    fi
+  fi
+
+  printf '%s\n' "$updated"
+  return 0
+}
 add_custom_kernel_params_interactive() {
   # add_custom_kernel_params_interactive "<current_cmdline>" "<target_label>"
   local current="$1"
@@ -3864,27 +3920,13 @@ systemd_boot_add_kernel_params() {
       read -r -a extra <<<"${GRUB_EXTRA_PARAMS}"
       params_to_add+=("${extra[@]}")
     fi
-    # If we know the exact vfio-pci.ids value for the selected guest GPU,
-    # persist it into /etc/kernel/cmdline as well.
-    # Safety: avoid forcing early vfio binding when selected guest GPU is
-    # currently Boot VGA, because that can break host display-manager boot.
-    if [[ -n "${CTX[guest_vfio_ids]:-}" ]]; then
-      local guest_boot_vga="0"
-      if [[ -n "${CTX[guest_gpu]:-}" && -f "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" ]]; then
-        guest_boot_vga="$(cat "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" 2>/dev/null || echo 0)"
-      fi
-      if [[ "$guest_boot_vga" == "1" ]]; then
-        note "Skipping vfio-pci.ids for ${CTX[guest_gpu]} because it is Boot VGA on this host."
-      else
-        params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
-      fi
-    fi
     local new_cmdline="$cmdline_content"
     
     local p
     for p in "${params_to_add[@]}"; do
       new_cmdline="$(add_param_once "$new_cmdline" "$p")"
     done
+    new_cmdline="$(append_guest_vfio_ids_with_detect_fallback "$new_cmdline" "/etc/kernel/cmdline (persistence)")"
     # Optional: USB/xHCI stability workaround for hosts that can freeze or
     # spam disconnects due to USB runtime PM / PCIe ASPM interactions.
     say
@@ -4118,15 +4160,11 @@ systemd_boot_add_kernel_params() {
     read -r -a extra <<<"${GRUB_EXTRA_PARAMS}"
     params_to_add+=("${extra[@]}")
   fi
-  # Mirror vfio-pci.ids for the selected guest GPU into the live entry as
-  # well so the current kernel uses the same binding.
-  if [[ -n "${CTX[guest_vfio_ids]:-}" ]]; then
-    params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
-  fi
   local new_opts="$current_opts"
   for p in "${params_to_add[@]}"; do
     new_opts="$(add_param_once "$new_opts" "$p")"
   done
+  new_opts="$(append_guest_vfio_ids_with_detect_fallback "$new_opts" "systemd-boot entry options")"
 
   # Optional: USB/xHCI stability workaround for the selected live entry.
   say
@@ -4201,21 +4239,6 @@ grub_add_kernel_params() {
     read -r -a extra <<<"${GRUB_EXTRA_PARAMS}"
     params_to_add+=("${extra[@]}")
   fi
-  # If we know vfio-pci.ids for the selected guest GPU, also place it on
-  # the GRUB cmdline so vfio-pci can bind in the initramfs.
-  # Safety: skip this when selected guest GPU is currently Boot VGA, because
-  # forcing early vfio-pci binding can break host graphical boot.
-  if [[ -n "${CTX[guest_vfio_ids]:-}" ]]; then
-    local guest_boot_vga="0"
-    if [[ -n "${CTX[guest_gpu]:-}" && -f "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" ]]; then
-      guest_boot_vga="$(cat "/sys/bus/pci/devices/${CTX[guest_gpu]}/boot_vga" 2>/dev/null || echo 0)"
-    fi
-    if [[ "$guest_boot_vga" == "1" ]]; then
-      note "Skipping vfio-pci.ids for ${CTX[guest_gpu]} because it is Boot VGA on this host."
-    else
-      params_to_add+=("vfio-pci.ids=${CTX[guest_vfio_ids]}")
-    fi
-  fi
 
   if [[ ! -f /etc/default/grub ]]; then
     print_manual_iommu_instructions
@@ -4235,6 +4258,7 @@ grub_add_kernel_params() {
   for p in "${params_to_add[@]}"; do
     new="$(add_param_once "$new" "$p")"
   done
+  new="$(append_guest_vfio_ids_with_detect_fallback "$new" "GRUB kernel cmdline")"
 
   # Optional USB/xHCI power-management workaround.
   say

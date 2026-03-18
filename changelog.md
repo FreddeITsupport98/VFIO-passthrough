@@ -1,14 +1,26 @@
 # Changelog
 ## Unreleased
+- Added new read-only mode `--print-effective-config`:
+  - reads `/etc/vfio-gpu-passthrough.conf` plus current `boot_vga` sysfs topology,
+  - reports normalized `VFIO_BOOT_VGA_POLICY`, effective bind decision (`ALLOW_BIND` / `SKIP_BIND`), and decision reason path (`auto_detect`, `explicit_opt_in`, etc.),
+  - runs without applying system changes and is treated as a dry-run/read-only mode.
+- Extended `regression/boot-vga-policy-regression.sh` with `print_effective_config()` decision-path checks:
+  - verifies strict mode without host-assisted opt-in reports `SKIP_BIND` and `host_assisted_available_but_not_enabled`,
+  - verifies `AUTO` policy reports `ALLOW_BIND` with `auto_detect`,
+  - verifies strict mode with explicit host-assisted opt-in reports `ALLOW_BIND` with `explicit_opt_in`.
 - Added Boot-VGA host-assisted auto-detect/self-adjust support:
   - generated config now persists `VFIO_BOOT_VGA_POLICY="AUTO"` by default,
   - generated bind helper now dynamically adjusts host-assisted Boot-VGA binding each boot based on runtime `boot_vga` topology.
 - Improved Boot-VGA health diagnostics for policy mode:
   - strict host-assisted warning is now emitted only when `VFIO_BOOT_VGA_POLICY` is not `AUTO`,
   - warning guidance now includes the new `AUTO` policy path.
+- Added install CLI override for Boot-VGA policy:
+  - new `--boot-vga-policy auto|strict` argument now controls persisted `VFIO_BOOT_VGA_POLICY` during install runs.
+  - install summary now reports the effective Boot-VGA policy and explicitly notes when a CLI override is applied.
 - Extended `regression/boot-vga-policy-regression.sh` coverage:
   - verifies `write_conf()` persists `VFIO_BOOT_VGA_POLICY="AUTO"`,
   - verifies `vfio_config_health()` suppresses strict-warning paths when `VFIO_BOOT_VGA_POLICY=AUTO`.
+  - verifies `normalize_boot_vga_policy_arg` accepts valid values and rejects invalid policy input.
 - Improved `regression/script.sh` shellcheck behavior:
   - when `shellcheck` is missing, the runner now attempts distro-aware installation with package-manager detection (`apt-get`, `dnf`, `yum`, `zypper`, `pacman`, `apk`, `xbps-install`) and sudo/root fallback.
   - when installation still fails, the runner now emits explicit manual-install guidance before continuing remaining checks.

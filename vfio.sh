@@ -42,6 +42,7 @@ DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
 MODE="install"   # install | verify
+BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 
 # Global context structure used to separate detection, user selection and
@@ -1139,13 +1140,19 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--verify] [--detect] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
   --no-tui          Force plain-text prompts even if whiptail is installed.
+  --boot-vga-policy Install-mode override for generated Boot-VGA policy:
+                   auto (default behavior, dynamic host-assisted detection) or
+                   strict (requires explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1).
   --verify          Do not change anything; validate an existing setup (reads $CONF_FILE).
   --detect          Print a detailed report of existing VFIO/passthrough configuration and exit.
+  --print-effective-config
+                   Read-only report of effective Boot-VGA policy and runtime decision path
+                   using $CONF_FILE plus current sysfs topology.
   --json            With --detect, print machine-readable JSON only (tri-state values: WORKS / NOT_WORK / NOT_PRESENT).
   --self-test       Run automated checks for common issues (awk compatibility, PipeWire access) and exit.
   --health-check    Audit the running kernel and logs for VFIO-friendliness (no changes made) and exit.
@@ -1161,6 +1168,19 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--verify] [--detect] [--js
 EOF
 }
 
+normalize_boot_vga_policy_arg() {
+  local raw="${1:-}" val
+  val="${raw^^}"
+  case "$val" in
+    AUTO|STRICT)
+      printf '%s\n' "$val"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 parse_args() {
   while (( $# )); do
     case "$1" in
@@ -1174,11 +1194,22 @@ parse_args() {
       --no-tui)
         HAS_TUI=0
         ;;
+      --boot-vga-policy)
+        shift
+        (( $# > 0 )) || die "--boot-vga-policy requires a value: auto|strict"
+        BOOT_VGA_POLICY_OVERRIDE="$(normalize_boot_vga_policy_arg "$1")" || die "Invalid --boot-vga-policy value: $1 (expected: auto|strict)"
+        ;;
+      --boot-vga-policy=*)
+        BOOT_VGA_POLICY_OVERRIDE="$(normalize_boot_vga_policy_arg "${1#*=}")" || die "Invalid --boot-vga-policy value: ${1#*=} (expected: auto|strict)"
+        ;;
       --verify)
         MODE="verify"
         ;;
       --detect)
         MODE="detect"
+        ;;
+      --print-effective-config)
+        MODE="print-effective-config"
         ;;
       --json)
         JSON_OUTPUT=1
@@ -1221,8 +1252,8 @@ parse_args() {
     shift
   done
 
-  # verify/detect/self-test implies dry-run
-  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "self-test" ]]; then
+  # verify/detect/self-test/print-effective-config implies dry-run
+  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" ]]; then
     DRY_RUN=1
   fi
 
@@ -2878,6 +2909,89 @@ detect_existing_vfio_report() {
   say "==== End report ===="
 }
 
+print_effective_config() {
+  readable_file "$CONF_FILE" || die "Missing or unreadable config: $CONF_FILE"
+
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+
+  local guest_gpu host_gpu
+  guest_gpu="${GUEST_GPU_BDF:-}"
+  host_gpu="${HOST_GPU_BDF:-}"
+
+  [[ -n "$guest_gpu" ]] || die "GUEST_GPU_BDF is missing in $CONF_FILE"
+
+  local boot_vga_policy guest_boot_vga host_boot_vga
+  local allow_boot_vga allow_boot_vga_if_host
+  local host_assisted_default allow_boot_vga_bind
+  local decision decision_reason
+
+  boot_vga_policy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+  boot_vga_policy="${boot_vga_policy^^}"
+  case "$boot_vga_policy" in
+    AUTO|STRICT) ;;
+    *) boot_vga_policy="STRICT" ;;
+  esac
+
+  allow_boot_vga="${VFIO_ALLOW_BOOT_VGA:-0}"
+  allow_boot_vga_if_host="${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}"
+
+  guest_boot_vga="$(pci_boot_vga_flag "$guest_gpu")"
+  host_boot_vga="n/a"
+  if [[ -n "$host_gpu" ]]; then
+    host_boot_vga="$(pci_boot_vga_flag "$host_gpu")"
+  fi
+  host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
+
+  allow_boot_vga_bind=1
+  decision_reason="guest_not_boot_vga_or_force_enabled"
+  if [[ "$guest_boot_vga" == "1" ]] && [[ "$allow_boot_vga" != "1" ]]; then
+    allow_boot_vga_bind=0
+    decision_reason="boot_vga_guard"
+    if [[ "$host_assisted_default" == "1" ]]; then
+      if [[ "$allow_boot_vga_if_host" == "1" ]]; then
+        allow_boot_vga_bind=1
+        decision_reason="explicit_opt_in"
+      fi
+      if [[ "$boot_vga_policy" == "AUTO" ]]; then
+        allow_boot_vga_bind=1
+        decision_reason="auto_detect"
+      fi
+      if [[ "$allow_boot_vga_bind" != "1" ]]; then
+        decision_reason="host_assisted_available_but_not_enabled"
+      fi
+    else
+      decision_reason="no_host_assisted_topology"
+    fi
+  fi
+
+  if [[ "$allow_boot_vga_bind" == "1" ]]; then
+    decision="ALLOW_BIND"
+  else
+    decision="SKIP_BIND"
+  fi
+
+  say
+  hdr "Effective Boot-VGA Policy Report"
+  print_kv "Config file" "$CONF_FILE"
+  print_kv "Host GPU BDF" "${host_gpu:-<unset>}"
+  print_kv "Guest GPU BDF" "$guest_gpu"
+  print_kv "Guest boot_vga" "$guest_boot_vga"
+  print_kv "Host boot_vga" "$host_boot_vga"
+  print_kv "Host-assisted topology" "$host_assisted_default"
+  print_kv "VFIO_BOOT_VGA_POLICY" "$boot_vga_policy"
+  print_kv "VFIO_ALLOW_BOOT_VGA" "$allow_boot_vga"
+  print_kv "VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU" "$allow_boot_vga_if_host"
+  print_kv "Effective decision" "$decision"
+  print_kv "Decision reason" "$decision_reason"
+
+  if [[ "$decision" == "ALLOW_BIND" ]]; then
+    note "Result: bind helper would proceed with vfio-pci binding for this boot."
+  else
+    note "Result: bind helper would skip vfio-pci binding for this boot."
+  fi
+}
+
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
@@ -3224,11 +3338,17 @@ write_conf() {
   local guest_audio_bdfs_csv="$5"
   local guest_vendor="$6"
   local graphics_protocol_mode="${7:-AUTO}"
+  local boot_vga_policy_mode="${8:-${BOOT_VGA_POLICY_OVERRIDE:-AUTO}}"
   local boot_vga_host_assisted_default="0"
   graphics_protocol_mode="${graphics_protocol_mode^^}"
   if [[ "$graphics_protocol_mode" != "X11" && "$graphics_protocol_mode" != "WAYLAND" ]]; then
     graphics_protocol_mode="AUTO"
   fi
+  boot_vga_policy_mode="${boot_vga_policy_mode^^}"
+  case "$boot_vga_policy_mode" in
+    AUTO|STRICT) ;;
+    *) boot_vga_policy_mode="AUTO" ;;
+  esac
 
   boot_vga_host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
 
@@ -3256,7 +3376,7 @@ VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="$boot_vga_host_assisted_default"
 # - AUTO: dynamically allows host-assisted Boot-VGA bind when runtime topology is safe
 #         (guest boot_vga=1, host boot_vga=0, different GPUs), and skips otherwise.
 # - STRICT: requires explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1.
-VFIO_BOOT_VGA_POLICY="AUTO"
+VFIO_BOOT_VGA_POLICY="$boot_vga_policy_mode"
 HOST_AUDIO_BDFS_CSV="$host_audio_bdfs_csv"
 HOST_AUDIO_NODE_NAME="$host_audio_node_name"
 
@@ -6917,6 +7037,12 @@ apply_configuration() {
   local guest_audio_csv="${CTX[guest_audio_csv]}"
   local host_audio_bdfs_csv="${CTX[host_audio_bdfs_csv]}"
   local host_audio_node_name="${CTX[host_audio_node_name]}"
+  local boot_vga_policy_mode="${BOOT_VGA_POLICY_OVERRIDE:-AUTO}"
+  boot_vga_policy_mode="${boot_vga_policy_mode^^}"
+  case "$boot_vga_policy_mode" in
+    AUTO|STRICT) ;;
+    *) boot_vga_policy_mode="AUTO" ;;
+  esac
 
   # Track whether we actually installed a dracut config for vfio modules
   # and whether we added rd.driver.pre=vfio-pci to the kernel cmdline.
@@ -6930,6 +7056,10 @@ apply_configuration() {
   say "  Host audio PCI:  ${host_audio_bdfs_csv:-<none>}"
   say "  Guest audio PCI: ${guest_audio_csv:-<none>}"
   say "  Host default sink node.name: ${host_audio_node_name:-<not set>}"
+  say "  Boot-VGA host-assisted policy: ${boot_vga_policy_mode}"
+  if [[ -n "${BOOT_VGA_POLICY_OVERRIDE:-}" ]]; then
+    note "CLI override applied: --boot-vga-policy ${BOOT_VGA_POLICY_OVERRIDE,,}"
+  fi
   if [[ "${XDG_CURRENT_DESKTOP:-}" =~ KDE|Plasma|PLASMA ]]; then
     note "Desktop session: KDE Plasma detected; these settings are tuned for Plasma + Wayland + PipeWire."
   fi
@@ -7024,7 +7154,7 @@ apply_configuration() {
     done
   fi
 
-  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode"
+  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode" "$boot_vga_policy_mode"
   install_vfio_modules_load
 
   # Optional: on openSUSE Tumbleweed offer to install the distribution's
@@ -7368,7 +7498,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
     need_cmd modprobe
   fi
 
@@ -7382,6 +7512,11 @@ main() {
 
   if [[ "$MODE" == "detect" ]]; then
     detect_existing_vfio_report
+    exit 0
+  fi
+
+  if [[ "$MODE" == "print-effective-config" ]]; then
+    print_effective_config
     exit 0
   fi
 

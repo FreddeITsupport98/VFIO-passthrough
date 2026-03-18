@@ -116,6 +116,29 @@ assert_contains \
   'VFIO_BOOT_VGA_POLICY="AUTO"' \
   "$(cat "$CONF_FILE")"
 
+# Test 2b: write_conf accepts explicit Boot-VGA policy override (STRICT).
+write_conf "$host_bdf" "" "" "$guest_bdf" "" "1002" "AUTO" "STRICT"
+assert_contains \
+  "write_conf persists explicit Boot-VGA policy STRICT" \
+  'VFIO_BOOT_VGA_POLICY="STRICT"' \
+  "$(cat "$CONF_FILE")"
+
+# Test 2c: parser helper accepts case-insensitive policy values.
+assert_eq \
+  "normalize_boot_vga_policy_arg accepts strict" \
+  "STRICT" \
+  "$(normalize_boot_vga_policy_arg strict)"
+assert_eq \
+  "normalize_boot_vga_policy_arg accepts AUTO" \
+  "AUTO" \
+  "$(normalize_boot_vga_policy_arg AUTO)"
+if normalize_boot_vga_policy_arg invalid >/dev/null 2>&1; then
+  printf 'FAIL: normalize_boot_vga_policy_arg rejects invalid values\\n' >&2
+  fail=1
+else
+  printf 'PASS: normalize_boot_vga_policy_arg rejects invalid values\\n'
+fi
+
 # Test 3: vfio_config_health warns when host-assisted conditions are true but config flag is disabled.
 cat >"$CONF_FILE" <<EOF
 HOST_GPU_BDF="$host_bdf"
@@ -162,6 +185,68 @@ assert_not_contains \
   "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
   "$health_out_auto"
 assert_eq "health status is OK when AUTO Boot-VGA policy is enabled" "STATUS=OK" "$(grep -m1 '^STATUS=' <<<"$health_out_auto")"
+
+# Test 6: print_effective_config reports SKIP_BIND in STRICT mode when host-assisted topology exists but no opt-in is enabled.
+pci_boot_vga_flag() {
+  case "${1:-}" in
+    "$guest_bdf") echo "1" ;;
+    "$host_bdf") echo "0" ;;
+    *) echo "unknown" ;;
+  esac
+}
+host_assisted_boot_vga_policy_default() { echo "1"; }
+cat >"$CONF_FILE" <<EOF
+HOST_GPU_BDF="$host_bdf"
+GUEST_GPU_BDF="$guest_bdf"
+VFIO_ALLOW_BOOT_VGA="0"
+VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="0"
+VFIO_BOOT_VGA_POLICY="STRICT"
+EOF
+effective_out_strict_skip="$(print_effective_config)"
+assert_contains \
+  "print_effective_config strict mode without opt-in reports SKIP_BIND" \
+  "SKIP_BIND" \
+  "$effective_out_strict_skip"
+assert_contains \
+  "print_effective_config strict mode without opt-in reports host-assisted-not-enabled reason" \
+  "host_assisted_available_but_not_enabled" \
+  "$effective_out_strict_skip"
+
+# Test 7: print_effective_config reports ALLOW_BIND with AUTO policy when host-assisted topology is safe.
+cat >"$CONF_FILE" <<EOF
+HOST_GPU_BDF="$host_bdf"
+GUEST_GPU_BDF="$guest_bdf"
+VFIO_ALLOW_BOOT_VGA="0"
+VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="0"
+VFIO_BOOT_VGA_POLICY="AUTO"
+EOF
+effective_out_auto_allow="$(print_effective_config)"
+assert_contains \
+  "print_effective_config AUTO policy reports ALLOW_BIND" \
+  "ALLOW_BIND" \
+  "$effective_out_auto_allow"
+assert_contains \
+  "print_effective_config AUTO policy reports auto_detect reason" \
+  "auto_detect" \
+  "$effective_out_auto_allow"
+
+# Test 8: print_effective_config reports ALLOW_BIND in STRICT mode when explicit host-assisted opt-in is enabled.
+cat >"$CONF_FILE" <<EOF
+HOST_GPU_BDF="$host_bdf"
+GUEST_GPU_BDF="$guest_bdf"
+VFIO_ALLOW_BOOT_VGA="0"
+VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="1"
+VFIO_BOOT_VGA_POLICY="STRICT"
+EOF
+effective_out_strict_opt_in="$(print_effective_config)"
+assert_contains \
+  "print_effective_config strict mode with explicit opt-in reports ALLOW_BIND" \
+  "ALLOW_BIND" \
+  "$effective_out_strict_opt_in"
+assert_contains \
+  "print_effective_config strict mode with explicit opt-in reports explicit_opt_in reason" \
+  "explicit_opt_in" \
+  "$effective_out_strict_opt_in"
 
 if (( fail != 0 )); then
   exit 1

@@ -16,12 +16,19 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Added new read-only inspection mode `--print-effective-config`:
+  - reads `/etc/vfio-gpu-passthrough.conf` plus current runtime `boot_vga` topology from sysfs,
+  - prints normalized Boot-VGA policy inputs and the effective bind decision path (`ALLOW_BIND` / `SKIP_BIND` with reason),
+  - does not apply system changes and is safe to run pre-reboot for policy validation.
 - Added Boot-VGA host-assisted auto-detect/self-adjust behavior:
   - generated config now writes `VFIO_BOOT_VGA_POLICY="AUTO"` by default,
   - generated bind helper now re-checks runtime `boot_vga` topology each boot and dynamically applies safe host-assisted binding when appropriate.
 - Improved Boot-VGA policy diagnostics:
   - strict host-assisted warnings now appear only when `VFIO_BOOT_VGA_POLICY` is not `AUTO`,
   - warning guidance now points to both `VFIO_BOOT_VGA_POLICY=AUTO` and explicit strict opt-in paths.
+- Added install CLI override for Boot-VGA policy mode:
+  - new `--boot-vga-policy auto|strict` option now controls the persisted `VFIO_BOOT_VGA_POLICY` value during install runs,
+  - install summary now prints the effective Boot-VGA policy and highlights when the CLI override is active.
 - Improved `regression/script.sh` shellcheck handling:
   - when `shellcheck` is missing, the runner now attempts distro-aware automatic installation (`apt-get`, `dnf`, `yum`, `zypper`, `pacman`, `apk`, `xbps-install`) with sudo/root fallback.
   - if automatic installation fails, the runner continues with clear manual-install guidance instead of silently skipping without remediation.
@@ -326,7 +333,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--verify] [--detect] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove]
 ```
 
 ### Common flags
@@ -338,7 +345,12 @@ The script supports several modes controlled by flags. By default, without any f
 - `--dry-run`
   - Prevents any persistent changes (no files written, no systemctl enable, etc.).
   - Most commands are only printed/logged.
-  - Automatically implied by `--verify`, `--detect`, and `--self-test`.
+  - Automatically implied by `--verify`, `--detect`, `--print-effective-config`, and `--self-test`.
+
+- `--boot-vga-policy auto|strict`
+  - Install-mode override for the generated Boot-VGA host-assisted policy in `/etc/vfio-gpu-passthrough.conf`.
+  - `auto`: dynamic host-assisted topology checks (recommended/default).
+  - `strict`: requires explicit `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1` to allow host-assisted Boot-VGA binding.
 
 - `--json`
   - Valid with `--detect` to output machine-readable JSON only.
@@ -408,6 +420,17 @@ The script supports several modes controlled by flags. By default, without any f
     - `display_manager_health`: `WORKS` / `NOT_WORK` / `NOT_PRESENT`
     - `graphics_stack_xorg`: `WORKS` / `NOT_WORK` / `NOT_PRESENT`
     - `graphics_stack_wayland`: `WORKS` / `NOT_WORK` / `NOT_PRESENT`
+
+- `--print-effective-config`
+  - Prints a read-only effective Boot-VGA decision report based on persisted config plus current runtime topology.
+  - Report fields include:
+    - `VFIO_BOOT_VGA_POLICY` (normalized),
+    - `VFIO_ALLOW_BOOT_VGA`,
+    - `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU`,
+    - guest/host `boot_vga` values,
+    - computed host-assisted topology default,
+    - effective bind decision (`ALLOW_BIND` / `SKIP_BIND`) and decision reason.
+  - This mode does not write files or modify system state.
 
 - `--self-test`
   - Runs a small self test suite:

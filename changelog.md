@@ -1,5 +1,41 @@
 # Changelog
 ## Unreleased
+- Improved `regression/script.sh` shellcheck behavior:
+  - when `shellcheck` is missing, the runner now attempts distro-aware installation with package-manager detection (`apt-get`, `dnf`, `yum`, `zypper`, `pacman`, `apk`, `xbps-install`) and sudo/root fallback.
+  - when installation still fails, the runner now emits explicit manual-install guidance before continuing remaining checks.
+- Cleaned residual shellcheck warnings in regression scripts used by the master runner so shellcheck-enabled runs complete cleanly for protocol/custom-kernel regression paths.
+- Added a shared shellcheck suppression convention in override-heavy regression scripts:
+  - `SC2317,SC2329` is now declared once at file scope with a convention note,
+  - repetitive per-function suppression comments were removed to keep regression scripts easier to maintain.
+- Added a reusable regression scaffold at `regression/regression-template.sh`:
+  - captures the standardized file bootstrap and assertion helpers,
+  - includes the shared file-level `SC2317,SC2329` convention for indirect helper overrides.
+- Added helper command `regression/new-regression.sh`:
+  - generates `regression/<name>-regression.sh` from the shared template,
+  - supports `--force` for explicit overwrite flows,
+  - regression auto-discovery now excludes this helper from executable `*-regression.sh` test runs.
+- Removed obsolete disabled legacy Xorg helper definitions (`_legacy_*_disabled`) from `vfio.sh` to keep only the active canonical helper implementation path.
+- Extended `--detect --json` output with persisted protocol config visibility:
+  - added `configured_graphics_protocol_mode` derived from `/etc/vfio-gpu-passthrough.conf` with normalization fallback to `AUTO`.
+- Added install-flow protocol-mode selection/wiring updates:
+  - install flow now calls `select_and_prepare_graphics_protocol_mode` after graphics preflight,
+  - selected mode is now applied via `apply_selected_graphics_protocol_mode` instead of unconditional Xorg prompting.
+- Added persisted graphics protocol mode in generated config:
+  - `write_conf()` now writes `GRAPHICS_PROTOCOL_MODE` (`X11` / `WAYLAND` / `AUTO` fallback) to `/etc/vfio-gpu-passthrough.conf`.
+- Improved mode-specific display behavior:
+  - `X11` mode retains explicit Xorg/LightDM host-GPU pinning prompt flow,
+  - `WAYLAND` mode skips Xorg forcing and supports optional removal of existing Xorg/LightDM pinning files.
+- Improved graphics stack detection:
+  - X11 detection now also treats `startx`/`xinit` presence as valid session-path readiness,
+  - Wayland detection now treats detected compositor runtime commands as session readiness signals.
+- Added `regression/protocol-mode-regression.sh` with coverage for protocol-mode persistence, runtime package mapping, and mode-application call paths.
+- Added explicit Xorg-aware install prompting for host/guest GPU split setups:
+  - new prompt now reports detected Xorg status (`WORKS`/`NOT_WORK`/`NOT_PRESENT`) before offering host-GPU pinning.
+  - prompt text explicitly states that it is an Xorg detection-driven action.
+- Added additive host-display safety installers for Xorg/LightDM when accepted in the new prompt:
+  - `/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf` to pin Xorg to the selected host GPU BusID.
+  - `/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf` to apply `xserver-command ... -isolateDevice` for LightDM.
+- Updated `--reset` cleanup to also remove the new Xorg/LightDM host-GPU pinning files.
 - Added optional custom kernel-parameter prompts during install boot-option flows for:
   - GRUB kernel cmdline updates,
   - systemd-boot current-entry updates,

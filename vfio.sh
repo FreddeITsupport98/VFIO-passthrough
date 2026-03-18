@@ -35,6 +35,8 @@ USB_BT_SCRIPT="/usr/local/sbin/vfio-usb-bluetooth.sh"
 USB_BT_SYSTEMD_UNIT="/etc/systemd/system/vfio-disable-usb-bluetooth.service"
 USB_BT_UDEV_RULE="/etc/udev/rules.d/99-vfio-disable-usb-bluetooth.rules"
 LIGHTDM_FALLBACK_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-greeter-fallback.conf"
+XORG_HOST_GPU_CONF="/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf"
+LIGHTDM_HOST_GPU_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf"
 
 DEBUG=0
 DRY_RUN=0
@@ -183,6 +185,9 @@ xorg_stack_status() {
   if compgen -G "/usr/share/xsessions/*.desktop" >/dev/null 2>&1; then
     has_sessions=1
   fi
+  if have_cmd startx || have_cmd xinit; then
+    has_sessions=1
+  fi
 
   if (( has_server && has_sessions )); then
     echo "WORKS"
@@ -217,6 +222,7 @@ wayland_stack_status() {
   fi
   if have_cmd gnome-shell || have_cmd kwin_wayland || have_cmd startplasma-wayland || have_cmd weston || have_cmd sway || have_cmd hyprland || have_cmd wayfire || have_cmd labwc || have_cmd river || have_cmd niri || have_cmd cage || have_cmd hikari || have_cmd qtile; then
     has_runtime=1
+    has_sessions=1
   fi
 
   if (( has_sessions && has_runtime )); then
@@ -2461,14 +2467,24 @@ detect_existing_vfio_report() {
   xfwm4_status="$(xfwm4_stack_status)"
 
   if (( JSON_OUTPUT )); then
-    local opensuse_like_json accountsservice_present_json hc status
+    local opensuse_like_json accountsservice_present_json configured_graphics_protocol_mode hc status
     opensuse_like_json=false
     accountsservice_present_json=false
+    configured_graphics_protocol_mode="AUTO"
     if opensuse_like_detection_reason >/dev/null 2>&1; then
       opensuse_like_json=true
     fi
     if accountsservice_is_present; then
       accountsservice_present_json=true
+    fi
+    if readable_file "$CONF_FILE"; then
+      configured_graphics_protocol_mode="$(awk -F= '/^GRAPHICS_PROTOCOL_MODE=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+      configured_graphics_protocol_mode="$(trim "${configured_graphics_protocol_mode:-}")"
+      configured_graphics_protocol_mode="${configured_graphics_protocol_mode^^}"
+      case "$configured_graphics_protocol_mode" in
+        X11|WAYLAND|AUTO) ;;
+        *) configured_graphics_protocol_mode="AUTO" ;;
+      esac
     fi
     hc="$(vfio_config_health)"
     status="$(printf '%s\n' "$hc" | awk -F= '/^STATUS=/{print $2; exit}')"
@@ -2484,6 +2500,7 @@ detect_existing_vfio_report() {
     printf '  \"graphics_stack_wayland\": \"%s\",\n' "$wayland_status"
     printf '  \"graphics_protocol_support\": \"%s\",\n' "$graphics_protocol_support"
     printf '  \"graphics_protocol_mode\": \"%s\",\n' "$graphics_protocol_mode"
+    printf '  \"configured_graphics_protocol_mode\": \"%s\",\n' "$configured_graphics_protocol_mode"
     printf '  \"window_manager_openbox\": \"%s\",\n' "$openbox_status"
     printf '  \"window_manager_i3\": \"%s\",\n' "$i3_status"
     printf '  \"window_manager_bspwm\": \"%s\",\n' "$bspwm_status"
@@ -2604,6 +2621,7 @@ detect_existing_vfio_report() {
     print_kv "Configured guest GPU" "${GUEST_GPU_BDF:-<unset>}"
     print_kv "Configured host audio" "${HOST_AUDIO_BDFS_CSV:-<unset>}"
     print_kv "Configured guest audio" "${GUEST_AUDIO_BDFS_CSV:-<unset>}"
+    print_kv "Configured graphics protocol" "${GRAPHICS_PROTOCOL_MODE:-AUTO}"
     if [[ -n "${GUEST_GPU_BDF:-}" ]]; then
       local rebar_state above4g_state
       rebar_state="$(rebar_status_for_bdf "$GUEST_GPU_BDF")"
@@ -3199,7 +3217,12 @@ write_conf() {
   local guest_gpu="$4"
   local guest_audio_bdfs_csv="$5"
   local guest_vendor="$6"
+  local graphics_protocol_mode="${7:-AUTO}"
   local boot_vga_host_assisted_default="0"
+  graphics_protocol_mode="${graphics_protocol_mode^^}"
+  if [[ "$graphics_protocol_mode" != "X11" && "$graphics_protocol_mode" != "WAYLAND" ]]; then
+    graphics_protocol_mode="AUTO"
+  fi
 
   boot_vga_host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
 
@@ -3229,6 +3252,7 @@ HOST_AUDIO_NODE_NAME="$host_audio_node_name"
 GUEST_GPU_BDF="$guest_gpu"
 GUEST_AUDIO_BDFS_CSV="$guest_audio_bdfs_csv"
 GUEST_GPU_VENDOR_ID="$guest_vendor"
+GRAPHICS_PROTOCOL_MODE="$graphics_protocol_mode"
 EOF
 }
 
@@ -5080,7 +5104,6 @@ EOF
 
   say "Installed udev isolation rules to prevent the host UI from grabbing the guest GPU (and HDMI audio, if selected)."
 }
-
 usb_bt_mitigation_explain() {
   note "This optional feature targets a specific (but nasty) class of stability problems: USB Bluetooth adapters that cause repeated kernel timeouts and USB reset storms."
   note "These storms can make other USB devices randomly glitch/disconnect and can interfere with VFIO/passthrough stability."
@@ -5812,6 +5835,360 @@ EOF
 
   say "Rollback script written: $path"
 }
+# Display protocol helpers (X11/Wayland adaptive mode).
+xorg_busid_from_bdf() {
+  local bdf="$1"
+  local bus_hex dev_hex func_dec
+  if [[ ! "$bdf" =~ ^[[:xdigit:]]{4}:([[:xdigit:]]{2}):([[:xdigit:]]{2})\.([0-7])$ ]]; then
+    return 1
+  fi
+  bus_hex="${BASH_REMATCH[1]}"
+  dev_hex="${BASH_REMATCH[2]}"
+  func_dec="${BASH_REMATCH[3]}"
+  printf 'PCI:%d:%d:%d' "$((16#$bus_hex))" "$((16#$dev_hex))" "$func_dec"
+}
+
+install_xorg_host_gpu_pinning() {
+  local host_gpu_bdf="$1"
+  local guest_gpu_bdf="$2"
+  local host_busid
+  host_busid="$(xorg_busid_from_bdf "$host_gpu_bdf" 2>/dev/null || true)"
+  [[ -n "$host_busid" ]] || die "Failed to convert host GPU BDF to Xorg BusID: $host_gpu_bdf"
+
+  backup_file "$XORG_HOST_GPU_CONF"
+  if (( ! DRY_RUN )); then
+    mkdir -p /etc/X11/xorg.conf.d
+  fi
+  write_file_atomic "$XORG_HOST_GPU_CONF" 0644 "root:root" <<EOF
+# Generated by $SCRIPT_NAME on $(date -Is)
+# Explicit host/guest split for Xorg:
+# - Host GPU (Xorg): $host_gpu_bdf
+# - Guest GPU (VFIO): $guest_gpu_bdf
+
+Section "ServerLayout"
+    Identifier "Layout0"
+    Screen 0 "Screen0"
+EndSection
+
+Section "Device"
+    Identifier "HostGPU"
+    Driver "amdgpu"
+    BusID "$host_busid"
+    Option "PrimaryGPU" "true"
+EndSection
+
+Section "Screen"
+    Identifier "Screen0"
+    Device "HostGPU"
+EndSection
+EOF
+  say "Installed explicit Xorg host-GPU pinning at $XORG_HOST_GPU_CONF"
+}
+
+install_lightdm_host_gpu_isolation() {
+  local host_gpu_bdf="$1"
+  local host_busid
+  host_busid="$(xorg_busid_from_bdf "$host_gpu_bdf" 2>/dev/null || true)"
+  [[ -n "$host_busid" ]] || die "Failed to convert host GPU BDF to Xorg BusID: $host_gpu_bdf"
+
+  backup_file "$LIGHTDM_HOST_GPU_CONF"
+  if (( ! DRY_RUN )); then
+    mkdir -p /etc/lightdm/lightdm.conf.d
+  fi
+  write_file_atomic "$LIGHTDM_HOST_GPU_CONF" 0644 "root:root" <<EOF
+# Generated by $SCRIPT_NAME on $(date -Is)
+# Keep LightDM/Xorg on host GPU while guest GPU is bound to VFIO.
+[Seat:*]
+xserver-command=X -core -isolateDevice $host_busid
+EOF
+  say "Installed LightDM host-GPU isolateDevice override at $LIGHTDM_HOST_GPU_CONF"
+}
+
+remove_xorg_host_gpu_pinning() {
+  local removed=0
+  if [[ -f "$XORG_HOST_GPU_CONF" ]]; then
+    backup_file "$XORG_HOST_GPU_CONF"
+    run rm -f "$XORG_HOST_GPU_CONF"
+    removed=1
+  fi
+  if [[ -f "$LIGHTDM_HOST_GPU_CONF" ]]; then
+    backup_file "$LIGHTDM_HOST_GPU_CONF"
+    run rm -f "$LIGHTDM_HOST_GPU_CONF"
+    removed=1
+  fi
+  if (( removed )); then
+    note "Removed Xorg/LightDM host-GPU pinning files for Wayland mode."
+  fi
+}
+
+maybe_offer_xorg_explicit_prompt() {
+  local host_gpu_bdf="$1"
+  local guest_gpu_bdf="$2"
+  local selected_mode="${3:-X11}"
+  local xorg_status dm
+  selected_mode="${selected_mode^^}"
+  xorg_status="$(xorg_stack_status)"
+  dm="$(detect_display_manager 2>/dev/null || true)"
+  [[ -n "$dm" ]] || dm="none"
+
+  if [[ "$selected_mode" != "X11" ]]; then
+    note "Skipping explicit Xorg prompt because selected protocol mode is $selected_mode."
+    return 0
+  fi
+
+  say
+  hdr "Xorg explicit prompt (host/guest split)"
+  note "Detected Xorg stack status: $(format_tri_state_status "$xorg_status")"
+  if [[ "$xorg_status" != "WORKS" ]]; then
+    note "Skipping explicit Xorg prompt because Xorg is not fully detected."
+    return 0
+  fi
+
+  if [[ -z "$host_gpu_bdf" || -z "$guest_gpu_bdf" || "$host_gpu_bdf" == "$guest_gpu_bdf" ]]; then
+    note "Skipping explicit Xorg prompt because host/guest GPU mapping is invalid."
+    return 0
+  fi
+
+  note "Detected Xorg explicitly. You can install host-GPU pinning so Xorg does not select the guest VFIO GPU."
+  note "Host GPU: $host_gpu_bdf | Guest GPU: $guest_gpu_bdf"
+  if prompt_yn "Detected Xorg explicitly. Install host-GPU Xorg pinning now? (recommended)" Y "Xorg explicit prompt"; then
+    install_xorg_host_gpu_pinning "$host_gpu_bdf" "$guest_gpu_bdf"
+  else
+    note "Skipping explicit Xorg host-GPU pinning."
+    return 0
+  fi
+
+  if [[ "$dm" == "lightdm" ]]; then
+    if prompt_yn "LightDM detected. Install LightDM host-GPU isolateDevice override too?" Y "Xorg explicit prompt"; then
+      install_lightdm_host_gpu_isolation "$host_gpu_bdf"
+    else
+      note "Skipping LightDM isolateDevice override."
+    fi
+  fi
+}
+
+install_packages_best_effort() {
+  local -a pkgs=("$@")
+  local use_sudo=0
+  (( ${#pkgs[@]} > 0 )) || return 1
+
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+
+  if have_cmd apt-get; then
+    if (( use_sudo )); then
+      run sudo apt-get -y install "${pkgs[@]}"
+    else
+      run apt-get -y install "${pkgs[@]}"
+    fi
+    return $?
+  fi
+  if have_cmd dnf; then
+    if (( use_sudo )); then
+      run sudo dnf -y install "${pkgs[@]}"
+    else
+      run dnf -y install "${pkgs[@]}"
+    fi
+    return $?
+  fi
+  if have_cmd zypper; then
+    if (( use_sudo )); then
+      run sudo zypper --non-interactive in "${pkgs[@]}"
+    else
+      run zypper --non-interactive in "${pkgs[@]}"
+    fi
+    return $?
+  fi
+  if have_cmd pacman; then
+    if (( use_sudo )); then
+      run sudo pacman --noconfirm -S "${pkgs[@]}"
+    else
+      run pacman --noconfirm -S "${pkgs[@]}"
+    fi
+    return $?
+  fi
+
+  return 1
+}
+
+protocol_runtime_packages_for_mode() {
+  local mode="${1:-}"
+  mode="${mode^^}"
+  [[ "$mode" == "X11" || "$mode" == "WAYLAND" ]] || return 1
+
+  if have_cmd apt-get; then
+    if [[ "$mode" == "X11" ]]; then
+      printf '%s\n' xserver-xorg xinit x11-xserver-utils
+    else
+      printf '%s\n' weston wayland-protocols
+    fi
+    return 0
+  fi
+  if have_cmd dnf; then
+    if [[ "$mode" == "X11" ]]; then
+      printf '%s\n' xorg-x11-server-Xorg xorg-x11-xinit
+    else
+      printf '%s\n' wayland-protocols weston
+    fi
+    return 0
+  fi
+  if have_cmd zypper; then
+    if [[ "$mode" == "X11" ]]; then
+      printf '%s\n' xorg-x11-server xinit
+    else
+      printf '%s\n' wayland weston
+    fi
+    return 0
+  fi
+  if have_cmd pacman; then
+    if [[ "$mode" == "X11" ]]; then
+      printf '%s\n' xorg-server xorg-xinit
+    else
+      printf '%s\n' wayland wayland-protocols weston
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
+protocol_stack_status_for_mode() {
+  local mode="${1:-}"
+  mode="${mode^^}"
+  if [[ "$mode" == "X11" ]]; then
+    xorg_stack_status
+  else
+    wayland_stack_status
+  fi
+}
+
+ensure_graphics_protocol_runtime() {
+  local mode="${1:-}"
+  mode="${mode^^}"
+  [[ "$mode" == "X11" || "$mode" == "WAYLAND" ]] || return 1
+
+  local before after
+  before="$(protocol_stack_status_for_mode "$mode")"
+  if [[ "$before" == "WORKS" ]]; then
+    return 0
+  fi
+
+  say
+  hdr "Graphics protocol runtime ($mode)"
+  note "$mode status before install: $(format_tri_state_status "$before")"
+
+  local -a pkgs=()
+  mapfile -t pkgs < <(protocol_runtime_packages_for_mode "$mode" || true)
+  if (( ${#pkgs[@]} == 0 )); then
+    note "No known package mapping for your package manager. Install $mode runtime manually and re-run."
+    return 1
+  fi
+
+  note "Suggested packages: ${pkgs[*]}"
+  if ! prompt_yn "Install missing $mode runtime packages now?" Y "Graphics protocol runtime"; then
+    return 1
+  fi
+
+  if ! install_packages_best_effort "${pkgs[@]}"; then
+    note "Automatic package installation failed. Install the packages manually and re-run."
+    return 1
+  fi
+
+  after="$(protocol_stack_status_for_mode "$mode")"
+  note "$mode status after install: $(format_tri_state_status "$after")"
+  [[ "$after" == "WORKS" ]]
+}
+
+select_and_prepare_graphics_protocol_mode() {
+  local xorg_status wayland_status support detected_mode selected_mode
+  xorg_status="$(xorg_stack_status)"
+  wayland_status="$(wayland_stack_status)"
+  support="$(x11_wayland_support_status "$xorg_status" "$wayland_status")"
+  detected_mode="$(x11_wayland_supported_mode "$xorg_status" "$wayland_status")"
+
+  say
+  hdr "Graphics protocol mode selection"
+  note "X11 (Xorg): $(format_tri_state_status "$xorg_status")"
+  note "Wayland: $(format_tri_state_status "$wayland_status")"
+  note "Detected mode availability: $detected_mode"
+
+  local -a modes=("X11" "WAYLAND")
+  local -a options=(
+    "X11 (Xorg)  | status: $(format_tri_state_status "$xorg_status")"$'\n'"      Enables Xorg-specific host GPU pinning options."
+    "Wayland     | status: $(format_tri_state_status "$wayland_status")"$'\n'"      Uses Wayland mode and skips forced Xorg pinning."
+  )
+
+  if [[ "$detected_mode" == "X11" ]]; then
+    selected_mode="X11"
+    note "Only X11 currently reports WORKS; selecting X11."
+  elif [[ "$detected_mode" == "WAYLAND" ]]; then
+    selected_mode="WAYLAND"
+    note "Only Wayland currently reports WORKS; selecting Wayland."
+  else
+    local idx
+    idx="$(select_from_list "Choose host graphics protocol mode for this VFIO setup:" "Graphics protocol mode" "${options[@]}")"
+    selected_mode="${modes[$idx]}"
+  fi
+
+  if ! ensure_graphics_protocol_runtime "$selected_mode"; then
+    xorg_status="$(xorg_stack_status)"
+    wayland_status="$(wayland_stack_status)"
+    local fallback_mode=""
+    if [[ "$selected_mode" == "X11" && "$wayland_status" == "WORKS" ]]; then
+      fallback_mode="WAYLAND"
+    elif [[ "$selected_mode" == "WAYLAND" && "$xorg_status" == "WORKS" ]]; then
+      fallback_mode="X11"
+    fi
+
+    if [[ -n "$fallback_mode" ]]; then
+      note "Selected mode $selected_mode is not fully ready, but $fallback_mode is WORKS."
+      if prompt_yn "Switch to $fallback_mode for this run?" Y "Graphics protocol mode"; then
+        selected_mode="$fallback_mode"
+      else
+        die "Selected graphics protocol mode '$selected_mode' is not ready. Install/repair it, then re-run."
+      fi
+    elif [[ "$support" == "WORKS" ]]; then
+      die "Selected graphics protocol mode '$selected_mode' is not ready. Choose a working mode or install runtime packages first."
+    else
+      die "Neither X11 nor Wayland is fully working. Install one runtime stack, then re-run."
+    fi
+  fi
+
+  CTX[graphics_protocol_mode]="$selected_mode"
+  note "Selected graphics protocol mode: $selected_mode"
+  note "VFIO passthrough binding remains persistent and protocol-independent."
+}
+
+apply_selected_graphics_protocol_mode() {
+  local host_gpu_bdf="$1"
+  local guest_gpu_bdf="$2"
+  local mode="${CTX[graphics_protocol_mode]:-AUTO}"
+  mode="${mode^^}"
+
+  case "$mode" in
+    X11)
+      maybe_offer_xorg_explicit_prompt "$host_gpu_bdf" "$guest_gpu_bdf" "$mode"
+      ;;
+    WAYLAND)
+      say
+      hdr "Wayland protocol adaptation"
+      note "Wayland mode selected. Skipping Xorg-specific host-GPU pinning prompts."
+      note "VFIO passthrough stays persistent; only host display protocol behavior changes."
+      if [[ -f "$XORG_HOST_GPU_CONF" || -f "$LIGHTDM_HOST_GPU_CONF" ]]; then
+        note "Existing Xorg/LightDM host-GPU pinning files were found."
+        if prompt_yn "Remove existing Xorg/LightDM host-GPU pinning files for Wayland mode?" Y "Wayland protocol adaptation"; then
+          remove_xorg_host_gpu_pinning
+        else
+          note "Keeping existing Xorg/LightDM pinning files."
+        fi
+      fi
+      ;;
+    *)
+      note "No explicit protocol mode selected; skipping protocol-specific display adjustments."
+      ;;
+  esac
+}
 
 iommu_group_preflight() {
   # Hard-gate unsafe IOMMU groups.
@@ -5921,7 +6298,7 @@ reset_vfio_all() {
            "$SOFTDEP_FILE" "$DRACUT_VFIO_CONF" \
            "$UDEV_ISOLATION_RULE" \
            "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" \
-           "$LIGHTDM_FALLBACK_CONF" \
+           "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook
@@ -6575,6 +6952,9 @@ apply_configuration() {
   # This helper supports only X11(Xorg)/Wayland and requires at least
   # one stack in WORKS state before installation proceeds.
   graphics_protocol_preflight
+  select_and_prepare_graphics_protocol_mode
+  local graphics_protocol_mode="${CTX[graphics_protocol_mode]:-AUTO}"
+  note "Selected graphics protocol mode for this setup: $graphics_protocol_mode"
 
   # Self-heal legacy user audio units that were created before the
   # ConditionPathExists guard was introduced.
@@ -6615,7 +6995,7 @@ apply_configuration() {
     done
   fi
 
-  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor"
+  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode"
   install_vfio_modules_load
 
   # Optional: on openSUSE Tumbleweed offer to install the distribution's
@@ -6717,6 +7097,7 @@ apply_configuration() {
 
   install_bind_script
   install_systemd_unit
+  apply_selected_graphics_protocol_mode "$host_gpu" "$guest_gpu"
 
   say
   hdr "Boot log capture (optional)"

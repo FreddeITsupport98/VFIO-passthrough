@@ -16,6 +16,42 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Improved `regression/script.sh` shellcheck handling:
+  - when `shellcheck` is missing, the runner now attempts distro-aware automatic installation (`apt-get`, `dnf`, `yum`, `zypper`, `pacman`, `apk`, `xbps-install`) with sudo/root fallback.
+  - if automatic installation fails, the runner continues with clear manual-install guidance instead of silently skipping without remediation.
+- Cleaned remaining shellcheck findings in regression coverage scripts so the shellcheck phase now passes with protocol/custom-kernel override-heavy test paths enabled.
+- Added a shared regression-shellcheck convention for indirect helper overrides:
+  - override-heavy regression scripts now use one file-level `SC2317,SC2329` directive with a convention note instead of repeating per-function suppressions.
+- Added `regression/regression-template.sh` as a standard scaffold for future regression suites:
+  - includes the shared file-level `SC2317,SC2329` convention,
+  - includes baseline assertion helpers and source/bootstrap structure to copy into new `*-regression.sh` files.
+- Added `regression/new-regression.sh` helper command for scaffold creation:
+  - creates `regression/<name>-regression.sh` from `regression/regression-template.sh`,
+  - supports `--force` for intentional overwrites,
+  - is excluded from regression auto-execution discovery so it behaves only as a helper command.
+- Removed obsolete disabled legacy Xorg helper definitions (`_legacy_*_disabled`) so only the canonical active helper path remains in `vfio.sh`.
+- Extended `--detect --json` output with persisted config state:
+  - new `configured_graphics_protocol_mode` field now reports normalized config value from `/etc/vfio-gpu-passthrough.conf` (`X11` / `WAYLAND` / `AUTO` fallback).
+- Added explicit host graphics protocol mode workflow in install flow:
+  - new `select_and_prepare_graphics_protocol_mode` step allows choosing `X11` or `WAYLAND`,
+  - selected mode now performs runtime readiness checks and optional package-install prompts before continuing.
+- Added persistent protocol-mode config output:
+  - `write_conf()` now stores `GRAPHICS_PROTOCOL_MODE` in `/etc/vfio-gpu-passthrough.conf` (`X11` / `WAYLAND` / `AUTO` fallback).
+- Updated protocol application wiring:
+  - install flow now applies `apply_selected_graphics_protocol_mode` instead of always prompting Xorg pinning,
+  - `X11` mode keeps explicit Xorg/LightDM host-GPU pinning prompts,
+  - `WAYLAND` mode skips Xorg forcing and can remove existing Xorg/LightDM pinning files additively when requested.
+- Improved protocol-stack detection robustness:
+  - X11 detection now treats `startx`/`xinit` as a valid session path signal,
+  - Wayland detection now treats detected compositor runtime commands as an active session signal.
+- Added `regression/protocol-mode-regression.sh` for protocol-mode config persistence, package-mapping, and mode-application path coverage.
+- Added explicit Xorg-aware install prompting for host/guest GPU split setups:
+  - the wizard now explicitly reports detected Xorg status before offering host-GPU pinning.
+  - prompt wording is now explicit that the action is driven by Xorg detection.
+- Added optional additive host-display pinning outputs from that prompt:
+  - `/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf` to pin Xorg to the selected host GPU BusID.
+  - `/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf` for LightDM `-isolateDevice` host-GPU forcing.
+- Updated `--reset` cleanup coverage to remove both new host-GPU pinning files.
 - Added optional custom kernel-parameter prompts in install boot-option flows:
   - classic GRUB cmdline updates,
   - systemd-boot current-entry updates,
@@ -875,10 +911,10 @@ sudo ./vfio.sh --reset
 ```
 
 inside the rolled-back snapshot if you also want its kernel parameters cleaned up.
-+
-+---
-+
-+## FAQ
+
+---
+
+## FAQ
 
 ### Can I use this with libvirt/virt‑manager?
 

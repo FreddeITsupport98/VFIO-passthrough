@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Convention: this regression overrides sourced vfio.sh helpers that are invoked indirectly.
+# shellcheck disable=SC2317,SC2329
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +90,6 @@ DRY_RUN=0
 
 # Keep health output deterministic and focused on Boot-VGA policy checks.
 is_service_enabled() { return 1; }
-# shellcheck disable=SC2329
 write_file_atomic() {
   local dst="$1" mode="$2" _owner_group="$3"
   cat >"$dst"
@@ -96,7 +97,6 @@ write_file_atomic() {
 }
 
 # Test 1: write_conf auto-default writes VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 when helper says host-assisted path is safe.
-# shellcheck disable=SC2329,SC2317
 host_assisted_boot_vga_policy_default() { echo "1"; }
 write_conf "$host_bdf" "" "" "$guest_bdf" "" "1002"
 assert_contains \
@@ -105,7 +105,6 @@ assert_contains \
   "$(cat "$CONF_FILE")"
 
 # Test 2: write_conf writes 0 when host-assisted default says disabled.
-# shellcheck disable=SC2329,SC2317
 host_assisted_boot_vga_policy_default() { echo "0"; }
 write_conf "$host_bdf" "" "" "$guest_bdf" "" "1002"
 assert_contains \
@@ -121,7 +120,6 @@ HOST_AUDIO_BDFS_CSV=""
 GUEST_AUDIO_BDFS_CSV=""
 VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="0"
 EOF
-# shellcheck disable=SC2329
 host_assisted_boot_vga_policy_default() { echo "1"; }
 health_out="$(vfio_config_health)"
 assert_contains "health status is WARN when host-assisted flag is disabled" "STATUS=WARN" "$health_out"

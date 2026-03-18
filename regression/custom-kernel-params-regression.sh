@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Convention: this regression overrides sourced vfio.sh helpers that are invoked indirectly.
+# shellcheck disable=SC2317,SC2329
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,7 +97,6 @@ assert_eq \
   "$with_dedup"
 
 # Test 2: helper no-change path (declined prompt) returns pure cmdline on stdout.
-# shellcheck disable=SC2329
 prompt_yn() { return 1; }
 declined_result="$(add_custom_kernel_params_interactive "quiet iommu=pt" "GRUB cmdline" 2>"$tmp_dir/decline.stderr")"
 assert_eq \
@@ -231,13 +232,9 @@ initrd /initrd-b
 options quiet legacy=1 root=UUID=ROOTB rootflags=subvol=@/.snapshots/38/snapshot rw
 EOF
 
-# shellcheck disable=SC2317
 is_opensuse_like() { return 0; }
-# shellcheck disable=SC2317
 detect_bootloader() { printf 'grub2-bls\n'; }
-# shellcheck disable=SC2317
 systemd_boot_entries_dir() { printf '%s\n' "$bls_dir"; }
-# shellcheck disable=SC2317
 kernel_cmdline_persistence_file() { printf '%s\n' "$cmdline_fixture"; }
 
 sync_bls_entries_from_kernel_cmdline >"$tmp_dir/bls-sync.stdout" 2>"$tmp_dir/bls-sync.stderr"
@@ -335,13 +332,9 @@ chmod +x "$sdbootutil_shim_dir/sdbootutil"
 old_path="$PATH"
 PATH="$sdbootutil_shim_dir:$PATH"
 
-# shellcheck disable=SC2317
 is_opensuse_like() { return 0; }
-# shellcheck disable=SC2317
 detect_bootloader() { printf 'grub2-bls\n'; }
-# shellcheck disable=SC2317
 systemd_boot_entries_dir() { printf '%s\n' "$fallback_bls_dir"; }
-# shellcheck disable=SC2317
 kernel_cmdline_persistence_file() { printf '%s\n' "$fallback_cmdline_fixture"; }
 
 opensuse_sdbootutil_update_all_entries >"$tmp_dir/bls-fallback-sync.stdout" 2>"$tmp_dir/bls-fallback-sync.stderr"
@@ -414,13 +407,9 @@ chmod +x "$partial_sdbootutil_shim_dir/sdbootutil"
 old_path="$PATH"
 PATH="$partial_sdbootutil_shim_dir:$PATH"
 
-# shellcheck disable=SC2317
 is_opensuse_like() { return 0; }
-# shellcheck disable=SC2317
 detect_bootloader() { printf 'grub2-bls\n'; }
-# shellcheck disable=SC2317
 systemd_boot_entries_dir() { printf '%s\n' "$partial_bls_dir"; }
-# shellcheck disable=SC2317
 kernel_cmdline_persistence_file() { printf '%s\n' "$partial_cmdline_fixture"; }
 
 opensuse_sdbootutil_update_all_entries >"$tmp_dir/bls-partial-fallback-sync.stdout" 2>"$tmp_dir/bls-partial-fallback-sync.stderr"

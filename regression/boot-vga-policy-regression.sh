@@ -111,6 +111,10 @@ assert_contains \
   "write_conf host-assisted default writes value 0" \
   'VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="0"' \
   "$(cat "$CONF_FILE")"
+assert_contains \
+  "write_conf writes Boot-VGA policy mode AUTO by default" \
+  'VFIO_BOOT_VGA_POLICY="AUTO"' \
+  "$(cat "$CONF_FILE")"
 
 # Test 3: vfio_config_health warns when host-assisted conditions are true but config flag is disabled.
 cat >"$CONF_FILE" <<EOF
@@ -125,7 +129,7 @@ health_out="$(vfio_config_health)"
 assert_contains "health status is WARN when host-assisted flag is disabled" "STATUS=WARN" "$health_out"
 assert_contains \
   "health warns about missing VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
-  "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
+  "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
   "$health_out"
 
 # Test 4: vfio_config_health does not emit the Boot-VGA warning when config flag is enabled.
@@ -139,9 +143,25 @@ EOF
 health_out_enabled="$(vfio_config_health)"
 assert_not_contains \
   "health warning disappears when VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
-  "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
+  "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
   "$health_out_enabled"
 assert_eq "health status is OK when only Boot-VGA warning condition is resolved" "STATUS=OK" "$(grep -m1 '^STATUS=' <<<"$health_out_enabled")"
+
+# Test 5: vfio_config_health does not emit strict warning when AUTO policy is enabled.
+cat >"$CONF_FILE" <<EOF
+HOST_GPU_BDF="$host_bdf"
+GUEST_GPU_BDF="$guest_bdf"
+HOST_AUDIO_BDFS_CSV=""
+GUEST_AUDIO_BDFS_CSV=""
+VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="0"
+VFIO_BOOT_VGA_POLICY="AUTO"
+EOF
+health_out_auto="$(vfio_config_health)"
+assert_not_contains \
+  "health warning is suppressed when VFIO_BOOT_VGA_POLICY=AUTO" \
+  "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1" \
+  "$health_out_auto"
+assert_eq "health status is OK when AUTO Boot-VGA policy is enabled" "STATUS=OK" "$(grep -m1 '^STATUS=' <<<"$health_out_auto")"
 
 if (( fail != 0 )); then
   exit 1

@@ -2357,10 +2357,16 @@ vfio_config_health() {
         add_reason WARN "Service is enabled but guest GPU is not currently bound to vfio-pci (likely needs reboot or Boot-VGA safety policy skipped binding): $GUEST_GPU_BDF"
       fi
       if [[ -n "${HOST_GPU_BDF:-}" ]]; then
-        local host_assisted_default
+        local host_assisted_default boot_vga_policy
         host_assisted_default="$(host_assisted_boot_vga_policy_default "$HOST_GPU_BDF" "$GUEST_GPU_BDF")"
-        if [[ "$host_assisted_default" == "1" && "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" != "1" ]]; then
-          add_reason WARN "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 in $CONF_FILE to allow safe host-assisted binding."
+        boot_vga_policy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+        boot_vga_policy="${boot_vga_policy^^}"
+        case "$boot_vga_policy" in
+          AUTO|STRICT) ;;
+          *) boot_vga_policy="STRICT" ;;
+        esac
+        if [[ "$host_assisted_default" == "1" && "$boot_vga_policy" != "AUTO" && "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" != "1" ]]; then
+          add_reason WARN "Guest GPU is Boot VGA while HOST_GPU_BDF has boot_vga=0; set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 in $CONF_FILE to allow safe host-assisted binding."
         fi
       fi
     fi
@@ -3246,6 +3252,11 @@ HOST_GPU_BDF="$host_gpu"
 # - 1 allows host-assisted binding when guest GPU is Boot VGA AND host GPU is a different adapter with boot_vga=0.
 # - 0 keeps Boot-VGA skip behavior unless fully forced via VFIO_ALLOW_BOOT_VGA=1.
 VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="$boot_vga_host_assisted_default"
+# Boot-VGA host-assisted policy mode:
+# - AUTO: dynamically allows host-assisted Boot-VGA bind when runtime topology is safe
+#         (guest boot_vga=1, host boot_vga=0, different GPUs), and skips otherwise.
+# - STRICT: requires explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1.
+VFIO_BOOT_VGA_POLICY="AUTO"
 HOST_AUDIO_BDFS_CSV="$host_audio_bdfs_csv"
 HOST_AUDIO_NODE_NAME="$host_audio_node_name"
 
@@ -4696,8 +4707,15 @@ die() {
 # adapter. Set VFIO_ALLOW_BOOT_VGA=1 to force binding unconditionally.
 if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
   guest_boot_vga="$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
+  boot_vga_policy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+  boot_vga_policy="${boot_vga_policy^^}"
+  case "$boot_vga_policy" in
+    AUTO|STRICT) ;;
+    *) boot_vga_policy="STRICT" ;;
+  esac
   if [[ "$guest_boot_vga" == "1" ]] && [[ "${VFIO_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
     allow_boot_vga_bind=0
+    allow_boot_vga_reason="none"
     host_assisted_boot_vga_bind=0
     if [[ -n "${HOST_GPU_BDF:-}" ]] && [[ "$HOST_GPU_BDF" != "$GUEST_GPU_BDF" ]] && [[ -f "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" ]]; then
       host_boot_vga="$(cat "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" 2>/dev/null || echo 1)"
@@ -4705,18 +4723,29 @@ if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
         host_assisted_boot_vga_bind=1
         if [[ "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" == "1" ]]; then
           allow_boot_vga_bind=1
+          allow_boot_vga_reason="explicit_opt_in"
+        fi
+        if [[ "$boot_vga_policy" == "AUTO" ]]; then
+          allow_boot_vga_bind=1
+          allow_boot_vga_reason="auto_detect"
         fi
       fi
     fi
 
     if [[ "$allow_boot_vga_bind" == "1" ]]; then
       say "WARN: $GUEST_GPU_BDF is Boot VGA, and HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
-      say "WARN: VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 is set; proceeding with host-assisted vfio bind."
-      say "INFO: Set VFIO_ALLOW_BOOT_VGA=1 to force this behavior without host GPU checks."
+      if [[ "$allow_boot_vga_reason" == "auto_detect" ]]; then
+        say "INFO: VFIO_BOOT_VGA_POLICY=AUTO auto-detected a safe host-assisted topology; proceeding with vfio bind."
+        say "INFO: Set VFIO_BOOT_VGA_POLICY=STRICT to require explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1."
+      else
+        say "WARN: VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 is set; proceeding with host-assisted vfio bind."
+        say "INFO: Set VFIO_ALLOW_BOOT_VGA=1 to force this behavior without host GPU checks."
+      fi
     else
       say "WARN: $GUEST_GPU_BDF is Boot VGA; skipping vfio-pci bind to keep host graphics alive."
       if [[ "$host_assisted_boot_vga_bind" == "1" ]]; then
-        say "INFO: HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0. Set VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 to allow host-assisted Boot VGA binding."
+        say "INFO: HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
+        say "INFO: Set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 to allow host-assisted Boot VGA binding."
       else
         say "INFO: Set HOST_GPU_BDF to a different GPU (boot_vga=0) or set VFIO_ALLOW_BOOT_VGA=1 to force binding."
       fi

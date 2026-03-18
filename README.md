@@ -16,6 +16,12 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Added Boot-VGA host-assisted auto-detect/self-adjust behavior:
+  - generated config now writes `VFIO_BOOT_VGA_POLICY="AUTO"` by default,
+  - generated bind helper now re-checks runtime `boot_vga` topology each boot and dynamically applies safe host-assisted binding when appropriate.
+- Improved Boot-VGA policy diagnostics:
+  - strict host-assisted warnings now appear only when `VFIO_BOOT_VGA_POLICY` is not `AUTO`,
+  - warning guidance now points to both `VFIO_BOOT_VGA_POLICY=AUTO` and explicit strict opt-in paths.
 - Improved `regression/script.sh` shellcheck handling:
   - when `shellcheck` is missing, the runner now attempts distro-aware automatic installation (`apt-get`, `dnf`, `yum`, `zypper`, `pacman`, `apk`, `xbps-install`) with sudo/root fallback.
   - if automatic installation fails, the runner continues with clear manual-install guidance instead of silently skipping without remediation.

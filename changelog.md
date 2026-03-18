@@ -1,5 +1,14 @@
 # Changelog
 ## Unreleased
+- Added Boot-VGA host-assisted auto-detect/self-adjust support:
+  - generated config now persists `VFIO_BOOT_VGA_POLICY="AUTO"` by default,
+  - generated bind helper now dynamically adjusts host-assisted Boot-VGA binding each boot based on runtime `boot_vga` topology.
+- Improved Boot-VGA health diagnostics for policy mode:
+  - strict host-assisted warning is now emitted only when `VFIO_BOOT_VGA_POLICY` is not `AUTO`,
+  - warning guidance now includes the new `AUTO` policy path.
+- Extended `regression/boot-vga-policy-regression.sh` coverage:
+  - verifies `write_conf()` persists `VFIO_BOOT_VGA_POLICY="AUTO"`,
+  - verifies `vfio_config_health()` suppresses strict-warning paths when `VFIO_BOOT_VGA_POLICY=AUTO`.
 - Improved `regression/script.sh` shellcheck behavior:
   - when `shellcheck` is missing, the runner now attempts distro-aware installation with package-manager detection (`apt-get`, `dnf`, `yum`, `zypper`, `pacman`, `apk`, `xbps-install`) and sudo/root fallback.
   - when installation still fails, the runner now emits explicit manual-install guidance before continuing remaining checks.

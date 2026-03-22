@@ -64,6 +64,14 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - when apply is declined in toggle-capable picker mode, wizard now prints a quick reminder for `full` / `focus` commands before re-entry.
 - Hardened USB Bluetooth exclusion apply path for missing config recovery:
   - if `/etc/vfio-usb-bluetooth-match.conf` is missing at picker start/apply time, defaults are now recreated automatically instead of aborting with an awk file-open error.
+- Added idempotent USB Bluetooth exclusion persistence behavior:
+  - picker now compares derived `EXCLUDE_IDS` against existing config and skips rewriting when unchanged.
+- Added idempotent USB Bluetooth mitigation service apply behavior on reruns:
+  - when exclusions are unchanged and mitigation unit already exists, installer now keeps the unit enabled without forcing an immediate re-run.
+- Added content-aware USB Bluetooth artifact writes:
+  - installer now skips rewriting the helper script, systemd unit, and udev rule when generated content is unchanged.
+- Refined unchanged-rerun service apply logic:
+  - immediate service start is now skipped only when both exclusion selection and generated artifact content are unchanged on rerun.
 - Updated storage-risk interlock to match VM-eligible-first input:
   - interlock/warning now triggers when storage IDs are selected as VM-eligible detach targets,
   - risk rejection now loops back with VM-eligible wording so users can remove storage from detach selection.
@@ -360,6 +368,9 @@ The script supports several modes controlled by flags. By default, without any f
   - During install, the wizard shows a numbered USB picker using VM-eligible-first semantics (selected IDs are detach-eligible; unselected IDs become `EXCLUDE_IDS` host-bound IDs).
   - In Bluetooth-only policy mode, the picker can start in a Bluetooth-focused list and offers an explicit prompt to show the full USB list before selection.
   - While entering selections, users can type `full` or `focus` to switch between full USB and Bluetooth-focused views without leaving the picker loop.
+  - Reruns are idempotent for USB selection: when the chosen VM-eligible set resolves to the same `EXCLUDE_IDS`, config writes are skipped.
+  - Reruns are also content-aware for mitigation artifacts: unchanged helper/unit/udev generated content is not rewritten.
+  - Existing mitigation service setup is not immediately re-run only when both selection and generated artifact content are unchanged.
   - If storage-marked entries are not excluded, the picker adds a final danger confirmation step before allowing install flow to continue.
 
 - `--print-fish-completion`

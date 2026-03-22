@@ -49,6 +49,14 @@
   - after users decline apply in toggle-capable mode, picker now prints a quick `full` / `focus` reminder before the next entry round.
 - Hardened USB Bluetooth exclusion persistence against missing match config:
   - picker now auto-recreates `/etc/vfio-usb-bluetooth-match.conf` with defaults when missing at selection/apply time, preventing awk \"cannot open file\" failures.
+- Added idempotent USB Bluetooth exclusion write behavior:
+  - `configure_usb_bt_exclude_ids_interactive()` now compares derived exclusions against existing `EXCLUDE_IDS` and skips config writes when unchanged.
+- Added idempotent mitigation apply behavior for existing USB Bluetooth service installs:
+  - installer now avoids immediate `systemctl enable --now` reruns when exclusion selection is unchanged and the service unit already exists, while still keeping the service enabled.
+- Added content-aware artifact write behavior for USB Bluetooth mitigation installer:
+  - helper script, systemd unit, and udev rule writes are now skipped when generated content is unchanged on rerun.
+- Refined unchanged-rerun immediate-start gating:
+  - immediate service start is now skipped only when both exclusion selection and generated artifact content are unchanged for an existing install.
 - Updated VM-eligible picker indexing/review behavior for focused view:
   - selection numbers are now mapped to the currently displayed list (focused or full),
   - selection review now uses the same active view indexing so confirmation output matches chosen view mode.
@@ -57,6 +65,12 @@
   - rejection path now loops with VM-eligible wording (`please choose VM-eligible devices again`) for clearer correction flow.
 - Added `regression/usb-storage-exclusion-regression.sh`:
   - validates storage-risk exclusion interlock behavior for re-entry, accepted risk phrase, and rejected risk-phrase loop flows.
+- Extended `regression/usb-storage-exclusion-regression.sh`:
+  - added unchanged-selection idempotency coverage that asserts `EXCLUDE_IDS` write-skip behavior and `USB_BT_EXCLUDE_CHANGED=0`,
+  - added installer helper-template generation coverage that bash-syntax-checks generated `vfio-usb-bluetooth.sh`.
+- Extended `regression/usb-storage-exclusion-regression.sh` installer rerun coverage:
+  - validates unchanged reruns do not rewrite generated helper/unit/udev artifacts,
+  - validates second unchanged rerun keeps service enabled without issuing immediate `enable --now`.
 - Added deterministic test hooks for USB exclusion picker regression control:
   - `VFIO_USB_SYSFS_GLOB` to override USB device discovery source in tests,
   - `VFIO_INTERACTIVE_IN` / `VFIO_INTERACTIVE_OUT` to override picker input/output streams in tests.

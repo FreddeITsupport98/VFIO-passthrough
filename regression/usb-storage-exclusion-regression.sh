@@ -401,6 +401,117 @@ assert_eq "case11 prompt_yn called once for apply" "1" "$prompt_yn_calls"
 assert_eq "case11 confirm_phrase not called" "0" "$confirm_phrase_calls"
 assert_contains_text "case11 recreate note shown" "USB Bluetooth match config was missing; recreating defaults at:" "$case11_stdout_text"
 BT_USB_DEVICE_NAME=""
+# Case 12: Unchanged VM-eligible selection should keep EXCLUDE_IDS unchanged and skip write.
+case12_conf="$tmp_dir/case12-match.conf"
+case12_input="$tmp_dir/case12-input.txt"
+case12_out="$tmp_dir/case12-prompt.txt"
+case12_stdout="$tmp_dir/case12-stdout.txt"
+case12_stderr="$tmp_dir/case12-stderr.txt"
+make_match_conf "$case12_conf" "auto" "" "aaaa:0001"
+cat >"$case12_input" <<'EOF'
+2
+EOF
+BT_USB_DEVICE_NAME=""
+prompt_yn_calls=0
+confirm_phrase_calls=0
+PROMPT_RESPONSES=(0)
+CONFIRM_RESPONSES=()
+run_case "case12-idempotent-unchanged-selection" "$case12_conf" "$case12_input" "$case12_out" "$case12_stdout" "$case12_stderr"
+case12_exclude_ids="$(extract_exclude_ids "$case12_conf")"
+case12_stdout_text="$(cat "$case12_stdout")"
+assert_eq "case12 keeps EXCLUDE_IDS unchanged when selection is unchanged" "aaaa:0001" "$case12_exclude_ids"
+assert_eq "case12 marks USB_BT_EXCLUDE_CHANGED as unchanged" "0" "${USB_BT_EXCLUDE_CHANGED:-}"
+assert_eq "case12 prompt_yn called once for apply" "1" "$prompt_yn_calls"
+assert_eq "case12 confirm_phrase not called" "0" "$confirm_phrase_calls"
+assert_contains_text "case12 unchanged-selection note shown" "EXCLUDE_IDS unchanged; skipping write." "$case12_stdout_text"
+
+# Case 13: Installer rerun should keep unchanged helper/unit/rule files untouched and avoid immediate restart.
+case13_root="$tmp_dir/case13-installer"
+case13_helper="$case13_root/vfio-usb-bluetooth.sh"
+case13_unit="$case13_root/vfio-disable-usb-bluetooth.service"
+case13_rule="$case13_root/99-vfio-disable-usb-bluetooth.rules"
+case13_conf="$case13_root/vfio-usb-bluetooth-match.conf"
+case13_run1_stdout="$tmp_dir/case13-run1-stdout.txt"
+case13_run1_stderr="$tmp_dir/case13-run1-stderr.txt"
+case13_run2_stdout="$tmp_dir/case13-run2-stdout.txt"
+case13_run2_stderr="$tmp_dir/case13-run2-stderr.txt"
+case13_write_log="$tmp_dir/case13-write.log"
+case13_run_log="$tmp_dir/case13-run.log"
+mkdir -p "$case13_root"
+: >"$case13_write_log"
+: >"$case13_run_log"
+
+USB_BT_SCRIPT="$case13_helper"
+USB_BT_SYSTEMD_UNIT="$case13_unit"
+USB_BT_UDEV_RULE="$case13_rule"
+USB_BT_MATCH_CONF="$case13_conf"
+DRY_RUN=0
+
+run() {
+  printf '%s\n' "$*" >>"$case13_run_log"
+  return 0
+}
+write_file_atomic_if_changed() {
+  local dst="$1" mode="$2" tmp
+  : "${3:-}"
+  : "${4:-}"
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  mkdir -p "$(dirname "$dst")"
+  if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp" || true
+    return 1
+  fi
+  install -m "$mode" "$tmp" "$dst"
+  rm -f "$tmp" || true
+  printf '%s\n' "$dst" >>"$case13_write_log"
+  return 0
+}
+
+PROMPT_RESPONSES=(1)
+CONFIRM_RESPONSES=()
+prompt_yn_calls=0
+confirm_phrase_calls=0
+: >"$case13_run_log"
+install_usb_bluetooth_disable >"$case13_run1_stdout" 2>"$case13_run1_stderr"
+if [[ -f "$case13_helper" ]]; then
+  case13_helper_present="yes"
+else
+  case13_helper_present="no"
+fi
+if bash -n "$case13_helper" >/dev/null 2>&1; then
+  case13_helper_syntax="ok"
+else
+  case13_helper_syntax="bad"
+fi
+assert_eq "case13 generated helper script file exists" "yes" "$case13_helper_present"
+assert_eq "case13 generated helper script passes bash syntax check" "ok" "$case13_helper_syntax"
+case13_helper_write_count_after_first="$(grep -Fc -- "$case13_helper" "$case13_write_log" || true)"
+case13_unit_write_count_after_first="$(grep -Fc -- "$case13_unit" "$case13_write_log" || true)"
+case13_rule_write_count_after_first="$(grep -Fc -- "$case13_rule" "$case13_write_log" || true)"
+assert_eq "case13 first run writes helper once" "1" "$case13_helper_write_count_after_first"
+assert_eq "case13 first run writes unit once" "1" "$case13_unit_write_count_after_first"
+assert_eq "case13 first run writes udev rule once" "1" "$case13_rule_write_count_after_first"
+case13_run1_log_text="$(cat "$case13_run_log")"
+assert_contains_text "case13 first run enables and starts service" "systemctl enable --now vfio-disable-usb-bluetooth.service" "$case13_run1_log_text"
+
+PROMPT_RESPONSES=(1)
+CONFIRM_RESPONSES=()
+prompt_yn_calls=0
+confirm_phrase_calls=0
+: >"$case13_run_log"
+install_usb_bluetooth_disable >"$case13_run2_stdout" 2>"$case13_run2_stderr"
+case13_helper_write_count_after_second="$(grep -Fc -- "$case13_helper" "$case13_write_log" || true)"
+case13_unit_write_count_after_second="$(grep -Fc -- "$case13_unit" "$case13_write_log" || true)"
+case13_rule_write_count_after_second="$(grep -Fc -- "$case13_rule" "$case13_write_log" || true)"
+assert_eq "case13 second run does not rewrite unchanged helper" "1" "$case13_helper_write_count_after_second"
+assert_eq "case13 second run does not rewrite unchanged unit" "1" "$case13_unit_write_count_after_second"
+assert_eq "case13 second run does not rewrite unchanged udev rule" "1" "$case13_rule_write_count_after_second"
+case13_run2_log_text="$(cat "$case13_run_log")"
+case13_run2_stdout_text="$(cat "$case13_run2_stdout")"
+assert_contains_text "case13 second run keeps service enabled without immediate run" "systemctl enable vfio-disable-usb-bluetooth.service" "$case13_run2_log_text"
+assert_not_contains_text "case13 second run does not issue enable --now when unchanged" "systemctl enable --now vfio-disable-usb-bluetooth.service" "$case13_run2_log_text"
+assert_contains_text "case13 second run prints unchanged-start skip note" "USB Bluetooth settings unchanged; skipping immediate service run." "$case13_run2_stdout_text"
 
 if (( fail != 0 )); then
   exit 1

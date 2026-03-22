@@ -44,7 +44,8 @@ trap 'rm -rf "$tmp_dir"' EXIT
 CONF_FILE="$tmp_dir/vfio-gpu-passthrough.conf"
 backup_file() { :; }
 write_file_atomic() {
-  local dst="$1" mode="$2" _owner_group="$3"
+  local dst="$1" mode="$2" owner_group="$3"
+  : "$owner_group"
   cat >"$dst"
   chmod "$mode" "$dst" 2>/dev/null || true
 }

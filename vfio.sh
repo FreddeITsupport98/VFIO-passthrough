@@ -2205,9 +2205,10 @@ health_check_all() {
   hdr "VFIO Kernel Health Audit (all GPUs)"
 
   local -a gpu_bdfs=()
-  local gpu_bdf gpu_desc vendor_id _device_id audio_csv audio_descs
-  while IFS=$'\t' read -r gpu_bdf gpu_desc vendor_id _device_id audio_csv audio_descs; do
+  local gpu_bdf gpu_desc vendor_id device_id_unused audio_csv audio_descs
+  while IFS=$'\t' read -r gpu_bdf gpu_desc vendor_id device_id_unused audio_csv audio_descs; do
     [[ -n "${gpu_bdf:-}" ]] || continue
+    : "${device_id_unused:-}"
     gpu_bdfs+=("$gpu_bdf")
   done < <(gpu_discover_all_sysfs)
 
@@ -7103,15 +7104,14 @@ reset_vfio_all() {
     remove_user_audio_unit "$SUDO_USER"
   fi
 
-  if prompt_yn "Also remove vfio-set-host-audio.service for ALL users under /home/* ?" N "Reset: user audio units"; then
-    local d u
-    for d in /home/*; do
-      [[ -d "$d" ]] || continue
-      u="$(basename "$d")"
-      # Some /home entries may not correspond to real user accounts; that's OK.
-      remove_user_audio_unit "$u"
-    done
-  fi
+  note "Reset mode: removing vfio-set-host-audio.service for all users under /home/*."
+  local d u
+  for d in /home/*; do
+    [[ -d "$d" ]] || continue
+    u="$(basename "$d")"
+    # Some /home entries may not correspond to real user accounts; that's OK.
+    remove_user_audio_unit "$u"
+  done
 
   local grub_changed=0
 
@@ -7123,47 +7123,46 @@ reset_vfio_all() {
   # Remove GRUB kernel parameters added by this script (classic GRUB only).
   # On GRUB2-BLS/systemd-boot setups, we instead operate on /etc/kernel/cmdline.
   if [[ "$reset_bl" == "grub" && -f /etc/default/grub ]]; then
-    if prompt_yn "Also remove VFIO-related kernel params from /etc/default/grub (IOMMU, ACS override, USB/xHCI workarounds, rd.driver.pre, SELinux/AppArmor, verbosity, multi-user.target)?" Y "Reset: boot options"; then
-      backup_file /etc/default/grub
+    note "Reset mode: removing VFIO-related kernel params from /etc/default/grub."
+    backup_file /etc/default/grub
 
-      local key current new
-      key="$(grub_get_key)" || die "Could not find GRUB_CMDLINE_LINUX(_DEFAULT) in /etc/default/grub"
-      current="$(grub_read_cmdline "$key")"
-      new="$current"
+    local key current new
+    key="$(grub_get_key)" || die "Could not find GRUB_CMDLINE_LINUX(_DEFAULT) in /etc/default/grub"
+    current="$(grub_read_cmdline "$key")"
+    new="$current"
 
-      # Core IOMMU / ACS params
-      new="$(remove_param_all "$new" "amd_iommu=on")"
-      new="$(remove_param_all "$new" "intel_iommu=on")"
-      new="$(remove_param_all "$new" "iommu=pt")"
-      new="$(remove_param_all "$new" "pcie_acs_override=downstream,multifunction")"
-      # Optional USB/xHCI stability workarounds
-      new="$(remove_param_all "$new" "usbcore.autosuspend=-1")"
-      new="$(remove_param_all "$new" "pcie_aspm=off")"
-      # Initramfs / VFIO ordering
-      new="$(remove_param_all "$new" "rd.driver.pre=vfio-pci")"
-      # LSM knobs we may have added
-      new="$(remove_param_all "$new" "selinux=0")"
-      new="$(remove_param_all "$new" "apparmor=0")"
-      # Boot verbosity and target overrides
-      new="$(remove_param_all "$new" "systemd.show_status=1")"
-      new="$(remove_param_all "$new" "loglevel=7")"
-      new="$(remove_param_all "$new" "rd.plymouth=0")"
-      new="$(remove_param_all "$new" "plymouth.enable=0")"
-      new="$(remove_param_all "$new" "splash=silent")"
-      new="$(remove_param_all "$new" "splash")"
-      new="$(remove_param_all "$new" "rhgb")"
-      new="$(remove_param_all "$new" "systemd.unit=multi-user.target")"
-      # Framebuffer / sysfb related tweaks
-      new="$(remove_param_all "$new" "video=efifb:off")"
-      new="$(remove_param_all "$new" "video=vesafb:off")"
-      new="$(remove_param_all "$new" "initcall_blacklist=sysfb_init")"
+    # Core IOMMU / ACS params
+    new="$(remove_param_all "$new" "amd_iommu=on")"
+    new="$(remove_param_all "$new" "intel_iommu=on")"
+    new="$(remove_param_all "$new" "iommu=pt")"
+    new="$(remove_param_all "$new" "pcie_acs_override=downstream,multifunction")"
+    # Optional USB/xHCI stability workarounds
+    new="$(remove_param_all "$new" "usbcore.autosuspend=-1")"
+    new="$(remove_param_all "$new" "pcie_aspm=off")"
+    # Initramfs / VFIO ordering
+    new="$(remove_param_all "$new" "rd.driver.pre=vfio-pci")"
+    # LSM knobs we may have added
+    new="$(remove_param_all "$new" "selinux=0")"
+    new="$(remove_param_all "$new" "apparmor=0")"
+    # Boot verbosity and target overrides
+    new="$(remove_param_all "$new" "systemd.show_status=1")"
+    new="$(remove_param_all "$new" "loglevel=7")"
+    new="$(remove_param_all "$new" "rd.plymouth=0")"
+    new="$(remove_param_all "$new" "plymouth.enable=0")"
+    new="$(remove_param_all "$new" "splash=silent")"
+    new="$(remove_param_all "$new" "splash")"
+    new="$(remove_param_all "$new" "rhgb")"
+    new="$(remove_param_all "$new" "systemd.unit=multi-user.target")"
+    # Framebuffer / sysfb related tweaks
+    new="$(remove_param_all "$new" "video=efifb:off")"
+    new="$(remove_param_all "$new" "video=vesafb:off")"
+    new="$(remove_param_all "$new" "initcall_blacklist=sysfb_init")"
 
-      if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
-        grub_write_cmdline_in_place "$key" "$new"
-        grub_changed=1
-      else
-        note "No matching VFIO/IOMMU-related params found in GRUB cmdline; leaving it unchanged."
-      fi
+    if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
+      grub_write_cmdline_in_place "$key" "$new"
+      grub_changed=1
+    else
+      note "No matching VFIO/IOMMU-related params found in GRUB cmdline; leaving it unchanged."
     fi
   fi
 
@@ -7171,49 +7170,47 @@ reset_vfio_all() {
   # remove VFIO/IOMMU params from /etc/kernel/cmdline so future kernel
   # entries stop inheriting them. This path is also used for GRUB2-BLS.
   if is_opensuse_like && [[ -f /etc/kernel/cmdline ]]; then
-    if prompt_yn "Also remove VFIO-related kernel params from /etc/kernel/cmdline (IOMMU, ACS override, USB/xHCI workarounds, rd.driver.pre, SELinux/AppArmor, verbosity, multi-user.target)?" Y "Reset: boot options (persistence)"; then
-      backup_file /etc/kernel/cmdline
-      local kcur knew
-      kcur="$(cat /etc/kernel/cmdline 2>/dev/null || true)"
-      knew="$kcur"
-      # Core IOMMU / ACS params
-      knew="$(remove_param_all "$knew" "amd_iommu=on")"
-      knew="$(remove_param_all "$knew" "intel_iommu=on")"
-      knew="$(remove_param_all "$knew" "iommu=pt")"
-      knew="$(remove_param_all "$knew" "pcie_acs_override=downstream,multifunction")"
-      # Optional USB/xHCI stability workarounds
-      knew="$(remove_param_all "$knew" "usbcore.autosuspend=-1")"
-      knew="$(remove_param_all "$knew" "pcie_aspm=off")"
-      # Initramfs / VFIO ordering
-      knew="$(remove_param_all "$knew" "rd.driver.pre=vfio-pci")"
-      # LSM knobs we may have added
-      knew="$(remove_param_all "$knew" "selinux=0")"
-      knew="$(remove_param_all "$knew" "apparmor=0")"
-      # Boot verbosity and target overrides
-      knew="$(remove_param_all "$knew" "systemd.show_status=1")"
-      knew="$(remove_param_all "$knew" "loglevel=7")"
-      knew="$(remove_param_all "$knew" "rd.plymouth=0")"
-      knew="$(remove_param_all "$knew" "plymouth.enable=0")"
-      knew="$(remove_param_all "$knew" "splash=silent")"
-      knew="$(remove_param_all "$knew" "splash")"
-      knew="$(remove_param_all "$knew" "rhgb")"
-      knew="$(remove_param_all "$knew" "systemd.unit=multi-user.target")"
-      # Framebuffer / sysfb related tweaks
-      knew="$(remove_param_all "$knew" "video=efifb:off")"
-      knew="$(remove_param_all "$knew" "video=vesafb:off")"
-      knew="$(remove_param_all "$knew" "initcall_blacklist=sysfb_init")"
+    note "Reset mode: removing VFIO-related kernel params from /etc/kernel/cmdline."
+    backup_file /etc/kernel/cmdline
+    local kcur knew
+    kcur="$(cat /etc/kernel/cmdline 2>/dev/null || true)"
+    knew="$kcur"
+    # Core IOMMU / ACS params
+    knew="$(remove_param_all "$knew" "amd_iommu=on")"
+    knew="$(remove_param_all "$knew" "intel_iommu=on")"
+    knew="$(remove_param_all "$knew" "iommu=pt")"
+    knew="$(remove_param_all "$knew" "pcie_acs_override=downstream,multifunction")"
+    # Optional USB/xHCI stability workarounds
+    knew="$(remove_param_all "$knew" "usbcore.autosuspend=-1")"
+    knew="$(remove_param_all "$knew" "pcie_aspm=off")"
+    # Initramfs / VFIO ordering
+    knew="$(remove_param_all "$knew" "rd.driver.pre=vfio-pci")"
+    # LSM knobs we may have added
+    knew="$(remove_param_all "$knew" "selinux=0")"
+    knew="$(remove_param_all "$knew" "apparmor=0")"
+    # Boot verbosity and target overrides
+    knew="$(remove_param_all "$knew" "systemd.show_status=1")"
+    knew="$(remove_param_all "$knew" "loglevel=7")"
+    knew="$(remove_param_all "$knew" "rd.plymouth=0")"
+    knew="$(remove_param_all "$knew" "plymouth.enable=0")"
+    knew="$(remove_param_all "$knew" "splash=silent")"
+    knew="$(remove_param_all "$knew" "splash")"
+    knew="$(remove_param_all "$knew" "rhgb")"
+    knew="$(remove_param_all "$knew" "systemd.unit=multi-user.target")"
+    # Framebuffer / sysfb related tweaks
+    knew="$(remove_param_all "$knew" "video=efifb:off")"
+    knew="$(remove_param_all "$knew" "video=vesafb:off")"
+    knew="$(remove_param_all "$knew" "initcall_blacklist=sysfb_init")"
 
-      if [[ "$(trim "$knew")" != "$(trim "$kcur")" ]]; then
-        if (( ! DRY_RUN )); then
-          printf '%s
-' "$knew" >/etc/kernel/cmdline
-        fi
-        # Ensure BLS/systemd-boot entries are regenerated without these
-        # params on openSUSE.
-        opensuse_sdbootutil_update_all_entries
-      else
-        note "No matching VFIO/IOMMU-related params found in /etc/kernel/cmdline; leaving it unchanged."
+    if [[ "$(trim "$knew")" != "$(trim "$kcur")" ]]; then
+      if (( ! DRY_RUN )); then
+        printf '%s\n' "$knew" >/etc/kernel/cmdline
       fi
+      # Ensure BLS/systemd-boot entries are regenerated without these
+      # params on openSUSE.
+      opensuse_sdbootutil_update_all_entries
+    else
+      note "No matching VFIO/IOMMU-related params found in /etc/kernel/cmdline; leaving it unchanged."
     fi
   fi
 
@@ -7401,9 +7398,10 @@ user_selection() {
 
   # Discover GPUs (via sysfs; lspci is only used for human-readable descriptions)
   local -a gpu_bdfs=() gpu_descs=() gpu_vendor_ids=() gpu_audio_bdfs_csv=() gpu_audio_descs=()
-  local gpu_bdf gpu_desc vendor_id _device_id audio_csv audio_descs
-  while IFS=$'\t' read -r gpu_bdf gpu_desc vendor_id _device_id audio_csv audio_descs; do
+  local gpu_bdf gpu_desc vendor_id device_id_unused audio_csv audio_descs
+  while IFS=$'\t' read -r gpu_bdf gpu_desc vendor_id device_id_unused audio_csv audio_descs; do
     [[ -n "${gpu_bdf:-}" ]] || continue
+    : "${device_id_unused:-}"
     gpu_bdfs+=("$gpu_bdf")
     gpu_descs+=("$gpu_desc")
     gpu_vendor_ids+=("$vendor_id")

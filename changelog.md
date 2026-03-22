@@ -1,5 +1,11 @@
 # Changelog
 ## Unreleased
+- Hardened CI shell-lint compatibility across older ShellCheck releases:
+  - updated modified scripts to explicitly consume intentionally ignored capture variables,
+  - avoids legacy `SC2034` false-positive failures in stricter/older ShellCheck environments.
+- Hardened `reset_vfio_all()` full-reset behavior in `vfio.sh`:
+  - now always removes `vfio-set-host-audio.service` user units for all `/home/*` users (no optional prompt-gating),
+  - now always removes VFIO-related boot parameters from `/etc/default/grub` (classic GRUB) and `/etc/kernel/cmdline` (openSUSE/BLS) when those files are present.
 - Added no-install shell completion support in `vfio.sh`:
   - new output modes: `--print-fish-completion`, `--print-bash-completion`, `--print-zsh-completion`,
   - completion output now includes all current script options plus `--boot-vga-policy` value completion (`auto`, `strict`).

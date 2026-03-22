@@ -68,6 +68,11 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - IDs not excluded remain eligible for automatic detach in USB passthrough workflows.
 - Improved USB exclusion review clarity:
   - review now includes per-device mode labels (`HOST-BOUND` / `VM-ELIGIBLE`) before apply so users can verify passthrough intent at a glance.
+- Hardened shell-lint compatibility for older CI environments:
+  - updated modified scripts to avoid legacy `ShellCheck` `SC2034` failures by explicitly consuming intentionally ignored capture variables.
+- Hardened `--reset` to behave as a full persisted-choice cleanup path:
+  - now always removes `vfio-set-host-audio.service` user units for all `/home/*` users without a secondary yes/no prompt,
+  - now always removes VFIO-related boot parameters from `/etc/default/grub` (classic GRUB) and `/etc/kernel/cmdline` (openSUSE/BLS) when present.
 
 ---
 
@@ -318,6 +323,7 @@ The script supports several modes controlled by flags. By default, without any f
         - A **GRUB syntax check** (`grub2-script-check`/`grub-script-check` when available) and automatic rollback to the backed‑up `/etc/default/grub` if the new config would cause lexer errors at boot.
       - `/etc/kernel/cmdline` on openSUSE/BLS systems, followed by a quiet `sdbootutil add-all-kernels` + `update-all-entries` to sync BLS entries.
     - Rebuilds initramfs to reflect the cleaned‑up configuration.
+    - Current behavior note: reset now performs the user-unit and boot-parameter cleanup paths automatically (no extra yes/no confirmation prompt for those sub-steps).
   - On openSUSE/Btrfs systems, prints a reminder that each snapshot has its own `/etc/kernel/cmdline`; after rolling back to an older snapshot you should re-run `--reset` from within that snapshot if you want its VFIO parameters removed as well.
 
 - `--disable-bootlog`

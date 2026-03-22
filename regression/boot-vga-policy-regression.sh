@@ -91,7 +91,8 @@ DRY_RUN=0
 # Keep health output deterministic and focused on Boot-VGA policy checks.
 is_service_enabled() { return 1; }
 write_file_atomic() {
-  local dst="$1" mode="$2" _owner_group="$3"
+  local dst="$1" mode="$2" owner_group="$3"
+  : "$owner_group"
   cat >"$dst"
   chmod "$mode" "$dst" 2>/dev/null || true
 }

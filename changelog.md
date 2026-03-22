@@ -4,6 +4,14 @@
   - new output modes: `--print-fish-completion`, `--print-bash-completion`, `--print-zsh-completion`,
   - completion output now includes all current script options plus `--boot-vga-policy` value completion (`auto`, `strict`).
 - Added main-flow handling so completion modes execute before runtime dependency checks, allowing completion generation in minimal environments.
+- Added `regression/completion-output-regression.sh`:
+  - validates `--print-fish-completion`, `--print-bash-completion`, and `--print-zsh-completion` all produce non-empty output,
+  - checks each completion output contains representative option coverage (including `--usb-health-check`, `--print-*-completion`, and `--boot-vga-policy` value completions).
+- Extended `regression/completion-output-regression.sh`:
+  - now verifies `--help` output includes `--print-fish-completion`, `--print-bash-completion`, and `--print-zsh-completion` so help/completion flags stay aligned.
+- Improved `regression/completion-output-regression.sh` option coverage checks:
+  - now derives long-option expectations dynamically from `vfio.sh --help`,
+  - verifies fish/bash/zsh completion outputs cover that parsed help-option set, reducing maintenance when new flags are added.
 - Improved optional USB Bluetooth mitigation install flow:
   - added interactive numbered USB device listing for `EXCLUDE_IDS` selection,
   - added helper hints that label entries where Bluetooth interfaces are detected.

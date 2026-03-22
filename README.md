@@ -30,6 +30,12 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - `--print-fish-completion`
   - `--print-bash-completion`
   - `--print-zsh-completion`
+- Added regression coverage for completion output modes:
+  - new `regression/completion-output-regression.sh` validates fish/bash/zsh completion output is non-empty and includes key options.
+- Extended completion regression coverage:
+  - `regression/completion-output-regression.sh` now also asserts `--help` includes `--print-fish-completion`, `--print-bash-completion`, and `--print-zsh-completion`.
+- Improved completion regression maintainability:
+  - `regression/completion-output-regression.sh` now parses long options from `vfio.sh --help` and dynamically verifies fish/bash/zsh completion outputs cover that derived option set.
 
 ---
 

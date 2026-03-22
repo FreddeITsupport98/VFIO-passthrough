@@ -31,6 +31,12 @@
 - Added storage omission confirmation interlock in exclusion picker:
   - when any storage-marked USB IDs are not selected for `EXCLUDE_IDS`, picker now shows an explicit danger summary,
   - user must either re-enter exclusions or type `I ACCEPT STORAGE RISK` to continue.
+- Improved USB exclusion picker copy for clearer host/VM behavior:
+  - prompt/instructions now consistently use natural-language “keep host-bound” wording for selections,
+  - guidance now explicitly states Bluetooth intent: selected adapters stay on host, unselected adapters remain VM-detach-eligible.
+- Refined storage interlock applicability for USB exclusion policy modes:
+  - strict storage risk-confirmation flow now runs only when non-Bluetooth detach is policy-eligible (`MATCH_MODE=include_only` or non-empty `INCLUDE_IDS`),
+  - default Bluetooth-only policy (`MATCH_MODE=auto` with empty `INCLUDE_IDS`) now emits informational storage notes without forcing risk-phrase confirmation.
 - Added `regression/usb-storage-exclusion-regression.sh`:
   - validates storage-risk exclusion interlock behavior for re-entry, accepted risk phrase, and rejected risk-phrase loop flows.
 - Added deterministic test hooks for USB exclusion picker regression control:

@@ -5521,6 +5521,14 @@ configure_usb_bt_exclude_ids_interactive() {
   # with that ID pair.
   local conf="$USB_BT_MATCH_CONF"
   [[ -f "$conf" ]] || return 0
+  local match_mode include_ids storage_interlock_required
+  match_mode="$(awk -F= '/^MATCH_MODE=/{v=$2; gsub(/"/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  include_ids="$(awk -F= '/^INCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  match_mode="${match_mode:-auto}"
+  storage_interlock_required=0
+  if [[ "$match_mode" == "include_only" || -n "$include_ids" ]]; then
+    storage_interlock_required=1
+  fi
 
   local -a ids=()
   local -a labels=()
@@ -5643,15 +5651,15 @@ configure_usb_bt_exclude_ids_interactive() {
 
   say
   hdr "USB Bluetooth mitigation exclusions"
-  note "Choose USB devices to exclude from automatic host-side Bluetooth detach."
+  note "Pick USB devices that should stay on your host (never detached by this helper)."
+  note "Selecting a number means: keep this device host-bound (saved in EXCLUDE_IDS)."
+  note "If you want a Bluetooth adapter available for VM passthrough, do NOT select it here."
+  note "If you want a Bluetooth adapter to remain usable on the host, select it."
   note "Entries marked '$bt_hint_note' are likely Bluetooth adapters."
-  note "Entries marked '$eth_hint_note' or '$prn_hint_note' are usually host devices to keep bound (do NOT unbind)."
-  note "Entries marked '$stg_hint_note' are high-risk to unbind (can disconnect active host storage)."
+  note "Entries marked '$eth_hint_note' or '$prn_hint_note' are usually host devices you should keep host-bound."
+  note "Entries marked '$stg_hint_note' are high-risk to detach (can disconnect active host storage)."
   note "When color output is enabled, entry numbers use the strongest matching hint color (Storage > Bluetooth > Ethernet > Printer)."
-  note "Recommended: include ALL '$stg_hint_note' entries in your exclusion selection."
-  note "Selecting a number here means EXCLUDE from unbind (keep bound on host)."
-  note "Only devices NOT excluded remain eligible for automatic detach so they can be used for VM USB passthrough."
-  note "Multi-select example: type '4 5 6' (or '4,5,6') to exclude multiple entries from unbind."
+  note "Multi-select example: type '4 5 6' (or '4,5,6') to keep multiple devices host-bound."
   note "Selection is saved as EXCLUDE_IDS in: $USB_BT_MATCH_CONF"
   local i idx_text
   for i in "${!labels[@]}"; do
@@ -5676,7 +5684,7 @@ configure_usb_bt_exclude_ids_interactive() {
 
   local exclude_csv=""
   while true; do
-    printf '%s' "Enter numbers to EXCLUDE from unbind (comma/space separated, ENTER for none): " >"$out"
+    printf '%s' "Enter numbers to keep host-bound (comma/space separated, ENTER for none): " >"$out"
     if [[ -n "$interactive_in_fd" ]]; then
       read -r -u "$interactive_in_fd" answer || answer=""
     else
@@ -5718,31 +5726,36 @@ configure_usb_bt_exclude_ids_interactive() {
     done
 
     if (( ${#missing_storage_ids[@]} > 0 )); then
-      say
-      if (( ENABLE_COLOR )); then
-        say "${C_BOLD}${C_RED}DANGER:${C_RESET} Some storage devices are NOT excluded from unbind."
-      else
-        say "DANGER: Some storage devices are NOT excluded from unbind."
-      fi
-      note "Unbinding storage-class USB devices can disconnect active host disks and cause data loss."
-      note "Storage entries currently not excluded:"
-      for sid in "${missing_storage_ids[@]}"; do
-        note "  - ${storage_id_to_label[$sid]}"
-      done
+      if (( storage_interlock_required )); then
+        say
+        if (( ENABLE_COLOR )); then
+          say "${C_BOLD}${C_RED}DANGER:${C_RESET} Some storage devices are NOT excluded from detach."
+        else
+          say "DANGER: Some storage devices are NOT excluded from detach."
+        fi
+        note "Detaching storage-class USB devices can disconnect active host disks and cause data loss."
+        note "Storage entries currently not kept host-bound:"
+        for sid in "${missing_storage_ids[@]}"; do
+          note "  - ${storage_id_to_label[$sid]}"
+        done
 
-      if prompt_yn "Re-enter exclusion numbers now to include these storage devices?" Y "Storage safety"; then
-        continue
-      fi
-      if ! confirm_phrase "Proceeding without excluding all storage devices is risky." "I ACCEPT STORAGE RISK"; then
-        note "Risk confirmation not accepted; please choose exclusions again."
-        continue
+        if prompt_yn "Re-enter numbers now and keep these storage devices host-bound?" Y "Storage safety"; then
+          continue
+        fi
+        if ! confirm_phrase "Proceeding without keeping all storage devices host-bound is risky." "I ACCEPT STORAGE RISK"; then
+          note "Risk confirmation not accepted; please choose exclusions again."
+          continue
+        fi
+      else
+        note "Info: some storage devices are not selected."
+        note "Current policy is Bluetooth-only (MATCH_MODE=auto with empty INCLUDE_IDS), so storage devices are not detach targets."
       fi
     fi
 
     say
-    note "Selection review (EXCLUDE from unbind):"
+    note "Selection review (devices kept host-bound):"
     if [[ -n "$exclude_csv" ]]; then
-      note "Selected EXCLUDE_IDS: $exclude_csv"
+      note "Selected EXCLUDE_IDS (kept on host): $exclude_csv"
       local selected_idx selected_idx_text selected_idx_num
       note "Selected entries:"
       for selected_idx in "${selected_indexes[@]}"; do
@@ -5757,8 +5770,11 @@ configure_usb_bt_exclude_ids_interactive() {
       note "No entries selected; EXCLUDE_IDS will be empty."
     fi
     note "Mode summary per listed device:"
-    note "  $mode_host_note = excluded from unbind (stays bound on host)"
-    note "  $mode_vm_note = not excluded (eligible for automatic detach for VM USB passthrough)"
+    note "  $mode_host_note = selected here (stays on host)"
+    note "  $mode_vm_note = not selected (eligible for automatic detach for VM passthrough)"
+    if (( ! storage_interlock_required )); then
+      note "  Note: in current Bluetooth-only policy, non-Bluetooth devices are not detach targets."
+    fi
     local entry_id mode_tag
     for i in "${!labels[@]}"; do
       idx_text="[$((i+1))]"
@@ -5774,7 +5790,7 @@ configure_usb_bt_exclude_ids_interactive() {
       note "  - ${idx_text} ${mode_tag} ${labels[$i]}"
     done
 
-    if prompt_yn "Apply this exclusion selection?" Y "USB exclusion review"; then
+    if prompt_yn "Apply this host-bound selection now?" Y "USB exclusion review"; then
       break
     fi
     note "Selection not applied; re-enter numbers to adjust your choices."

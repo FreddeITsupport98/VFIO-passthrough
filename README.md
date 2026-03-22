@@ -47,6 +47,12 @@ The script is designed to be **interactive, defensive and reversible**, so that 
   - if any storage-marked USB IDs are left out of `EXCLUDE_IDS`, the picker now shows an explicit danger summary and requires either:
     - re-entering exclusions to include them, or
     - typing the confirmation phrase `I ACCEPT STORAGE RISK` to proceed anyway.
+- Improved USB exclusion picker wording with natural-language host/VM intent:
+  - picker instructions now consistently describe selection as “keep host-bound” instead of only “exclude from unbind,”
+  - guidance now explicitly explains Bluetooth intent: select adapter to keep it on host, leave unselected to keep it VM-detach-eligible.
+- Improved storage-risk gating behavior for USB exclusion flows:
+  - strict storage interlock now activates only when policy can target non-Bluetooth devices (`MATCH_MODE=include_only` or non-empty `INCLUDE_IDS`),
+  - default Bluetooth-only policy (`MATCH_MODE=auto` with empty `INCLUDE_IDS`) now reports unselected storage as informational instead of forcing risk-phrase confirmation.
 - Added focused regression coverage for storage-risk exclusion safety:
   - new `regression/usb-storage-exclusion-regression.sh` verifies:
     - re-entry flow when storage IDs are missed,

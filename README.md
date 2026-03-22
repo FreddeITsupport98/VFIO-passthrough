@@ -1,3 +1,5 @@
+[![vfio.sh banner](icon/images.webp)](icon/images.webp)
+
 # vfio.sh – Safe multi‑GPU VFIO passthrough helper
 
 > **Status:** This script is a highly defensive, feature‑rich VFIO helper that has been hardened for modern Fedora/RHEL/Arch‑style setups, AMD reset quirks, and boot‑VGA framebuffer conflicts. It is designed as a _host configuration wizard_, **not** a VM manager.
@@ -16,7 +18,7 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
-- No changes yet for the next project cycle.
+- Added a top README banner image with a relative clickable path (`icon/images.webp`) so documentation paths stay portable and non-hardcoded.
 - Add upcoming updates below this line as new work lands.
 
 

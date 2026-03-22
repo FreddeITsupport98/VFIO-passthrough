@@ -1,5 +1,6 @@
 # Changelog
 ## Unreleased
+- Added a top-level README banner image link using a relative path (`icon/images.webp`) to keep documentation image references non-hardcoded and repo-portable.
 - Improved `regression/custom-kernel-params-regression.sh` CI triage readability:
   - failed assertion names are now collected and printed in a final `FAIL SUMMARY (N)` block before non-zero exit.
 - Extended the same CI triage fail-summary pattern across existing regression suites:

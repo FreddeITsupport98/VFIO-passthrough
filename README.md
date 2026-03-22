@@ -18,6 +18,18 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 ## Unreleased
 - No changes yet for the next project cycle.
 - Add upcoming updates below this line as new work lands.
+- Added interactive USB Bluetooth mitigation exclusion selection:
+  - install flow now offers a numbered USB device list for `EXCLUDE_IDS` selection,
+  - list entries include a helper hint when Bluetooth interfaces are detected.
+- Added match-policy config documentation for USB Bluetooth mitigation:
+  - `/etc/vfio-usb-bluetooth-match.conf` is now installed and managed with `MATCH_MODE`, `INCLUDE_IDS`, and `EXCLUDE_IDS`.
+- Improved `--usb-health-check` guidance:
+  - now explicitly recommends running with sudo for full log visibility,
+  - and audits rotated `/var/log/kern.log(.1)` / `/var/log/syslog(.1)` when journal access is unavailable.
+- Added no-install shell completion output modes:
+  - `--print-fish-completion`
+  - `--print-bash-completion`
+  - `--print-zsh-completion`
 
 ---
 
@@ -68,6 +80,7 @@ The script uses the following paths on the host:
   - `/usr/local/sbin/vfio-usb-bluetooth.sh` – helper to detach USB Bluetooth adapters from the host `btusb` driver (stops reset-spam while keeping the device available for VM USB passthrough).
   - `/etc/systemd/system/vfio-disable-usb-bluetooth.service` – optional system service that runs the helper at boot.
   - `/etc/udev/rules.d/99-vfio-disable-usb-bluetooth.rules` – optional udev rule that triggers the systemd service when a USB Bluetooth interface appears.
+  - `/etc/vfio-usb-bluetooth-match.conf` – match policy file with `MATCH_MODE`, `INCLUDE_IDS`, and `EXCLUDE_IDS` (configured from the installer’s numbered USB exclusion picker).
 
 - **Openbox monitor auto-activation (optional)**
   - `/usr/local/bin/vfio-openbox-activate-monitors.sh` – helper that detects currently connected displays and enables them with `xrandr`.
@@ -142,7 +155,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
 
 ### Common flags
@@ -193,6 +206,8 @@ The script supports several modes controlled by flags. By default, without any f
 
 - `--usb-health-check`
   - Audits **current and previous boot** kernel logs for USB/xHCI instability signals, including host-controller death, timeout markers, repeated USB disconnect storms, and USB enumeration failures.
+  - For best coverage, run with sudo: `sudo ./vfio.sh --usb-health-check`.
+  - When journal access is restricted, it also falls back to readable log files (`/var/log/kern.log`, `/var/log/kern.log.1`, `/var/log/syslog`, `/var/log/syslog.1`) when present.
   - Prints key matching log lines and a summary grade:
     - `USB HEALTH: PASS` (exit 0)
     - `USB HEALTH: WARN` (exit 1)
@@ -275,6 +290,22 @@ The script supports several modes controlled by flags. By default, without any f
 - `--boot-remove`
   - Alias of `--disable-bootlog`.
   - Same behavior, provided as an additive convenience flag name.
+
+- `--install-usb-bt-mitigation`
+  - Installs only the optional USB Bluetooth mitigation (`vfio-usb-bluetooth` helper + systemd + udev + match-policy config).
+  - During install, the wizard can show a numbered USB list and let you set `EXCLUDE_IDS` interactively, including Bluetooth detection hints.
+
+- `--print-fish-completion`
+  - Prints fish completions to stdout without installing files.
+  - Example (current session): `source (./vfio.sh --print-fish-completion)`
+
+- `--print-bash-completion`
+  - Prints bash completions to stdout without installing files.
+  - Example (current session): `source <(./vfio.sh --print-bash-completion)`
+
+- `--print-zsh-completion`
+  - Prints zsh completions to stdout without installing files.
+  - Example (current session): `source <(./vfio.sh --print-zsh-completion)`
 
 ---
 

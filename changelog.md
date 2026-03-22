@@ -1,5 +1,21 @@
 # Changelog
 ## Unreleased
+- Added no-install shell completion support in `vfio.sh`:
+  - new output modes: `--print-fish-completion`, `--print-bash-completion`, `--print-zsh-completion`,
+  - completion output now includes all current script options plus `--boot-vga-policy` value completion (`auto`, `strict`).
+- Added main-flow handling so completion modes execute before runtime dependency checks, allowing completion generation in minimal environments.
+- Improved optional USB Bluetooth mitigation install flow:
+  - added interactive numbered USB device listing for `EXCLUDE_IDS` selection,
+  - added helper hints that label entries where Bluetooth interfaces are detected.
+- Added managed USB Bluetooth match-policy config lifecycle updates:
+  - installer now creates `/etc/vfio-usb-bluetooth-match.conf` with `MATCH_MODE`, `INCLUDE_IDS`, `EXCLUDE_IDS`,
+  - rollback/reset cleanup now also tracks/removes this match-policy config file.
+- Improved USB Bluetooth mitigation trigger and observability:
+  - udev rules now include `ACTION=="bind"` for `btusb` interface binds in addition to existing add triggers,
+  - install output now reports the installed match-policy config path.
+- Improved `--usb-health-check` log-access behavior:
+  - now prints explicit sudo guidance for full kernel-log visibility,
+  - now falls back to `/var/log/kern.log(.1)` and `/var/log/syslog(.1)` when journal/dmesg data is unavailable.
 - Added new read-only mode `--print-effective-config`:
   - reads `/etc/vfio-gpu-passthrough.conf` plus current `boot_vga` sysfs topology,
   - reports normalized `VFIO_BOOT_VGA_POLICY`, effective bind decision (`ALLOW_BIND` / `SKIP_BIND`), and decision reason path (`auto_detect`, `explicit_opt_in`, etc.),

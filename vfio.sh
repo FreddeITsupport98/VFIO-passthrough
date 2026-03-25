@@ -38,12 +38,19 @@ USB_BT_MATCH_CONF="/etc/vfio-usb-bluetooth-match.conf"
 LIGHTDM_FALLBACK_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-greeter-fallback.conf"
 XORG_HOST_GPU_CONF="/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf"
 LIGHTDM_HOST_GPU_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf"
+GRAPHICS_DAEMON_SCRIPT="/usr/local/sbin/vfio-graphics-protocold.sh"
+GRAPHICS_DAEMON_UNIT="/etc/systemd/system/vfio-graphics-protocold.service"
+GRAPHICS_DAEMON_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/vfio-graphics-protocold.service"
 
 DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
-MODE="install"   # install | verify | detect | self-test | health-check | reset | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
+GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
+INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
+GRAPHICS_DAEMON_INTERVAL_DEFAULT=2
+GRAPHICS_DAEMON_INTERVAL_OVERRIDE="" # positive integer seconds (empty = default)
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 
 # Global context structure used to separate detection, user selection and
@@ -79,6 +86,9 @@ C_CYAN="${CSI}36m"
 # Track backups for rollback script generation
 declare -A BACKUP_MAP=()
 BACKUP_ENTRIES=()
+# Regression guard: tracks attempted writes to snapper-* BLS entries.
+VFIO_BLS_SNAPPER_WRITE_ATTEMPTS=0
+declare -ag VFIO_BLS_SNAPPER_WRITE_ATTEMPT_PATHS=()
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
@@ -105,6 +115,7 @@ run() {
   fi
   "$@"
 }
+
 
 detect_display_manager() {
   # Return one of: lightdm | sddm | gdm | lxdm | xdm | none
@@ -562,8 +573,15 @@ complete -c $cmd -l debug -d 'Enable verbose debug logging'
 complete -c $cmd -l dry-run -d 'Show actions without changing the system'
 complete -c $cmd -l no-tui -d 'Force plain-text prompts'
 complete -c $cmd -l boot-vga-policy -r -a 'auto strict' -d 'Install-mode Boot-VGA policy override'
+complete -c $cmd -l graphics-protocol -r -a 'auto x11 wayland' -d 'Install-mode graphics protocol override'
+complete -c $cmd -l graphics-daemon-interval -r -d 'Set graphics daemon polling interval in seconds (1-3600)'
+complete -c $cmd -l no-graphics-daemon -d 'Do not install graphics protocol daemon service'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
+complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
+complete -c $cmd -l verify-bls-sync -d 'Verify BLS entry options are synchronized with /etc/kernel/cmdline'
+complete -c $cmd -l verify-bls-nosnapper -d 'Regression check: assert snapper BLS entries are never write targets'
+complete -c $cmd -l create-fallback-entry -d 'Create/update a non-VFIO fallback BLS entry from the current system entry'
 complete -c $cmd -l print-effective-config -d 'Print effective Boot-VGA policy decision path'
 complete -c $cmd -l json -d 'Machine-readable output with --detect'
 complete -c $cmd -l self-test -d 'Run self-tests and exit'
@@ -590,10 +608,18 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --verify --detect --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --disable-bootlog --boot-remove --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --verify --detect --sync-bls-only --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --disable-bootlog --boot-remove --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
+    return 0
+  fi
+  if [[ "\$prev" == "--graphics-protocol" ]]; then
+    COMPREPLY=(\$(compgen -W "auto x11 wayland" -- "\$cur"))
+    return 0
+  fi
+  if [[ "\$prev" == "--graphics-daemon-interval" ]]; then
+    COMPREPLY=(\$(compgen -W "5 10 15 30 60" -- "\$cur"))
     return 0
   fi
 
@@ -616,8 +642,15 @@ _vfio_sh_complete() {
     '--dry-run[Show actions without changing the system]' \\
     '--no-tui[Force plain-text prompts]' \\
     '--boot-vga-policy=[Install-mode Boot-VGA policy override]:policy:(auto strict)' \\
+    '--graphics-protocol=[Install-mode graphics protocol override]:protocol:(auto x11 wayland)' \\
+    '--graphics-daemon-interval=[Set graphics daemon polling interval in seconds (1-3600)]:seconds:(5 10 15 30 60)' \\
+    '--no-graphics-daemon[Do not install graphics protocol daemon service]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
+    '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \
+    '--verify-bls-sync[Verify BLS entry options are synchronized with /etc/kernel/cmdline]' \
+    '--verify-bls-nosnapper[Regression check: assert snapper BLS entries are never write targets]' \
+    '--create-fallback-entry[Create/update a non-VFIO fallback BLS entry from the current system entry]' \
     '--print-effective-config[Print effective Boot-VGA policy decision path]' \\
     '--json[Machine-readable output with --detect]' \\
     '--self-test[Run self-tests and exit]' \\
@@ -1226,7 +1259,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--verify] [--detect] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1234,8 +1267,26 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
   --boot-vga-policy Install-mode override for generated Boot-VGA policy:
                    auto (default behavior, dynamic host-assisted detection) or
                    strict (requires explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1).
+  --graphics-protocol
+                   Install-mode graphics protocol override:
+                   auto (default, protocol-agnostic), x11, or wayland.
+  --graphics-daemon-interval
+                   Set the independent graphics daemon polling interval in seconds
+                   (valid range: 1-3600, default: $GRAPHICS_DAEMON_INTERVAL_DEFAULT).
+  --no-graphics-daemon
+                   Skip installation of the independent graphics protocol daemon service.
   --verify          Do not change anything; validate an existing setup (reads $CONF_FILE).
   --detect          Print a detailed report of existing VFIO/passthrough configuration and exit.
+  --sync-bls-only   Non-interactive mode: sync BLS entry options from /etc/kernel/cmdline, then run strict drift verification.
+                   Intended for openSUSE BLS/systemd-boot workflows and snapshot recovery.
+  --verify-bls-sync Non-interactive regression check: verify BLS entry options against /etc/kernel/cmdline.
+                   Prints final PASS/FAIL summary and exits non-zero on drift.
+  --verify-bls-nosnapper
+                   Non-interactive regression check: assert sync logic does not attempt writes to snapper-* BLS entries.
+                   Prints final PASS/FAIL summary and exits non-zero on any snapper write attempt.
+  --create-fallback-entry
+                   Non-interactive mode: create or update a dedicated non-VFIO fallback Boot Loader Spec entry
+                   from the current system entry by removing VFIO-forcing kernel parameters.
   --print-effective-config
                    Read-only report of effective Boot-VGA policy and runtime decision path
                    using $CONF_FILE plus current sysfs topology.
@@ -1277,6 +1328,27 @@ normalize_boot_vga_policy_arg() {
       ;;
   esac
 }
+normalize_graphics_protocol_arg() {
+  local raw="${1:-}" val
+  val="${raw^^}"
+  case "$val" in
+    AUTO|X11|WAYLAND)
+      printf '%s\n' "$val"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+normalize_graphics_daemon_interval_arg() {
+  local raw="${1:-}"
+  [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+  if (( 10#$raw < 1 || 10#$raw > 3600 )); then
+    return 1
+  fi
+  printf '%s\n' "$((10#$raw))"
+}
 parse_args() {
   while (( $# )); do
     case "$1" in
@@ -1298,11 +1370,42 @@ parse_args() {
       --boot-vga-policy=*)
         BOOT_VGA_POLICY_OVERRIDE="$(normalize_boot_vga_policy_arg "${1#*=}")" || die "Invalid --boot-vga-policy value: ${1#*=} (expected: auto|strict)"
         ;;
+      --graphics-protocol)
+        shift
+        (( $# > 0 )) || die "--graphics-protocol requires a value: auto|x11|wayland"
+        GRAPHICS_PROTOCOL_OVERRIDE="$(normalize_graphics_protocol_arg "$1")" || die "Invalid --graphics-protocol value: $1 (expected: auto|x11|wayland)"
+        ;;
+      --graphics-protocol=*)
+        GRAPHICS_PROTOCOL_OVERRIDE="$(normalize_graphics_protocol_arg "${1#*=}")" || die "Invalid --graphics-protocol value: ${1#*=} (expected: auto|x11|wayland)"
+        ;;
+      --graphics-daemon-interval)
+        shift
+        (( $# > 0 )) || die "--graphics-daemon-interval requires a value: 1-3600"
+        GRAPHICS_DAEMON_INTERVAL_OVERRIDE="$(normalize_graphics_daemon_interval_arg "$1")" || die "Invalid --graphics-daemon-interval value: $1 (expected integer range 1-3600)"
+        ;;
+      --graphics-daemon-interval=*)
+        GRAPHICS_DAEMON_INTERVAL_OVERRIDE="$(normalize_graphics_daemon_interval_arg "${1#*=}")" || die "Invalid --graphics-daemon-interval value: ${1#*=} (expected integer range 1-3600)"
+        ;;
+      --no-graphics-daemon)
+        INSTALL_GRAPHICS_DAEMON=0
+        ;;
       --verify)
         MODE="verify"
         ;;
       --detect)
         MODE="detect"
+        ;;
+      --sync-bls-only)
+        MODE="sync-bls-only"
+        ;;
+      --verify-bls-sync)
+        MODE="verify-bls-sync"
+        ;;
+      --verify-bls-nosnapper)
+        MODE="verify-bls-nosnapper"
+        ;;
+      --create-fallback-entry)
+        MODE="create-fallback-entry"
         ;;
       --print-effective-config)
         MODE="print-effective-config"
@@ -1358,7 +1461,7 @@ parse_args() {
   done
 
   # verify/detect/self-test/print-effective-config/completion modes imply dry-run
-  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" || "$MODE" == "print-fish-completion" || "$MODE" == "print-bash-completion" || "$MODE" == "print-zsh-completion" ]]; then
+  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "verify-bls-sync" || "$MODE" == "verify-bls-nosnapper" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" || "$MODE" == "print-fish-completion" || "$MODE" == "print-bash-completion" || "$MODE" == "print-zsh-completion" ]]; then
     DRY_RUN=1
   fi
 
@@ -1373,7 +1476,8 @@ disable_bootlog_dumper() {
   hdr "Disable VFIO boot log dumper"
 
   local unit="/etc/systemd/system/vfio-dump-boot-log.service"
-  local bin="/home/${SUDO_USER:-root}/.local/bin/vfio-dump-boot-log.sh"
+  local bin
+  bin="$(bootlog_bin_path)"
 
   if ! [[ -f "$unit" || -f "$bin" ]]; then
     note "Boot log dumper unit/script not found; nothing to disable."
@@ -1607,8 +1711,14 @@ gpu_in_use_preflight() {
         fi
 
         # IMPORTANT for stability on some systems ("Christmas tree" crash):
-        # this prompt now matches the recommended wording exactly.
-        if prompt_yn "Add '$fb_param' to GRUB?" Y "Boot framebuffer options"; then
+        # keep this mitigation explicitly opt-in on openSUSE, because it can
+        # over-constrain display init on snapshot-heavy rollback workflows.
+        local fb_prompt_default="Y"
+        if is_opensuse_like; then
+          fb_prompt_default="N"
+          note "openSUSE detected: framebuffer-disable flags stay opt-in by default. Enable only if you confirm framebuffer lock symptoms."
+        fi
+        if prompt_yn "Add '$fb_param' to boot kernel parameters?" "$fb_prompt_default" "Boot framebuffer options"; then
           export GRUB_EXTRA_PARAMS="${GRUB_EXTRA_PARAMS:-} ${fb_param}"
           say "Queued '$fb_param' for GRUB update. It will be applied if you enable IOMMU/GRUB editing."
         else
@@ -1679,6 +1789,44 @@ print_kv() {
 
 readable_file() {
   [[ -f "$1" && -r "$1" ]]
+}
+resolve_desktop_user_home() {
+  # Resolve the primary desktop user and home directory.
+  # 1) Prefer SUDO_USER when valid and mapped to an existing home.
+  # 2) Fallback to first non-system user with an existing /home/* directory.
+  local home user uid shell
+
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    if [[ -n "$home" && -d "$home" ]]; then
+      printf '%s\t%s\n' "$SUDO_USER" "$home"
+      return 0
+    fi
+  fi
+
+  while IFS=: read -r user _ uid _ _ home shell; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    (( uid >= 1000 )) || continue
+    [[ "$user" == "nobody" ]] && continue
+    [[ -n "$home" && "$home" == /home/* && -d "$home" ]] || continue
+    case "$shell" in
+      */false|*/nologin) continue ;;
+    esac
+    printf '%s\t%s\n' "$user" "$home"
+    return 0
+  done </etc/passwd
+
+  return 1
+}
+
+bootlog_bin_path() {
+  local pair home
+  pair="$(resolve_desktop_user_home 2>/dev/null || true)"
+  if [[ -n "$pair" ]]; then
+    home="${pair#*$'\t'}"
+    [[ -n "$home" ]] && { printf '%s\n' "$home/.local/bin/vfio-dump-boot-log.sh"; return 0; }
+  fi
+  printf '%s\n' "/home/${SUDO_USER:-root}/.local/bin/vfio-dump-boot-log.sh"
 }
 report_vm_network_precheck() {
   # Detect a common host-side cause of "VM has no internet":
@@ -1978,6 +2126,20 @@ rebar_status_for_bdf() {
     echo "present (lspci does not show any BAR as Enabled for this device)"
   fi
 }
+extract_drm_panic_registration_lines() {
+  # DRM panic registration lines are informational (panic handler registration),
+  # not proof of a real kernel panic.
+  local logs="${1:-}"
+  [[ -n "$logs" ]] || return 0
+  printf '%s\n' "$logs" | grep -E '\[drm\] Registered [0-9]+ planes with drm panic' || true
+}
+
+extract_real_kernel_panic_lines() {
+  # Strong panic/oops signatures only (avoid broad false positives).
+  local logs="${1:-}"
+  [[ -n "$logs" ]] || return 0
+  printf '%s\n' "$logs" | grep -Ei '(Kernel panic - not syncing|BUG: unable to handle kernel|Oops:|general protection fault:|fatal exception)' || true
+}
 
 # Audit whether the *currently running* kernel looks hostile to VFIO for the
 # selected guest GPU. This is a diagnostic only; it does not change any
@@ -2127,6 +2289,29 @@ audit_vfio_health() {
   fi
 
   if [[ -n "$log_data" ]]; then
+    local drm_panic_lines real_panic_lines
+    drm_panic_lines="$(extract_drm_panic_registration_lines "$log_data")"
+    real_panic_lines="$(extract_real_kernel_panic_lines "$log_data")"
+
+    if [[ -n "$real_panic_lines" ]]; then
+      CTX[kernel_vfio_risk]=1
+      CTX[kernel_vfio_log_error]=1
+      if (( ENABLE_COLOR )); then
+        say "${C_RED}CRITICAL${C_RESET}: Real kernel panic/oops markers were detected in kernel logs."
+      else
+        say "CRITICAL: Real kernel panic/oops markers were detected in kernel logs."
+      fi
+      say "--- panic markers ---"
+      printf '%s\n' "$real_panic_lines"
+      say "---------------------"
+    elif [[ -n "$drm_panic_lines" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "${C_BLUE}INFO${C_RESET}: Detected DRM panic-handler registration lines."
+      else
+        say "INFO: Detected DRM panic-handler registration lines."
+      fi
+      note "\"[drm] Registered ... with drm panic\" means the DRM panic handler is available; it is not a kernel panic by itself."
+    fi
     # Filter for vfio-pci messages that are strongly indicative of BAR or
     # probe failures for this device. We intentionally avoid generic
     # "error" matches here to reduce false positives across distros.
@@ -2185,7 +2370,7 @@ audit_vfio_health() {
     return 0
   elif (( log_bad == 1 )); then
     if (( ENABLE_COLOR )); then
-      say "${C_RED}✖ HEALTH: FAIL${C_RESET} (vfio-pci probe/BAR errors seen in logs)"
+      say "${C_RED}✖ HEALTH: FAIL${C_RESET} (critical kernel log errors seen: vfio-pci probe/BAR or panic/oops markers)"
       say "${C_RED}Kernel regression (known VFIO/simpledrm issue): YES${C_RESET}"
       if (( env_ok == 1 )); then
         say "${C_GREEN}VFIO environment OK (IOMMU, vfio-pci, no framebuffer lock): YES${C_RESET}"
@@ -2193,7 +2378,7 @@ audit_vfio_health() {
         say "${C_YELLOW}VFIO environment OK (IOMMU, vfio-pci, no framebuffer lock): NO${C_RESET}"
       fi
     else
-      say "HEALTH: FAIL (vfio-pci probe/BAR errors seen in logs)"
+      say "HEALTH: FAIL (critical kernel log errors seen: vfio-pci probe/BAR or panic/oops markers)"
       say "Kernel regression (known VFIO/simpledrm issue): YES"
       if (( env_ok == 1 )); then
         say "VFIO environment OK (IOMMU, vfio-pci, no framebuffer lock): YES"
@@ -2266,7 +2451,7 @@ health_check_all() {
       say "Overall health (all GPUs): WARN (at least one GPU reported VFIO risk markers)"
       ;;
     2)
-      say "Overall health (all GPUs): FAIL (at least one GPU reported vfio-pci errors in logs)"
+      say "Overall health (all GPUs): FAIL (at least one GPU reported critical kernel log errors: vfio-pci or panic/oops markers)"
       ;;
   esac
   return "$worst"
@@ -2661,10 +2846,19 @@ detect_existing_vfio_report() {
   xfwm4_status="$(xfwm4_stack_status)"
 
   if (( JSON_OUTPUT )); then
-    local opensuse_like_json accountsservice_present_json configured_graphics_protocol_mode hc status
+    local opensuse_like_json accountsservice_present_json configured_graphics_protocol_mode configured_graphics_daemon_interval hc status
+    local fallback_report fallback_status fallback_reason fallback_source_entry fallback_target_entry fallback_source_name fallback_target_name fallback_applicable_json
     opensuse_like_json=false
     accountsservice_present_json=false
     configured_graphics_protocol_mode="AUTO"
+    configured_graphics_daemon_interval="$GRAPHICS_DAEMON_INTERVAL_DEFAULT"
+    fallback_status="NOT_APPLICABLE"
+    fallback_reason=""
+    fallback_source_entry=""
+    fallback_target_entry=""
+    fallback_source_name=""
+    fallback_target_name=""
+    fallback_applicable_json=false
     if opensuse_like_detection_reason >/dev/null 2>&1; then
       opensuse_like_json=true
     fi
@@ -2679,10 +2873,36 @@ detect_existing_vfio_report() {
         X11|WAYLAND|AUTO) ;;
         *) configured_graphics_protocol_mode="AUTO" ;;
       esac
+      configured_graphics_daemon_interval="$(awk -F= '/^VFIO_GRAPHICS_DAEMON_INTERVAL=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+      configured_graphics_daemon_interval="$(trim "${configured_graphics_daemon_interval:-}")"
+      if [[ ! "$configured_graphics_daemon_interval" =~ ^[0-9]+$ ]] || (( 10#$configured_graphics_daemon_interval < 1 || 10#$configured_graphics_daemon_interval > 3600 )); then
+        configured_graphics_daemon_interval="$GRAPHICS_DAEMON_INTERVAL_DEFAULT"
+      else
+        configured_graphics_daemon_interval="$((10#$configured_graphics_daemon_interval))"
+      fi
     fi
     hc="$(vfio_config_health)"
     status="$(printf '%s\n' "$hc" | awk -F= '/^STATUS=/{print $2; exit}')"
     status="${status:-UNKNOWN}"
+    fallback_report="$(bls_fallback_entry_detect_status)"
+    local key value
+    while IFS='=' read -r key value; do
+      case "$key" in
+        STATUS) fallback_status="$value" ;;
+        REASON) fallback_reason="$value" ;;
+        SOURCE_ENTRY) fallback_source_entry="$value" ;;
+        TARGET_ENTRY) fallback_target_entry="$value" ;;
+      esac
+    done <<<"$fallback_report"
+    if [[ "$fallback_status" != "NOT_APPLICABLE" ]]; then
+      fallback_applicable_json=true
+    fi
+    if [[ -n "$fallback_source_entry" ]]; then
+      fallback_source_name="$(basename "$fallback_source_entry")"
+    fi
+    if [[ -n "$fallback_target_entry" ]]; then
+      fallback_target_name="$(basename "$fallback_target_entry")"
+    fi
 
     printf '{\n'
     printf '  \"mode\": \"detect\",\n'
@@ -2695,6 +2915,7 @@ detect_existing_vfio_report() {
     printf '  \"graphics_protocol_support\": \"%s\",\n' "$graphics_protocol_support"
     printf '  \"graphics_protocol_mode\": \"%s\",\n' "$graphics_protocol_mode"
     printf '  \"configured_graphics_protocol_mode\": \"%s\",\n' "$configured_graphics_protocol_mode"
+    printf '  \"configured_graphics_daemon_interval_seconds\": %s,\n' "$configured_graphics_daemon_interval"
     printf '  \"window_manager_openbox\": \"%s\",\n' "$openbox_status"
     printf '  \"window_manager_i3\": \"%s\",\n' "$i3_status"
     printf '  \"window_manager_bspwm\": \"%s\",\n' "$bspwm_status"
@@ -2702,6 +2923,11 @@ detect_existing_vfio_report() {
     printf '  \"window_manager_dwm\": \"%s\",\n' "$dwm_status"
     printf '  \"window_manager_qtile\": \"%s\",\n' "$qtile_status"
     printf '  \"window_manager_xfwm4\": \"%s\",\n' "$xfwm4_status"
+    printf '  \"bls_fallback_applicable\": %s,\n' "$fallback_applicable_json"
+    printf '  \"bls_fallback_status\": \"%s\",\n' "${fallback_status:-NOT_APPLICABLE}"
+    printf '  \"bls_fallback_reason\": \"%s\",\n' "${fallback_reason:-}"
+    printf '  \"bls_fallback_source_entry\": \"%s\",\n' "${fallback_source_name:-}"
+    printf '  \"bls_fallback_target_entry\": \"%s\",\n' "${fallback_target_name:-}"
     printf '  \"accountsservice_present\": %s,\n' "$accountsservice_present_json"
     printf '  \"vfio_health\": \"%s\"\n' "$status"
     printf '}\n'
@@ -2816,6 +3042,7 @@ detect_existing_vfio_report() {
     print_kv "Configured host audio" "${HOST_AUDIO_BDFS_CSV:-<unset>}"
     print_kv "Configured guest audio" "${GUEST_AUDIO_BDFS_CSV:-<unset>}"
     print_kv "Configured graphics protocol" "${GRAPHICS_PROTOCOL_MODE:-AUTO}"
+    print_kv "Configured graphics daemon interval" "${VFIO_GRAPHICS_DAEMON_INTERVAL:-$GRAPHICS_DAEMON_INTERVAL_DEFAULT}s"
     if [[ -n "${GUEST_GPU_BDF:-}" ]]; then
       local rebar_state above4g_state
       rebar_state="$(rebar_status_for_bdf "$GUEST_GPU_BDF")"
@@ -3025,6 +3252,8 @@ detect_existing_vfio_report() {
       shopt -u nullglob
     fi
   fi
+  # openSUSE-specific BLS fallback recommendation/remediation path.
+  maybe_offer_detect_fallback_entry_create
 
   # Current device bindings
   say
@@ -3165,6 +3394,26 @@ require_systemd() {
     die "systemd not detected (/run/systemd/system missing)."
   fi
   need_cmd systemctl
+}
+require_writable_root_or_die() {
+  # Install/reset/disable modes must be able to write system state.
+  # openSUSE snapshot boots can be read-only (e.g. /.snapshots/*/snapshot),
+  # which would make deployment silently fail later.
+  (( DRY_RUN )) && return 0
+
+  local marker="/etc/.vfio-write-test.$$"
+  if ! : >"$marker" 2>/dev/null; then
+    local cmdline rootflags msg
+    cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+    rootflags="$(sed -nE 's/.*rootflags=([^ ]+).*/\1/p' <<<"$cmdline")"
+    msg="Root filesystem appears read-only (cannot write to /etc)."
+    if [[ -n "$rootflags" ]]; then
+      msg+=" Current rootflags=${rootflags}."
+    fi
+    msg+=" Boot a writable subvolume/snapshot and rerun."
+    die "$msg"
+  fi
+  rm -f "$marker" || true
 }
 
 backup_file() {
@@ -3496,6 +3745,7 @@ write_conf() {
   local guest_vendor="$6"
   local graphics_protocol_mode="${7:-AUTO}"
   local boot_vga_policy_mode="${8:-${BOOT_VGA_POLICY_OVERRIDE:-AUTO}}"
+  local graphics_daemon_interval="${9:-${GRAPHICS_DAEMON_INTERVAL_OVERRIDE:-$GRAPHICS_DAEMON_INTERVAL_DEFAULT}}"
   local boot_vga_host_assisted_default="0"
   graphics_protocol_mode="${graphics_protocol_mode^^}"
   if [[ "$graphics_protocol_mode" != "X11" && "$graphics_protocol_mode" != "WAYLAND" ]]; then
@@ -3506,6 +3756,9 @@ write_conf() {
     AUTO|STRICT) ;;
     *) boot_vga_policy_mode="AUTO" ;;
   esac
+  if [[ ! "$graphics_daemon_interval" =~ ^[0-9]+$ ]] || (( 10#$graphics_daemon_interval < 1 || 10#$graphics_daemon_interval > 3600 )); then
+    graphics_daemon_interval="$GRAPHICS_DAEMON_INTERVAL_DEFAULT"
+  fi
 
   boot_vga_host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
 
@@ -3541,6 +3794,15 @@ GUEST_GPU_BDF="$guest_gpu"
 GUEST_AUDIO_BDFS_CSV="$guest_audio_bdfs_csv"
 GUEST_GPU_VENDOR_ID="$guest_vendor"
 GRAPHICS_PROTOCOL_MODE="$graphics_protocol_mode"
+VFIO_GRAPHICS_DAEMON_INTERVAL="$graphics_daemon_interval"
+# AUTO-mode X11 pinning policy:
+# - 1 (default): allow X11 host-GPU pinning in AUTO mode for pre-login X11
+#                display managers (for example SDDM/LightDM) and active X11 sessions.
+#                This avoids \"no screens found\" failures when the guest GPU is
+#                already bound to vfio-pci before the display manager starts.
+# - 0: keep AUTO conservative for active user sessions; pre-login safety pinning
+#      for X11 display managers still applies.
+VFIO_GRAPHICS_AUTO_X11_PINNING=\"1\"
 EOF
 }
 
@@ -3695,9 +3957,9 @@ install_softdep_config() {
   write_file_atomic "$file" 0644 "root:root" <<EOF
 # Generated by $SCRIPT_NAME on $(date -Is)
 # Ensures vfio-pci loads before the graphics driver to prevent race conditions.
+# Use exact module names only; wildcard module names are not valid in modprobe softdep entries.
 
 softdep $target_driver pre: vfio-pci
-softdep ${target_driver}* pre: vfio-pci
 EOF
 
   say "Installed soft dependency to ensure vfio-pci loads before $target_driver."
@@ -3856,6 +4118,18 @@ remove_param_all() {
   local out="" tok
   for tok in $cmdline; do
     if [[ "$tok" == "$param" ]]; then
+      continue
+    fi
+    out+="${out:+ }$tok"
+  done
+  trim "$out"
+}
+remove_param_prefix() {
+  # Remove cmdline tokens that start with a given prefix (e.g. key=).
+  local cmdline="$1" prefix="$2"
+  local out="" tok
+  for tok in $cmdline; do
+    if [[ "$tok" == "${prefix}"* ]]; then
       continue
     fi
     out+="${out:+ }$tok"
@@ -4139,6 +4413,99 @@ systemd_boot_entries_dir() {
 kernel_cmdline_persistence_file() {
   echo "/etc/kernel/cmdline"
 }
+kernel_cmdline_rehydrate_boot_metadata_if_missing() {
+  # Best-effort safety net: if /etc/kernel/cmdline lost root metadata,
+  # recover it from current/backup BLS entry options before any sync/update.
+  local cmdline_file="${1:-}"
+  if [[ -z "$cmdline_file" ]]; then
+    cmdline_file="$(kernel_cmdline_persistence_file 2>/dev/null || true)"
+  fi
+  cmdline_file="$(trim "${cmdline_file:-}")"
+  [[ -n "$cmdline_file" ]] || return 1
+  [[ -f "$cmdline_file" ]] || return 1
+
+  local current_cmdline
+  current_cmdline="$(cat "$cmdline_file" 2>/dev/null || true)"
+  current_cmdline="$(trim "${current_cmdline:-}")"
+  [[ -n "$current_cmdline" ]] || return 1
+  if cmdline_get_key_value_token "$current_cmdline" "root" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local metadata_opts recovered_cmdline recovered_root_tok
+  metadata_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
+  metadata_opts="$(trim "${metadata_opts:-}")"
+  [[ -n "$metadata_opts" ]] || return 1
+
+  recovered_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$current_cmdline" "$metadata_opts")"
+  recovered_cmdline="$(trim "${recovered_cmdline:-}")"
+  recovered_root_tok="$(cmdline_get_key_value_token "$recovered_cmdline" "root" 2>/dev/null || true)"
+  [[ -n "$recovered_root_tok" ]] || return 1
+
+  if [[ "$recovered_cmdline" == "$current_cmdline" ]]; then
+    return 0
+  fi
+
+  backup_file "$cmdline_file"
+  if (( ! DRY_RUN )); then
+    printf '%s\n' "$recovered_cmdline" >"$cmdline_file"
+  fi
+  note "Rehydrated missing root boot metadata in $cmdline_file from Boot Loader Spec options."
+  return 0
+}
+kernel_cmdline_reconcile_boot_metadata_with_current_mount() {
+  # Align persisted root/rootflags metadata with the currently mounted root.
+  # This prevents stale snapshot rootflags from surviving across BLS sync runs.
+  local cmdline_file="${1:-}"
+  if [[ -z "$cmdline_file" ]]; then
+    cmdline_file="$(kernel_cmdline_persistence_file 2>/dev/null || true)"
+  fi
+  cmdline_file="$(trim "${cmdline_file:-}")"
+  [[ -n "$cmdline_file" ]] || return 1
+  [[ -f "$cmdline_file" ]] || return 1
+
+  local current_cmdline
+  current_cmdline="$(cat "$cmdline_file" 2>/dev/null || true)"
+  current_cmdline="$(trim "${current_cmdline:-}")"
+  [[ -n "$current_cmdline" ]] || return 1
+
+  local mount_root_tok mount_rootflags_tok
+  mount_root_tok="$(bls_current_mount_root_token 2>/dev/null || true)"
+  mount_rootflags_tok="$(bls_current_mount_rootflags_token 2>/dev/null || true)"
+  [[ -n "$mount_root_tok" || -n "$mount_rootflags_tok" ]] || return 1
+
+  local cmdline_root_tok cmdline_rootflags_tok updated_cmdline
+  cmdline_root_tok="$(cmdline_get_key_value_token "$current_cmdline" "root" 2>/dev/null || true)"
+  cmdline_rootflags_tok="$(cmdline_get_key_value_token "$current_cmdline" "rootflags" 2>/dev/null || true)"
+  updated_cmdline="$current_cmdline"
+
+  if [[ -n "$mount_root_tok" ]] && [[ "$cmdline_root_tok" != "$mount_root_tok" ]]; then
+    updated_cmdline="$(cmdline_set_key_value_token "$updated_cmdline" "$mount_root_tok")"
+  fi
+  if [[ -n "$mount_rootflags_tok" ]]; then
+    local root_context_matches=1
+    if [[ -n "$mount_root_tok" && -n "$cmdline_root_tok" && "$cmdline_root_tok" != "$mount_root_tok" ]]; then
+      root_context_matches=0
+    fi
+    if (( root_context_matches )) && [[ "$cmdline_rootflags_tok" != "$mount_rootflags_tok" ]]; then
+      updated_cmdline="$(cmdline_set_key_value_token "$updated_cmdline" "$mount_rootflags_tok")"
+    fi
+  fi
+
+  updated_cmdline="$(trim "${updated_cmdline:-}")"
+  [[ -n "$updated_cmdline" ]] || return 1
+  if [[ "$updated_cmdline" == "$current_cmdline" ]]; then
+    return 0
+  fi
+
+  backup_file "$cmdline_file"
+  if (( ! DRY_RUN )); then
+    printf '%s\n' "$updated_cmdline" >"$cmdline_file"
+  fi
+  note "Reconciled root boot metadata in $cmdline_file with the currently mounted root."
+  return 0
+}
+
 # Extract the first key=value token for a given key from a kernel cmdline
 # string. Example:
 #   cmdline_get_key_value_token "quiet root=UUID=abcd rw" "root"
@@ -4154,6 +4521,757 @@ cmdline_get_key_value_token() {
     esac
   done
   return 1
+}
+cmdline_contains_exact_token() {
+  local cmdline="$1" token="$2" tok
+  [[ -n "$token" ]] || return 1
+  for tok in $cmdline; do
+    if [[ "$tok" == "$token" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+cmdline_remove_key_value_tokens() {
+  # Remove all key=value tokens for one key from a cmdline string.
+  local cmdline="$1" key="$2" tok out=""
+  for tok in $cmdline; do
+    case "$tok" in
+      "${key}"=*) continue ;;
+    esac
+    out+="${out:+ }$tok"
+  done
+  trim "$out"
+}
+cmdline_set_key_value_token() {
+  # Replace key=value tokens for this key with the provided token.
+  local cmdline="$1" token="$2"
+  local key
+  key="${token%%=*}"
+  local out
+  out="$(cmdline_remove_key_value_tokens "$cmdline" "$key")"
+  add_param_once "$out" "$token"
+}
+bls_current_mount_root_token() {
+  # Best-effort root= token from current mount metadata.
+  # Works in normal boot and inside chroot (where / points at target root).
+  have_cmd findmnt || return 1
+  local uuid
+  uuid="$(findmnt -no UUID / 2>/dev/null || true)"
+  uuid="$(trim "${uuid:-}")"
+  [[ -n "$uuid" ]] || return 1
+  printf 'root=UUID=%s\n' "$uuid"
+}
+bls_current_mount_rootflags_token() {
+  # Best-effort rootflags=subvol=... token from current mount options.
+  have_cmd findmnt || return 1
+  local opts subvol
+  opts="$(findmnt -no OPTIONS / 2>/dev/null || true)"
+  opts="$(trim "${opts:-}")"
+  [[ -n "$opts" ]] || return 1
+  subvol="$(tr ',' '\n' <<<"$opts" | sed -n 's/^subvol=//p' | head -n1)"
+  subvol="$(trim "${subvol:-}")"
+  [[ -n "$subvol" ]] || return 1
+  printf 'rootflags=subvol=%s\n' "$subvol"
+}
+bls_find_entry_backup_metadata_options() {
+  # Return newest backup options for this exact entry path that still contains root=.
+  local entry="$1"
+  local bak opts
+  local best_bak="" best_opts=""
+  shopt -s nullglob
+  for bak in "${entry}.bak."*; do
+    [[ -f "$bak" ]] || continue
+    opts="$(bls_entry_options "$bak")"
+    opts="$(trim "${opts:-}")"
+    [[ -n "$opts" ]] || continue
+    if ! cmdline_get_key_value_token "$opts" "root" >/dev/null 2>&1; then
+      continue
+    fi
+    if [[ -z "$best_bak" || "$bak" > "$best_bak" ]]; then
+      best_bak="$bak"
+      best_opts="$opts"
+    fi
+  done
+  shopt -u nullglob
+  [[ -n "$best_opts" ]] || return 1
+  printf '%s\n' "$best_opts"
+}
+bls_find_boot_metadata_options() {
+  # Best-effort source for stable boot metadata tokens used by openSUSE BLS:
+  # root=, rootflags=, rootfstype=, resume=, systemd.machine_id, ro/rw.
+  # Preference order:
+  #   1) selected source system entry
+  #   2) any current *.conf entry that still contains root=
+  #   3) newest backup *.conf.bak.* entry, preferring root/rootflags that
+  #      match the currently mounted root subvolume when available
+  local dir source opts f
+  dir="$(systemd_boot_entries_dir 2>/dev/null || true)"
+  [[ -n "$dir" ]] || return 1
+
+  source="$(bls_select_source_system_entry "$dir" 2>/dev/null || true)"
+  if [[ -n "$source" && -f "$source" ]]; then
+    opts="$(bls_entry_options "$source")"
+    opts="$(trim "${opts:-}")"
+    if [[ -n "$opts" ]] && cmdline_get_key_value_token "$opts" "root" >/dev/null 2>&1; then
+      printf '%s\n' "$opts"
+      return 0
+    fi
+  fi
+  shopt -s nullglob
+  for f in "$dir"/system-*.conf "$dir"/snapper-*.conf "$dir"/*.conf; do
+    [[ -f "$f" ]] || continue
+    opts="$(bls_entry_options "$f")"
+    opts="$(trim "${opts:-}")"
+    [[ -n "$opts" ]] || continue
+    if cmdline_get_key_value_token "$opts" "root" >/dev/null 2>&1; then
+      printf '%s\n' "$opts"
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+
+  local root_hint_tok rootflags_hint_tok cmdline_file cmdline_opts
+  root_hint_tok="$(bls_current_mount_root_token 2>/dev/null || true)"
+  rootflags_hint_tok="$(bls_current_mount_rootflags_token 2>/dev/null || true)"
+  cmdline_file="$(kernel_cmdline_persistence_file 2>/dev/null || true)"
+  cmdline_file="$(trim "${cmdline_file:-}")"
+  if [[ -n "$cmdline_file" && -f "$cmdline_file" ]]; then
+    cmdline_opts="$(cat "$cmdline_file" 2>/dev/null || true)"
+    cmdline_opts="$(trim "${cmdline_opts:-}")"
+    if [[ -z "$root_hint_tok" ]]; then
+      root_hint_tok="$(cmdline_get_key_value_token "$cmdline_opts" "root" 2>/dev/null || true)"
+    fi
+    if [[ -z "$rootflags_hint_tok" ]]; then
+      rootflags_hint_tok="$(cmdline_get_key_value_token "$cmdline_opts" "rootflags" 2>/dev/null || true)"
+    fi
+  fi
+
+  local best_bak="" best_opts="" best_score=-1 score
+
+  shopt -s nullglob
+  for f in "$dir"/system-*.conf.bak.* "$dir"/snapper-*.conf.bak.* "$dir"/*.conf.bak.*; do
+    [[ -f "$f" ]] || continue
+    opts="$(bls_entry_options "$f")"
+    opts="$(trim "${opts:-}")"
+    [[ -n "$opts" ]] || continue
+    if ! cmdline_get_key_value_token "$opts" "root" >/dev/null 2>&1; then
+      continue
+    fi
+    score=0
+    if [[ -n "$rootflags_hint_tok" ]] && cmdline_contains_exact_token "$opts" "$rootflags_hint_tok"; then
+      (( score += 2 ))
+    fi
+    if [[ -n "$root_hint_tok" ]] && cmdline_contains_exact_token "$opts" "$root_hint_tok"; then
+      (( score += 1 ))
+    fi
+    if (( score > best_score )) || { (( score == best_score )) && [[ -z "$best_bak" || "$f" > "$best_bak" ]]; }; then
+      best_score="$score"
+      best_bak="$f"
+      best_opts="$opts"
+    fi
+  done
+  shopt -u nullglob
+  if [[ -n "$best_opts" ]]; then
+    printf '%s\n' "$best_opts"
+    return 0
+  fi
+  return 1
+}
+cmdline_add_boot_metadata_tokens_from_options() {
+  # Merge boot-metadata tokens from one options string into another cmdline.
+  local cmdline="$1" source_opts="$2"
+  local out="$cmdline"
+  local tok key
+  for key in root rootflags rootfstype resume systemd.machine_id; do
+    tok="$(cmdline_get_key_value_token "$source_opts" "$key" 2>/dev/null || true)"
+    [[ -n "$tok" ]] && out="$(cmdline_set_key_value_token "$out" "$tok")"
+  done
+  if grep -Eq '(^|[[:space:]])ro([[:space:]]|$)' <<<"$source_opts"; then
+    out="$(add_param_once "$out" "ro")"
+  fi
+  if grep -Eq '(^|[[:space:]])rw([[:space:]]|$)' <<<"$source_opts"; then
+    out="$(add_param_once "$out" "rw")"
+  fi
+  trim "$out"
+}
+bls_entry_is_vfio_fallback() {
+  local entry="$1" base
+  base="$(basename "$entry")"
+  if [[ "$base" == fallback-* || "$base" == *-fallback.conf || "$base" == *-novfio.conf ]]; then
+    return 0
+  fi
+  grep -Eq '^# vfio-fallback-entry:[[:space:]]*1([[:space:]]*)?$' "$entry" 2>/dev/null
+}
+bls_entry_options() {
+  local entry="$1"
+  grep -m1 -E '^options[[:space:]]+' "$entry" 2>/dev/null | sed -E 's/^options[[:space:]]+//'
+}
+bls_entry_snapshot_id() {
+  # Extract trailing snapshot ID from BLS filename, e.g. *-33.conf -> 33.
+  local entry="$1" base
+  base="$(basename "$entry")"
+  if [[ "$base" =~ -([0-9]+)\.conf$ ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+rootflags_snapshot_id_from_token() {
+  # Extract snapshot ID from rootflags token when it follows .snapshots/<id>/snapshot.
+  local tok="${1:-}" val
+  [[ "$tok" == rootflags=* ]] || return 1
+  val="${tok#rootflags=}"
+  if [[ "$val" =~ \.snapshots/([0-9]+)/snapshot ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+bls_rootflags_token_for_snapshot_id() {
+  local snapshot_id="${1:-}"
+  [[ "$snapshot_id" =~ ^[0-9]+$ ]] || return 1
+  printf 'rootflags=subvol=@/.snapshots/%s/snapshot\n' "$snapshot_id"
+}
+bls_rd_driver_pre_remove_vfio_pci() {
+  # Remove vfio-pci from one rd.driver.pre= token while preserving other drivers.
+  local token="$1"
+  local value
+  value="${token#rd.driver.pre=}"
+  local old_ifs="$IFS"
+  IFS=','
+  local -a drivers=()
+  read -r -a drivers <<<"$value"
+  IFS="$old_ifs"
+
+  local -a keep=()
+  local driver
+  for driver in "${drivers[@]}"; do
+    [[ -n "$driver" ]] || continue
+    if [[ "$driver" == "vfio-pci" ]]; then
+      continue
+    fi
+    keep+=("$driver")
+  done
+  if (( ${#keep[@]} == 0 )); then
+    return 1
+  fi
+  local joined
+  old_ifs="$IFS"
+  IFS=','
+  joined="${keep[*]}"
+  IFS="$old_ifs"
+  printf 'rd.driver.pre=%s\n' "$joined"
+}
+bls_strip_vfio_forcing_tokens_from_options() {
+  # Remove known VFIO-forcing cmdline tokens from one BLS options string.
+  local opts="$1"
+  local out="" tok
+  for tok in $opts; do
+    case "$tok" in
+      vfio-pci.ids=*|pcie_acs_override=*)
+        continue
+        ;;
+      rd.driver.pre=*)
+        local rewritten
+        rewritten="$(bls_rd_driver_pre_remove_vfio_pci "$tok" 2>/dev/null || true)"
+        if [[ -z "$rewritten" ]]; then
+          continue
+        fi
+        tok="$rewritten"
+        ;;
+    esac
+    out+="${out:+ }$tok"
+  done
+  trim "$out"
+}
+bls_options_has_forbidden_vfio_tokens() {
+  local opts="$1" tok
+  for tok in $opts; do
+    case "$tok" in
+      vfio-pci.ids=*|pcie_acs_override=*)
+        return 0
+        ;;
+      rd.driver.pre=*)
+        local values
+        values=",$(printf '%s' "${tok#rd.driver.pre=}" | tr -s ','),"
+        if [[ "$values" == *,vfio-pci,* ]]; then
+          return 0
+        fi
+        ;;
+    esac
+  done
+  return 1
+}
+bls_fallback_entry_target_path() {
+  local source="$1" dir base stem
+  dir="$(dirname "$source")"
+  base="$(basename "$source")"
+  stem="${base%.conf}"
+  printf '%s/%s-fallback.conf\n' "$dir" "$stem"
+}
+bls_select_source_system_entry() {
+  # Select a non-fallback system-*.conf source, preferring the currently booted root/rootflags.
+  local dir="$1"
+  local -a entries=()
+  local f
+  shopt -s nullglob
+  for f in "$dir"/system-*.conf; do
+    bls_entry_is_vfio_fallback "$f" && continue
+    entries+=("$f")
+  done
+  shopt -u nullglob
+  (( ${#entries[@]} > 0 )) || return 1
+
+  local running_cmdline running_root_tok running_rootflags_tok
+  running_cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+  running_root_tok="$(cmdline_get_key_value_token "$running_cmdline" "root" 2>/dev/null || true)"
+  running_rootflags_tok="$(cmdline_get_key_value_token "$running_cmdline" "rootflags" 2>/dev/null || true)"
+
+  local entry entry_opts entry_root_tok entry_rootflags_tok
+  if [[ -n "$running_root_tok" ]]; then
+    for entry in "${entries[@]}"; do
+      entry_opts="$(bls_entry_options "$entry")"
+      entry_opts="$(trim "${entry_opts:-}")"
+      [[ -n "$entry_opts" ]] || continue
+      entry_root_tok="$(cmdline_get_key_value_token "$entry_opts" "root" 2>/dev/null || true)"
+      [[ "$entry_root_tok" == "$running_root_tok" ]] || continue
+      if [[ -n "$running_rootflags_tok" ]]; then
+        entry_rootflags_tok="$(cmdline_get_key_value_token "$entry_opts" "rootflags" 2>/dev/null || true)"
+        [[ "$entry_rootflags_tok" == "$running_rootflags_tok" ]] || continue
+      fi
+      printf '%s\n' "$entry"
+      return 0
+    done
+  fi
+
+  printf '%s\n' "${entries[0]}"
+}
+bls_render_fallback_entry_from_source() {
+  # Emit fallback entry content from a source BLS entry.
+  local source="$1"
+  local line marker_written=0 options_seen=0
+  local opts sanitized title
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Normalize marker placement by writing one canonical marker ourselves.
+    if [[ "$line" =~ ^#\ vfio-fallback-entry: ]]; then
+      continue
+    fi
+
+    if [[ "$line" =~ ^title[[:space:]]+ ]]; then
+      title="$(sed -E 's/^title[[:space:]]+//' <<<"$line")"
+      if [[ "$title" != *"(fallback)"* ]]; then
+        line="title ${title} (fallback)"
+      fi
+    fi
+
+    if [[ "$line" =~ ^options[[:space:]]+ ]]; then
+      if (( marker_written == 0 )); then
+        printf '# vfio-fallback-entry: 1\n'
+        marker_written=1
+      fi
+      opts="$(sed -E 's/^options[[:space:]]+//' <<<"$line")"
+      sanitized="$(bls_strip_vfio_forcing_tokens_from_options "$opts")"
+      printf 'options %s\n' "$sanitized"
+      options_seen=1
+      continue
+    fi
+
+    printf '%s\n' "$line"
+  done <"$source"
+
+  if (( marker_written == 0 )); then
+    printf '# vfio-fallback-entry: 1\n'
+  fi
+  if (( options_seen == 0 )); then
+    printf 'options \n'
+  fi
+}
+create_or_update_bls_fallback_entry() {
+  local fail_count=0
+  local -a fail_assertions=()
+
+  if ! is_opensuse_like; then
+    (( fail_count += 1 ))
+    fail_assertions+=("opensuse_like_required")
+  fi
+
+  local bl
+  bl="$(detect_bootloader 2>/dev/null || true)"
+  if [[ "$bl" != "grub2-bls" && "$bl" != "systemd-boot" ]]; then
+    (( fail_count += 1 ))
+    fail_assertions+=("bls_bootloader_required:detected=${bl:-unknown}")
+  fi
+
+  local dir
+  dir="$(systemd_boot_entries_dir 2>/dev/null || true)"
+  if [[ -z "$dir" ]]; then
+    (( fail_count += 1 ))
+    fail_assertions+=("bls_entries_dir_present")
+  fi
+
+  local source_entry=""
+  if [[ -n "$dir" ]]; then
+    source_entry="$(bls_select_source_system_entry "$dir" 2>/dev/null || true)"
+    if [[ -z "$source_entry" || ! -f "$source_entry" ]]; then
+      (( fail_count += 1 ))
+      fail_assertions+=("source_system_entry_present")
+    fi
+  fi
+
+  local target_entry=""
+  if [[ -n "$source_entry" ]]; then
+    target_entry="$(bls_fallback_entry_target_path "$source_entry")"
+    if [[ "$target_entry" == "$source_entry" ]]; then
+      (( fail_count += 1 ))
+      fail_assertions+=("target_entry_distinct_from_source")
+    fi
+  fi
+
+  local tmp=""
+  if [[ -n "$source_entry" ]]; then
+    tmp="$(mktemp)"
+    bls_render_fallback_entry_from_source "$source_entry" >"$tmp"
+
+    local candidate_opts
+    candidate_opts="$(bls_entry_options "$tmp")"
+    candidate_opts="$(trim "${candidate_opts:-}")"
+    if ! grep -Eq '^# vfio-fallback-entry:[[:space:]]*1([[:space:]]*)?$' "$tmp" 2>/dev/null; then
+      (( fail_count += 1 ))
+      fail_assertions+=("fallback_marker_present_in_rendered_entry")
+    fi
+    if [[ -z "$candidate_opts" ]]; then
+      (( fail_count += 1 ))
+      fail_assertions+=("fallback_options_line_present")
+    elif bls_options_has_forbidden_vfio_tokens "$candidate_opts"; then
+      (( fail_count += 1 ))
+      fail_assertions+=("fallback_options_forbidden_tokens_absent")
+    fi
+  fi
+
+  if (( fail_count > 0 )); then
+    if [[ -n "$tmp" ]]; then
+      rm -f "$tmp" || true
+    fi
+    say "FAIL SUMMARY (${fail_count})"
+    local item
+    for item in "${fail_assertions[@]}"; do
+      say "  - assertion: $item"
+    done
+    return 1
+  fi
+
+  local target_existed=0 changed=1 wrote=0
+  if [[ -f "$target_entry" ]]; then
+    target_existed=1
+    if have_cmd cmp && cmp -s "$tmp" "$target_entry"; then
+      changed=0
+    fi
+  fi
+
+  if (( changed )); then
+    if (( DRY_RUN )); then
+      if (( target_existed )); then
+        say "DRY RUN: would update fallback BLS entry $(basename "$target_entry") from source $(basename "$source_entry")."
+      else
+        say "DRY RUN: would create fallback BLS entry $(basename "$target_entry") from source $(basename "$source_entry")."
+      fi
+    else
+      local mode owner group
+      if (( target_existed )); then
+        backup_file "$target_entry"
+        mode="$(stat -c '%a' "$target_entry")"
+        owner="$(stat -c '%u' "$target_entry")"
+        group="$(stat -c '%g' "$target_entry")"
+      else
+        mode="$(stat -c '%a' "$source_entry" 2>/dev/null || echo 644)"
+        owner="$(stat -c '%u' "$source_entry" 2>/dev/null || id -u)"
+        group="$(stat -c '%g' "$source_entry" 2>/dev/null || id -g)"
+      fi
+      install -o "$owner" -g "$group" -m "$mode" "$tmp" "$target_entry"
+      wrote=1
+    fi
+  fi
+
+  local verify_path verify_opts
+  verify_path="$tmp"
+  if (( ! DRY_RUN )); then
+    verify_path="$target_entry"
+  fi
+  verify_opts="$(bls_entry_options "$verify_path")"
+  verify_opts="$(trim "${verify_opts:-}")"
+  if ! bls_entry_is_vfio_fallback "$verify_path"; then
+    (( fail_count += 1 ))
+    fail_assertions+=("fallback_marker_present_in_written_entry")
+  fi
+  if [[ -z "$verify_opts" ]]; then
+    (( fail_count += 1 ))
+    fail_assertions+=("written_fallback_options_line_present")
+  elif bls_options_has_forbidden_vfio_tokens "$verify_opts"; then
+    (( fail_count += 1 ))
+    fail_assertions+=("written_fallback_options_forbidden_tokens_absent")
+  fi
+
+  rm -f "$tmp" || true
+
+  if (( fail_count > 0 )); then
+    say "FAIL SUMMARY (${fail_count})"
+    local item
+    for item in "${fail_assertions[@]}"; do
+      say "  - assertion: $item"
+    done
+    return 1
+  fi
+
+  if (( ! DRY_RUN )); then
+    if (( changed )); then
+      if (( target_existed )); then
+        say "Updated fallback BLS entry: $(basename "$target_entry")"
+      else
+        say "Created fallback BLS entry: $(basename "$target_entry")"
+      fi
+    else
+      say "Fallback BLS entry already up to date: $(basename "$target_entry")"
+    fi
+  fi
+  say "Source BLS entry: $(basename "$source_entry")"
+  say "PASS SUMMARY (1)"
+  say "Fallback entry verification passed."
+  if (( ! DRY_RUN )) && (( wrote == 0 )) && (( changed == 0 )); then
+    return 0
+  fi
+  return 0
+}
+bls_fallback_entry_detect_status() {
+  # Read-only status report for openSUSE BLS fallback readiness.
+  # Emits key=value lines:
+  #   BOOTLOADER, STATUS, REASON, SOURCE_ENTRY, TARGET_ENTRY
+  local bootloader status reason source_entry target_entry dir target_opts tmp
+  local in_sync
+
+  bootloader="$(detect_bootloader 2>/dev/null || true)"
+  status="NOT_APPLICABLE"
+  reason=""
+  source_entry=""
+  target_entry=""
+  in_sync=0
+
+  if ! is_opensuse_like; then
+    reason="openSUSE-like system not detected"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=\n'
+    printf 'TARGET_ENTRY=\n'
+    return 0
+  fi
+
+  if [[ "$bootloader" != "grub2-bls" && "$bootloader" != "systemd-boot" ]]; then
+    reason="Boot Loader Spec fallback applies only to grub2-bls/systemd-boot (detected: ${bootloader:-unknown})"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=\n'
+    printf 'TARGET_ENTRY=\n'
+    return 0
+  fi
+
+  dir="$(systemd_boot_entries_dir 2>/dev/null || true)"
+  if [[ -z "$dir" ]]; then
+    status="INVALID"
+    reason="Boot Loader Spec entries directory not found"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=\n'
+    printf 'TARGET_ENTRY=\n'
+    return 0
+  fi
+
+  source_entry="$(bls_select_source_system_entry "$dir" 2>/dev/null || true)"
+  if [[ -z "$source_entry" || ! -f "$source_entry" ]]; then
+    status="INVALID"
+    reason="Source system BLS entry was not found"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=\n'
+    printf 'TARGET_ENTRY=\n'
+    return 0
+  fi
+
+  target_entry="$(bls_fallback_entry_target_path "$source_entry")"
+  if [[ -z "$target_entry" ]]; then
+    status="INVALID"
+    reason="Could not derive fallback entry path from source"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=%s\n' "$source_entry"
+    printf 'TARGET_ENTRY=\n'
+    return 0
+  fi
+
+  if [[ ! -f "$target_entry" ]]; then
+    status="MISSING"
+    reason="Fallback entry file is missing"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=%s\n' "$source_entry"
+    printf 'TARGET_ENTRY=%s\n' "$target_entry"
+    return 0
+  fi
+
+  target_opts="$(bls_entry_options "$target_entry")"
+  target_opts="$(trim "${target_opts:-}")"
+  if ! bls_entry_is_vfio_fallback "$target_entry"; then
+    status="INVALID"
+    reason="Fallback marker is missing from fallback entry"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=%s\n' "$source_entry"
+    printf 'TARGET_ENTRY=%s\n' "$target_entry"
+    return 0
+  fi
+  if [[ -z "$target_opts" ]]; then
+    status="INVALID"
+    reason="Fallback entry options line is missing"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=%s\n' "$source_entry"
+    printf 'TARGET_ENTRY=%s\n' "$target_entry"
+    return 0
+  fi
+  if bls_options_has_forbidden_vfio_tokens "$target_opts"; then
+    status="INVALID"
+    reason="Fallback entry options still contain VFIO-forcing tokens"
+    printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+    printf 'STATUS=%s\n' "$status"
+    printf 'REASON=%s\n' "$reason"
+    printf 'SOURCE_ENTRY=%s\n' "$source_entry"
+    printf 'TARGET_ENTRY=%s\n' "$target_entry"
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  bls_render_fallback_entry_from_source "$source_entry" >"$tmp"
+  if have_cmd cmp; then
+    if cmp -s "$tmp" "$target_entry"; then
+      in_sync=1
+    fi
+  elif have_cmd diff; then
+    if diff -q "$tmp" "$target_entry" >/dev/null 2>&1; then
+      in_sync=1
+    fi
+  else
+    if [[ "$(cat "$tmp" 2>/dev/null || true)" == "$(cat "$target_entry" 2>/dev/null || true)" ]]; then
+      in_sync=1
+    fi
+  fi
+  rm -f "$tmp" || true
+
+  if (( in_sync )); then
+    status="OK"
+    reason="Fallback entry is present and synchronized with source entry"
+  else
+    status="OUTDATED"
+    reason="Fallback entry exists but differs from expected rendered fallback"
+  fi
+
+  printf 'BOOTLOADER=%s\n' "${bootloader:-unknown}"
+  printf 'STATUS=%s\n' "$status"
+  printf 'REASON=%s\n' "$reason"
+  printf 'SOURCE_ENTRY=%s\n' "$source_entry"
+  printf 'TARGET_ENTRY=%s\n' "$target_entry"
+}
+maybe_offer_detect_fallback_entry_create() {
+  [[ "${MODE:-}" == "detect" ]] || return 0
+
+  local report status reason source_entry target_entry bootloader
+  report="$(bls_fallback_entry_detect_status)"
+  status=""
+  reason=""
+  source_entry=""
+  target_entry=""
+  bootloader=""
+
+  local key value
+  while IFS='=' read -r key value; do
+    case "$key" in
+      BOOTLOADER) bootloader="$value" ;;
+      STATUS) status="$value" ;;
+      REASON) reason="$value" ;;
+      SOURCE_ENTRY) source_entry="$value" ;;
+      TARGET_ENTRY) target_entry="$value" ;;
+    esac
+  done <<<"$report"
+
+  [[ -n "$status" ]] || return 0
+  [[ "$status" == "NOT_APPLICABLE" ]] && return 0
+
+  local source_name target_name
+  source_name="<unknown>"
+  target_name="<unknown>"
+  [[ -n "$source_entry" ]] && source_name="$(basename "$source_entry")"
+  [[ -n "$target_entry" ]] && target_name="$(basename "$target_entry")"
+
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}-- Boot Loader Spec fallback entry (openSUSE-specific) --${C_RESET}"
+  else
+    say "-- Boot Loader Spec fallback entry (openSUSE-specific) --"
+  fi
+  print_kv "Bootloader (detected)" "${bootloader:-unknown}"
+  print_kv "Source entry" "$source_name"
+  print_kv "Fallback entry" "$target_name"
+
+  case "$status" in
+    OK)
+      print_kv "Fallback status" "OK (synchronized)"
+      return 0
+      ;;
+    MISSING)
+      print_kv "Fallback status" "MISSING"
+      ;;
+    OUTDATED)
+      print_kv "Fallback status" "OUTDATED"
+      ;;
+    INVALID)
+      print_kv "Fallback status" "INVALID"
+      ;;
+    *)
+      print_kv "Fallback status" "$status"
+      ;;
+  esac
+
+  [[ -n "$reason" ]] && note "Reason: $reason"
+  note "Recommendation: run $SCRIPT_NAME --create-fallback-entry"
+
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    note "Run as root to create or update the fallback entry."
+    return 0
+  fi
+
+  if ! prompt_yn "Create/update fallback BLS entry now from detect mode?" N "BLS fallback entry"; then
+    return 0
+  fi
+  if ! confirm_phrase "This will edit Boot Loader Spec entry files now." "CREATE FALLBACK ENTRY"; then
+    note "Skipping fallback entry remediation (confirmation phrase not provided)."
+    return 0
+  fi
+
+  local prev_dry="${DRY_RUN:-0}"
+  DRY_RUN=0
+  if create_or_update_bls_fallback_entry; then
+    say "Fallback entry remediation completed from detect mode."
+  else
+    note "Fallback entry remediation failed; review FAIL SUMMARY above."
+  fi
+  DRY_RUN="$prev_dry"
 }
 
 # Enforce that every Boot Loader Spec entry options line follows the current
@@ -4182,6 +5300,8 @@ sync_bls_entries_from_kernel_cmdline() {
     note "Skipping BLS entry sync: $cmdline_file is missing."
     return 0
   fi
+  kernel_cmdline_rehydrate_boot_metadata_if_missing "$cmdline_file" || true
+  kernel_cmdline_reconcile_boot_metadata_with_current_mount "$cmdline_file" || true
 
   local base_cmdline
   base_cmdline="$(cat "$cmdline_file" 2>/dev/null || true)"
@@ -4190,6 +5310,21 @@ sync_bls_entries_from_kernel_cmdline() {
     note "Skipping BLS entry sync: $cmdline_file is empty."
     return 0
   fi
+  local fallback_metadata_opts
+  fallback_metadata_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
+  if [[ -n "$fallback_metadata_opts" ]]; then
+    base_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$base_cmdline" "$fallback_metadata_opts")"
+  fi
+  if ! cmdline_get_key_value_token "$base_cmdline" "root" >/dev/null 2>&1; then
+    note "Skipping BLS entry sync: unable to determine root=... metadata from $cmdline_file or BLS backups."
+    return 1
+  fi
+  local base_root_tok base_rootflags_tok base_rootfstype_tok base_resume_tok base_machine_id_tok
+  base_root_tok="$(cmdline_get_key_value_token "$base_cmdline" "root" 2>/dev/null || true)"
+  base_rootflags_tok="$(cmdline_get_key_value_token "$base_cmdline" "rootflags" 2>/dev/null || true)"
+  base_rootfstype_tok="$(cmdline_get_key_value_token "$base_cmdline" "rootfstype" 2>/dev/null || true)"
+  base_resume_tok="$(cmdline_get_key_value_token "$base_cmdline" "resume" 2>/dev/null || true)"
+  base_machine_id_tok="$(cmdline_get_key_value_token "$base_cmdline" "systemd.machine_id" 2>/dev/null || true)"
 
   local dir
   dir="$(systemd_boot_entries_dir 2>/dev/null || true)"
@@ -4211,29 +5346,122 @@ sync_bls_entries_from_kernel_cmdline() {
     return 0
   fi
 
-  local changed=0 examined=0
-  local current_opts merged_opts root_tok rootflags_tok rootfstype_tok resume_tok
+  local changed=0 examined=0 snapper_skipped=0 root_examined=0 fallback_skipped=0
+  local current_opts merged_opts root_tok rootflags_tok rootfstype_tok resume_tok machine_id_tok
+  local entry_snapshot_id entry_snapshot_rootflags_tok current_rootflags_snapshot_id
+  local entry_backup_opts backup_root_tok backup_rootflags_tok backup_rootfstype_tok backup_resume_tok backup_machine_id_tok
   for f in "${entries[@]}"; do
+    if bls_entry_is_vfio_fallback "$f"; then
+      (( fallback_skipped += 1 ))
+      continue
+    fi
+    if [[ "$(basename "$f")" == snapper-* ]]; then
+      (( snapper_skipped += 1 ))
+      continue
+    fi
     current_opts="$(grep -m1 -E '^options[[:space:]]+' "$f" 2>/dev/null | sed -E 's/^options[[:space:]]+//')"
     current_opts="$(trim "${current_opts:-}")"
     [[ -n "$current_opts" ]] || continue
     (( examined += 1 ))
+    (( root_examined += 1 ))
 
     merged_opts="$base_cmdline"
     root_tok="$(cmdline_get_key_value_token "$current_opts" "root" 2>/dev/null || true)"
     rootflags_tok="$(cmdline_get_key_value_token "$current_opts" "rootflags" 2>/dev/null || true)"
     rootfstype_tok="$(cmdline_get_key_value_token "$current_opts" "rootfstype" 2>/dev/null || true)"
     resume_tok="$(cmdline_get_key_value_token "$current_opts" "resume" 2>/dev/null || true)"
+    machine_id_tok="$(cmdline_get_key_value_token "$current_opts" "systemd.machine_id" 2>/dev/null || true)"
+    entry_backup_opts="$(bls_find_entry_backup_metadata_options "$f" 2>/dev/null || true)"
+    backup_root_tok=""
+    backup_rootflags_tok=""
+    backup_rootfstype_tok=""
+    backup_resume_tok=""
+    backup_machine_id_tok=""
+    if [[ -n "$entry_backup_opts" ]]; then
+      backup_root_tok="$(cmdline_get_key_value_token "$entry_backup_opts" "root" 2>/dev/null || true)"
+      backup_rootflags_tok="$(cmdline_get_key_value_token "$entry_backup_opts" "rootflags" 2>/dev/null || true)"
+      backup_rootfstype_tok="$(cmdline_get_key_value_token "$entry_backup_opts" "rootfstype" 2>/dev/null || true)"
+      backup_resume_tok="$(cmdline_get_key_value_token "$entry_backup_opts" "resume" 2>/dev/null || true)"
+      backup_machine_id_tok="$(cmdline_get_key_value_token "$entry_backup_opts" "systemd.machine_id" 2>/dev/null || true)"
 
-    [[ -n "$root_tok" ]] && merged_opts="$(add_param_once "$merged_opts" "$root_tok")"
-    [[ -n "$rootflags_tok" ]] && merged_opts="$(add_param_once "$merged_opts" "$rootflags_tok")"
-    [[ -n "$rootfstype_tok" ]] && merged_opts="$(add_param_once "$merged_opts" "$rootfstype_tok")"
-    [[ -n "$resume_tok" ]] && merged_opts="$(add_param_once "$merged_opts" "$resume_tok")"
+      if [[ -n "$backup_root_tok" ]]; then
+        if [[ -z "$root_tok" ]]; then
+          root_tok="$backup_root_tok"
+        elif [[ -n "$base_root_tok" && "$root_tok" == "$base_root_tok" && "$backup_root_tok" != "$base_root_tok" ]]; then
+          root_tok="$backup_root_tok"
+        fi
+      fi
+      if [[ -n "$backup_rootflags_tok" ]]; then
+        if [[ -z "$rootflags_tok" ]]; then
+          rootflags_tok="$backup_rootflags_tok"
+        elif [[ -n "$base_rootflags_tok" && "$rootflags_tok" == "$base_rootflags_tok" && "$backup_rootflags_tok" != "$base_rootflags_tok" ]]; then
+          rootflags_tok="$backup_rootflags_tok"
+        fi
+      fi
+      if [[ -n "$backup_rootfstype_tok" ]]; then
+        if [[ -z "$rootfstype_tok" ]]; then
+          rootfstype_tok="$backup_rootfstype_tok"
+        elif [[ -n "$base_rootfstype_tok" && "$rootfstype_tok" == "$base_rootfstype_tok" && "$backup_rootfstype_tok" != "$base_rootfstype_tok" ]]; then
+          rootfstype_tok="$backup_rootfstype_tok"
+        fi
+      fi
+      if [[ -n "$backup_resume_tok" ]]; then
+        if [[ -z "$resume_tok" ]]; then
+          resume_tok="$backup_resume_tok"
+        elif [[ -n "$base_resume_tok" && "$resume_tok" == "$base_resume_tok" && "$backup_resume_tok" != "$base_resume_tok" ]]; then
+          resume_tok="$backup_resume_tok"
+        fi
+      fi
+      if [[ -n "$backup_machine_id_tok" ]]; then
+        if [[ -z "$machine_id_tok" ]]; then
+          machine_id_tok="$backup_machine_id_tok"
+        elif [[ -n "$base_machine_id_tok" && "$machine_id_tok" == "$base_machine_id_tok" && "$backup_machine_id_tok" != "$base_machine_id_tok" ]]; then
+          machine_id_tok="$backup_machine_id_tok"
+        fi
+      fi
+    fi
+    if [[ -z "$root_tok" && -n "$fallback_metadata_opts" ]]; then
+      root_tok="$(cmdline_get_key_value_token "$fallback_metadata_opts" "root" 2>/dev/null || true)"
+    fi
+    if [[ -z "$rootflags_tok" && -n "$fallback_metadata_opts" ]]; then
+      rootflags_tok="$(cmdline_get_key_value_token "$fallback_metadata_opts" "rootflags" 2>/dev/null || true)"
+    fi
+    if [[ -z "$rootfstype_tok" && -n "$fallback_metadata_opts" ]]; then
+      rootfstype_tok="$(cmdline_get_key_value_token "$fallback_metadata_opts" "rootfstype" 2>/dev/null || true)"
+    fi
+    if [[ -z "$resume_tok" && -n "$fallback_metadata_opts" ]]; then
+      resume_tok="$(cmdline_get_key_value_token "$fallback_metadata_opts" "resume" 2>/dev/null || true)"
+    fi
+    if [[ -z "$machine_id_tok" && -n "$fallback_metadata_opts" ]]; then
+      machine_id_tok="$(cmdline_get_key_value_token "$fallback_metadata_opts" "systemd.machine_id" 2>/dev/null || true)"
+    fi
+    entry_snapshot_id="$(bls_entry_snapshot_id "$f" 2>/dev/null || true)"
+    if [[ -n "$entry_snapshot_id" ]]; then
+      entry_snapshot_rootflags_tok="$(bls_rootflags_token_for_snapshot_id "$entry_snapshot_id" 2>/dev/null || true)"
+      current_rootflags_snapshot_id="$(rootflags_snapshot_id_from_token "${rootflags_tok:-}" 2>/dev/null || true)"
+      if [[ -n "$entry_snapshot_rootflags_tok" ]] && [[ "$current_rootflags_snapshot_id" != "$entry_snapshot_id" ]]; then
+        rootflags_tok="$entry_snapshot_rootflags_tok"
+      fi
+    fi
+
+    [[ -n "$root_tok" ]] && merged_opts="$(cmdline_set_key_value_token "$merged_opts" "$root_tok")"
+    [[ -n "$rootflags_tok" ]] && merged_opts="$(cmdline_set_key_value_token "$merged_opts" "$rootflags_tok")"
+    [[ -n "$rootfstype_tok" ]] && merged_opts="$(cmdline_set_key_value_token "$merged_opts" "$rootfstype_tok")"
+    [[ -n "$resume_tok" ]] && merged_opts="$(cmdline_set_key_value_token "$merged_opts" "$resume_tok")"
+    [[ -n "$machine_id_tok" ]] && merged_opts="$(cmdline_set_key_value_token "$merged_opts" "$machine_id_tok")"
 
     if grep -Eq '(^|[[:space:]])ro([[:space:]]|$)' <<<"$current_opts"; then
       merged_opts="$(add_param_once "$merged_opts" "ro")"
+    elif [[ -n "$entry_backup_opts" ]] && grep -Eq '(^|[[:space:]])ro([[:space:]]|$)' <<<"$entry_backup_opts"; then
+      merged_opts="$(add_param_once "$merged_opts" "ro")"
+    elif [[ -n "$fallback_metadata_opts" ]] && grep -Eq '(^|[[:space:]])ro([[:space:]]|$)' <<<"$fallback_metadata_opts"; then
+      merged_opts="$(add_param_once "$merged_opts" "ro")"
     fi
     if grep -Eq '(^|[[:space:]])rw([[:space:]]|$)' <<<"$current_opts"; then
+      merged_opts="$(add_param_once "$merged_opts" "rw")"
+    elif [[ -n "$entry_backup_opts" ]] && grep -Eq '(^|[[:space:]])rw([[:space:]]|$)' <<<"$entry_backup_opts"; then
+      merged_opts="$(add_param_once "$merged_opts" "rw")"
+    elif [[ -n "$fallback_metadata_opts" ]] && grep -Eq '(^|[[:space:]])rw([[:space:]]|$)' <<<"$fallback_metadata_opts"; then
       merged_opts="$(add_param_once "$merged_opts" "rw")"
     fi
 
@@ -4247,7 +5475,7 @@ sync_bls_entries_from_kernel_cmdline() {
   done
 
   if (( changed == 0 )); then
-    note "Boot Loader Spec options are already synchronized with /etc/kernel/cmdline (${examined} entries checked)."
+    note "Boot Loader Spec options are already synchronized with /etc/kernel/cmdline (${examined} root/system entries checked, ${snapper_skipped} snapper skipped, ${fallback_skipped} fallback skipped)."
     return 0
   fi
 
@@ -4256,10 +5484,267 @@ sync_bls_entries_from_kernel_cmdline() {
     entry_word="entry"
   fi
   if (( DRY_RUN )); then
-    say "DRY RUN: would synchronize ${changed} Boot Loader Spec ${entry_word} from $cmdline_file."
+    say "DRY RUN: would synchronize ${changed} Boot Loader Spec ${entry_word} from $cmdline_file (${examined} root/system entries checked, ${snapper_skipped} snapper skipped, ${fallback_skipped} fallback skipped)."
   else
-    say "Synchronized ${changed} Boot Loader Spec ${entry_word} from $cmdline_file (preserved per-entry root/rootflags metadata)."
+    say "Synchronized ${changed} Boot Loader Spec ${entry_word} from $cmdline_file (preserved per-entry root/rootflags/systemd.machine_id metadata; ${examined} root/system entries checked, ${snapper_skipped} snapper skipped, ${fallback_skipped} fallback skipped)."
   fi
+  return 0
+}
+verify_bls_entries_against_kernel_cmdline() {
+  local fail_count=0
+  local -a fail_assertions=()
+
+  if ! is_opensuse_like; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: opensuse_like_required"
+    say "    detail: this verification mode is intended for openSUSE-style BLS systems"
+    return 1
+  fi
+
+  local bl
+  bl="$(detect_bootloader 2>/dev/null || true)"
+  if [[ "$bl" != "grub2-bls" && "$bl" != "systemd-boot" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: bls_bootloader_required"
+    say "    detail: detected bootloader '$bl' (expected grub2-bls or systemd-boot)"
+    return 1
+  fi
+
+  local cmdline_file
+  cmdline_file="$(kernel_cmdline_persistence_file 2>/dev/null || true)"
+  cmdline_file="$(trim "${cmdline_file:-}")"
+  if [[ -z "$cmdline_file" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: kernel_cmdline_path_nonempty"
+    say "    detail: kernel cmdline persistence path is empty"
+    return 1
+  fi
+  if [[ ! -f "$cmdline_file" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: kernel_cmdline_file_present"
+    say "    detail: missing $cmdline_file"
+    return 1
+  fi
+
+  local base_cmdline
+  base_cmdline="$(cat "$cmdline_file" 2>/dev/null || true)"
+  base_cmdline="$(trim "${base_cmdline:-}")"
+  if [[ -z "$base_cmdline" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: kernel_cmdline_nonempty"
+    say "    detail: $cmdline_file is empty"
+    return 1
+  fi
+  if ! cmdline_get_key_value_token "$base_cmdline" "root" >/dev/null 2>&1; then
+    (( fail_count += 1 ))
+    fail_assertions+=("kernel_cmdline_root_token_present")
+  fi
+  local mount_root_tok mount_rootflags_tok base_root_tok base_rootflags_tok
+  mount_root_tok="$(bls_current_mount_root_token 2>/dev/null || true)"
+  mount_rootflags_tok="$(bls_current_mount_rootflags_token 2>/dev/null || true)"
+  base_root_tok="$(cmdline_get_key_value_token "$base_cmdline" "root" 2>/dev/null || true)"
+  base_rootflags_tok="$(cmdline_get_key_value_token "$base_cmdline" "rootflags" 2>/dev/null || true)"
+  if [[ -n "$mount_root_tok" && "$base_root_tok" != "$mount_root_tok" ]]; then
+    (( fail_count += 1 ))
+    fail_assertions+=("kernel_cmdline_root_matches_current_mount")
+  fi
+  if [[ -n "$mount_rootflags_tok" && "$base_rootflags_tok" != "$mount_rootflags_tok" ]]; then
+    (( fail_count += 1 ))
+    fail_assertions+=("kernel_cmdline_rootflags_matches_current_mount")
+  fi
+
+  local expected_base_cmdline
+  expected_base_cmdline="$base_cmdline"
+  local fallback_metadata_opts
+  fallback_metadata_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
+  if [[ -n "$fallback_metadata_opts" ]]; then
+    expected_base_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$expected_base_cmdline" "$fallback_metadata_opts")"
+  fi
+  if ! cmdline_get_key_value_token "$expected_base_cmdline" "root" >/dev/null 2>&1; then
+    (( fail_count += 1 ))
+    fail_assertions+=("kernel_cmdline_effective_root_token_present")
+  fi
+
+  local dir
+  dir="$(systemd_boot_entries_dir 2>/dev/null || true)"
+  if [[ -z "$dir" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: bls_entries_dir_present"
+    say "    detail: loader entries directory was not found"
+    return 1
+  fi
+
+  local -a entries=()
+  local f
+  shopt -s nullglob
+  for f in "$dir"/*.conf; do
+    entries+=("$f")
+  done
+  shopt -u nullglob
+  if (( ${#entries[@]} == 0 )); then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: bls_entries_present"
+    say "    detail: no *.conf entries found under $dir"
+    return 1
+  fi
+
+  local examined=0 snapper_skipped=0 root_examined=0 fallback_skipped=0
+  local current_opts expected_opts root_tok rootflags_tok rootfstype_tok resume_tok machine_id_tok tok
+  local -a missing_tokens=() extra_tokens=()
+  for f in "${entries[@]}"; do
+    if bls_entry_is_vfio_fallback "$f"; then
+      (( fallback_skipped += 1 ))
+      continue
+    fi
+    if [[ "$(basename "$f")" == snapper-* ]]; then
+      (( snapper_skipped += 1 ))
+      continue
+    fi
+    current_opts="$(grep -m1 -E '^options[[:space:]]+' "$f" 2>/dev/null | sed -E 's/^options[[:space:]]+//')"
+    current_opts="$(trim "${current_opts:-}")"
+    if [[ -z "$current_opts" ]]; then
+      (( fail_count += 1 ))
+      fail_assertions+=("options_line_present:$(basename "$f")")
+      continue
+    fi
+    if ! cmdline_get_key_value_token "$current_opts" "root" >/dev/null 2>&1; then
+      (( fail_count += 1 ))
+      fail_assertions+=("entry_root_token_present:$(basename "$f")")
+    fi
+
+    (( examined += 1 ))
+    (( root_examined += 1 ))
+
+    expected_opts="$expected_base_cmdline"
+    root_tok="$(cmdline_get_key_value_token "$current_opts" "root" 2>/dev/null || true)"
+    rootflags_tok="$(cmdline_get_key_value_token "$current_opts" "rootflags" 2>/dev/null || true)"
+    rootfstype_tok="$(cmdline_get_key_value_token "$current_opts" "rootfstype" 2>/dev/null || true)"
+    resume_tok="$(cmdline_get_key_value_token "$current_opts" "resume" 2>/dev/null || true)"
+    machine_id_tok="$(cmdline_get_key_value_token "$current_opts" "systemd.machine_id" 2>/dev/null || true)"
+    [[ -n "$root_tok" ]] && expected_opts="$(cmdline_set_key_value_token "$expected_opts" "$root_tok")"
+    [[ -n "$rootflags_tok" ]] && expected_opts="$(cmdline_set_key_value_token "$expected_opts" "$rootflags_tok")"
+    [[ -n "$rootfstype_tok" ]] && expected_opts="$(cmdline_set_key_value_token "$expected_opts" "$rootfstype_tok")"
+    [[ -n "$resume_tok" ]] && expected_opts="$(cmdline_set_key_value_token "$expected_opts" "$resume_tok")"
+    [[ -n "$machine_id_tok" ]] && expected_opts="$(cmdline_set_key_value_token "$expected_opts" "$machine_id_tok")"
+    if grep -Eq '(^|[[:space:]])ro([[:space:]]|$)' <<<"$current_opts"; then
+      expected_opts="$(add_param_once "$expected_opts" "ro")"
+    fi
+    if grep -Eq '(^|[[:space:]])rw([[:space:]]|$)' <<<"$current_opts"; then
+      expected_opts="$(add_param_once "$expected_opts" "rw")"
+    fi
+    expected_opts="$(trim "$expected_opts")"
+
+    if [[ "$expected_opts" == "$current_opts" ]]; then
+      continue
+    fi
+
+    (( fail_count += 1 ))
+    fail_assertions+=("options_sync_with_kernel_cmdline:$(basename "$f")")
+    missing_tokens=()
+    extra_tokens=()
+    for tok in $expected_opts; do
+      if ! cmdline_contains_exact_token "$current_opts" "$tok"; then
+        missing_tokens+=("$tok")
+      fi
+    done
+    for tok in $current_opts; do
+      if ! cmdline_contains_exact_token "$expected_opts" "$tok"; then
+        extra_tokens+=("$tok")
+      fi
+    done
+    say "DRIFT: $(basename "$f")"
+    if (( ${#missing_tokens[@]} > 0 )); then
+      say "  missing: ${missing_tokens[*]}"
+    fi
+    if (( ${#extra_tokens[@]} > 0 )); then
+      say "  unexpected: ${extra_tokens[*]}"
+    fi
+  done
+
+  if (( examined == 0 )); then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: nonsnapper_nonfallback_bls_entries_present"
+    say "    detail: no non-snapper, non-fallback Boot Loader Spec entries were found under $dir (${snapper_skipped} snapper skipped, ${fallback_skipped} fallback skipped)"
+    return 1
+  fi
+
+  if (( fail_count > 0 )); then
+    say "FAIL SUMMARY (${fail_count})"
+    local item
+    for item in "${fail_assertions[@]}"; do
+      say "  - assertion: $item"
+    done
+    say "Checked entries: ${examined} root/system (${snapper_skipped} snapper skipped, ${fallback_skipped} fallback skipped)"
+    return 1
+  fi
+
+  say "PASS SUMMARY (${examined})"
+  say "All Boot Loader Spec root/system entries are synchronized with $cmdline_file (${root_examined} root/system, ${snapper_skipped} snapper skipped, ${fallback_skipped} fallback skipped)."
+  return 0
+}
+verify_bls_no_snapper_writes() {
+  # Regression guard: ensure sync logic never targets snapper-* entries for writes.
+  if ! is_opensuse_like; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: opensuse_like_required"
+    say "    detail: this regression mode is intended for openSUSE-style BLS systems"
+    return 1
+  fi
+
+  local bl
+  bl="$(detect_bootloader 2>/dev/null || true)"
+  if [[ "$bl" != "grub2-bls" && "$bl" != "systemd-boot" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: bls_bootloader_required"
+    say "    detail: detected bootloader '$bl' (expected grub2-bls or systemd-boot)"
+    return 1
+  fi
+
+  local dir
+  dir="$(systemd_boot_entries_dir 2>/dev/null || true)"
+  if [[ -z "$dir" ]]; then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: bls_entries_dir_present"
+    say "    detail: loader entries directory was not found"
+    return 1
+  fi
+
+  local -a snapper_entries=()
+  local f
+  shopt -s nullglob
+  for f in "$dir"/snapper-*.conf; do
+    [[ -f "$f" ]] || continue
+    snapper_entries+=("$f")
+  done
+  shopt -u nullglob
+
+  VFIO_BLS_SNAPPER_WRITE_ATTEMPTS=0
+  VFIO_BLS_SNAPPER_WRITE_ATTEMPT_PATHS=()
+
+  local prev_dry="${DRY_RUN:-0}"
+  DRY_RUN=1
+  sync_bls_entries_from_kernel_cmdline || true
+  DRY_RUN="$prev_dry"
+
+  if (( VFIO_BLS_SNAPPER_WRITE_ATTEMPTS > 0 )); then
+    say "FAIL SUMMARY (1)"
+    say "  - assertion: no_snapper_bls_write_attempts"
+    say "    detail: detected ${VFIO_BLS_SNAPPER_WRITE_ATTEMPTS} attempted write target(s) under snapper-* entries"
+    local p
+    for p in "${VFIO_BLS_SNAPPER_WRITE_ATTEMPT_PATHS[@]}"; do
+      say "    attempted: $(basename "$p")"
+    done
+    return 1
+  fi
+
+  if (( ${#snapper_entries[@]} == 0 )); then
+    say "PASS SUMMARY (1)"
+    say "No snapper-* BLS entries were found under $dir, and no snapper write attempts were observed."
+    return 0
+  fi
+
+  say "PASS SUMMARY (1)"
+  say "No snapper BLS write attempts detected (${#snapper_entries[@]} snapper entries observed)."
   return 0
 }
 
@@ -4275,6 +5760,13 @@ opensuse_sdbootutil_update_all_entries() {
   bl="$(detect_bootloader 2>/dev/null || true)"
   if [[ "$bl" != "grub2-bls" && "$bl" != "systemd-boot" ]]; then
     return 0
+  fi
+
+  local cmdline_file
+  cmdline_file="$(kernel_cmdline_persistence_file 2>/dev/null || true)"
+  cmdline_file="$(trim "${cmdline_file:-}")"
+  if [[ -n "$cmdline_file" && -f "$cmdline_file" ]]; then
+    kernel_cmdline_rehydrate_boot_metadata_if_missing "$cmdline_file" || true
   fi
 
   local sdbootutil_ok=0
@@ -4295,6 +5787,7 @@ opensuse_sdbootutil_update_all_entries() {
   fi
 
   sync_bls_entries_from_kernel_cmdline
+  # Keep snapper-* entries untouched; only root/system entries are synchronized.
 
   if (( sdbootutil_ok == 0 )); then
     note "BLS entry option sync completed without a clean sdbootutil run; review entries if your setup relies on sdbootutil-managed boot artifacts."
@@ -4306,6 +5799,10 @@ opensuse_sdbootutil_update_all_entries() {
 systemd_boot_write_options() {
   local entry="$1" new_opts="$2"
   [[ -f "$entry" ]] || die "systemd-boot entry not found: $entry"
+  if [[ "$(basename "$entry")" == snapper-* ]]; then
+    (( VFIO_BLS_SNAPPER_WRITE_ATTEMPTS += 1 ))
+    VFIO_BLS_SNAPPER_WRITE_ATTEMPT_PATHS+=("$entry")
+  fi
 
   backup_file "$entry"
 
@@ -4379,6 +5876,11 @@ systemd_boot_add_kernel_params() {
       new_cmdline="$(add_param_once "$new_cmdline" "$p")"
     done
     new_cmdline="$(append_guest_vfio_ids_with_detect_fallback "$new_cmdline" "/etc/kernel/cmdline (persistence)")"
+    local boot_metadata_opts
+    boot_metadata_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
+    if [[ -n "$boot_metadata_opts" ]]; then
+      new_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$new_cmdline" "$boot_metadata_opts")"
+    fi
     # Optional: USB/xHCI stability workaround for hosts that can freeze or
     # spam disconnects due to USB runtime PM / PCIe ASPM interactions.
     say
@@ -4403,7 +5905,20 @@ systemd_boot_add_kernel_params() {
     note "On some setups the EFI/simple framebuffer (efifb/vesafb/sysfb) can lock your guest GPU and cause black screens or hangs when using VFIO."
     note "If you pass your primary/Boot VGA dGPU to a VM, disabling these framebuffers is often recommended."
     note "If your guest GPU is a secondary card and the host only uses an iGPU or a different card for the boot console, you may not need this."
-    if prompt_yn "Add video=efifb:off video=vesafb:off initcall_blacklist=sysfb_init to /etc/kernel/cmdline?" Y "Boot framebuffer mitigation"; then
+    local fb_default="N"
+    if [[ -n "${CTX[guest_gpu]:-}" && "$(pci_boot_vga_flag "${CTX[guest_gpu]}")" == "1" ]]; then
+      if is_opensuse_like; then
+        fb_default="N"
+        note "Detected guest GPU as Boot VGA on this boot, but on openSUSE we default this mitigation to NO for safer first boot behavior."
+        note "Enable it only if you confirm early framebuffer locking is causing passthrough failures."
+      else
+        fb_default="Y"
+        note "Detected guest GPU as Boot VGA on this boot; defaulting this mitigation to YES."
+      fi
+    else
+      note "Guest GPU does not appear to be Boot VGA on this boot; defaulting this mitigation to NO."
+    fi
+    if prompt_yn "Add video=efifb:off video=vesafb:off initcall_blacklist=sysfb_init to /etc/kernel/cmdline?" "$fb_default" "Boot framebuffer mitigation"; then
       new_cmdline="$(add_param_once "$new_cmdline" "video=efifb:off")"
       new_cmdline="$(add_param_once "$new_cmdline" "video=vesafb:off")"
       new_cmdline="$(add_param_once "$new_cmdline" "initcall_blacklist=sysfb_init")"
@@ -4419,11 +5934,10 @@ systemd_boot_add_kernel_params() {
     # not LSM-policy aware, so the safest default for passthrough
     # debugging is to turn those off via selinux=0 apparmor=0.
     say
-    hdr "Kernel security modules (SELinux/AppArmor)"
-    note "On openSUSE Tumbleweed with snapshot rollbacks, SELinux or AppArmor on the rolled-back root can cause subtle boot issues."
-    note "Examples: desktop spinning then rebooting, services failing because /etc or /var look read-only or mislabelled after rollback."
-    note "This helper does not manage SELinux/AppArmor policy. For predictable VFIO testing it is safest to disable them via kernel params."
-    if prompt_yn "Disable SELinux and AppArmor in kernel parameters (add selinux=0 apparmor=0 and remove security=selinux/apparmor)?" Y "Kernel security modules"; then
+    hdr "Kernel security modules (SELinux/AppArmor, optional)"
+    note "By default this helper keeps existing SELinux/AppArmor settings unchanged."
+    note "Only disable them for troubleshooting if you have confirmed policy denials are causing VFIO boot/login failures."
+    if prompt_yn "Disable SELinux and AppArmor in kernel parameters (add selinux=0 apparmor=0 and remove security=selinux/apparmor)?" N "Kernel security modules"; then
       new_cmdline="$(remove_param_all "$new_cmdline" "security=selinux")"
       new_cmdline="$(remove_param_all "$new_cmdline" "security=apparmor")"
       new_cmdline="$(remove_param_all "$new_cmdline" "selinux=1")"
@@ -4464,7 +5978,7 @@ systemd_boot_add_kernel_params() {
     note "While you are testing VFIO passthrough it is often useful to see full boot logs instead of a silent splash screen."
     note "This option will remove 'quiet' and 'splash=silent' from the kernel cmdline and add 'systemd.show_status=1 loglevel=7'."
     note "This automatically removes quiet and splash=silent and adds loglevel=7 for you when installing."
-    if prompt_yn "Disable boot splash / quiet and enable detailed text logs on boot?" Y "Boot verbosity (persistence)"; then
+    if prompt_yn "Disable boot splash / quiet and enable detailed text logs on boot?" N "Boot verbosity (persistence)"; then
       new_cmdline="$(remove_param_all "$new_cmdline" "quiet")"
       new_cmdline="$(remove_param_all "$new_cmdline" "splash=silent")"
       new_cmdline="$(remove_param_all "$new_cmdline" "splash")"
@@ -4498,6 +6012,39 @@ systemd_boot_add_kernel_params() {
       new_cmdline="$(add_param_once "$new_cmdline" "pcie_acs_override=downstream,multifunction")"
     fi
     new_cmdline="$(add_custom_kernel_params_interactive "$new_cmdline" "/etc/kernel/cmdline (persistence)")"
+    if ! cmdline_get_key_value_token "$new_cmdline" "root" >/dev/null 2>&1; then
+      local recovered_boot_opts recovered_cmdline recovered_root_tok
+      recovered_boot_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
+      if [[ -n "$recovered_boot_opts" ]]; then
+        recovered_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$new_cmdline" "$recovered_boot_opts")"
+        recovered_root_tok="$(cmdline_get_key_value_token "$recovered_cmdline" "root" 2>/dev/null || true)"
+        if [[ -n "$recovered_root_tok" ]]; then
+          say
+          hdr "openSUSE BLS safety recovery"
+          note "Detected missing root=... token in /etc/kernel/cmdline candidate."
+          note "Recovered boot metadata from existing Boot Loader Spec entries."
+          note "Recovered root token: $recovered_root_tok"
+          if [[ -r /dev/tty && -w /dev/tty ]]; then
+            if prompt_yn "Apply recovered boot metadata (root/rootflags/rootfstype/resume/systemd.machine_id) and continue?" Y "openSUSE BLS safety"; then
+              new_cmdline="$recovered_cmdline"
+              note "Applied recovered boot metadata and continuing with persistence update."
+            else
+              note "Skipped metadata recovery by user choice."
+            fi
+          else
+            new_cmdline="$recovered_cmdline"
+            note "Applied recovered boot metadata automatically (non-interactive context)."
+          fi
+        fi
+      fi
+    fi
+    if ! cmdline_get_key_value_token "$new_cmdline" "root" >/dev/null 2>&1; then
+      note "openSUSE BLS safety: /etc/kernel/cmdline has no explicit root=... token."
+      note "Skipping /etc/kernel/cmdline write to avoid unsafe persistence and /dev/gpt-auto-root boot hangs."
+      note "VFIO setup will continue, but persistent kernel parameter changes were not applied."
+      note "Run this helper from the installed target root (with a valid root=... cmdline) to apply persistent kernel parameters safely."
+      return 0
+    fi
 
     if [[ "$(trim "$new_cmdline")" != "$(trim "$cmdline_content")" ]]; then
       if preview_cmdline_change_interactive "$cmdline_content" "$new_cmdline" "/etc/kernel/cmdline (persistence)"; then
@@ -4734,7 +6281,11 @@ grub_add_kernel_params() {
   note "On some systems, early EFI/vesa framebuffers can keep the guest GPU busy and interfere with VFIO (black screens, hangs, \"Header type 127\")."
   note "If you are passing your primary dGPU (Boot VGA) to a VM, disabling those framebuffers is usually recommended."
   note "If the host only uses an iGPU or a different card for the console, you may not need this."
-  if prompt_yn "Add video=efifb:off video=vesafb:off initcall_blacklist=sysfb_init to GRUB kernel parameters?" Y "Boot framebuffer mitigation"; then
+  local grub_fb_default="N"
+  if [[ -n "${CTX[guest_gpu]:-}" && "$(pci_boot_vga_flag "${CTX[guest_gpu]}")" == "1" ]] && ! is_opensuse_like; then
+    grub_fb_default="Y"
+  fi
+  if prompt_yn "Add video=efifb:off video=vesafb:off initcall_blacklist=sysfb_init to GRUB kernel parameters?" "$grub_fb_default" "Boot framebuffer mitigation"; then
     new="$(add_param_once "$new" "video=efifb:off")"
     new="$(add_param_once "$new" "video=vesafb:off")"
     new="$(add_param_once "$new" "initcall_blacklist=sysfb_init")"
@@ -4748,7 +6299,7 @@ grub_add_kernel_params() {
   hdr "Kernel security modules (SELinux/AppArmor)"
   note "On systems that use Btrfs rollbacks (like openSUSE), SELinux/AppArmor combined with an older root snapshot can cause boot issues."
   note "This helper focuses on VFIO and does not manage LSM policy, so for stable passthrough testing it is often safest to turn them off."
-  if prompt_yn "Disable SELinux and AppArmor in GRUB kernel parameters (selinux=0 apparmor=0)?" Y "Kernel security modules"; then
+  if prompt_yn "Disable SELinux and AppArmor in GRUB kernel parameters (selinux=0 apparmor=0)?" N "Kernel security modules"; then
     new="$(remove_param_all "$new" "security=selinux")"
     new="$(remove_param_all "$new" "security=apparmor")"
     new="$(remove_param_all "$new" "selinux=1")"
@@ -4777,7 +6328,7 @@ grub_add_kernel_params() {
   note "This option will remove 'quiet' and 'splash=silent' from the kernel cmdline and add 'systemd.show_status=1 loglevel=7'."
   note "This automatically removes quiet and splash=silent and adds loglevel=7 for you when installing."
   note "You can later revert this by running the script with --reset or manually editing /etc/default/grub."
-  if prompt_yn "Disable boot splash / quiet and enable detailed text logs on boot?" Y "Boot verbosity"; then
+  if prompt_yn "Disable boot splash / quiet and enable detailed text logs on boot?" N "Boot verbosity"; then
     new="$(remove_param_all "$new" "quiet")"
     new="$(remove_param_all "$new" "splash=silent")"
     new="$(remove_param_all "$new" "splash")"
@@ -5121,6 +6672,7 @@ Before=multi-user.target
 [Service]
 Type=oneshot
 ExecStart=$BIND_SCRIPT
+ExecStartPost=/bin/sh -c 'if [ -x /usr/local/sbin/vfio-graphics-protocold.sh ]; then /usr/local/sbin/vfio-graphics-protocold.sh --once --prelogin || true; fi'
 RemainAfterExit=yes
 
 [Install]
@@ -5129,6 +6681,452 @@ EOF
 
   run systemctl daemon-reload
   run systemctl enable vfio-bind-selected-gpu.service
+}
+ensure_graphics_daemon_deployment_safety() {
+  # Guardrail for partial/failed deployments:
+  # if a unit exists without its daemon script, disable and remove the stale unit.
+  local changed=0
+  local cond_line="ConditionPathExists=$GRAPHICS_DAEMON_SCRIPT"
+
+  if [[ -f "$GRAPHICS_DAEMON_UNIT" && ! -f "$GRAPHICS_DAEMON_SCRIPT" ]]; then
+    note "Detected incomplete graphics daemon deployment (unit present, script missing)."
+    if have_cmd systemctl; then
+      run systemctl disable --now vfio-graphics-protocold.service 2>/dev/null || true
+    fi
+    run rm -f "$GRAPHICS_DAEMON_WANTS_LINK" 2>/dev/null || true
+    run rm -f "$GRAPHICS_DAEMON_UNIT" 2>/dev/null || true
+    changed=1
+  fi
+
+  if [[ -f "$GRAPHICS_DAEMON_UNIT" ]] && ! grep -Fqx "$cond_line" "$GRAPHICS_DAEMON_UNIT"; then
+    backup_file "$GRAPHICS_DAEMON_UNIT"
+    if (( ! DRY_RUN )); then
+      local tmp
+      tmp="$(mktemp)"
+      awk -v cond="$cond_line" '
+        {
+          print
+          if ($0 ~ /^ConditionPathExists=\/etc\/vfio-gpu-passthrough\.conf$/) {
+            print cond
+          }
+        }
+      ' "$GRAPHICS_DAEMON_UNIT" >"$tmp"
+      install -m 0644 -o root -g root "$tmp" "$GRAPHICS_DAEMON_UNIT"
+      rm -f "$tmp" || true
+    fi
+    changed=1
+  fi
+
+  if (( changed )) && have_cmd systemctl; then
+    run systemctl daemon-reload 2>/dev/null || true
+  fi
+}
+install_graphics_protocol_daemon() {
+  local daemon_interval="${1:-${GRAPHICS_DAEMON_INTERVAL_OVERRIDE:-$GRAPHICS_DAEMON_INTERVAL_DEFAULT}}"
+  if [[ ! "$daemon_interval" =~ ^[0-9]+$ ]] || (( 10#$daemon_interval < 1 || 10#$daemon_interval > 3600 )); then
+    daemon_interval="$GRAPHICS_DAEMON_INTERVAL_DEFAULT"
+  fi
+  ensure_graphics_daemon_deployment_safety
+  if ! have_cmd systemctl; then
+    note "systemctl is not available; skipping graphics protocol daemon installation."
+    return 0
+  fi
+  if (( ! DRY_RUN )); then
+    mkdir -p "$(dirname "$GRAPHICS_DAEMON_SCRIPT")" "$(dirname "$GRAPHICS_DAEMON_UNIT")"
+  fi
+
+  backup_file "$GRAPHICS_DAEMON_SCRIPT"
+  backup_file "$GRAPHICS_DAEMON_UNIT"
+
+  write_file_atomic "$GRAPHICS_DAEMON_SCRIPT" 0755 "root:root" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+XORG_HOST_GPU_CONF="/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf"
+LIGHTDM_HOST_GPU_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf"
+STATE_FILE="/run/vfio-graphics-protocold.state"
+DEFAULT_SLEEP_SECS=2
+DEFAULT_AUTO_X11_PINNING=0
+
+trim() {
+  local s="$*"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s\n' "$s"
+}
+
+daemon_sleep_secs() {
+  local raw=""
+  if [[ -n "${VFIO_GRAPHICS_DAEMON_INTERVAL:-}" ]]; then
+    raw="${VFIO_GRAPHICS_DAEMON_INTERVAL}"
+  elif [[ -f "$CONF_FILE" ]]; then
+    raw="$(awk -F= '/^VFIO_GRAPHICS_DAEMON_INTERVAL=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  fi
+  raw="$(trim "$raw")"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( 10#$raw >= 1 && 10#$raw <= 3600 )); then
+    printf '%s\n' "$((10#$raw))"
+  else
+    printf '%s\n' "$DEFAULT_SLEEP_SECS"
+  fi
+}
+
+auto_x11_pinning_enabled() {
+  local raw=""
+  if [[ -n "${VFIO_GRAPHICS_AUTO_X11_PINNING:-}" ]]; then
+    raw="${VFIO_GRAPHICS_AUTO_X11_PINNING}"
+  elif [[ -f "$CONF_FILE" ]]; then
+    raw="$(awk -F= '/^VFIO_GRAPHICS_AUTO_X11_PINNING=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  fi
+  raw="$(trim "$raw")"
+  raw="${raw,,}"
+  case "$raw" in
+    1|y|yes|true|on) return 0 ;;
+    0|n|no|false|off) return 1 ;;
+    *)
+      (( DEFAULT_AUTO_X11_PINNING == 1 )) && return 0
+      return 1
+      ;;
+  esac
+}
+
+xorg_busid_from_bdf() {
+  local bdf="$1"
+  local bus_hex dev_hex func_dec
+  if [[ ! "$bdf" =~ ^[[:xdigit:]]{4}:([[:xdigit:]]{2}):([[:xdigit:]]{2})\.([0-7])$ ]]; then
+    return 1
+  fi
+  bus_hex="${BASH_REMATCH[1]}"
+  dev_hex="${BASH_REMATCH[2]}"
+  func_dec="${BASH_REMATCH[3]}"
+  printf 'PCI:%d:%d:%d\n' "$((16#$bus_hex))" "$((16#$dev_hex))" "$func_dec"
+}
+
+display_manager_name() {
+  local dm_link base
+  if [[ -L /etc/systemd/system/display-manager.service ]]; then
+    dm_link="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null || true)"
+    base="$(basename "${dm_link:-}")"
+    case "$base" in
+      lightdm.service) echo "lightdm"; return 0 ;;
+      sddm.service) echo "sddm"; return 0 ;;
+      gdm.service|gdm3.service) echo "gdm"; return 0 ;;
+      lxdm.service) echo "lxdm"; return 0 ;;
+      xdm.service) echo "xdm"; return 0 ;;
+    esac
+  fi
+  echo "none"
+}
+display_manager_prefers_x11_prelogin() {
+  # Display managers that typically launch an Xorg greeter before login.
+  case "$(display_manager_name)" in
+    lightdm|sddm|lxdm|xdm) return 0 ;;
+    gdm|none|*) return 1 ;;
+  esac
+}
+
+display_manager_prefers_wayland_prelogin() {
+  # GDM commonly defaults to Wayland greeter when available.
+  case "$(display_manager_name)" in
+    gdm) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+active_user_session_exists() {
+  local sid state class
+  while read -r sid _rest; do
+    [[ -n "${sid:-}" ]] || continue
+    state="$(loginctl show-session "$sid" -p State --value 2>/dev/null || true)"
+    class="$(loginctl show-session "$sid" -p Class --value 2>/dev/null || true)"
+    [[ "$class" == "user" ]] || continue
+    [[ "$state" == "active" ]] || continue
+    return 0
+  done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+  return 1
+}
+
+infer_prelogin_protocol_mode() {
+  if display_manager_prefers_x11_prelogin; then
+    echo "x11"
+    return 0
+  fi
+  if display_manager_prefers_wayland_prelogin; then
+    echo "wayland"
+    return 0
+  fi
+  echo "unknown"
+}
+
+write_file_if_changed() {
+  local dst="$1"
+  local mode="$2"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  if [[ -f "$dst" ]] && cmp -s "$tmp" "$dst"; then
+    rm -f "$tmp" || true
+    return 1
+  fi
+  install -m "$mode" -o root -g root "$tmp" "$dst"
+  rm -f "$tmp" || true
+  return 0
+}
+
+ensure_x11_host_gpu_pinning() {
+  local host_gpu_bdf="$1"
+  local guest_gpu_bdf="$2"
+  local host_busid changed=0 dm
+
+  [[ -n "$host_gpu_bdf" && -n "$guest_gpu_bdf" ]] || return 0
+  [[ "$host_gpu_bdf" != "$guest_gpu_bdf" ]] || return 0
+
+  host_busid="$(xorg_busid_from_bdf "$host_gpu_bdf" 2>/dev/null || true)"
+  [[ -n "$host_busid" ]] || return 0
+
+  mkdir -p /etc/X11/xorg.conf.d
+  if write_file_if_changed "$XORG_HOST_GPU_CONF" 0644 <<EOF_XORG
+# Managed by vfio-graphics-protocold (AUTO/X11 policy)
+# Host GPU (Xorg): $host_gpu_bdf
+# Guest GPU (VFIO): $guest_gpu_bdf
+Section "ServerLayout"
+    Identifier "Layout0"
+    Screen 0 "Screen0"
+EndSection
+Section "Device"
+    Identifier "HostGPU"
+    BusID "$host_busid"
+    Option "PrimaryGPU" "true"
+EndSection
+Section "Screen"
+    Identifier "Screen0"
+    Device "HostGPU"
+EndSection
+EOF_XORG
+  then
+    changed=1
+  fi
+
+  dm="$(display_manager_name)"
+  if [[ "$dm" == "lightdm" ]]; then
+    mkdir -p /etc/lightdm/lightdm.conf.d
+    if write_file_if_changed "$LIGHTDM_HOST_GPU_CONF" 0644 <<EOF_LIGHTDM
+# Managed by vfio-graphics-protocold (AUTO/X11 policy)
+[Seat:*]
+xserver-command=X -core -isolateDevice $host_busid
+EOF_LIGHTDM
+    then
+      changed=1
+    fi
+  fi
+
+  return "$changed"
+}
+
+remove_x11_host_gpu_pinning() {
+  local removed=0
+  if [[ -f "$XORG_HOST_GPU_CONF" ]]; then
+    rm -f "$XORG_HOST_GPU_CONF"
+    removed=1
+  fi
+  if [[ -f "$LIGHTDM_HOST_GPU_CONF" ]]; then
+    rm -f "$LIGHTDM_HOST_GPU_CONF"
+    removed=1
+  fi
+  return "$removed"
+}
+
+detect_active_session_type() {
+  local sid state class stype
+  while read -r sid _rest; do
+    [[ -n "${sid:-}" ]] || continue
+    state="$(loginctl show-session "$sid" -p State --value 2>/dev/null || true)"
+    class="$(loginctl show-session "$sid" -p Class --value 2>/dev/null || true)"
+    stype="$(loginctl show-session "$sid" -p Type --value 2>/dev/null || true)"
+    [[ "$class" == "user" ]] || continue
+    [[ "$state" == "active" ]] || continue
+    case "$stype" in
+      x11|wayland) echo "$stype"; return 0 ;;
+    esac
+  done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+  echo "unknown"
+}
+
+apply_policy_once() {
+  local prelogin="${1:-0}"
+  [[ -f "$CONF_FILE" ]] || return 0
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+
+  local mode host guest session_type inferred_prelogin action prev
+  mode="$(trim "${GRAPHICS_PROTOCOL_MODE:-AUTO}")"
+  mode="${mode^^}"
+  host="$(trim "${HOST_GPU_BDF:-}")"
+  guest="$(trim "${GUEST_GPU_BDF:-}")"
+  session_type="unknown"
+  action="noop"
+
+  if [[ "$prelogin" == "1" ]]; then
+    inferred_prelogin="$(infer_prelogin_protocol_mode)"
+    case "$mode" in
+      X11)
+        action="x11"
+        session_type="prelogin-x11"
+        ;;
+      WAYLAND)
+        action="wayland"
+        session_type="prelogin-wayland"
+        ;;
+      AUTO)
+        case "$inferred_prelogin" in
+          x11)
+            action="x11"
+            session_type="prelogin-x11"
+            ;;
+          wayland)
+            action="wayland"
+            session_type="prelogin-wayland"
+            ;;
+          *)
+            if auto_x11_pinning_enabled; then
+              action="x11"
+              session_type="prelogin-auto-x11-fallback"
+            else
+              action="noop"
+              session_type="prelogin-unknown"
+            fi
+            ;;
+        esac
+        ;;
+      *)
+        action="noop"
+        session_type="prelogin-unknown"
+        ;;
+    esac
+  else
+    session_type="$(detect_active_session_type)"
+    if [[ "$session_type" == "unknown" ]] && ! active_user_session_exists; then
+      inferred_prelogin="$(infer_prelogin_protocol_mode)"
+      case "$inferred_prelogin" in
+        x11) session_type="prelogin-x11" ;;
+        wayland) session_type="prelogin-wayland" ;;
+        *) session_type="unknown" ;;
+      esac
+    fi
+
+    case "$mode" in
+      X11)
+        action="x11"
+        ;;
+      WAYLAND)
+        action="wayland"
+        ;;
+      AUTO)
+        case "$session_type" in
+          x11|prelogin-x11)
+            if auto_x11_pinning_enabled || [[ "$session_type" == "prelogin-x11" ]]; then
+              action="x11"
+            else
+              # Conservative AUTO default for active X11 sessions when pinning override is disabled.
+              action="auto-safe-no-x11"
+            fi
+            ;;
+          wayland|prelogin-wayland)
+            action="wayland"
+            ;;
+          prelogin-auto-x11-fallback)
+            action="x11"
+            ;;
+          *)
+            action="noop"
+            ;;
+        esac
+        ;;
+      *)
+        action="noop"
+        ;;
+    esac
+  fi
+
+  case "$action" in
+    x11)
+      ensure_x11_host_gpu_pinning "$host" "$guest" || true
+      ;;
+    wayland)
+      remove_x11_host_gpu_pinning || true
+      ;;
+    auto-safe-no-x11)
+      remove_x11_host_gpu_pinning || true
+      ;;
+    noop)
+      ;;
+  esac
+
+  prev="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  if [[ "$prev" != "$mode:$session_type:$action" ]]; then
+    printf '%s\n' "$mode:$session_type:$action" >"$STATE_FILE" 2>/dev/null || true
+    printf 'vfio-graphics-protocold: mode=%s session=%s action=%s\n' "$mode" "$session_type" "$action"
+  fi
+}
+
+main() {
+  local once=0 prelogin=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --once) once=1 ;;
+      --prelogin) prelogin=1 ;;
+      *) ;;
+    esac
+    shift
+  done
+
+  if (( once )); then
+    apply_policy_once "$prelogin"
+    exit 0
+  fi
+
+  apply_policy_once "$prelogin" || true
+  while true; do
+    sleep "$(daemon_sleep_secs)"
+    apply_policy_once 0 || true
+  done
+}
+
+main "$@"
+EOF
+
+  write_file_atomic "$GRAPHICS_DAEMON_UNIT" 0644 "root:root" <<EOF
+[Unit]
+Description=VFIO graphics protocol adaptation daemon
+ConditionPathExists=$CONF_FILE
+ConditionPathExists=$GRAPHICS_DAEMON_SCRIPT
+After=local-fs.target systemd-logind.service vfio-bind-selected-gpu.service
+Wants=systemd-logind.service vfio-bind-selected-gpu.service
+Before=display-manager.service
+
+[Service]
+Type=simple
+Environment=VFIO_GRAPHICS_DAEMON_INTERVAL=$daemon_interval
+ExecStart=$GRAPHICS_DAEMON_SCRIPT --prelogin
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  if (( ! DRY_RUN )); then
+    [[ -f "$GRAPHICS_DAEMON_SCRIPT" ]] || die "Graphics daemon deployment failed: missing script at $GRAPHICS_DAEMON_SCRIPT"
+    [[ -x "$GRAPHICS_DAEMON_SCRIPT" ]] || die "Graphics daemon deployment failed: script is not executable at $GRAPHICS_DAEMON_SCRIPT"
+    [[ -f "$GRAPHICS_DAEMON_UNIT" ]] || die "Graphics daemon deployment failed: missing unit at $GRAPHICS_DAEMON_UNIT"
+    grep -Fqx "ConditionPathExists=$GRAPHICS_DAEMON_SCRIPT" "$GRAPHICS_DAEMON_UNIT" || \
+      die "Graphics daemon deployment failed: unit missing script condition guard ($GRAPHICS_DAEMON_SCRIPT)"
+  fi
+  run systemctl daemon-reload
+  run systemctl enable --now vfio-graphics-protocold.service
+  say "Installed graphics protocol daemon: $GRAPHICS_DAEMON_SCRIPT"
+  say "Installed graphics protocol unit:   $GRAPHICS_DAEMON_UNIT"
+  say "Graphics daemon polling interval:    ${daemon_interval}s"
 }
 
 # ---------------- Host audio default (PipeWire/PulseAudio) ----------------
@@ -6337,12 +8335,19 @@ EOF
 # desktop of the primary user. This makes it easy to inspect what happened
 # during early boot without having to remember journalctl incantations.
 install_bootlog_dumper() {
-  local user="${SUDO_USER:-}"
-  [[ -n "$user" ]] || return 0
+  local user home user_home
+  user_home="$(resolve_desktop_user_home 2>/dev/null || true)"
+  if [[ -z "$user_home" ]]; then
+    note "Skipping boot log dumper: could not resolve a desktop user home under /home."
+    return 0
+  fi
+  user="${user_home%%$'\t'*}"
+  home="${user_home#*$'\t'}"
 
-  local home
-  home="$(getent passwd "$user" | cut -d: -f6)"
-  [[ -n "$home" && -d "$home" ]] || return 0
+  [[ -n "$home" && -d "$home" ]] || {
+    note "Skipping boot log dumper: resolved user '$user' has no accessible home directory."
+    return 0
+  }
 
   # Place the helper script under the user's home (on /home), so it
   # survives Btrfs root snapshot rollbacks. Only the small systemd
@@ -6418,23 +8423,16 @@ if journalctl -b -1 >/dev/null 2>&1; then
 fi
 EOF
 
-  # Service: run as early as is reasonably safe, after local filesystems
-  # and journald are up, but before basic.target and any display manager.
-  # This follows the constraints you outlined: no default dependencies,
-  # ordered right after disk mount, and ahead of graphics.
+  # Service: run once each boot as early as practical while still guaranteeing
+  # journald and local filesystems are available, and complete BEFORE
+  # multi-user.target is reached.
   write_file_atomic "$unit" 0644 "root:root" <<EOF
 [Unit]
 Description=VFIO Early Boot Log Dumper (current and previous boot)
-# Disable standard dependencies so we don't wait for network, timers, etc.
-DefaultDependencies=no
-
-# START CONDITION: need local filesystems and journald so we can read the
-# journal and write logs to the Desktop on /home.
+Wants=local-fs.target systemd-journald.service
 After=local-fs.target systemd-journald.service
-
-# STOP CONDITION: ensure this runs before basic system + display manager.
-Before=sysinit.target basic.target display-manager.service plymouth-start.service
-Conflicts=shutdown.target
+Before=multi-user.target
+ConditionPathExists=$bin
 
 [Service]
 Type=oneshot
@@ -6450,13 +8448,17 @@ EOF
       sed -i "s#__VFIO_BOOT_USER_HOME__#$home#g" "$bin" || true
     fi
   fi
+  if (( ! DRY_RUN )); then
+    [[ -x "$bin" ]] || die "Boot log dumper deployment failed: script is not executable at $bin"
+    [[ -f "$unit" ]] || die "Boot log dumper deployment failed: missing unit at $unit"
+  fi
 
   if have_cmd systemctl; then
     run systemctl daemon-reload
     run systemctl enable vfio-dump-boot-log.service || true
   fi
 
-  note "Boot log dumper installed. It will run once each boot (after multi-user.target) and drop vfio-boot-*.log files under ${home}/Desktop/vfio-boot-logs/."
+  note "Boot log dumper installed. It will run once each boot before multi-user.target and drop vfio-boot-*.log files under ${home}/Desktop/vfio-boot-logs/."
 }
 
 # Small helper to set KDE Plasma Wayland as the default SDDM session when desired.
@@ -6796,6 +8798,8 @@ verify_setup() {
 
 generate_rollback_script() {
   local path="/root/vfio-rollback-${RUN_TS}.sh"
+  local bootlog_bin
+  bootlog_bin="$(bootlog_bin_path)"
 
   if (( DRY_RUN )); then
     say "DRY RUN: would write rollback script to: $path"
@@ -6814,9 +8818,11 @@ generate_rollback_script() {
     "$BLACKLIST_FILE"
     "$SOFTDEP_FILE"
     "$BIND_SCRIPT"
+    "$GRAPHICS_DAEMON_SCRIPT"
     "$AUDIO_SCRIPT"
     "$OPENBOX_MONITOR_SCRIPT"
     "$SYSTEMD_UNIT"
+    "$GRAPHICS_DAEMON_UNIT"
     "$UDEV_ISOLATION_RULE"
     "$USB_BT_SCRIPT"
     "$USB_BT_SYSTEMD_UNIT"
@@ -6824,7 +8830,7 @@ generate_rollback_script() {
     "$USB_BT_MATCH_CONF"
     "$LIGHTDM_FALLBACK_CONF"
     "/etc/systemd/system/vfio-dump-boot-log.service"
-    "/home/${SUDO_USER:-root}/.local/bin/vfio-dump-boot-log.sh"
+    "$bootlog_bin"
     "$CONF_FILE"
     "$DRACUT_VFIO_CONF"
   )
@@ -6844,6 +8850,7 @@ echo "Rolling back VFIO setup from ${RUN_TS}..."
 # Disable/stop VFIO-related services (best-effort)
 if command -v systemctl >/dev/null 2>&1; then
   systemctl disable --now vfio-bind-selected-gpu.service 2>/dev/null || true
+  systemctl disable --now vfio-graphics-protocold.service 2>/dev/null || true
   systemctl disable --now vfio-disable-usb-bluetooth.service 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 fi
@@ -6933,7 +8940,6 @@ EndSection
 
 Section "Device"
     Identifier "HostGPU"
-    Driver "amdgpu"
     BusID "$host_busid"
     Option "PrimaryGPU" "true"
 EndSection
@@ -6978,7 +8984,7 @@ remove_xorg_host_gpu_pinning() {
     removed=1
   fi
   if (( removed )); then
-    note "Removed Xorg/LightDM host-GPU pinning files for Wayland mode."
+    note "Removed Xorg/LightDM host-GPU pinning files."
   fi
 }
 
@@ -7162,69 +9168,77 @@ ensure_graphics_protocol_runtime() {
 }
 
 select_and_prepare_graphics_protocol_mode() {
-  local xorg_status wayland_status support detected_mode selected_mode
+  local xorg_status wayland_status support detected_mode selected_mode forced_mode
   xorg_status="$(xorg_stack_status)"
   wayland_status="$(wayland_stack_status)"
   support="$(x11_wayland_support_status "$xorg_status" "$wayland_status")"
   detected_mode="$(x11_wayland_supported_mode "$xorg_status" "$wayland_status")"
+  forced_mode="${GRAPHICS_PROTOCOL_OVERRIDE:-}"
 
   say
-  hdr "Graphics protocol mode selection"
+  hdr "Graphics protocol auto-detection"
   note "X11 (Xorg): $(format_tri_state_status "$xorg_status")"
   note "Wayland: $(format_tri_state_status "$wayland_status")"
   note "Detected mode availability: $detected_mode"
 
-  local -a modes=("X11" "WAYLAND")
-  local -a options=(
-    "X11 (Xorg)  | status: $(format_tri_state_status "$xorg_status")"$'\n'"      Enables Xorg-specific host GPU pinning options."
-    "Wayland     | status: $(format_tri_state_status "$wayland_status")"$'\n'"      Uses Wayland mode and skips forced Xorg pinning."
-  )
-
-  if [[ "$detected_mode" == "X11" ]]; then
-    selected_mode="X11"
-    note "Only X11 currently reports WORKS; selecting X11."
-  elif [[ "$detected_mode" == "WAYLAND" ]]; then
-    selected_mode="WAYLAND"
-    note "Only Wayland currently reports WORKS; selecting Wayland."
+  if [[ -n "$forced_mode" ]]; then
+    selected_mode="$forced_mode"
+    note "CLI override applied: --graphics-protocol ${forced_mode,,}"
+    case "$selected_mode" in
+      X11|WAYLAND)
+        if ! ensure_graphics_protocol_runtime "$selected_mode"; then
+          die "${selected_mode} mode is required by CLI override but not fully ready. Install/repair ${selected_mode} runtime, then re-run."
+        fi
+        ;;
+      AUTO)
+        if [[ "$support" != "WORKS" ]]; then
+          die "AUTO mode requested but neither X11 nor Wayland is fully working. Install one runtime stack, then re-run."
+        fi
+        ;;
+    esac
   else
-    local idx
-    idx="$(select_from_list "Choose host graphics protocol mode for this VFIO setup:" "Graphics protocol mode" "${options[@]}")"
-    selected_mode="${modes[$idx]}"
-  fi
-
-  if ! ensure_graphics_protocol_runtime "$selected_mode"; then
-    xorg_status="$(xorg_stack_status)"
-    wayland_status="$(wayland_stack_status)"
-    local fallback_mode=""
-    if [[ "$selected_mode" == "X11" && "$wayland_status" == "WORKS" ]]; then
-      fallback_mode="WAYLAND"
-    elif [[ "$selected_mode" == "WAYLAND" && "$xorg_status" == "WORKS" ]]; then
-      fallback_mode="X11"
-    fi
-
-    if [[ -n "$fallback_mode" ]]; then
-      note "Selected mode $selected_mode is not fully ready, but $fallback_mode is WORKS."
-      if prompt_yn "Switch to $fallback_mode for this run?" Y "Graphics protocol mode"; then
-        selected_mode="$fallback_mode"
-      else
-        die "Selected graphics protocol mode '$selected_mode' is not ready. Install/repair it, then re-run."
+    if [[ "$detected_mode" == "BOTH" ]]; then
+      selected_mode="AUTO"
+      note "Both X11 and Wayland report WORKS; enabling protocol-agnostic AUTO mode."
+      note "No graphics-mode selection is required during install."
+    elif [[ "$detected_mode" == "X11" ]]; then
+      selected_mode="X11"
+      note "Only X11 currently reports WORKS; selecting X11 automatically."
+      if ! ensure_graphics_protocol_runtime "$selected_mode"; then
+        die "X11 mode is required but not fully ready. Install/repair X11 runtime, then re-run."
       fi
-    elif [[ "$support" == "WORKS" ]]; then
-      die "Selected graphics protocol mode '$selected_mode' is not ready. Choose a working mode or install runtime packages first."
+    elif [[ "$detected_mode" == "WAYLAND" ]]; then
+      selected_mode="WAYLAND"
+      note "Only Wayland currently reports WORKS; selecting Wayland automatically."
+      if ! ensure_graphics_protocol_runtime "$selected_mode"; then
+        die "Wayland mode is required but not fully ready. Install/repair Wayland runtime, then re-run."
+      fi
     else
-      die "Neither X11 nor Wayland is fully working. Install one runtime stack, then re-run."
+      # PARTIAL/NONE: no interactive protocol chooser. Try to make one stack
+      # ready automatically in a deterministic order.
+      if ensure_graphics_protocol_runtime "WAYLAND"; then
+        selected_mode="WAYLAND"
+        note "Auto-selected Wayland after runtime preparation."
+      elif ensure_graphics_protocol_runtime "X11"; then
+        selected_mode="X11"
+        note "Auto-selected X11 after runtime preparation."
+      else
+        die "Neither X11 nor Wayland is fully working. Install one runtime stack, then re-run."
+      fi
     fi
   fi
 
   CTX[graphics_protocol_mode]="$selected_mode"
   note "Selected graphics protocol mode: $selected_mode"
   note "VFIO passthrough binding remains persistent and protocol-independent."
+  note "Switching between Wayland and X11 later will not require rerunning protocol selection."
 }
 
 apply_selected_graphics_protocol_mode() {
   local host_gpu_bdf="$1"
   local guest_gpu_bdf="$2"
   local mode="${CTX[graphics_protocol_mode]:-AUTO}"
+  local dm auto_pin_x11=0
   mode="${mode^^}"
 
   case "$mode" in
@@ -7243,6 +9257,24 @@ apply_selected_graphics_protocol_mode() {
         else
           note "Keeping existing Xorg/LightDM pinning files."
         fi
+      fi
+      ;;
+    AUTO)
+      say
+      hdr "Automatic graphics protocol adaptation"
+      note "AUTO mode keeps this setup compatible with both Wayland and X11."
+      dm="$(detect_display_manager 2>/dev/null || true)"
+      case "$dm" in
+        lightdm|sddm|lxdm|xdm) auto_pin_x11=1 ;;
+      esac
+      if (( auto_pin_x11 == 1 )); then
+        note "Detected pre-login X11 display manager ($dm); applying host-GPU X11 safety pinning for AUTO mode."
+        install_xorg_host_gpu_pinning "$host_gpu_bdf" "$guest_gpu_bdf"
+        if [[ "$dm" == "lightdm" ]]; then
+          maybe_offer_lightdm_isolatedevice "$host_gpu_bdf" "$guest_gpu_bdf"
+        fi
+      else
+        note "No pre-login X11 display-manager requirement detected; AUTO mode leaves protocol pinning files unchanged."
       fi
       ;;
     *)
@@ -7341,6 +9373,8 @@ reset_vfio_all() {
     run systemctl disable --now vfio-dump-boot-log.service 2>/dev/null || true
     # Optional USB Bluetooth disable unit
     run systemctl disable --now vfio-disable-usb-bluetooth.service 2>/dev/null || true
+    # Graphics protocol adaptation daemon
+    run systemctl disable --now vfio-graphics-protocold.service 2>/dev/null || true
 
     # If we previously masked plymouth units as part of "disable splash",
     # unmask them on reset so the system can return to distro defaults.
@@ -7351,7 +9385,8 @@ reset_vfio_all() {
 
   # Remove managed files, including optional helpers
   local bootlog_unit="/etc/systemd/system/vfio-dump-boot-log.service"
-  local bootlog_bin="/home/${SUDO_USER:-root}/.local/bin/vfio-dump-boot-log.sh"
+  local bootlog_bin
+  bootlog_bin="$(bootlog_bin_path)"
 
   run rm -f "$SYSTEMD_UNIT" "$BIND_SCRIPT" "$AUDIO_SCRIPT" \
            "$OPENBOX_MONITOR_SCRIPT" \
@@ -7359,6 +9394,7 @@ reset_vfio_all() {
            "$SOFTDEP_FILE" "$DRACUT_VFIO_CONF" \
            "$UDEV_ISOLATION_RULE" \
            "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF" \
+           "$GRAPHICS_DAEMON_SCRIPT" "$GRAPHICS_DAEMON_UNIT" \
            "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
@@ -7384,6 +9420,7 @@ reset_vfio_all() {
   done
 
   local grub_changed=0
+  local opensuse_cmdline_present=0
 
   # Detect active bootloader so we do not try to "classic GRUB"-reset on
   # systems that actually use systemd-boot/GRUB2-BLS with /etc/kernel/cmdline.
@@ -7411,6 +9448,7 @@ reset_vfio_all() {
     new="$(remove_param_all "$new" "pcie_aspm=off")"
     # Initramfs / VFIO ordering
     new="$(remove_param_all "$new" "rd.driver.pre=vfio-pci")"
+    new="$(remove_param_prefix "$new" "vfio-pci.ids=")"
     # LSM knobs we may have added
     new="$(remove_param_all "$new" "selinux=0")"
     new="$(remove_param_all "$new" "apparmor=0")"
@@ -7440,6 +9478,7 @@ reset_vfio_all() {
   # remove VFIO/IOMMU params from /etc/kernel/cmdline so future kernel
   # entries stop inheriting them. This path is also used for GRUB2-BLS.
   if is_opensuse_like && [[ -f /etc/kernel/cmdline ]]; then
+    opensuse_cmdline_present=1
     note "Reset mode: removing VFIO-related kernel params from /etc/kernel/cmdline."
     backup_file /etc/kernel/cmdline
     local kcur knew
@@ -7455,6 +9494,7 @@ reset_vfio_all() {
     knew="$(remove_param_all "$knew" "pcie_aspm=off")"
     # Initramfs / VFIO ordering
     knew="$(remove_param_all "$knew" "rd.driver.pre=vfio-pci")"
+    knew="$(remove_param_prefix "$knew" "vfio-pci.ids=")"
     # LSM knobs we may have added
     knew="$(remove_param_all "$knew" "selinux=0")"
     knew="$(remove_param_all "$knew" "apparmor=0")"
@@ -7471,17 +9511,36 @@ reset_vfio_all() {
     knew="$(remove_param_all "$knew" "video=efifb:off")"
     knew="$(remove_param_all "$knew" "video=vesafb:off")"
     knew="$(remove_param_all "$knew" "initcall_blacklist=sysfb_init")"
+    if ! cmdline_get_key_value_token "$knew" "root" >/dev/null 2>&1; then
+      local reset_recovered_opts reset_recovered_cmdline reset_recovered_root_tok
+      reset_recovered_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
+      if [[ -n "$reset_recovered_opts" ]]; then
+        reset_recovered_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$knew" "$reset_recovered_opts")"
+        reset_recovered_root_tok="$(cmdline_get_key_value_token "$reset_recovered_cmdline" "root" 2>/dev/null || true)"
+        if [[ -n "$reset_recovered_root_tok" ]]; then
+          knew="$reset_recovered_cmdline"
+          note "Reset mode safety: restored missing root boot metadata in /etc/kernel/cmdline."
+        fi
+      fi
+    fi
 
-    if [[ "$(trim "$knew")" != "$(trim "$kcur")" ]]; then
+    if ! cmdline_get_key_value_token "$knew" "root" >/dev/null 2>&1; then
+      note "Reset mode safety: refusing to write /etc/kernel/cmdline without root=... token."
+      note "Leaving existing /etc/kernel/cmdline unchanged."
+    elif [[ "$(trim "$knew")" != "$(trim "$kcur")" ]]; then
       if (( ! DRY_RUN )); then
         printf '%s\n' "$knew" >/etc/kernel/cmdline
       fi
-      # Ensure BLS/systemd-boot entries are regenerated without these
-      # params on openSUSE.
-      opensuse_sdbootutil_update_all_entries
     else
       note "No matching VFIO/IOMMU-related params found in /etc/kernel/cmdline; leaving it unchanged."
     fi
+  fi
+
+  # Always refresh openSUSE BLS entries during reset (even when /etc/kernel/cmdline
+  # did not change) so stale entry options are reconciled immediately.
+  if (( opensuse_cmdline_present )); then
+    note "Reset mode: refreshing Boot Loader Spec entries on openSUSE."
+    opensuse_sdbootutil_update_all_entries
   fi
 
   # Always regenerate GRUB config if we changed /etc/default/grub.
@@ -8022,7 +10081,20 @@ apply_configuration() {
   graphics_protocol_preflight
   select_and_prepare_graphics_protocol_mode
   local graphics_protocol_mode="${CTX[graphics_protocol_mode]:-AUTO}"
-  note "Selected graphics protocol mode for this setup: $graphics_protocol_mode"
+  local graphics_daemon_interval="${GRAPHICS_DAEMON_INTERVAL_OVERRIDE:-$GRAPHICS_DAEMON_INTERVAL_DEFAULT}"
+  if [[ "$graphics_protocol_mode" == "AUTO" ]]; then
+    say "  Graphics protocol: AUTO (X11 + Wayland compatible, no manual mode selection)"
+  else
+    say "  Graphics protocol: $graphics_protocol_mode (auto-detected)"
+  fi
+  if [[ -n "${GRAPHICS_PROTOCOL_OVERRIDE:-}" ]]; then
+    note "Graphics protocol override in effect: --graphics-protocol ${GRAPHICS_PROTOCOL_OVERRIDE,,}"
+  fi
+  if (( INSTALL_GRAPHICS_DAEMON == 0 )); then
+    note "CLI override applied: --no-graphics-daemon (independent graphics daemon will not be installed)."
+  elif [[ -n "${GRAPHICS_DAEMON_INTERVAL_OVERRIDE:-}" ]]; then
+    note "CLI override in effect: --graphics-daemon-interval ${graphics_daemon_interval}s"
+  fi
 
   # Self-heal legacy user audio units that were created before the
   # ConditionPathExists guard was introduced.
@@ -8063,7 +10135,7 @@ apply_configuration() {
     done
   fi
 
-  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode" "$boot_vga_policy_mode"
+  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode" "$boot_vga_policy_mode" "$graphics_daemon_interval"
   install_vfio_modules_load
 
   # Optional: on openSUSE Tumbleweed offer to install the distribution's
@@ -8166,6 +10238,11 @@ apply_configuration() {
   install_bind_script
   install_systemd_unit
   apply_selected_graphics_protocol_mode "$host_gpu" "$guest_gpu"
+  if (( INSTALL_GRAPHICS_DAEMON )); then
+    install_graphics_protocol_daemon "$graphics_daemon_interval"
+  else
+    note "Skipping graphics protocol daemon installation by user request (--no-graphics-daemon)."
+  fi
 
   say
   hdr "Boot log capture (optional)"
@@ -8420,7 +10497,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
     need_cmd modprobe
   fi
 
@@ -8435,6 +10512,28 @@ main() {
   if [[ "$MODE" == "detect" ]]; then
     detect_existing_vfio_report
     exit 0
+  fi
+  if [[ "$MODE" == "verify-bls-sync" ]]; then
+    verify_bls_entries_against_kernel_cmdline
+    exit $?
+  fi
+  if [[ "$MODE" == "verify-bls-nosnapper" ]]; then
+    verify_bls_no_snapper_writes
+    exit $?
+  fi
+
+  if [[ "$MODE" == "sync-bls-only" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    sync_bls_entries_from_kernel_cmdline
+    verify_bls_entries_against_kernel_cmdline
+    exit $?
+  fi
+  if [[ "$MODE" == "create-fallback-entry" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    create_or_update_bls_fallback_entry
+    exit $?
   fi
 
   if [[ "$MODE" == "print-effective-config" ]]; then
@@ -8495,6 +10594,7 @@ main() {
   if [[ "$MODE" == "reset" ]]; then
     require_root "$@"
     require_systemd
+    require_writable_root_or_die
     reset_vfio_all
     exit 0
   fi
@@ -8502,6 +10602,7 @@ main() {
   if [[ "$MODE" == "disable-bootlog" ]]; then
     require_root "$@"
     require_systemd
+    require_writable_root_or_die
     disable_bootlog_dumper
     exit 0
   fi
@@ -8509,6 +10610,7 @@ main() {
   if [[ "$MODE" == "install-usb-bt-mitigation" ]]; then
     require_root "$@"
     require_systemd
+    require_writable_root_or_die
 
     say
     hdr "USB Bluetooth reset-spam mitigation (standalone install)"
@@ -8530,6 +10632,7 @@ main() {
 
   require_root "$@"
   require_systemd
+  require_writable_root_or_die
 
   detect_system
   user_selection

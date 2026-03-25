@@ -6961,6 +6961,7 @@ apply_policy_once() {
   local mode host guest session_type inferred_prelogin action prev
   mode="$(trim "${GRAPHICS_PROTOCOL_MODE:-AUTO}")"
   mode="${mode^^}"
+  : "$host_gpu_bdf" "$guest_gpu_bdf"
   host="$(trim "${HOST_GPU_BDF:-}")"
   guest="$(trim "${GUEST_GPU_BDF:-}")"
   session_type="unknown"
@@ -7123,10 +7124,11 @@ EOF
       die "Graphics daemon deployment failed: unit missing script condition guard ($GRAPHICS_DAEMON_SCRIPT)"
   fi
   run systemctl daemon-reload
-  run systemctl enable --now vfio-graphics-protocold.service
+  run systemctl enable vfio-graphics-protocold.service
   say "Installed graphics protocol daemon: $GRAPHICS_DAEMON_SCRIPT"
   say "Installed graphics protocol unit:   $GRAPHICS_DAEMON_UNIT"
   say "Graphics daemon polling interval:    ${daemon_interval}s"
+  note "Graphics protocol daemon will activate on next boot (not started immediately)."
 }
 
 # ---------------- Host audio default (PipeWire/PulseAudio) ----------------
@@ -9238,49 +9240,26 @@ apply_selected_graphics_protocol_mode() {
   local host_gpu_bdf="$1"
   local guest_gpu_bdf="$2"
   local mode="${CTX[graphics_protocol_mode]:-AUTO}"
-  local dm auto_pin_x11=0
   mode="${mode^^}"
 
+  say
+  hdr "Graphics protocol activation schedule"
   case "$mode" in
     X11)
-      maybe_offer_xorg_explicit_prompt "$host_gpu_bdf" "$guest_gpu_bdf" "$mode"
+      note "X11 mode selected."
       ;;
     WAYLAND)
-      say
-      hdr "Wayland protocol adaptation"
-      note "Wayland mode selected. Skipping Xorg-specific host-GPU pinning prompts."
-      note "VFIO passthrough stays persistent; only host display protocol behavior changes."
-      if [[ -f "$XORG_HOST_GPU_CONF" || -f "$LIGHTDM_HOST_GPU_CONF" ]]; then
-        note "Existing Xorg/LightDM host-GPU pinning files were found."
-        if prompt_yn "Remove existing Xorg/LightDM host-GPU pinning files for Wayland mode?" Y "Wayland protocol adaptation"; then
-          remove_xorg_host_gpu_pinning
-        else
-          note "Keeping existing Xorg/LightDM pinning files."
-        fi
-      fi
+      note "Wayland mode selected."
       ;;
     AUTO)
-      say
-      hdr "Automatic graphics protocol adaptation"
-      note "AUTO mode keeps this setup compatible with both Wayland and X11."
-      dm="$(detect_display_manager 2>/dev/null || true)"
-      case "$dm" in
-        lightdm|sddm|lxdm|xdm) auto_pin_x11=1 ;;
-      esac
-      if (( auto_pin_x11 == 1 )); then
-        note "Detected pre-login X11 display manager ($dm); applying host-GPU X11 safety pinning for AUTO mode."
-        install_xorg_host_gpu_pinning "$host_gpu_bdf" "$guest_gpu_bdf"
-        if [[ "$dm" == "lightdm" ]]; then
-          maybe_offer_lightdm_isolatedevice "$host_gpu_bdf" "$guest_gpu_bdf"
-        fi
-      else
-        note "No pre-login X11 display-manager requirement detected; AUTO mode leaves protocol pinning files unchanged."
-      fi
+      note "AUTO mode selected (protocol-agnostic)."
       ;;
     *)
-      note "No explicit protocol mode selected; skipping protocol-specific display adjustments."
+      note "No explicit protocol mode selected; keeping protocol behavior unchanged."
       ;;
   esac
+  note "Protocol adaptation is deferred to next boot."
+  note "No live Wayland/X11 switching is performed during this install run."
 }
 
 iommu_group_preflight() {
@@ -10237,7 +10216,6 @@ apply_configuration() {
 
   install_bind_script
   install_systemd_unit
-  apply_selected_graphics_protocol_mode "$host_gpu" "$guest_gpu"
   if (( INSTALL_GRAPHICS_DAEMON )); then
     install_graphics_protocol_daemon "$graphics_daemon_interval"
   else
@@ -10445,6 +10423,7 @@ apply_configuration() {
   else
     note "Skipping user systemd audio helper. You can install it later by re-running this helper."
   fi
+  apply_selected_graphics_protocol_mode "$host_gpu" "$guest_gpu"
 
   say
   say "Done. Next steps:"

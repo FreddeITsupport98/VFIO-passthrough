@@ -1,5 +1,13 @@
 # Changelog
 ## Unreleased
+- Deferred installer-time graphics protocol activation in `vfio.sh`:
+  - `apply_selected_graphics_protocol_mode()` now records/summarizes selected mode behavior without performing live X11/Wayland switching during the install run.
+  - protocol adaptation is explicitly deferred to next boot.
+- Updated graphics protocol daemon installation behavior in `vfio.sh`:
+  - replaced `systemctl enable --now vfio-graphics-protocold.service` with `systemctl enable vfio-graphics-protocold.service`,
+  - daemon activation now begins on next reboot instead of immediately during wizard execution.
+- Reordered install-flow protocol-mode application messaging:
+  - `apply_selected_graphics_protocol_mode` call now runs at the end of `apply_configuration()` after interactive input sections complete.
 - Added a top-level README banner image link using a relative path (`icon/images.webp`) to keep documentation image references non-hardcoded and repo-portable.
 - Expanded the top-level README banner image rendering to full-width display for improved visual visibility while keeping the same relative link path.
 - Improved `regression/custom-kernel-params-regression.sh` CI triage readability:

@@ -22,6 +22,9 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Deferred graphics protocol activation so installer runs no longer switch Wayland/X11 behavior live during wizard execution.
+- Updated graphics protocol daemon install flow to enable on boot without immediate start, so protocol adaptation takes effect after reboot.
+- Moved installer protocol-mode application messaging to end-of-flow so it runs after all interactive input steps complete.
 - Added a top README banner image with a relative clickable path (`icon/images.webp`) so documentation paths stay portable and non-hardcoded.
 - Expanded the README top banner display to full-width rendering for better visibility while keeping the same relative clickable path.
 - Add upcoming updates below this line as new work lands.

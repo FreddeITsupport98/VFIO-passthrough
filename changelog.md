@@ -1,5 +1,9 @@
 # Changelog
 ## Unreleased
+- Extended `regression/protocol-mode-regression.sh` deferred-activation coverage:
+  - validates installer protocol-mode application remains deferred-only (no live X11/Wayland side effects during install),
+  - validates graphics protocol daemon install wiring uses `systemctl enable` without `--now`,
+  - validates `apply_selected_graphics_protocol_mode "$host_gpu" "$guest_gpu"` remains ordered after host-audio prompt flow in `apply_configuration()`.
 - Deferred installer-time graphics protocol activation in `vfio.sh`:
   - `apply_selected_graphics_protocol_mode()` now records/summarizes selected mode behavior without performing live X11/Wayland switching during the install run.
   - protocol adaptation is explicitly deferred to next boot.

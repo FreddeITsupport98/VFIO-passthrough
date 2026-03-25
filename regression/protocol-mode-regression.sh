@@ -44,6 +44,36 @@ assert_contains_text() {
   fi
 }
 
+assert_not_contains_text() {
+  local name="$1" pattern="$2" haystack="$3"
+  if grep -Fq -- "$pattern" <<<"$haystack"; then
+    printf 'FAIL: %s (unexpected pattern found: %s)\n' "$name" "$pattern" >&2
+    record_failure "$name"
+  else
+    printf 'PASS: %s\n' "$name"
+  fi
+}
+
+assert_line_order() {
+  local name="$1" file="$2" earlier_pattern="$3" later_pattern="$4"
+  local earlier_line later_line
+  earlier_line="$(grep -nF -- "$earlier_pattern" "$file" | awk -F: 'NR==1{print $1}')"
+  later_line="$(grep -nF -- "$later_pattern" "$file" | awk -F: 'NR==1{print $1}')"
+
+  if [[ -z "$earlier_line" || -z "$later_line" ]]; then
+    printf 'FAIL: %s (missing pattern(s): "%s" or "%s")\n' "$name" "$earlier_pattern" "$later_pattern" >&2
+    record_failure "$name"
+    return
+  fi
+
+  if (( later_line > earlier_line )); then
+    printf 'PASS: %s\n' "$name"
+  else
+    printf 'FAIL: %s (line order mismatch: %s <= %s)\n' "$name" "$later_line" "$earlier_line" >&2
+    record_failure "$name"
+  fi
+}
+
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -98,14 +128,29 @@ have_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-# --- Test 3: mode-specific apply path behavior.
+# --- Test 3: mode-specific apply path behavior is deferred-only.
 x11_prompt_calls=0
 remove_calls=0
+install_calls=0
+lightdm_calls=0
+captured_notes=()
+
+say() { :; }
+hdr() { :; }
+note() {
+  captured_notes+=("$*")
+}
 maybe_offer_xorg_explicit_prompt() {
   x11_prompt_calls=$((x11_prompt_calls + 1))
 }
 remove_xorg_host_gpu_pinning() {
   remove_calls=$((remove_calls + 1))
+}
+install_xorg_host_gpu_pinning() {
+  install_calls=$((install_calls + 1))
+}
+maybe_offer_lightdm_isolatedevice() {
+  lightdm_calls=$((lightdm_calls + 1))
 }
 prompt_yn() {
   return 0
@@ -113,18 +158,30 @@ prompt_yn() {
 
 CTX["graphics_protocol_mode"]="X11"
 apply_selected_graphics_protocol_mode "0000:00:01.0" "0000:01:00.0"
-assert_eq "X11 mode calls explicit Xorg prompt path once" "1" "$x11_prompt_calls"
+x11_notes="$(printf '%s\n' "${captured_notes[@]}")"
+assert_eq "X11 mode does not call Xorg prompt path during install" "0" "$x11_prompt_calls"
+assert_eq "X11 mode does not install live Xorg pinning during install" "0" "$install_calls"
+assert_eq "X11 mode does not run LightDM isolate-device helper during install" "0" "$lightdm_calls"
+assert_eq "X11 mode does not remove live Xorg pinning during install" "0" "$remove_calls"
+assert_contains_text "X11 mode reports selected mode" "X11 mode selected." "$x11_notes"
+assert_contains_text "X11 mode reports deferred activation to next boot" "Protocol adaptation is deferred to next boot." "$x11_notes"
+assert_contains_text "X11 mode reports no live switching in installer" "No live Wayland/X11 switching is performed during this install run." "$x11_notes"
 
-XORG_HOST_GPU_CONF="$tmp_dir/20-vfio-host-gpu.conf"
-LIGHTDM_HOST_GPU_CONF="$tmp_dir/90-vfio-host-gpu.conf"
-: >"$XORG_HOST_GPU_CONF"
-: >"$LIGHTDM_HOST_GPU_CONF"
 x11_prompt_calls=0
 remove_calls=0
+install_calls=0
+lightdm_calls=0
+captured_notes=()
 CTX["graphics_protocol_mode"]="WAYLAND"
 apply_selected_graphics_protocol_mode "0000:00:01.0" "0000:01:00.0"
-assert_eq "WAYLAND mode does not call Xorg prompt path" "0" "$x11_prompt_calls"
-assert_eq "WAYLAND mode can trigger Xorg pinning cleanup path" "1" "$remove_calls"
+wayland_notes="$(printf '%s\n' "${captured_notes[@]}")"
+assert_eq "WAYLAND mode does not call Xorg prompt path during install" "0" "$x11_prompt_calls"
+assert_eq "WAYLAND mode does not install live Xorg pinning during install" "0" "$install_calls"
+assert_eq "WAYLAND mode does not run LightDM isolate-device helper during install" "0" "$lightdm_calls"
+assert_eq "WAYLAND mode does not remove live Xorg pinning during install" "0" "$remove_calls"
+assert_contains_text "WAYLAND mode reports selected mode" "Wayland mode selected." "$wayland_notes"
+assert_contains_text "WAYLAND mode reports deferred activation to next boot" "Protocol adaptation is deferred to next boot." "$wayland_notes"
+assert_contains_text "WAYLAND mode reports no live switching in installer" "No live Wayland/X11 switching is performed during this install run." "$wayland_notes"
 
 # --- Test 4: selection helper auto-selects single WORKS protocol mode.
 xorg_stack_status() { echo "WORKS"; }
@@ -141,13 +198,31 @@ x11_wayland_support_status() { echo "WORKS"; }
 x11_wayland_supported_mode() { echo "WAYLAND"; }
 select_and_prepare_graphics_protocol_mode >/dev/null 2>&1 || true
 assert_eq "auto mode selection picks WAYLAND when only Wayland is WORKS" "WAYLAND" "${CTX[graphics_protocol_mode]:-}"
+
 # --- Test 5: detect JSON includes persisted configured graphics protocol key.
 vfio_source="$(cat "$VFIO_SCRIPT")"
 assert_contains_text \
   "detect JSON output includes configured_graphics_protocol_mode key" \
   'configured_graphics_protocol_mode' \
   "$vfio_source"
+# --- Test 6: daemon install keeps next-boot activation semantics (enable only, no enable --now).
+assert_contains_text \
+  "graphics protocol daemon install uses systemctl enable without --now" \
+  'run systemctl enable vfio-graphics-protocold.service' \
+  "$vfio_source"
+assert_not_contains_text \
+  "graphics protocol daemon install does not use immediate enable --now" \
+  'run systemctl enable --now vfio-graphics-protocold.service' \
+  "$vfio_source"
 
+# --- Test 7: protocol-mode scheduling message remains at end of install flow.
+assert_line_order \
+  "apply_configuration runs protocol scheduling after host-audio user-unit prompt block" \
+  "$VFIO_SCRIPT" \
+  'Install a user systemd unit to set the host default audio sink after login?' \
+  "apply_selected_graphics_protocol_mode \"\$host_gpu\" \"\$guest_gpu\""
+
+# --- Test 8: removed disabled legacy Xorg helper definitions stay absent.
 # --- Test 6: removed disabled legacy Xorg helper definitions stay absent.
 legacy_hits="$(grep -nE '_legacy_(xorg_busid_from_bdf_disabled|install_xorg_host_gpu_pinning_disabled|install_lightdm_host_gpu_isolation_disabled|maybe_offer_xorg_explicit_prompt_disabled)' "$VFIO_SCRIPT" || true)"
 assert_eq \

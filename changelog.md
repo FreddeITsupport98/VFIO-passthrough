@@ -12,11 +12,16 @@
   - added optional `--entry` basename glob filtering for `--debug-cmdline-tokens` runs so tracing can be scoped to matching BLS entry files.
   - added parse-time validation that rejects empty/whitespace-only `--entry` patterns (`--entry=` / `--entry ''` / `--entry '   '`) with an explicit non-empty pattern error.
   - added machine-readable output for `--debug-cmdline-tokens --json` with `mode`, `entry_filter`, `exit_code`, and ordered `lines`.
+- Hardened install-time X11 prelogin safety flow in `vfio.sh`:
+  - `apply_configuration()` now installs a prelogin host-GPU Xorg pinning failsafe for explicit `X11` mode and `AUTO` mode when using X11-greeter display managers (`sddm`, `lightdm`, `lxdm`, `xdm`).
+  - reduces `no screens found`/black-screen failures when the guest GPU is pre-bound to `vfio-pci` before display-manager startup.
 - Updated `regression/custom-kernel-params-regression.sh`:
   - added functional coverage that validates `--debug-cmdline-tokens` mode exits cleanly, emits representative baseline/per-entry debug source lines, and keeps BLS entry options unchanged.
   - added functional coverage for `--debug-cmdline-tokens --json` with `--entry` filtering and assertions that non-matching entry traces are excluded.
   - added functional parser coverage for empty/whitespace-only `--entry` rejection in both `--entry=` and split-argument forms.
   - added static wiring assertions for parser and main-dispatch integration of `--debug-cmdline-tokens`.
+- Updated `regression/protocol-mode-regression.sh`:
+  - added static coverage that guards install-time prelogin X11 host-GPU failsafe helper presence and `apply_configuration()` wiring/order relative to graphics-daemon installation.
 - Hardened openSUSE root-metadata safety fallback in `vfio.sh`:
   - openSUSE `/etc/kernel/cmdline` persistence path now attempts recovery from running `/proc/cmdline` when `root=` metadata is still missing after existing cmdline/BLS/current-mount fallback stages.
   - `sync_bls_entries_from_kernel_cmdline()` now also attempts `/proc/cmdline` metadata recovery before emitting root-missing skip behavior.

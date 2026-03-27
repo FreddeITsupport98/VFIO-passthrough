@@ -37,6 +37,7 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Added parse-time validation for `--entry` so empty/whitespace-only patterns (`--entry=`, `--entry ''`, or `--entry '   '`) are rejected with a clear non-empty pattern error.
 - Added machine-readable debug token trace output for `--debug-cmdline-tokens --json`, including mode, active entry filter, exit code, and emitted trace lines.
 - Added regression coverage that validates `--debug-cmdline-tokens` mode wiring, representative debug trace lines, and dry-run non-mutating behavior.
+- Added an install-time prelogin X11 host-GPU pinning failsafe for explicit `X11` mode and `AUTO` mode on X11-greeter display managers (SDDM/LightDM/LXDM/XDM) to reduce `no screens found` black-screen failures when the guest GPU is pre-bound to `vfio-pci`.
 - Fixed a boot-time graphics protocol daemon crash path caused by an undefined variable reference in generated daemon policy code (`host_gpu_bdf`/`guest_gpu_bdf` no-op line removed).
 - Deferred graphics protocol activation so installer runs no longer switch Wayland/X11 behavior live during wizard execution.
 - Updated graphics protocol daemon install flow to enable on boot without immediate start, so protocol adaptation takes effect after reboot.

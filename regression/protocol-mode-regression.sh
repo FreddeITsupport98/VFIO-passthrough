@@ -218,6 +218,14 @@ assert_not_contains_text \
   "graphics protocol daemon template does not reference undefined host_gpu_bdf no-op" \
   ": \"\$host_gpu_bdf\" \"\$guest_gpu_bdf\"" \
   "$vfio_source"
+assert_contains_text \
+  "install-time prelogin X11 host-GPU failsafe helper exists" \
+  "install_prelogin_x11_host_gpu_pinning_failsafe()" \
+  "$vfio_source"
+assert_contains_text \
+  "apply_configuration invokes install-time prelogin X11 host-GPU failsafe" \
+  "install_prelogin_x11_host_gpu_pinning_failsafe \"\$host_gpu\" \"\$guest_gpu\" \"\$graphics_protocol_mode\"" \
+  "$vfio_source"
 
 # --- Test 7: protocol-mode scheduling message remains at end of install flow.
 assert_line_order \
@@ -225,6 +233,11 @@ assert_line_order \
   "$VFIO_SCRIPT" \
   'Install a user systemd unit to set the host default audio sink after login?' \
   "apply_selected_graphics_protocol_mode \"\$host_gpu\" \"\$guest_gpu\""
+assert_line_order \
+  "apply_configuration applies install-time prelogin X11 failsafe after graphics-daemon install block" \
+  "$VFIO_SCRIPT" \
+  "install_graphics_protocol_daemon \"\$graphics_daemon_interval\"" \
+  "install_prelogin_x11_host_gpu_pinning_failsafe \"\$host_gpu\" \"\$guest_gpu\" \"\$graphics_protocol_mode\""
 
 # --- Test 8: removed disabled legacy Xorg helper definitions stay absent.
 # --- Test 6: removed disabled legacy Xorg helper definitions stay absent.

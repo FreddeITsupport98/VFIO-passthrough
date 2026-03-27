@@ -9314,6 +9314,57 @@ maybe_offer_xorg_explicit_prompt() {
     fi
   fi
 }
+install_prelogin_x11_host_gpu_pinning_failsafe() {
+  # Install-time guardrail for black-screen/no-screens failures:
+  # when guest GPU is pre-bound to vfio-pci before display-manager startup,
+  # X11 greeters can fail unless the host GPU is explicitly pinned.
+  #
+  # We apply this proactively for:
+  # - explicit X11 mode
+  # - AUTO mode with X11-prelogin display managers (SDDM/LightDM/LXDM/XDM)
+  #
+  # This is additive and compatible with the runtime graphics daemon policy.
+  local host_gpu_bdf="$1"
+  local guest_gpu_bdf="$2"
+  local selected_mode="${3:-AUTO}"
+  local dm xorg_status should_pin=0
+
+  selected_mode="${selected_mode^^}"
+  [[ -n "$host_gpu_bdf" && -n "$guest_gpu_bdf" ]] || return 0
+  [[ "$host_gpu_bdf" != "$guest_gpu_bdf" ]] || return 0
+
+  xorg_status="$(xorg_stack_status)"
+  if [[ "$xorg_status" != "WORKS" ]]; then
+    return 0
+  fi
+
+  dm="$(detect_display_manager 2>/dev/null || true)"
+  [[ -n "$dm" ]] || dm="none"
+
+  case "$selected_mode" in
+    X11)
+      should_pin=1
+      ;;
+    AUTO)
+      case "$dm" in
+        lightdm|sddm|lxdm|xdm)
+          should_pin=1
+          ;;
+      esac
+      ;;
+  esac
+
+  (( should_pin == 1 )) || return 0
+
+  say
+  hdr "Prelogin X11 host-GPU failsafe"
+  note "Installing persistent host-GPU Xorg pinning to prevent no-screens black-screen failures when the guest GPU is pre-bound to vfio-pci."
+  note "Display manager: ${dm} | Graphics mode: ${selected_mode}"
+  install_xorg_host_gpu_pinning "$host_gpu_bdf" "$guest_gpu_bdf"
+  if [[ "$dm" == "lightdm" ]]; then
+    install_lightdm_host_gpu_isolation "$host_gpu_bdf"
+  fi
+}
 
 install_packages_best_effort() {
   local -a pkgs=("$@")
@@ -10500,6 +10551,7 @@ apply_configuration() {
   else
     note "Skipping graphics protocol daemon installation by user request (--no-graphics-daemon)."
   fi
+  install_prelogin_x11_host_gpu_pinning_failsafe "$host_gpu" "$guest_gpu" "$graphics_protocol_mode"
 
   say
   hdr "Boot log capture (optional)"

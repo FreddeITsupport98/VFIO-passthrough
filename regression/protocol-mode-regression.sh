@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Convention: this regression overrides sourced vfio.sh helpers that are invoked indirectly.
-# shellcheck disable=SC2317,SC2329
+# shellcheck disable=SC2016,SC2317,SC2329
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,6 +133,7 @@ x11_prompt_calls=0
 remove_calls=0
 install_calls=0
 lightdm_calls=0
+wayland_default_session_calls=0
 captured_notes=()
 
 say() { :; }
@@ -152,6 +153,9 @@ install_xorg_host_gpu_pinning() {
 maybe_offer_lightdm_isolatedevice() {
   lightdm_calls=$((lightdm_calls + 1))
 }
+set_plasma_wayland_default_session() {
+  wayland_default_session_calls=$((wayland_default_session_calls + 1))
+}
 prompt_yn() {
   return 0
 }
@@ -163,6 +167,7 @@ assert_eq "X11 mode does not call Xorg prompt path during install" "0" "$x11_pro
 assert_eq "X11 mode does not install live Xorg pinning during install" "0" "$install_calls"
 assert_eq "X11 mode does not run LightDM isolate-device helper during install" "0" "$lightdm_calls"
 assert_eq "X11 mode does not remove live Xorg pinning during install" "0" "$remove_calls"
+assert_eq "X11 mode does not force Wayland default-session helper" "0" "$wayland_default_session_calls"
 assert_contains_text "X11 mode reports selected mode" "X11 mode selected." "$x11_notes"
 assert_contains_text "X11 mode reports deferred activation to next boot" "Protocol adaptation is deferred to next boot." "$x11_notes"
 assert_contains_text "X11 mode reports no live switching in installer" "No live Wayland/X11 switching is performed during this install run." "$x11_notes"
@@ -171,6 +176,7 @@ x11_prompt_calls=0
 remove_calls=0
 install_calls=0
 lightdm_calls=0
+wayland_default_session_calls=0
 captured_notes=()
 CTX["graphics_protocol_mode"]="WAYLAND"
 apply_selected_graphics_protocol_mode "0000:00:01.0" "0000:01:00.0"
@@ -179,7 +185,9 @@ assert_eq "WAYLAND mode does not call Xorg prompt path during install" "0" "$x11
 assert_eq "WAYLAND mode does not install live Xorg pinning during install" "0" "$install_calls"
 assert_eq "WAYLAND mode does not run LightDM isolate-device helper during install" "0" "$lightdm_calls"
 assert_eq "WAYLAND mode does not remove live Xorg pinning during install" "0" "$remove_calls"
+assert_eq "WAYLAND mode refreshes Wayland default-session helper once" "1" "$wayland_default_session_calls"
 assert_contains_text "WAYLAND mode reports selected mode" "Wayland mode selected." "$wayland_notes"
+assert_contains_text "WAYLAND mode reports default-session refresh" "Wayland default-session preference has been refreshed for next login when supported by SDDM." "$wayland_notes"
 assert_contains_text "WAYLAND mode reports deferred activation to next boot" "Protocol adaptation is deferred to next boot." "$wayland_notes"
 assert_contains_text "WAYLAND mode reports no live switching in installer" "No live Wayland/X11 switching is performed during this install run." "$wayland_notes"
 
@@ -225,6 +233,38 @@ assert_contains_text \
 assert_contains_text \
   "apply_configuration invokes install-time prelogin X11 host-GPU failsafe" \
   "install_prelogin_x11_host_gpu_pinning_failsafe \"\$host_gpu\" \"\$guest_gpu\" \"\$graphics_protocol_mode\"" \
+  "$vfio_source"
+assert_contains_text \
+  "boot log helper template includes target user placeholder" \
+  'TARGET_USER="__VFIO_BOOT_USER__"' \
+  "$vfio_source"
+assert_contains_text \
+  "boot log helper template includes target group placeholder" \
+  'TARGET_GROUP="__VFIO_BOOT_GROUP__"' \
+  "$vfio_source"
+assert_contains_text \
+  "boot log helper normalizes ownership of log root for desktop user" \
+  'chown -R "$TARGET_USER:$TARGET_GROUP" "$LOG_ROOT" 2>/dev/null || true' \
+  "$vfio_source"
+assert_contains_text \
+  "boot log helper install wiring replaces user placeholder" \
+  'sed -i "s#__VFIO_BOOT_USER__#$user#g" "$bin" || true' \
+  "$vfio_source"
+assert_contains_text \
+  "boot log helper install wiring replaces group placeholder" \
+  'sed -i "s#__VFIO_BOOT_GROUP__#$user_group#g" "$bin" || true' \
+  "$vfio_source"
+assert_contains_text \
+  "graphics daemon template includes watchdog log placeholder" \
+  'WATCHDOG_LOG="__VFIO_GRAPHICS_WATCHDOG_LOG__"' \
+  "$vfio_source"
+assert_contains_text \
+  "graphics daemon writes state transitions to watchdog log" \
+  'watchdog_log_event "$mode" "$session_type" "$action"' \
+  "$vfio_source"
+assert_contains_text \
+  "parse args supports standalone install-bootlog mode" \
+  '--install-bootlog' \
   "$vfio_source"
 
 # --- Test 7: protocol-mode scheduling message remains at end of install flow.

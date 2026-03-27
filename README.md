@@ -316,6 +316,9 @@ The script supports several modes controlled by flags. By default, without any f
 - `--boot-remove`
   - Alias of `--disable-bootlog`.
   - Same behavior, provided as an additive convenience flag name.
+- `--install-bootlog`
+  - Installs/reinstalls only the optional `vfio-dump-boot-log.service` helper + unit.
+  - Useful after snapshot rollbacks where `/etc` systemd state may differ from user-home helper state.
 
 - `--install-usb-bt-mitigation`
   - Installs only the optional USB Bluetooth mitigation (`vfio-usb-bluetooth` helper + systemd + udev + match-policy config).
@@ -403,6 +406,9 @@ The script can install a small helper + systemd service that automatically dumps
 - A helper script is placed under the invoking user’s home (e.g. `~/.local/bin/vfio-dump-boot-log.sh`).
 - A system service (`vfio-dump-boot-log.service`) runs once at boot and writes snapshot-aware logs into:
   - `~/Desktop/vfio-boot-logs/<year>/<month>/<day>/vfio-boot-<kernel>-{current,previous}.log`
+- Ownership/perms are normalized to the desktop user after each dump run:
+  - even though capture is performed by a root system service, files under `~/Desktop/vfio-boot-logs` are re-owned for the desktop user.
+  - this keeps routine log inspection and cleanup (`rm`) user-manageable without requiring `sudo`.
 - The log capture is **Btrfs snapshot aware**:
   - It parses the `rootflags=subvol=...` from `/proc/cmdline`.
   - It encodes the snapshot or subvolume name into the path so you can tell which snapshot a log came from.
@@ -414,6 +420,22 @@ The boot log dumper is **off by default**:
 - The installer explains that this helper is mainly useful while you are actively debugging VFIO failures.
 - On a stable setup it can generate many log files over time.
 - The prompt default is **No**; you must explicitly opt in if you want per-boot log files on your desktop.
+### Graphics protocol watchdog log (Wayland/X11 action trace)
+
+The graphics protocol daemon now writes a persistent action trace under `/home` so protocol decisions remain visible even when root snapshots are rolled back.
+
+- Default path (when desktop user/home is resolved): `~/.local/state/vfio-graphics-protocol/watchdog.log`
+- Fallback path (when no desktop user home is resolved): `/home/vfio-graphics-protocol/watchdog.log`
+
+Each line records:
+
+- timestamp (`date -Is`),
+- selected mode (`AUTO`, `X11`, `WAYLAND`),
+- detected session type,
+- applied action (`x11`, `wayland`, `noop`, etc.),
+- detected root subvolume (`rootflags=subvol=...`).
+
+Ownership/perms are normalized back to the desktop user so routine inspection and cleanup stay user-manageable.
 
 ### udev isolation rules for the guest GPU
 

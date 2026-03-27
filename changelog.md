@@ -1,5 +1,15 @@
 # Changelog
 ## Unreleased
+- Added standalone boot-log dumper reinstall mode in `vfio.sh`:
+  - new `--install-bootlog` mode installs/reinstalls only the optional boot-log helper + unit without rerunning full interactive setup.
+  - intended for snapshot workflows where `/etc` systemd state may diverge from user-home helper files after rollback.
+- Added persistent graphics protocol watchdog logging in `vfio.sh`:
+  - generated `vfio-graphics-protocold.sh` now writes mode/session/action transitions to a `/home`-hosted watchdog log (`~/.local/state/vfio-graphics-protocol/watchdog.log` when a desktop user is resolved).
+  - watchdog lines include timestamp, mode, session type, applied action, and detected root subvolume for snapshot-context debugging.
+  - daemon now normalizes watchdog log ownership/perms back to the desktop user so logs remain user-manageable.
+- Hardened boot-log dumper ownership behavior in `vfio.sh`:
+  - generated `vfio-dump-boot-log.sh` now templates desktop user/group metadata and normalizes `~/Desktop/vfio-boot-logs` ownership/perms on each run.
+  - resulting `vfio-boot-*.log` files remain user-manageable (read/delete without sudo) even though capture runs from a root systemd service.
 - Hardened cmdline token parsing in `vfio.sh` against inherited non-default shell `IFS`:
   - `cmdline_get_key_value_token`, `cmdline_contains_exact_token`, `cmdline_remove_key_value_tokens`, and related cmdline token-removal helpers now force canonical whitespace splitting internally.
   - prevents false `root=` detection failures in openSUSE `/etc/kernel/cmdline` persistence and `sync_bls_entries_from_kernel_cmdline()` flows when shell word-splitting state is non-standard.

@@ -596,6 +596,7 @@ complete -c $cmd -l usb-health-check -d 'Audit USB/xHCI instability markers'
 complete -c $cmd -l reset -d 'Remove VFIO setup installed by this script'
 complete -c $cmd -l disable-bootlog -d 'Disable/remove optional VFIO boot-log dumper'
 complete -c $cmd -l boot-remove -d 'Alias of --disable-bootlog'
+complete -c $cmd -l install-bootlog -d 'Install/reinstall only optional VFIO boot-log dumper'
 complete -c $cmd -l install-usb-bt-mitigation -d 'Install only optional USB Bluetooth mitigation'
 complete -c $cmd -l print-fish-completion -d 'Print fish completion script'
 complete -c $cmd -l print-bash-completion -d 'Print bash completion script'
@@ -612,7 +613,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --disable-bootlog --boot-remove --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --disable-bootlog --boot-remove --install-bootlog --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -671,6 +672,7 @@ _vfio_sh_complete() {
     '--reset[Remove VFIO setup installed by this script]' \\
     '--disable-bootlog[Disable/remove optional VFIO boot-log dumper]' \\
     '--boot-remove[Alias of --disable-bootlog]' \\
+    '--install-bootlog[Install/reinstall only optional VFIO boot-log dumper]' \
     '--install-usb-bt-mitigation[Install only optional USB Bluetooth mitigation]' \\
     '--print-fish-completion[Print fish completion script]' \\
     '--print-bash-completion[Print bash completion script]' \\
@@ -1269,7 +1271,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-bootlog] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1316,6 +1318,8 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
   --reset           Reset/remove VFIO passthrough settings installed by this script (systemd/modprobe/grub/initramfs/user units).
   --disable-bootlog Disable only the optional VFIO boot log dumper service/unit, keeping the rest of the VFIO setup intact.
   --boot-remove     Alias of --disable-bootlog.
+  --install-bootlog Install/reinstall only the optional VFIO boot log dumper helper + systemd unit.
+                   Useful after snapshot rollbacks where /etc systemd state differs from user-home helper state.
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev). This detaches USB Bluetooth adapters from btusb on the host but keeps them available for VM passthrough.
   --print-fish-completion
@@ -1468,6 +1472,9 @@ parse_args() {
         ;;
       --boot-remove)
         MODE="disable-bootlog"
+        ;;
+      --install-bootlog)
+        MODE="install-bootlog"
         ;;
       --install-usb-bt-mitigation)
         MODE="install-usb-bt-mitigation"
@@ -7003,8 +7010,24 @@ ensure_graphics_daemon_deployment_safety() {
 }
 install_graphics_protocol_daemon() {
   local daemon_interval="${1:-${GRAPHICS_DAEMON_INTERVAL_OVERRIDE:-$GRAPHICS_DAEMON_INTERVAL_DEFAULT}}"
+  local desktop_pair watchdog_user watchdog_home watchdog_group watchdog_log
   if [[ ! "$daemon_interval" =~ ^[0-9]+$ ]] || (( 10#$daemon_interval < 1 || 10#$daemon_interval > 3600 )); then
     daemon_interval="$GRAPHICS_DAEMON_INTERVAL_DEFAULT"
+  fi
+  desktop_pair="$(resolve_desktop_user_home 2>/dev/null || true)"
+  watchdog_user="root"
+  watchdog_home="/home"
+  watchdog_group="root"
+  if [[ -n "$desktop_pair" ]]; then
+    watchdog_user="${desktop_pair%%$'\t'*}"
+    watchdog_home="${desktop_pair#*$'\t'}"
+    watchdog_group="$(id -gn "$watchdog_user" 2>/dev/null || true)"
+    [[ -n "$watchdog_group" ]] || watchdog_group="$watchdog_user"
+  fi
+  if [[ -n "$watchdog_home" && -d "$watchdog_home" && "$watchdog_home" != "/home" ]]; then
+    watchdog_log="$watchdog_home/.local/state/vfio-graphics-protocol/watchdog.log"
+  else
+    watchdog_log="/home/vfio-graphics-protocol/watchdog.log"
   fi
   ensure_graphics_daemon_deployment_safety
   if ! have_cmd systemctl; then
@@ -7026,6 +7049,10 @@ CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 XORG_HOST_GPU_CONF="/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf"
 LIGHTDM_HOST_GPU_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf"
 STATE_FILE="/run/vfio-graphics-protocold.state"
+WATCHDOG_LOG="__VFIO_GRAPHICS_WATCHDOG_LOG__"
+WATCHDOG_TARGET_USER="__VFIO_GRAPHICS_WATCHDOG_USER__"
+WATCHDOG_TARGET_GROUP="__VFIO_GRAPHICS_WATCHDOG_GROUP__"
+WATCHDOG_LOG_DIR="$(dirname "$WATCHDOG_LOG")"
 DEFAULT_SLEEP_SECS=2
 DEFAULT_AUTO_X11_PINNING=0
 
@@ -7231,6 +7258,25 @@ detect_active_session_type() {
   done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
   echo "unknown"
 }
+current_root_subvolume() {
+  local cmdline subvol
+  cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+  subvol="$(printf '%s\n' "$cmdline" | sed -n 's/.*rootflags=[^ ]*subvol=\([^ ,]*\).*/\1/p')"
+  printf '%s\n' "${subvol:-unknown}"
+}
+watchdog_log_event() {
+  local mode="$1" session_type="$2" action="$3" ts root_subvol
+  ts="$(date -Is 2>/dev/null || true)"
+  [[ -n "$ts" ]] || ts="unknown-time"
+  root_subvol="$(current_root_subvolume)"
+  mkdir -p "$WATCHDOG_LOG_DIR" 2>/dev/null || true
+  printf '%s mode=%s session=%s action=%s subvol=%s\n' \
+    "$ts" "$mode" "$session_type" "$action" "$root_subvol" >>"$WATCHDOG_LOG" 2>/dev/null || true
+  if [[ -n "$WATCHDOG_TARGET_USER" && -n "$WATCHDOG_TARGET_GROUP" ]]; then
+    chown "$WATCHDOG_TARGET_USER:$WATCHDOG_TARGET_GROUP" "$WATCHDOG_LOG_DIR" "$WATCHDOG_LOG" 2>/dev/null || true
+    chmod u+rwX "$WATCHDOG_LOG_DIR" "$WATCHDOG_LOG" 2>/dev/null || true
+  fi
+}
 
 apply_policy_once() {
   local prelogin="${1:-0}"
@@ -7346,6 +7392,7 @@ apply_policy_once() {
   if [[ "$prev" != "$mode:$session_type:$action" ]]; then
     printf '%s\n' "$mode:$session_type:$action" >"$STATE_FILE" 2>/dev/null || true
     printf 'vfio-graphics-protocold: mode=%s session=%s action=%s\n' "$mode" "$session_type" "$action"
+    watchdog_log_event "$mode" "$session_type" "$action"
   fi
 }
 
@@ -7396,6 +7443,12 @@ WantedBy=multi-user.target
 EOF
 
   if (( ! DRY_RUN )); then
+    sed -i "s#__VFIO_GRAPHICS_WATCHDOG_LOG__#$watchdog_log#g" "$GRAPHICS_DAEMON_SCRIPT" || true
+    sed -i "s#__VFIO_GRAPHICS_WATCHDOG_USER__#$watchdog_user#g" "$GRAPHICS_DAEMON_SCRIPT" || true
+    sed -i "s#__VFIO_GRAPHICS_WATCHDOG_GROUP__#$watchdog_group#g" "$GRAPHICS_DAEMON_SCRIPT" || true
+  fi
+
+  if (( ! DRY_RUN )); then
     [[ -f "$GRAPHICS_DAEMON_SCRIPT" ]] || die "Graphics daemon deployment failed: missing script at $GRAPHICS_DAEMON_SCRIPT"
     [[ -x "$GRAPHICS_DAEMON_SCRIPT" ]] || die "Graphics daemon deployment failed: script is not executable at $GRAPHICS_DAEMON_SCRIPT"
     [[ -f "$GRAPHICS_DAEMON_UNIT" ]] || die "Graphics daemon deployment failed: missing unit at $GRAPHICS_DAEMON_UNIT"
@@ -7406,6 +7459,7 @@ EOF
   run systemctl enable vfio-graphics-protocold.service
   say "Installed graphics protocol daemon: $GRAPHICS_DAEMON_SCRIPT"
   say "Installed graphics protocol unit:   $GRAPHICS_DAEMON_UNIT"
+  say "Graphics protocol watchdog log:      $watchdog_log"
   say "Graphics daemon polling interval:    ${daemon_interval}s"
   note "Graphics protocol daemon will activate on next boot (not started immediately)."
 }
@@ -8616,7 +8670,7 @@ EOF
 # desktop of the primary user. This makes it easy to inspect what happened
 # during early boot without having to remember journalctl incantations.
 install_bootlog_dumper() {
-  local user home user_home
+  local user home user_home user_group
   user_home="$(resolve_desktop_user_home 2>/dev/null || true)"
   if [[ -z "$user_home" ]]; then
     note "Skipping boot log dumper: could not resolve a desktop user home under /home."
@@ -8624,6 +8678,8 @@ install_bootlog_dumper() {
   fi
   user="${user_home%%$'\t'*}"
   home="${user_home#*$'\t'}"
+  user_group="$(id -gn "$user" 2>/dev/null || true)"
+  [[ -n "$user_group" ]] || user_group="$user"
 
   [[ -n "$home" && -d "$home" ]] || {
     note "Skipping boot log dumper: resolved user '$user' has no accessible home directory."
@@ -8647,6 +8703,8 @@ install_bootlog_dumper() {
 set -euo pipefail
 
 USER_HOME="__VFIO_BOOT_USER_HOME__"
+TARGET_USER="__VFIO_BOOT_USER__"
+TARGET_GROUP="__VFIO_BOOT_GROUP__"
 DESKTOP_DIR="${USER_HOME}/Desktop"
 
 # Try to detect the current Btrfs root subvolume/snapshot from the
@@ -8667,6 +8725,11 @@ LOG_ROOT="${DESKTOP_DIR}/vfio-boot-logs"
 DATE_PATH="$(date +%Y/%m/%d)"
 LOG_DIR="${LOG_ROOT}/${DATE_PATH}"
 mkdir -p "${LOG_DIR}" || true
+# Keep the full log tree user-manageable even though this helper runs as root.
+# This allows the desktop user to inspect and delete collected boot logs
+# without requiring sudo for routine cleanup.
+chown -R "$TARGET_USER:$TARGET_GROUP" "$LOG_ROOT" 2>/dev/null || true
+chmod -R u+rwX "$LOG_ROOT" 2>/dev/null || true
 
 # Dump as much information as possible for the current boot, including
 # early failures, kernel messages, and systemd unit errors.
@@ -8702,6 +8765,11 @@ if journalctl -b -1 >/dev/null 2>&1; then
     journalctl -b -1 -x -a --no-pager || true
   } >"$OUT_PREV" 2>&1 || true
 fi
+
+# Normalize ownership/perms after writes so newly created files from this run
+# are also user-manageable.
+chown -R "$TARGET_USER:$TARGET_GROUP" "$LOG_ROOT" 2>/dev/null || true
+chmod -R u+rwX "$LOG_ROOT" 2>/dev/null || true
 EOF
 
   # Service: run once each boot as early as practical while still guaranteeing
@@ -8727,6 +8795,8 @@ EOF
   if [[ -n "$home" ]]; then
     if (( ! DRY_RUN )); then
       sed -i "s#__VFIO_BOOT_USER_HOME__#$home#g" "$bin" || true
+      sed -i "s#__VFIO_BOOT_USER__#$user#g" "$bin" || true
+      sed -i "s#__VFIO_BOOT_GROUP__#$user_group#g" "$bin" || true
     fi
   fi
   if (( ! DRY_RUN )); then
@@ -9580,6 +9650,10 @@ apply_selected_graphics_protocol_mode() {
       ;;
     WAYLAND)
       note "Wayland mode selected."
+      # Ensure next-login/session preference aligns with explicit WAYLAND mode.
+      # This writes an additive SDDM config only when supported.
+      set_plasma_wayland_default_session
+      note "Wayland default-session preference has been refreshed for next login when supported by SDDM."
       ;;
     AUTO)
       note "AUTO mode selected (protocol-agnostic)."
@@ -10807,7 +10881,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-usb-bt-mitigation" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" ]]; then
     need_cmd modprobe
   fi
 
@@ -10918,6 +10992,14 @@ main() {
     require_systemd
     require_writable_root_or_die
     disable_bootlog_dumper
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-bootlog" ]]; then
+    require_root "$@"
+    require_systemd
+    require_writable_root_or_die
+    install_bootlog_dumper
     exit 0
   fi
 

@@ -105,6 +105,10 @@ assert_contains_text \
   "write_conf falls back to AUTO on invalid protocol mode" \
   'GRAPHICS_PROTOCOL_MODE="AUTO"' \
   "$(cat "$CONF_FILE")"
+assert_contains_text \
+  "write_conf persists AUTO X11 pinning default as plain numeric string" \
+  'VFIO_GRAPHICS_AUTO_X11_PINNING="1"' \
+  "$(cat "$CONF_FILE")"
 
 # --- Test 2: package mapping helper returns expected apt mappings.
 have_cmd() {
@@ -269,6 +273,10 @@ assert_contains_text \
 assert_contains_text \
   "AUTO mode keeps X11 pinning for X11-prelogin display managers during active X11 sessions" \
   'if auto_x11_pinning_enabled || [[ "$session_type" == "prelogin-x11" ]] || display_manager_prefers_x11_prelogin; then' \
+  "$vfio_source"
+assert_contains_text \
+  "AUTO mode keeps X11 pinning during Wayland sessions when display manager is X11-prelogin" \
+  'reason="auto-dm-prefers-x11-prelogin-wayland-session"' \
   "$vfio_source"
 assert_contains_text \
   "parse args supports standalone install-bootlog mode" \

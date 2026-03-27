@@ -22,6 +22,12 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
+- Fixed persisted AUTO X11 pinning default formatting:
+  - `write_conf()` now emits `VFIO_GRAPHICS_AUTO_X11_PINNING="1"` as a plain quoted numeric value, not an escaped-quote literal.
+  - avoids false fallback to disabled behavior when daemon reads the setting from config.
+- Stabilized AUTO-mode Wayland logout handoff for X11-prelogin display managers:
+  - AUTO policy now keeps X11 host-GPU pinning active during Wayland sessions when the detected display manager is X11-prelogin (`sddm`, `lightdm`, `lxdm`, `xdm`).
+  - this avoids remove/re-add pinning races during Wayland logout that can present as black-screen before greeter recovery.
 - Updated graphics protocol daemon polling defaults to 1 second:
   - installer/runtime default interval now uses `GRAPHICS_DAEMON_INTERVAL_DEFAULT=1`.
   - generated daemon fallback poll interval now uses `DEFAULT_SLEEP_SECS=1`.

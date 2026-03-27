@@ -1,5 +1,15 @@
 # Changelog
 ## Unreleased
+- Fixed persisted AUTO X11 pinning default in `vfio.sh`:
+  - `write_conf()` now emits `VFIO_GRAPHICS_AUTO_X11_PINNING=\"1\"` as a plain quoted numeric value (not escaped-quote literal text).
+  - prevents daemon config parsing from falling back to disabled behavior for AUTO X11 pinning.
+- Updated `regression/protocol-mode-regression.sh`:
+  - added assertion that `write_conf()` persists `VFIO_GRAPHICS_AUTO_X11_PINNING=\"1\"` correctly.
+- Hardened AUTO graphics protocol handoff logic in `vfio.sh` for Wayland logout stability:
+  - generated `vfio-graphics-protocold.sh` now keeps X11 host-GPU pinning during active Wayland sessions when the detected display manager is X11-prelogin (`sddm`, `lightdm`, `lxdm`, `xdm`).
+  - avoids remove/re-add pinning races at Wayland logout that can cause black-screen before greeter recovery.
+- Updated `regression/protocol-mode-regression.sh`:
+  - added static assertion for `auto-dm-prefers-x11-prelogin-wayland-session` AUTO decision path wiring.
 - Updated graphics daemon polling defaults in `vfio.sh`:
   - `GRAPHICS_DAEMON_INTERVAL_DEFAULT` changed from `2` to `1`.
   - generated `vfio-graphics-protocold.sh` fallback polling default (`DEFAULT_SLEEP_SECS`) changed from `2` to `1`.

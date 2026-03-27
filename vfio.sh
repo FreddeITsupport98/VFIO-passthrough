@@ -3930,7 +3930,7 @@ VFIO_GRAPHICS_WATCHDOG_MAX_LINES="5000"
 #                already bound to vfio-pci before the display manager starts.
 # - 0: keep AUTO conservative for active user sessions; pre-login safety pinning
 #      for X11 display managers still applies.
-VFIO_GRAPHICS_AUTO_X11_PINNING=\"1\"
+VFIO_GRAPHICS_AUTO_X11_PINNING="1"
 EOF
 }
 
@@ -7526,8 +7526,13 @@ apply_policy_once() {
             fi
             ;;
           wayland|prelogin-wayland)
-            action="wayland"
-            reason="auto-wayland-session"
+            if display_manager_prefers_x11_prelogin; then
+              action="x11"
+              reason="auto-dm-prefers-x11-prelogin-wayland-session"
+            else
+              action="wayland"
+              reason="auto-wayland-session"
+            fi
             ;;
           prelogin-auto-x11-fallback)
             action="x11"

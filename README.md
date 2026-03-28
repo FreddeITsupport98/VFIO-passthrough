@@ -24,6 +24,9 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 ## Unreleased
 - No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
+- Added USB mitigation support for optional USB Ethernet EEE-off targeting (per selected USB NIC VID:PID IDs) with USB-only safeguards.
+- Added `--reset-usb-mitigation` mode to remove only USB mitigation artifacts/config (including USB Ethernet EEE-off settings) without touching core VFIO GPU passthrough setup.
+- Updated CLI/help/completion coverage to include `--reset-usb-mitigation` consistently across fish/bash/zsh completion output paths.
 
 ---
 
@@ -149,7 +152,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
 
 ### Common flags
@@ -285,6 +288,16 @@ The script supports several modes controlled by flags. By default, without any f
     - Current behavior note: reset now performs the user-unit and boot-parameter cleanup paths automatically (no extra yes/no confirmation prompt for those sub-steps).
   - On openSUSE/Btrfs systems, prints a reminder that each snapshot has its own `/etc/kernel/cmdline`; after rolling back to an older snapshot you should re-run `--reset` from within that snapshot if you want its VFIO parameters removed as well.
 
+- `--reset-usb-mitigation`
+  - USB-only reset path for mitigation artifacts/config.
+  - Removes:
+    - `/usr/local/sbin/vfio-usb-bluetooth.sh`
+    - `/etc/systemd/system/vfio-disable-usb-bluetooth.service`
+    - `/etc/udev/rules.d/99-vfio-disable-usb-bluetooth.rules`
+    - `/etc/vfio-usb-bluetooth-match.conf`
+  - Explicitly includes USB Ethernet EEE-off config reset (`USB_ETHERNET_EEE_OFF` / `USB_ETHERNET_EEE_IDS`) because those keys live in the same match-policy file.
+  - Does **not** remove core VFIO GPU passthrough configuration.
+
 - `--disable-bootlog`
   - Helper that disables and removes the optional `vfio-dump-boot-log.service` boot log dumper unit and its helper script.
   - Leaves all VFIO bindings, core config files, and kernel parameters intact.
@@ -303,6 +316,10 @@ The script supports several modes controlled by flags. By default, without any f
 
 - `--install-usb-bt-mitigation`
   - Installs only the optional USB Bluetooth mitigation (`vfio-usb-bluetooth` helper + systemd + udev + match-policy config).
+  - Also supports optional USB Ethernet EEE-off tuning for selected USB NIC IDs (`ethtool --set-eee <iface> eee off`), controlled by:
+    - `USB_ETHERNET_EEE_OFF`
+    - `USB_ETHERNET_EEE_IDS`
+  - USB Ethernet EEE-off logic is USB-scoped only and does not target motherboard/PCI NIC devices.
   - Picker flow (VM-eligible-first):
     - Selected IDs are detach-eligible for VM usage.
     - Unselected IDs are written to `EXCLUDE_IDS` and kept host-bound.

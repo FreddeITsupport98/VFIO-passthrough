@@ -1,5 +1,17 @@
 # Changelog
 ## Unreleased
+- 2026-03-28 20:49 UTC: Added USB Ethernet EEE-off integration to USB mitigation flow in `vfio.sh`:
+  - mitigation config now persists `USB_ETHERNET_EEE_OFF` and `USB_ETHERNET_EEE_IDS` in `/etc/vfio-usb-bluetooth-match.conf`,
+  - installer flow now supports interactive USB Ethernet ID selection for EEE-off policy,
+  - generated mitigation helper now applies `ethtool --set-eee ... eee off` only for selected USB Ethernet targets with USB-only safeguards.
+- 2026-03-28 20:49 UTC: Added dedicated `--reset-usb-mitigation` mode in `vfio.sh`:
+  - removes only USB mitigation helper/unit/udev/match-policy artifacts,
+  - resets USB mitigation state including USB Ethernet EEE-off config keys,
+  - keeps core VFIO GPU passthrough configuration intact.
+- 2026-03-28 20:49 UTC: Updated CLI/help/completion wiring for USB mitigation reset mode:
+  - parser and main dispatch now recognize `--reset-usb-mitigation`,
+  - usage/help output now documents the USB-only reset behavior,
+  - fish/bash/zsh completion generators now include `--reset-usb-mitigation`.
 - Improved USB Bluetooth mitigation helper behavior in `vfio.sh` for advanced include-only policy:
   - generated `vfio-usb-bluetooth.sh` now detaches explicitly selected non-Bluetooth USB interfaces when `MATCH_MODE=\"include_only\"` and matching `INCLUDE_IDS` are configured.
   - default Bluetooth-only behavior in `MATCH_MODE=\"auto\"` remains unchanged.

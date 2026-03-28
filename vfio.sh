@@ -47,7 +47,7 @@ DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | install-bootlog | install-graphics-daemon | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | install-bootlog | install-graphics-daemon | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
@@ -619,6 +619,7 @@ complete -c $cmd -l health-check-previous -d 'Audit previous boot for VFIO frien
 complete -c $cmd -l health-check-all -d 'Audit all detected GPUs'
 complete -c $cmd -l usb-health-check -d 'Audit USB/xHCI instability markers'
 complete -c $cmd -l reset -d 'Remove VFIO setup installed by this script'
+complete -c $cmd -l reset-usb-mitigation -d 'Remove only USB mitigation artifacts'
 complete -c $cmd -l disable-bootlog -d 'Disable/remove optional VFIO boot-log dumper'
 complete -c $cmd -l boot-remove -d 'Alias of --disable-bootlog'
 complete -c $cmd -l install-bootlog -d 'Install/reinstall only optional VFIO boot-log dumper'
@@ -639,7 +640,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --disable-bootlog --boot-remove --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -682,12 +683,12 @@ _vfio_sh_complete() {
     '--no-graphics-daemon[Do not install graphics protocol daemon service]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
-    '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \
-    '--debug-cmdline-tokens[Trace BLS root/rootflags token source selection (read-only)]' \
-    '--entry=[Filter BLS entry basenames (glob) for --debug-cmdline-tokens]:pattern:(system-*.conf snapper-*.conf *.conf)' \
-    '--verify-bls-sync[Verify BLS entry options are synchronized with /etc/kernel/cmdline]' \
-    '--verify-bls-nosnapper[Regression check: assert snapper BLS entries are never write targets]' \
-    '--create-fallback-entry[Create/update a non-VFIO fallback BLS entry from the current system entry]' \
+    '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
+    '--debug-cmdline-tokens[Trace BLS root/rootflags token source selection (read-only)]' \\
+    '--entry=[Filter BLS entry basenames (glob) for --debug-cmdline-tokens]:pattern:(system-*.conf snapper-*.conf *.conf)' \\
+    '--verify-bls-sync[Verify BLS entry options are synchronized with /etc/kernel/cmdline]' \\
+    '--verify-bls-nosnapper[Regression check: assert snapper BLS entries are never write targets]' \\
+    '--create-fallback-entry[Create/update a non-VFIO fallback BLS entry from the current system entry]' \\
     '--print-effective-config[Print effective Boot-VGA policy decision path]' \\
     '--json[Machine-readable output with --detect or --debug-cmdline-tokens]' \\
     '--self-test[Run self-tests and exit]' \\
@@ -696,10 +697,11 @@ _vfio_sh_complete() {
     '--health-check-all[Audit all detected GPUs]' \\
     '--usb-health-check[Audit USB/xHCI instability markers]' \\
     '--reset[Remove VFIO setup installed by this script]' \\
+    '--reset-usb-mitigation[Remove only USB mitigation artifacts]' \\
     '--disable-bootlog[Disable/remove optional VFIO boot-log dumper]' \\
     '--boot-remove[Alias of --disable-bootlog]' \\
-    '--install-bootlog[Install/reinstall only optional VFIO boot-log dumper]' \
-    '--install-graphics-daemon[Install/reinstall only VFIO graphics protocol daemon]' \
+    '--install-bootlog[Install/reinstall only optional VFIO boot-log dumper]' \\
+    '--install-graphics-daemon[Install/reinstall only VFIO graphics protocol daemon]' \\
     '--install-usb-bt-mitigation[Install only optional USB Bluetooth mitigation]' \\
     '--print-fish-completion[Print fish completion script]' \\
     '--print-bash-completion[Print bash completion script]' \\
@@ -1298,7 +1300,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--disable-bootlog] [--boot-remove] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1343,6 +1345,9 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Audit current and previous boot kernel logs for USB/xHCI crash signatures and print optional stability mitigation guidance.
                    Tip: run with full kernel-log access: sudo ./$SCRIPT_NAME --usb-health-check
   --reset           Reset/remove VFIO passthrough settings installed by this script (systemd/modprobe/grub/initramfs/user units).
+  --reset-usb-mitigation
+                   Reset/remove only USB mitigation artifacts (helper/unit/udev/match policy),
+                   including USB Ethernet EEE-off mitigation config, while keeping core VFIO GPU setup.
   --disable-bootlog Disable only the optional VFIO boot log dumper service/unit, keeping the rest of the VFIO setup intact.
   --boot-remove     Alias of --disable-bootlog.
   --install-bootlog Install/reinstall only the optional VFIO boot log dumper helper + systemd unit.
@@ -1498,6 +1503,9 @@ parse_args() {
         ;;
       --reset)
         MODE="reset"
+        ;;
+      --reset-usb-mitigation)
+        MODE="reset-usb-mitigation"
         ;;
       --disable-bootlog)
         MODE="disable-bootlog"
@@ -8111,6 +8119,11 @@ ensure_usb_bt_match_conf_present() {
 #   include_only -> only match INCLUDE_IDS entries.
 #
 # INCLUDE_IDS / EXCLUDE_IDS entries are comma-separated VID:PID patterns.
+# USB_ETHERNET_EEE_OFF:
+#   0 -> do not change USB Ethernet EEE settings.
+#   1 -> apply ethtool "eee off" on selected USB Ethernet IDs.
+#
+# USB_ETHERNET_EEE_IDS entries are comma-separated VID:PID patterns.
 # Wildcards are supported per component:
 #   *:*          (match all)
 #   2357:*       (any product for vendor 2357)
@@ -8119,6 +8132,8 @@ ensure_usb_bt_match_conf_present() {
 MATCH_MODE="auto"
 INCLUDE_IDS=""
 EXCLUDE_IDS=""
+USB_ETHERNET_EEE_OFF="0"
+USB_ETHERNET_EEE_IDS=""
 EOF
   chmod 0644 "$conf" 2>/dev/null || true
   [[ -f "$conf" ]]
@@ -8169,6 +8184,199 @@ update_usb_bt_match_conf_values() {
   install -o "$file_owner" -g "$file_group" -m "$file_mode" "$tmp" "$conf"
   rm -f "$tmp" || true
   return 0
+}
+normalize_usb_ethernet_eee_flag() {
+  local raw="${1:-0}"
+  raw="${raw,,}"
+  case "$raw" in
+    1|y|yes|true|on) printf '1\n' ;;
+    *) printf '0\n' ;;
+  esac
+}
+update_usb_bt_ethernet_eee_conf_values() {
+  # Update USB_ETHERNET_EEE_OFF / USB_ETHERNET_EEE_IDS keys in-place,
+  # preserving unrelated lines and file ownership/mode.
+  local conf="$1" eee_off_value="$2" eee_ids_value="$3"
+  [[ -n "$conf" ]] || return 1
+  [[ -f "$conf" ]] || return 1
+
+  local tmp file_mode file_owner file_group
+  tmp="$(mktemp)"
+  awk -v off_val="$eee_off_value" -v ids_val="$eee_ids_value" '
+    BEGIN { done_off=0; done_ids=0 }
+    /^USB_ETHERNET_EEE_OFF=/ {
+      print "USB_ETHERNET_EEE_OFF=\"" off_val "\""
+      done_off=1
+      next
+    }
+    /^USB_ETHERNET_EEE_IDS=/ {
+      print "USB_ETHERNET_EEE_IDS=\"" ids_val "\""
+      done_ids=1
+      next
+    }
+    { print }
+    END {
+      if (!done_off) {
+        print "USB_ETHERNET_EEE_OFF=\"" off_val "\""
+      }
+      if (!done_ids) {
+        print "USB_ETHERNET_EEE_IDS=\"" ids_val "\""
+      }
+    }
+  ' "$conf" >"$tmp"
+
+  file_mode="$(stat -c '%a' "$conf" 2>/dev/null || echo 644)"
+  file_owner="$(stat -c '%u' "$conf" 2>/dev/null || id -u)"
+  file_group="$(stat -c '%g' "$conf" 2>/dev/null || id -g)"
+  install -o "$file_owner" -g "$file_group" -m "$file_mode" "$tmp" "$conf"
+  rm -f "$tmp" || true
+  return 0
+}
+configure_usb_bt_ethernet_eee_interactive() {
+  # Configure optional EEE-off policy for USB Ethernet adapters.
+  USB_BT_ETH_EEE_CHANGED=0
+  local conf="$USB_BT_MATCH_CONF"
+  if [[ ! -f "$conf" ]]; then
+    if ! ensure_usb_bt_match_conf_present "$conf"; then
+      note "No USB Bluetooth match config available at $conf; skipping USB Ethernet EEE tuning."
+      return 0
+    fi
+  fi
+
+  local current_eee_off current_eee_ids
+  current_eee_off="$(awk -F= '/^USB_ETHERNET_EEE_OFF=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  current_eee_ids="$(awk -F= '/^USB_ETHERNET_EEE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  current_eee_off="$(normalize_usb_ethernet_eee_flag "$current_eee_off")"
+  current_eee_ids="${current_eee_ids:-}"
+
+  local -a eth_ids=()
+  local -a eth_labels=()
+  local -A seen_eth_ids=()
+  local usb_devices_glob
+  local dev name vid pid manufacturer product line
+
+  usb_devices_glob="${VFIO_USB_SYSFS_GLOB:-/sys/bus/usb/devices/*}"
+  for dev in $usb_devices_glob; do
+    [[ -f "$dev/idVendor" && -f "$dev/idProduct" ]] || continue
+    name="$(basename "$dev")"
+    [[ "$name" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || continue
+    if ! usb_sysfs_device_is_ethernet "$dev"; then
+      continue
+    fi
+
+    vid="$(tr -d '\n' <"$dev/idVendor" 2>/dev/null | tr 'A-F' 'a-f')"
+    pid="$(tr -d '\n' <"$dev/idProduct" 2>/dev/null | tr 'A-F' 'a-f')"
+    [[ -n "$vid" && -n "$pid" ]] || continue
+    [[ -n "${seen_eth_ids[$vid:$pid]:-}" ]] && continue
+    seen_eth_ids["$vid:$pid"]=1
+
+    manufacturer="$(cat "$dev/manufacturer" 2>/dev/null || true)"
+    product="$(cat "$dev/product" 2>/dev/null || true)"
+    line="$(trim "$name $vid:$pid $manufacturer $product")"
+    eth_ids+=("$vid:$pid")
+    eth_labels+=("$line")
+  done
+
+  if (( ${#eth_ids[@]} == 0 )); then
+    note "No USB Ethernet devices detected for EEE-off tuning; leaving USB_ETHERNET_EEE_* unchanged."
+    return 0
+  fi
+
+  say
+  hdr "USB Ethernet EEE-off tuning"
+  note "Optional: disable EEE on selected USB Ethernet adapters to reduce link-reset/retraining instability."
+  note "Safeguard: this applies only to USB NICs (never motherboard/PCI Ethernet devices)."
+
+  local default_choice
+  default_choice="N"
+  if [[ "$current_eee_off" == "1" ]]; then
+    default_choice="Y"
+  fi
+  if ! prompt_yn "Enable USB Ethernet EEE-off tuning now?" "$default_choice" "USB Ethernet EEE"; then
+    if [[ "$current_eee_off" == "0" && -z "$current_eee_ids" ]]; then
+      note "USB Ethernet EEE-off tuning unchanged (disabled)."
+      return 0
+    fi
+    if (( DRY_RUN )); then
+      note "DRY RUN: would disable USB Ethernet EEE-off tuning in $conf"
+      USB_BT_ETH_EEE_CHANGED=1
+      return 0
+    fi
+    update_usb_bt_ethernet_eee_conf_values "$conf" "0" ""
+    USB_BT_ETH_EEE_CHANGED=1
+    note "Disabled USB Ethernet EEE-off tuning."
+    return 0
+  fi
+
+  note "Detected USB Ethernet IDs:"
+  local i
+  for i in "${!eth_ids[@]}"; do
+    say "  [$((i+1))] ${eth_labels[$i]}"
+  done
+
+  local in out answer interactive_in_fd
+  interactive_in_fd=""
+  in="${VFIO_INTERACTIVE_IN:-/dev/stdin}"
+  out="${VFIO_INTERACTIVE_OUT:-/dev/stderr}"
+  if [[ -z "${VFIO_INTERACTIVE_IN:-}" && -z "${VFIO_INTERACTIVE_OUT:-}" && -r /dev/tty && -w /dev/tty ]]; then
+    in="/dev/tty"
+    out="/dev/tty"
+  fi
+  if [[ -n "${VFIO_INTERACTIVE_IN:-}" ]]; then
+    exec {interactive_in_fd}<"$in"
+  fi
+  printf '%s' "Enter numbers to apply EEE-off (comma/space separated, ENTER for all listed): " >"$out"
+  if [[ -n "$interactive_in_fd" ]]; then
+    read -r -u "$interactive_in_fd" answer || answer=""
+  else
+    read -r answer <"$in" || answer=""
+  fi
+  if [[ -n "$interactive_in_fd" ]]; then
+    exec {interactive_in_fd}<&-
+  fi
+  answer="$(trim "$answer")"
+
+  local target_ids=""
+  if [[ -z "$answer" ]]; then
+    target_ids="$(IFS=,; printf '%s' "${eth_ids[*]}")"
+  else
+    answer="${answer//,/ }"
+    local token idx id
+    local -A selected_eth=()
+    for token in $answer; do
+      if [[ ! "$token" =~ ^[0-9]+$ ]]; then
+        note "Ignoring invalid token: $token"
+        continue
+      fi
+      if (( token < 1 || token > ${#eth_ids[@]} )); then
+        note "Ignoring out-of-range selection: $token"
+        continue
+      fi
+      idx=$((token-1))
+      id="${eth_ids[$idx]}"
+      if [[ -z "${selected_eth[$id]:-}" ]]; then
+        selected_eth["$id"]=1
+        target_ids+="${target_ids:+,}$id"
+      fi
+    done
+    if [[ -z "$target_ids" ]]; then
+      target_ids="$(IFS=,; printf '%s' "${eth_ids[*]}")"
+      note "No valid selection entered; defaulting to all detected USB Ethernet IDs."
+    fi
+  fi
+
+  if [[ "$current_eee_off" == "1" && "$target_ids" == "$current_eee_ids" ]]; then
+    note "USB Ethernet EEE-off tuning unchanged; skipping write."
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY RUN: would set USB_ETHERNET_EEE_OFF=\"1\" and USB_ETHERNET_EEE_IDS=\"$target_ids\" in $conf"
+    USB_BT_ETH_EEE_CHANGED=1
+    return 0
+  fi
+  update_usb_bt_ethernet_eee_conf_values "$conf" "1" "$target_ids"
+  USB_BT_ETH_EEE_CHANGED=1
+  say "Configured USB Ethernet EEE-off IDs: $target_ids"
 }
 configure_usb_bt_policy_mode_interactive() {
   # Prompt for default Bluetooth-only mode vs advanced include_only mode.
@@ -8706,7 +8914,7 @@ configure_usb_bt_exclude_ids_interactive() {
 
 install_usb_bluetooth_disable() {
   local had_unit had_match_conf should_start_now usb_bt_artifacts_changed
-  local existing_match_mode existing_include_ids existing_exclude_ids exclusions_preconfigured
+  local existing_match_mode existing_include_ids existing_exclude_ids existing_eee_off existing_eee_ids exclusions_preconfigured
   USB_BT_POLICY_CHANGED=0
   had_unit=0
   had_match_conf=0
@@ -8727,8 +8935,11 @@ install_usb_bluetooth_disable() {
   existing_match_mode="$(awk -F= '/^MATCH_MODE=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
   existing_include_ids="$(awk -F= '/^INCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
   existing_exclude_ids="$(awk -F= '/^EXCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
+  existing_eee_off="$(awk -F= '/^USB_ETHERNET_EEE_OFF=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
+  existing_eee_ids="$(awk -F= '/^USB_ETHERNET_EEE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
   existing_match_mode="${existing_match_mode:-auto}"
-  if [[ "$existing_match_mode" != "auto" || -n "$existing_include_ids" || -n "$existing_exclude_ids" ]]; then
+  existing_eee_off="$(normalize_usb_ethernet_eee_flag "$existing_eee_off")"
+  if [[ "$existing_match_mode" != "auto" || -n "$existing_include_ids" || -n "$existing_exclude_ids" || "$existing_eee_off" == "1" || -n "$existing_eee_ids" ]]; then
     exclusions_preconfigured=1
   fi
 
@@ -8749,6 +8960,8 @@ MATCH_CONF="/etc/vfio-usb-bluetooth-match.conf"
 MATCH_MODE="auto"
 INCLUDE_IDS=""
 EXCLUDE_IDS=""
+USB_ETHERNET_EEE_OFF="0"
+USB_ETHERNET_EEE_IDS=""
 if [[ -r "$MATCH_CONF" ]]; then
   # shellcheck disable=SC1091
   source "$MATCH_CONF"
@@ -8758,6 +8971,11 @@ MATCH_MODE="${MATCH_MODE,,}"
 case "$MATCH_MODE" in
   auto|include_only) ;;
   *) MATCH_MODE="auto" ;;
+esac
+USB_ETHERNET_EEE_OFF="${USB_ETHERNET_EEE_OFF,,}"
+case "$USB_ETHERNET_EEE_OFF" in
+  1|y|yes|true|on) USB_ETHERNET_EEE_OFF=1 ;;
+  *) USB_ETHERNET_EEE_OFF=0 ;;
 esac
 
 normalize_id_component() {
@@ -8823,6 +9041,36 @@ usb_device_is_bluetooth() {
 
   return 1
 }
+usb_device_is_ethernet() {
+  # USB Ethernet detection by interface driver/class with a text fallback.
+  local dev="$1" intf cls drv text_hint
+  shopt -s nullglob
+  for intf in "$dev":*; do
+    if [[ -L "$intf/driver" ]]; then
+      drv="$(basename "$(readlink -f "$intf/driver" 2>/dev/null || true)")"
+      case "$drv" in
+        r8152|asix|ax88179_178a|cdc_ether|rndis_host|cdc_ncm|cdc_mbim|lan78xx|smsc95xx|qmi_wwan|aqc111)
+          shopt -u nullglob
+          return 0
+          ;;
+      esac
+    fi
+    if [[ -f "$intf/bInterfaceClass" ]]; then
+      cls="$(tr -d '\n' <"$intf/bInterfaceClass" | tr 'A-F' 'a-f')"
+      if [[ "$cls" == "02" || "$cls" == "0a" ]]; then
+        shopt -u nullglob
+        return 0
+      fi
+    fi
+  done
+  shopt -u nullglob
+
+  text_hint="$(printf '%s %s' "$(cat "$dev/manufacturer" 2>/dev/null || true)" "$(cat "$dev/product" 2>/dev/null || true)" | tr '[:upper:]' '[:lower:]')"
+  if grep -Eq '(ethernet|usb ?lan|network adapter|realtek.*lan|gigabit.*lan)' <<<"$text_hint"; then
+    return 0
+  fi
+  return 1
+}
 
 device_matches_policy() {
   local dev="$1" vid pid
@@ -8844,6 +9092,57 @@ device_matches_policy() {
   fi
 
   return 0
+}
+device_matches_usb_ethernet_eee_policy() {
+  local dev="$1" vid pid
+  (( USB_ETHERNET_EEE_OFF == 1 )) || return 1
+  usb_device_is_ethernet "$dev" || return 1
+  vid="$(normalize_id_component "$(cat "$dev/idVendor" 2>/dev/null || echo '')")"
+  pid="$(normalize_id_component "$(cat "$dev/idProduct" 2>/dev/null || echo '')")"
+  [[ -n "$vid" && -n "$pid" ]] || return 1
+
+  if [[ -n "$USB_ETHERNET_EEE_IDS" ]] && ! id_in_csv "$USB_ETHERNET_EEE_IDS" "$vid" "$pid"; then
+    return 1
+  fi
+  return 0
+}
+apply_usb_ethernet_eee_off_for_device() {
+  local dev="$1" dev_real netdir ifname net_dev_real changed
+  local vid pid
+  changed=0
+  command -v ethtool >/dev/null 2>&1 || {
+    echo "vfio-usb-bluetooth: ethtool not found; skipping USB Ethernet EEE-off tuning"
+    return 1
+  }
+
+  dev_real="$(readlink -f "$dev" 2>/dev/null || true)"
+  vid="$(normalize_id_component "$(cat "$dev/idVendor" 2>/dev/null || echo '?')")"
+  pid="$(normalize_id_component "$(cat "$dev/idProduct" 2>/dev/null || echo '?')")"
+
+  shopt -s nullglob
+  for netdir in "$dev"/net/*; do
+    [[ -d "$netdir" ]] || continue
+    ifname="$(basename "$netdir")"
+    [[ -n "$ifname" ]] || continue
+    net_dev_real="$(readlink -f "/sys/class/net/$ifname/device" 2>/dev/null || true)"
+    case "$net_dev_real" in
+      "$dev_real"|"$dev_real":*|"$dev_real"/*) ;;
+      *) continue ;;
+    esac
+
+    if ethtool --set-eee "$ifname" eee off >/dev/null 2>&1; then
+      echo "vfio-usb-bluetooth: applied usb-ethernet eee=off iface=${ifname} $(basename "$dev") (${vid}:${pid})"
+      changed=1
+    else
+      if ethtool --show-eee "$ifname" >/dev/null 2>&1; then
+        echo "vfio-usb-bluetooth: EEE-off not applied for iface=${ifname} (unsupported or driver rejected request)"
+      else
+        echo "vfio-usb-bluetooth: unable to query/apply EEE for iface=${ifname} (leaving unchanged)"
+      fi
+    fi
+  done
+  shopt -u nullglob
+  (( changed == 1 ))
 }
 intf_disable() {
   local intf="$1"
@@ -8914,10 +9213,15 @@ for dev in /sys/bus/usb/devices/*; do
       changed=1
     fi
   fi
+  if [[ "$MODE" == "disable" ]] && device_matches_usb_ethernet_eee_policy "$dev"; then
+    if apply_usb_ethernet_eee_off_for_device "$dev"; then
+      changed=1
+    fi
+  fi
 done
 
 if (( ! changed )); then
-  echo "vfio-usb-bluetooth: no matching USB Bluetooth devices found"
+  echo "vfio-usb-bluetooth: no matching USB mitigation targets found"
 fi
 EOF
   then
@@ -8962,13 +9266,15 @@ EOF
     if prompt_yn "Existing USB Bluetooth exclusions/policy detected. Reconfigure now?" N "USB Bluetooth exclusions"; then
       configure_usb_bt_policy_mode_interactive "$USB_BT_MATCH_CONF"
       configure_usb_bt_exclude_ids_interactive
-      if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
+      configure_usb_bt_ethernet_eee_interactive
+      if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "${USB_BT_ETH_EEE_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
         should_start_now=0
       fi
     else
       note "Keeping existing USB Bluetooth exclusions/policy without reconfiguration."
       USB_BT_EXCLUDE_CHANGED=0
       USB_BT_POLICY_CHANGED=0
+      USB_BT_ETH_EEE_CHANGED=0
       if [[ "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
         should_start_now=0
       fi
@@ -8976,12 +9282,14 @@ EOF
   elif prompt_yn "Configure mitigation policy mode and review USB devices now?" Y "USB Bluetooth exclusions"; then
     configure_usb_bt_policy_mode_interactive "$USB_BT_MATCH_CONF"
     configure_usb_bt_exclude_ids_interactive
-    if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
+    configure_usb_bt_ethernet_eee_interactive
+    if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "${USB_BT_ETH_EEE_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
       should_start_now=0
     fi
   else
     note "Keeping EXCLUDE_IDS empty (no explicit USB exclusions)."
     USB_BT_POLICY_CHANGED=0
+    USB_BT_ETH_EEE_CHANGED=0
     if [[ "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
       should_start_now=0
     fi
@@ -9007,6 +9315,15 @@ EOF
   say "Installed systemd unit: $USB_BT_SYSTEMD_UNIT"
   say "Installed udev rule: $USB_BT_UDEV_RULE"
   say "Installed match policy config: $USB_BT_MATCH_CONF"
+  local final_eee_off final_eee_ids
+  final_eee_off="$(awk -F= '/^USB_ETHERNET_EEE_OFF=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
+  final_eee_ids="$(awk -F= '/^USB_ETHERNET_EEE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$USB_BT_MATCH_CONF" 2>/dev/null || true)"
+  final_eee_off="$(normalize_usb_ethernet_eee_flag "$final_eee_off")"
+  if [[ "$final_eee_off" == "1" ]]; then
+    say "Configured USB Ethernet EEE-off IDs: ${final_eee_ids:-<none>}"
+  else
+    say "Configured USB Ethernet EEE-off IDs: <disabled>"
+  fi
 }
 
 # Install a small helper that dumps the current boot's VFIO-related logs to the
@@ -10353,6 +10670,29 @@ reset_vfio_all() {
     note "If you roll back to an older snapshot later, run 'sudo sh vfio.sh --reset' again inside that snapshot to clean its VFIO kernel params too."
   fi
 }
+reset_usb_mitigation_only() {
+  hdr "RESET USB MITIGATION"
+  note "This will remove USB mitigation artifacts installed by this script:"
+  note "  - USB Bluetooth host-detach helper/service/rule"
+  note "  - USB mitigation match-policy config (including USB Ethernet EEE-off settings)"
+  note "It does NOT remove core VFIO GPU passthrough configuration."
+
+  if ! confirm_phrase "To continue, confirm USB mitigation reset." "RESET USB MITIGATION"; then
+    die "USB mitigation reset cancelled"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl disable --now vfio-disable-usb-bluetooth.service 2>/dev/null || true
+    run systemctl daemon-reload 2>/dev/null || true
+  fi
+
+  run rm -f "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF" 2>/dev/null || true
+  if have_cmd udevadm; then
+    run udevadm control --reload-rules 2>/dev/null || true
+    run udevadm trigger --subsystem-match=usb 2>/dev/null || true
+  fi
+  say "USB mitigation reset complete."
+}
 
 preflight_existing_config_gate() {
   # If we detect existing VFIO configuration, leftover kernel params, or active vfio bindings, offer reset.
@@ -10992,7 +11332,7 @@ apply_configuration() {
   fi
 
   say
-  hdr "USB Bluetooth (optional)"
+  hdr "USB mitigation (optional)"
   note "Optional feature: most systems do NOT need this."
   note "Enable only when a USB Bluetooth adapter (dongle/dock) is causing timeout/reset instability."
   usb_bt_mitigation_explain
@@ -11000,21 +11340,23 @@ apply_configuration() {
   note "Install scope:"
   note "  - systemd + udev helper to detach USB Bluetooth interfaces from host btusb"
   note "  - uses unbind + driver_override=none flow"
+  note "  - optional USB Ethernet EEE-off for selected USB NIC IDs (ethtool eee off)"
   note "Expected result:"
   note "  - host Bluetooth side is disabled (reset-spam reduced)"
   note "  - USB device still enumerates and remains VM-pass-through eligible"
   note "Advanced mode:"
   note "  - MATCH_MODE=include_only with INCLUDE_IDS detaches only explicitly selected USB IDs"
   note "  - useful for targeted unstable devices (for example a flaky dock LAN adapter)"
+  note "  - USB Ethernet EEE-off selection is scoped only to chosen USB Ethernet IDs"
   note "Safety guardrails:"
   note "  - operates only on /sys/bus/usb/devices interfaces + USB drivers"
   note "  - never unbinds motherboard PCI ethernet/Wi-Fi devices"
   note "  - selecting storage-class devices as VM-eligible detach targets is risky"
-  note "Recovery: run $USB_BT_SCRIPT --enable, or remove mitigation via --reset."
-  if prompt_yn "Install and enable automatic USB Bluetooth host detach (systemd+udev)?" N "USB Bluetooth"; then
+  note "Recovery: run $USB_BT_SCRIPT --enable, or remove mitigation via --reset-usb-mitigation (or full --reset)."
+  if prompt_yn "Install and enable automatic USB mitigation (Bluetooth host detach + optional USB Ethernet EEE-off)?" N "USB mitigation"; then
     install_usb_bluetooth_disable
   else
-    note "Skipping USB Bluetooth helper."
+    note "Skipping USB mitigation helper."
   fi
 
   say
@@ -11236,7 +11578,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" ]]; then
     need_cmd modprobe
   fi
 
@@ -11341,6 +11683,13 @@ main() {
     reset_vfio_all
     exit 0
   fi
+  if [[ "$MODE" == "reset-usb-mitigation" ]]; then
+    require_root "$@"
+    require_systemd
+    require_writable_root_or_die
+    reset_usb_mitigation_only
+    exit 0
+  fi
 
   if [[ "$MODE" == "disable-bootlog" ]]; then
     require_root "$@"
@@ -11372,7 +11721,7 @@ main() {
     require_writable_root_or_die
 
     say
-    hdr "USB Bluetooth reset-spam mitigation (standalone install)"
+    hdr "USB mitigation (standalone install)"
     usb_bt_mitigation_explain
     say
     note "This standalone mode installs only USB mitigation artifacts:"
@@ -11380,9 +11729,10 @@ main() {
     note "  - $USB_BT_SYSTEMD_UNIT"
     note "  - $USB_BT_UDEV_RULE"
     note "  - $USB_BT_MATCH_CONF"
+    note "It also supports optional USB Ethernet EEE-off targeting for selected USB NIC IDs."
     note "Safety scope: USB interface drivers only (never motherboard PCI NIC/Wi-Fi)."
     say
-    if prompt_yn "Install USB Bluetooth host-detach mitigation now?" Y "USB Bluetooth"; then
+    if prompt_yn "Install USB mitigation now? (Bluetooth host-detach + optional USB Ethernet EEE-off)" Y "USB mitigation"; then
       install_usb_bluetooth_disable
       say "Done."
     else

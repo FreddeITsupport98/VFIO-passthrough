@@ -8127,6 +8127,107 @@ EOF
   chmod 0644 "$conf" 2>/dev/null || true
   [[ -f "$conf" ]]
 }
+update_usb_bt_match_conf_values() {
+  # Update MATCH_MODE / INCLUDE_IDS / EXCLUDE_IDS keys in-place, preserving
+  # unrelated lines and file ownership/mode.
+  local conf="$1" mode_value="$2" include_value="$3" exclude_value="$4"
+  [[ -n "$conf" ]] || return 1
+  [[ -f "$conf" ]] || return 1
+
+  local tmp file_mode file_owner file_group
+  tmp="$(mktemp)"
+  awk -v mode_val="$mode_value" -v include_val="$include_value" -v exclude_val="$exclude_value" '
+    BEGIN { done_mode=0; done_include=0; done_exclude=0 }
+    /^MATCH_MODE=/ {
+      print "MATCH_MODE=\"" mode_val "\""
+      done_mode=1
+      next
+    }
+    /^INCLUDE_IDS=/ {
+      print "INCLUDE_IDS=\"" include_val "\""
+      done_include=1
+      next
+    }
+    /^EXCLUDE_IDS=/ {
+      print "EXCLUDE_IDS=\"" exclude_val "\""
+      done_exclude=1
+      next
+    }
+    { print }
+    END {
+      if (!done_mode) {
+        print "MATCH_MODE=\"" mode_val "\""
+      }
+      if (!done_include) {
+        print "INCLUDE_IDS=\"" include_val "\""
+      }
+      if (!done_exclude) {
+        print "EXCLUDE_IDS=\"" exclude_val "\""
+      }
+    }
+  ' "$conf" >"$tmp"
+
+  file_mode="$(stat -c '%a' "$conf" 2>/dev/null || echo 644)"
+  file_owner="$(stat -c '%u' "$conf" 2>/dev/null || id -u)"
+  file_group="$(stat -c '%g' "$conf" 2>/dev/null || id -g)"
+  install -o "$file_owner" -g "$file_group" -m "$file_mode" "$tmp" "$conf"
+  rm -f "$tmp" || true
+  return 0
+}
+configure_usb_bt_policy_mode_interactive() {
+  # Prompt for default Bluetooth-only mode vs advanced include_only mode.
+  # Sets USB_BT_POLICY_CHANGED=1 when the selected mode changes.
+  local conf="$1"
+  USB_BT_POLICY_CHANGED=0
+  [[ -f "$conf" ]] || return 0
+
+  local current_mode current_include current_exclude target_mode use_advanced default_choice
+  current_mode="$(awk -F= '/^MATCH_MODE=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  current_include="$(awk -F= '/^INCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  current_exclude="$(awk -F= '/^EXCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  current_mode="${current_mode:-auto}"
+  current_include="${current_include:-}"
+  current_exclude="${current_exclude:-}"
+
+  default_choice="N"
+  if [[ "$current_mode" == "include_only" ]]; then
+    default_choice="Y"
+  fi
+
+  say
+  hdr "USB mitigation policy mode"
+  note "Bluetooth-only (default): detach only Bluetooth-class adapters."
+  note "Include-only (advanced): detach only explicitly selected INCLUDE_IDS (can include non-Bluetooth devices such as a dock LAN adapter)."
+  if prompt_yn "Use include-only advanced mode?" "$default_choice" "USB mitigation policy"; then
+    use_advanced=1
+    target_mode="include_only"
+  else
+    use_advanced=0
+    target_mode="auto"
+  fi
+
+  if [[ "$target_mode" == "$current_mode" ]]; then
+    note "USB mitigation policy unchanged: MATCH_MODE=\"$current_mode\""
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    note "DRY RUN: would set MATCH_MODE=\"$target_mode\" in $conf"
+    USB_BT_POLICY_CHANGED=1
+    return 0
+  fi
+
+  if (( use_advanced )); then
+    update_usb_bt_match_conf_values "$conf" "$target_mode" "$current_include" "$current_exclude"
+  else
+    update_usb_bt_match_conf_values "$conf" "$target_mode" "" "$current_exclude"
+  fi
+  USB_BT_POLICY_CHANGED=1
+  say "Configured USB mitigation MATCH_MODE=\"$target_mode\""
+  if (( ! use_advanced )); then
+    note "Cleared INCLUDE_IDS for Bluetooth-only auto mode."
+  fi
+}
 
 configure_usb_bt_exclude_ids_interactive() {
   # Build a numbered USB device list and let the user choose VM-eligible IDs.
@@ -8553,16 +8654,30 @@ configure_usb_bt_exclude_ids_interactive() {
       die "Unable to apply EXCLUDE_IDS; match config is missing and could not be recreated: $conf"
     fi
   fi
-  local existing_exclude
+  local existing_include existing_exclude desired_include
+  existing_include="$(awk -F= '/^INCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
   existing_exclude="$(awk -F= '/^EXCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  existing_include="${existing_include:-}"
   existing_exclude="${existing_exclude:-}"
-  if [[ "$existing_exclude" == "$exclude_csv" ]]; then
-    note "EXCLUDE_IDS unchanged; skipping write."
+  desired_include="$existing_include"
+  if [[ "$match_mode" == "include_only" ]]; then
+    desired_include="$vm_csv"
+  fi
+
+  if [[ "$existing_exclude" == "$exclude_csv" && "$existing_include" == "$desired_include" ]]; then
+    note "INCLUDE_IDS/EXCLUDE_IDS unchanged; skipping write."
     USB_BT_EXCLUDE_CHANGED=0
     if [[ -n "$vm_csv" ]]; then
       say "Configured USB Bluetooth VM-eligible IDs: $vm_csv"
     else
       say "Configured USB Bluetooth VM-eligible IDs: <empty>"
+    fi
+    if [[ "$match_mode" == "include_only" ]]; then
+      if [[ -n "$desired_include" ]]; then
+        say "Configured USB Bluetooth INCLUDE_IDS (include-only detach targets): $desired_include"
+      else
+        say "Configured USB Bluetooth INCLUDE_IDS (include-only detach targets): <empty>"
+      fi
     fi
     if [[ -n "$exclude_csv" ]]; then
       say "Configured USB Bluetooth EXCLUDE_IDS (kept host-bound): $exclude_csv"
@@ -8571,31 +8686,20 @@ configure_usb_bt_exclude_ids_interactive() {
     fi
     return 0
   fi
-
-  local tmp mode owner group
-  tmp="$(mktemp)"
-  awk -v exclude="$exclude_csv" '
-    BEGIN { done=0 }
-    /^EXCLUDE_IDS=/ { print "EXCLUDE_IDS=\"" exclude "\""; done=1; next }
-    { print }
-    END {
-      if (!done) {
-        print "EXCLUDE_IDS=\"" exclude "\""
-      }
-    }
-  ' "$conf" >"$tmp"
-  mode="$(stat -c '%a' "$conf" 2>/dev/null || echo 644)"
-  owner="$(stat -c '%u' "$conf" 2>/dev/null || id -u)"
-  group="$(stat -c '%g' "$conf" 2>/dev/null || id -g)"
-
-  install -o "$owner" -g "$group" -m "$mode" "$tmp" "$conf"
-  rm -f "$tmp" || true
+  update_usb_bt_match_conf_values "$conf" "$match_mode" "$desired_include" "$exclude_csv"
   USB_BT_EXCLUDE_CHANGED=1
 
   if [[ -n "$vm_csv" ]]; then
     say "Configured USB Bluetooth VM-eligible IDs: $vm_csv"
   else
     say "Configured USB Bluetooth VM-eligible IDs: <empty>"
+  fi
+  if [[ "$match_mode" == "include_only" ]]; then
+    if [[ -n "$desired_include" ]]; then
+      say "Configured USB Bluetooth INCLUDE_IDS (include-only detach targets): $desired_include"
+    else
+      say "Configured USB Bluetooth INCLUDE_IDS (include-only detach targets): <empty>"
+    fi
   fi
   if [[ -n "$exclude_csv" ]]; then
     say "Configured USB Bluetooth EXCLUDE_IDS (kept host-bound): $exclude_csv"
@@ -8607,6 +8711,7 @@ configure_usb_bt_exclude_ids_interactive() {
 install_usb_bluetooth_disable() {
   local had_unit had_match_conf should_start_now usb_bt_artifacts_changed
   local existing_match_mode existing_include_ids existing_exclude_ids exclusions_preconfigured
+  USB_BT_POLICY_CHANGED=0
   had_unit=0
   had_match_conf=0
   should_start_now=1
@@ -8746,17 +8851,19 @@ device_matches_policy() {
 }
 intf_disable() {
   local intf="$1"
-  local name drv
+  local name drv drv_path
   name="$(basename "$intf")"
+  # Safety: this helper must only operate on USB interface paths.
+  [[ "$intf" == /sys/bus/usb/devices/*:* ]] || return 0
   # Prevent automatic rebind while this mitigation is active.
-  # Prevent btusb from binding again.
   if [[ -w "$intf/driver_override" ]]; then
     echo "none" >"$intf/driver_override" 2>/dev/null || true
   fi
-  # If currently bound, unbind from the current driver.
-  # If currently bound, unbind from btusb.
+  # If currently bound, unbind from the current USB interface driver only.
   if [[ -L "$intf/driver" ]]; then
-    drv="$(basename "$(readlink -f "$intf/driver" 2>/dev/null || true)")"
+    drv_path="$(readlink -f "$intf/driver" 2>/dev/null || true)"
+    [[ "$drv_path" == /sys/bus/usb/drivers/* ]] || return 0
+    drv="$(basename "$drv_path")"
     if [[ -n "$drv" && -w "/sys/bus/usb/drivers/$drv/unbind" ]]; then
       echo "$name" >"/sys/bus/usb/drivers/$drv/unbind" 2>/dev/null || true
     fi
@@ -8767,6 +8874,8 @@ intf_enable() {
   local intf="$1"
   local name
   name="$(basename "$intf")"
+  # Safety: this helper must only operate on USB interface paths.
+  [[ "$intf" == /sys/bus/usb/devices/*:* ]] || return 0
 
   # Allow drivers to bind again.
   if [[ -w "$intf/driver_override" ]]; then
@@ -8854,24 +8963,28 @@ EOF
   if (( exclusions_preconfigured )) && [[ "$had_unit" -eq 1 && "$had_match_conf" -eq 1 ]]; then
     note "Detected existing USB Bluetooth mitigation configuration in: $USB_BT_MATCH_CONF"
     if prompt_yn "Existing USB Bluetooth exclusions/policy detected. Reconfigure now?" N "USB Bluetooth exclusions"; then
+      configure_usb_bt_policy_mode_interactive "$USB_BT_MATCH_CONF"
       configure_usb_bt_exclude_ids_interactive
-      if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
+      if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
         should_start_now=0
       fi
     else
       note "Keeping existing USB Bluetooth exclusions/policy without reconfiguration."
       USB_BT_EXCLUDE_CHANGED=0
+      USB_BT_POLICY_CHANGED=0
       if [[ "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
         should_start_now=0
       fi
     fi
-  elif prompt_yn "Review USB devices now and choose EXCLUDE_IDS for mitigation?" Y "USB Bluetooth exclusions"; then
+  elif prompt_yn "Configure mitigation policy mode and review USB devices now?" Y "USB Bluetooth exclusions"; then
+    configure_usb_bt_policy_mode_interactive "$USB_BT_MATCH_CONF"
     configure_usb_bt_exclude_ids_interactive
-    if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
+    if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
       should_start_now=0
     fi
   else
     note "Keeping EXCLUDE_IDS empty (no explicit USB exclusions)."
+    USB_BT_POLICY_CHANGED=0
     if [[ "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
       should_start_now=0
     fi
@@ -10887,6 +11000,7 @@ apply_configuration() {
   note "What this installs: systemd+udev helper that detaches USB Bluetooth adapters from the host btusb driver (unbind + driver_override=none)."
   note "Result: host-side USB Bluetooth is effectively disabled (no reset-spam), but the USB device stays enumerated so it can be passed through to a VM."
   note "Advanced: if MATCH_MODE=include_only and INCLUDE_IDS is set, the helper also detaches those exact selected USB IDs (for example a flaky dock LAN adapter)."
+  note "Safety: this helper only operates on /sys/bus/usb/devices interfaces and USB drivers; it does NOT unbind motherboard PCI ethernet/Wi-Fi devices."
   note "Use include_only carefully; selecting storage-class USB devices as VM-eligible detach targets is risky."
   note "Re-enable later: $USB_BT_SCRIPT --enable (or remove everything via --reset)."
   if prompt_yn "Install and enable automatic USB Bluetooth host detach (systemd+udev)?" N "USB Bluetooth"; then

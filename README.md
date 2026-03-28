@@ -22,55 +22,8 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
 
 ## Unreleased
-- Improved USB Bluetooth mitigation helper behavior for advanced include-only policy:
-  - generated `vfio-usb-bluetooth.sh` now detaches explicitly selected non-Bluetooth USB interfaces when `MATCH_MODE="include_only"` and matching `INCLUDE_IDS` are configured.
-  - this allows targeted detach of specific unstable USB IDs (for example some dock LAN adapters) while keeping default Bluetooth-only behavior unchanged in `MATCH_MODE="auto"`.
-  - helper re-enable path now uses generic USB driver reprobe (`/sys/bus/usb/drivers_probe`) with fallback bind behavior for broader interface-driver compatibility.
-- Fixed persisted AUTO X11 pinning default formatting:
-  - `write_conf()` now emits `VFIO_GRAPHICS_AUTO_X11_PINNING="1"` as a plain quoted numeric value, not an escaped-quote literal.
-  - avoids false fallback to disabled behavior when daemon reads the setting from config.
-- Stabilized AUTO-mode Wayland logout handoff for X11-prelogin display managers:
-  - AUTO policy now keeps X11 host-GPU pinning active during Wayland sessions when the detected display manager is X11-prelogin (`sddm`, `lightdm`, `lxdm`, `xdm`).
-  - this avoids remove/re-add pinning races during Wayland logout that can present as black-screen before greeter recovery.
-- Updated graphics protocol daemon polling defaults to 1 second:
-  - installer/runtime default interval now uses `GRAPHICS_DAEMON_INTERVAL_DEFAULT=1`.
-  - generated daemon fallback poll interval now uses `DEFAULT_SLEEP_SECS=1`.
-- Added dedicated detect-output regression coverage for watchdog sizing defaults/fallback:
-  - new `regression/watchdog-detect-defaults-regression.sh` validates that detect JSON surfaces persisted watchdog retention/max-line values when valid.
-  - also validates default fallback behavior when watchdog config is missing or out-of-range.
-- Added standalone graphics protocol daemon reinstall mode:
-  - new `--install-graphics-daemon` mode installs/reinstalls only `vfio-graphics-protocold` + unit from existing persisted config without rerunning the full interactive wizard.
-  - intended for rolling out protocol-policy/watchdog updates in snapshot workflows where core VFIO setup is already present.
-- Improved graphics protocol watchdog retention and debugging detail:
-  - watchdog entries now include structured decision context (`reason`, `dm`, `prelogin`, `host`, `guest`) in addition to mode/session/action/subvolume.
-  - watchdog log growth is now bounded with retention + hard line-cap pruning (defaults: 10 days, 5000 lines) to reduce long-term space usage.
-  - detect JSON/report output now includes persisted watchdog sizing controls (`configured_graphics_watchdog_retention_days`, `configured_graphics_watchdog_max_lines`).
-- Hardened watchdog-driven graphics protocol AUTO behavior so display-manager detection now falls back through `/usr/lib/X11/displaymanagers/default-displaymanager` on wrapper-based systems (for example openSUSE), and AUTO keeps X11 host-GPU pinning active for X11-prelogin display managers during active X11 sessions to reduce logout/switch black-screen handoff failures.
-- Hardened kernel-cmdline/BLS token parsing helpers to use deterministic whitespace splitting even when the shell runs with a non-default `IFS`, preventing false `root=` metadata misses during openSUSE persistence and BLS synchronization flows.
-- Added functional regression coverage that forces a non-space global `IFS` and verifies `sync_bls_entries_from_kernel_cmdline()` still preserves entry `root=` metadata and applies baseline VFIO/IOMMU parameters.
-- Added openSUSE root-metadata safety fallback from running `/proc/cmdline` for `/etc/kernel/cmdline` persistence candidates when `root=` cannot be recovered from existing cmdline/BLS/current-mount metadata.
-- Added the same `/proc/cmdline` fallback to Boot Loader Spec sync baseline building to prevent false `root=`-missing skips in non-snapshot boots.
-- Added functional regression coverage for the `/proc/cmdline` root-metadata recovery path so BLS sync is validated end-to-end when other metadata sources are intentionally unavailable.
-- Updated Boot Loader Spec sync safety behavior to continue with per-entry root preservation when global root metadata cannot be recovered, skipping only entries that still lack provable `root=` metadata.
-- Hardened openSUSE GRUB snapshot/BLS bootloader detection so systems with active Boot Loader Spec entries are classified as `grub2-bls` even when explicit BLS markers are missing, preventing VFIO cmdline updates from being silently limited to legacy `/etc/default/grub` edits.
-- Added regression guard coverage to keep the openSUSE GRUB+BLS fallback detection path in `detect_bootloader()` from regressing.
-- Hardened openSUSE `/etc/kernel/cmdline` persistence updates to preserve existing boot metadata (`root=`, `rootflags=`, `rootfstype=`, `resume=`, `systemd.machine_id`) while adding VFIO/IOMMU parameters.
-- Added additional current-mount metadata fallback in BLS sync/persistence paths so cmdline updates avoid dropping root metadata and avoid false safety-abort skips.
-- Added a new read-only token trace mode, `--debug-cmdline-tokens`, that prints baseline and per-entry `root`/`rootflags` source selection used by Boot Loader Spec synchronization logic.
-- Extended `--debug-cmdline-tokens` with an optional `--entry` basename glob filter so trace runs can target specific Boot Loader Spec entries.
-- Added parse-time validation for `--entry` so empty/whitespace-only patterns (`--entry=`, `--entry ''`, or `--entry '   '`) are rejected with a clear non-empty pattern error.
-- Added machine-readable debug token trace output for `--debug-cmdline-tokens --json`, including mode, active entry filter, exit code, and emitted trace lines.
-- Added regression coverage that validates `--debug-cmdline-tokens` mode wiring, representative debug trace lines, and dry-run non-mutating behavior.
-- Added an install-time prelogin X11 host-GPU pinning failsafe for explicit `X11` mode and `AUTO` mode on X11-greeter display managers (SDDM/LightDM/LXDM/XDM) to reduce `no screens found` black-screen failures when the guest GPU is pre-bound to `vfio-pci`.
-- Fixed a boot-time graphics protocol daemon crash path caused by an undefined variable reference in generated daemon policy code (`host_gpu_bdf`/`guest_gpu_bdf` no-op line removed).
-- Deferred graphics protocol activation so installer runs no longer switch Wayland/X11 behavior live during wizard execution.
-- Updated graphics protocol daemon install flow to enable on boot without immediate start, so protocol adaptation takes effect after reboot.
-- Moved installer protocol-mode application messaging to end-of-flow so it runs after all interactive input steps complete.
-- Extended protocol regression coverage to guard deferred activation semantics (no immediate daemon `enable --now`, and install-flow protocol scheduling remains end-of-flow).
-- Added a top README banner image with a relative clickable path (`icon/images.webp`) so documentation paths stay portable and non-hardcoded.
-- Expanded the README top banner display to full-width rendering for better visibility while keeping the same relative clickable path.
+- No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
-
 
 ---
 

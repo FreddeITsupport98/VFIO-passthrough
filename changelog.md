@@ -1,5 +1,9 @@
 # Changelog
 ## Unreleased
+- 2026-03-31 19:58 UTC: Corrected USB mitigation effective-target hard-block summary behavior in `vfio.sh`:
+  - `[HARD-BLOCK]` tags/counts now apply only to devices that are mitigation targets under the active match policy,
+  - prevents misleading `[HOST-BOUND][HARD-BLOCK]` summary lines in include-only targeting scenarios,
+  - added regression coverage in `regression/usb-storage-exclusion-regression.sh` to assert host-bound entries never receive hard-block tags and totals stay mitigation-scoped.
 - 2026-03-31 19:43 UTC: Fixed Bluetooth hint/index classification gaps in USB mitigation picker and helper matching:
   - `usb_sysfs_device_is_bluetooth()` and generated `vfio-usb-bluetooth.sh` bluetooth detection now include product/manufacturer text fallback (`bluetooth`) when btusb/class metadata is unavailable,
   - restores expected Bluetooth hints and yellow picker index emphasis for adapters that expose incomplete interface metadata during mitigation states,

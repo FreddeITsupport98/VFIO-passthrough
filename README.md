@@ -24,6 +24,7 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 ## Unreleased
 - No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
+- Corrected USB mitigation effective-target summary semantics so `[HARD-BLOCK]` tags/counts are shown only for active `[MITIGATE]` targets under policy, preventing misleading host-bound hard-block labeling in include-only flows.
 - Added USB mitigation support for optional USB Ethernet EEE-off targeting (per selected USB NIC VID:PID IDs) with USB-only safeguards.
 - Expanded USB Bluetooth mitigation advanced policy controls with additive config keys:
   - `USB_BT_STOP_BLUETOOTH_SERVICE` to gate temporary `bluetooth.service` stop/start around mitigation actions.

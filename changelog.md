@@ -1,5 +1,13 @@
 # Changelog
 ## Unreleased
+- 2026-03-31 19:43 UTC: Fixed Bluetooth hint/index classification gaps in USB mitigation picker and helper matching:
+  - `usb_sysfs_device_is_bluetooth()` and generated `vfio-usb-bluetooth.sh` bluetooth detection now include product/manufacturer text fallback (`bluetooth`) when btusb/class metadata is unavailable,
+  - restores expected Bluetooth hints and yellow picker index emphasis for adapters that expose incomplete interface metadata during mitigation states,
+  - extended `regression/usb-storage-exclusion-regression.sh` with explicit fallback-detection assertions and generated-helper fallback wiring checks.
+- 2026-03-31 19:37 UTC: Improved USB mitigation usability and targeting visibility in `vfio.sh`:
+  - added interactive configuration for `USB_BT_STOP_BLUETOOTH_SERVICE` so users can explicitly enable/disable bluetooth.service stop/start integration during mitigation runs,
+  - added installer output section `USB mitigation effective targets` that enumerates detected USB devices with policy tags (`[MITIGATE]`, `[HOST-BOUND]`, `[HARD-BLOCK]`, `[EEE-OFF]`) and totals,
+  - added helper matching utilities used by summary output to mirror active match-policy behavior for include/exclude, hard-block scope, and USB Ethernet EEE scope.
 - 2026-03-31 19:14 UTC: Expanded USB Bluetooth mitigation control surface in `vfio.sh`:
   - mitigation match-policy defaults now include additive keys `USB_BT_STOP_BLUETOOTH_SERVICE`, `USB_BT_HARD_BLOCK`, and `USB_BT_HARD_BLOCK_IDS`,
   - installer reruns now backfill missing advanced keys in existing `/etc/vfio-usb-bluetooth-match.conf` files and treat non-default advanced values as preconfigured policy,

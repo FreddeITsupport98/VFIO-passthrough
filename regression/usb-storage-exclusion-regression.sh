@@ -71,6 +71,21 @@ write_fake_usb_device() {
 
 write_fake_usb_device "1-1" "aaaa" "0001" "SanDisk" "Portable SSD"
 write_fake_usb_device "1-2" "bbbb" "0002" "Logitech" "USB Receiver"
+write_fake_usb_device "1-4" "2357" "0604" "TP-Link" "Bluetooth USB Adapter"
+
+if usb_sysfs_device_is_bluetooth "$usb_fake_root/1-4"; then
+  case0_bt_name_detected="yes"
+else
+  case0_bt_name_detected="no"
+fi
+assert_eq "case0 bluetooth text fallback detects adapter by product/manufacturer name" "yes" "$case0_bt_name_detected"
+if usb_sysfs_device_is_bluetooth "$usb_fake_root/1-2"; then
+  case0_non_bt_text_detected="yes"
+else
+  case0_non_bt_text_detected="no"
+fi
+assert_eq "case0 bluetooth text fallback does not misclassify non-bluetooth receiver name" "no" "$case0_non_bt_text_detected"
+rm -rf "$usb_fake_root/1-4"
 
 # Deterministic classification for this regression fixture.
 BT_USB_DEVICE_NAME=""
@@ -498,6 +513,7 @@ assert_contains_text "case13 helper uses generic driver unbind path" "/sys/bus/u
 assert_contains_text "case13 helper uses generic USB drivers_probe rebind path" "/sys/bus/usb/drivers_probe" "$case13_helper_text"
 assert_contains_text "case13 helper keeps include_only detach gate" "[[ \"\$MATCH_MODE\" == \"include_only\" ]]" "$case13_helper_text"
 assert_contains_text "case13 helper emits scope marker for matched devices" "scope=\${target_scope}" "$case13_helper_text"
+assert_contains_text "case13 helper includes bluetooth text fallback detection" "grep -Eq '(bluetooth)' <<<\"\$text_hint\"" "$case13_helper_text"
 assert_contains_text "case13 helper normalizes bluetooth-service toggle flag" "USB_BT_STOP_BLUETOOTH_SERVICE=\"\$(normalize_bool_flag \"\${USB_BT_STOP_BLUETOOTH_SERVICE:-1}\")\"" "$case13_helper_text"
 assert_contains_text "case13 helper normalizes hard-block toggle flag" "USB_BT_HARD_BLOCK=\"\$(normalize_bool_flag \"\${USB_BT_HARD_BLOCK:-0}\")\"" "$case13_helper_text"
 assert_contains_text "case13 helper includes hard-block policy matcher" "device_matches_usb_bt_hard_block_policy()" "$case13_helper_text"
@@ -606,6 +622,8 @@ USB_BT_SCRIPT="$case15_helper"
 USB_BT_SYSTEMD_UNIT="$case15_unit"
 USB_BT_UDEV_RULE="$case15_rule"
 USB_BT_MATCH_CONF="$case15_conf"
+VFIO_USB_SYSFS_GLOB="$usb_fake_root/*"
+BT_USB_DEVICE_NAME="1-2"
 prompt_yn_calls=0
 confirm_phrase_calls=0
 PROMPT_RESPONSES=(1)
@@ -616,6 +634,41 @@ assert_eq "case15 installer summary asks one reconfigure prompt when preconfigur
 assert_contains_text "case15 installer summary reports bluetooth.service integration disabled" "Configured bluetooth.service stop/start integration: <disabled>" "$case15_stdout_text"
 assert_contains_text "case15 installer summary reports scoped hard-block IDs" "Configured aggressive USB hard-block IDs: aaaa:0001" "$case15_stdout_text"
 assert_contains_text "case15 installer summary still reports EEE-off disabled state" "Configured USB Ethernet EEE-off IDs: <disabled>" "$case15_stdout_text"
+assert_contains_text "case15 installer summary prints effective target section" "==== USB mitigation effective targets ====" "$case15_stdout_text"
+assert_contains_text "case15 effective target list includes mitigate-tagged bluetooth device" "[MITIGATE]" "$case15_stdout_text"
+assert_contains_text "case15 effective target summary totals are present" "Summary totals: scanned=" "$case15_stdout_text"
+
+# Case 16: bluetooth.service guard interactive flow should allow disabling integration.
+case16_conf="$tmp_dir/case16-service-guard.conf"
+case16_input="$tmp_dir/case16-service-guard-input.txt"
+case16_out="$tmp_dir/case16-service-guard-prompt.txt"
+case16_stdout="$tmp_dir/case16-service-guard-stdout.txt"
+case16_stderr="$tmp_dir/case16-service-guard-stderr.txt"
+cat >"$case16_conf" <<'EOF'
+MATCH_MODE="auto"
+INCLUDE_IDS=""
+EXCLUDE_IDS=""
+USB_BT_STOP_BLUETOOTH_SERVICE="1"
+USB_BT_HARD_BLOCK="0"
+USB_BT_HARD_BLOCK_IDS=""
+USB_ETHERNET_EEE_OFF="0"
+USB_ETHERNET_EEE_IDS=""
+EOF
+: >"$case16_input"
+USB_BT_MATCH_CONF="$case16_conf"
+VFIO_INTERACTIVE_IN="$case16_input"
+VFIO_INTERACTIVE_OUT="$case16_out"
+prompt_yn_calls=0
+confirm_phrase_calls=0
+PROMPT_RESPONSES=(1)
+CONFIRM_RESPONSES=()
+configure_usb_bt_service_guard_interactive >"$case16_stdout" 2>"$case16_stderr"
+case16_service_guard="$(awk -F= '/^USB_BT_STOP_BLUETOOTH_SERVICE=/{gsub(/"/,"",$2); print $2; exit}' "$case16_conf")"
+case16_stdout_text="$(cat "$case16_stdout")"
+assert_eq "case16 service-guard interactive disables bluetooth.service integration" "0" "$case16_service_guard"
+assert_eq "case16 service-guard interactive marks changed state" "1" "${USB_BT_SERVICE_GUARD_CHANGED:-}"
+assert_eq "case16 service-guard interactive uses one yes/no prompt" "1" "$prompt_yn_calls"
+assert_contains_text "case16 service-guard interactive prints disabled summary" "Configured bluetooth.service stop/start integration: <disabled>" "$case16_stdout_text"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

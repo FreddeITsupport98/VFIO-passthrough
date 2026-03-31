@@ -28,6 +28,9 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Expanded USB Bluetooth mitigation advanced policy controls with additive config keys:
   - `USB_BT_STOP_BLUETOOTH_SERVICE` to gate temporary `bluetooth.service` stop/start around mitigation actions.
   - `USB_BT_HARD_BLOCK` and `USB_BT_HARD_BLOCK_IDS` for optional aggressive USB `authorized` 0/1 toggling on selected IDs.
+- Added interactive USB mitigation prompt flow for `USB_BT_STOP_BLUETOOTH_SERVICE` so users can explicitly enable/disable bluetooth.service stop/start integration during mitigation runs.
+- Added an install-time “USB mitigation effective targets” summary that enumerates detected USB devices with `[MITIGATE]`, `[HOST-BOUND]`, `[HARD-BLOCK]`, and `[EEE-OFF]` tags to make active targeting policy easier to understand.
+- Improved USB Bluetooth detection fallback so adapters with Bluetooth in product/manufacturer text still get Bluetooth hints and yellow index emphasis in the exclusions picker when class/driver metadata is unavailable.
 - Added `--reset-usb-mitigation` mode to remove only USB mitigation artifacts/config (including USB Ethernet EEE-off settings) without touching core VFIO GPU passthrough setup.
 - Updated CLI/help/completion coverage to include `--reset-usb-mitigation` consistently across fish/bash/zsh completion output paths.
 - Added `--remove-bootlog` as an additive convenience alias of `--disable-bootlog` so install/remove bootlog flows read naturally (`--install-bootlog` vs `--remove-bootlog`).

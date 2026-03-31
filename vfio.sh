@@ -7999,8 +7999,9 @@ usb_bt_mitigation_explain() {
 }
 usb_sysfs_device_is_bluetooth() {
   # Return 0 if the sysfs USB device directory appears to expose Bluetooth
-  # interfaces (btusb driver or interface class/subclass e0/01).
-  local dev="$1" intf cls sub drv
+  # interfaces (btusb driver, interface class/subclass e0/01, or Bluetooth
+  # product/manufacturer text fallback).
+  local dev="$1" intf cls sub drv text_hint
   shopt -s nullglob
   for intf in "$dev":*; do
     if [[ -L "$intf/driver" ]]; then
@@ -8020,6 +8021,10 @@ usb_sysfs_device_is_bluetooth() {
     fi
   done
   shopt -u nullglob
+  text_hint="$(printf '%s %s' "$(cat "$dev/manufacturer" 2>/dev/null || true)" "$(cat "$dev/product" 2>/dev/null || true)" | tr '[:upper:]' '[:lower:]')"
+  if grep -Eq '(bluetooth)' <<<"$text_hint"; then
+    return 0
+  fi
   return 1
 }
 usb_sysfs_device_is_ethernet() {
@@ -8283,6 +8288,77 @@ normalize_usb_id_pattern_csv() {
   done
   printf '%s\n' "$out"
 }
+normalize_usb_id_component() {
+  local v="${1,,}"
+  v="${v#0x}"
+  printf '%s\n' "$v"
+}
+usb_id_pattern_matches() {
+  local pattern="${1,,}" vid="$2" pid="$3"
+  local pvid ppid
+  [[ "$pattern" == *:* ]] || return 1
+  pvid="$(normalize_usb_id_component "${pattern%%:*}")"
+  ppid="$(normalize_usb_id_component "${pattern##*:}")"
+  [[ -n "$pvid" && -n "$ppid" ]] || return 1
+  [[ "$pvid" == "*" || "$pvid" == "$vid" ]] || return 1
+  [[ "$ppid" == "*" || "$ppid" == "$pid" ]] || return 1
+  return 0
+}
+usb_id_in_csv_patterns() {
+  local csv="$1" vid="$2" pid="$3" item
+  [[ -n "$csv" ]] || return 1
+  local IFS=','
+  for item in $csv; do
+    item="${item//[[:space:]]/}"
+    [[ -n "$item" ]] || continue
+    if usb_id_pattern_matches "$item" "$vid" "$pid"; then
+      return 0
+    fi
+  done
+  return 1
+}
+usb_bt_device_matches_policy_from_conf() {
+  local dev="$1" match_mode="$2" include_ids="$3" exclude_ids="$4" vid pid
+  vid="$(normalize_usb_id_component "$(cat "$dev/idVendor" 2>/dev/null || echo '')")"
+  pid="$(normalize_usb_id_component "$(cat "$dev/idProduct" 2>/dev/null || echo '')")"
+  [[ -n "$vid" && -n "$pid" ]] || return 1
+
+  if [[ "$match_mode" == "include_only" ]]; then
+    usb_id_in_csv_patterns "$include_ids" "$vid" "$pid" || return 1
+  else
+    usb_sysfs_device_is_bluetooth "$dev" || return 1
+    if [[ -n "$include_ids" ]] && ! usb_id_in_csv_patterns "$include_ids" "$vid" "$pid"; then
+      return 1
+    fi
+  fi
+  if usb_id_in_csv_patterns "$exclude_ids" "$vid" "$pid"; then
+    return 1
+  fi
+  return 0
+}
+usb_bt_device_matches_hard_block_scope_from_conf() {
+  local dev="$1" hard_block="$2" hard_block_ids="$3" vid pid
+  [[ "$hard_block" == "1" ]] || return 1
+  if [[ -z "$hard_block_ids" ]]; then
+    return 0
+  fi
+  vid="$(normalize_usb_id_component "$(cat "$dev/idVendor" 2>/dev/null || echo '')")"
+  pid="$(normalize_usb_id_component "$(cat "$dev/idProduct" 2>/dev/null || echo '')")"
+  [[ -n "$vid" && -n "$pid" ]] || return 1
+  usb_id_in_csv_patterns "$hard_block_ids" "$vid" "$pid"
+}
+usb_bt_device_matches_eee_scope_from_conf() {
+  local dev="$1" eee_off="$2" eee_ids="$3" vid pid
+  [[ "$eee_off" == "1" ]] || return 1
+  usb_sysfs_device_is_ethernet "$dev" || return 1
+  vid="$(normalize_usb_id_component "$(cat "$dev/idVendor" 2>/dev/null || echo '')")"
+  pid="$(normalize_usb_id_component "$(cat "$dev/idProduct" 2>/dev/null || echo '')")"
+  [[ -n "$vid" && -n "$pid" ]] || return 1
+  if [[ -n "$eee_ids" ]] && ! usb_id_in_csv_patterns "$eee_ids" "$vid" "$pid"; then
+    return 1
+  fi
+  return 0
+}
 update_usb_bt_hard_block_conf_values() {
   # Update USB_BT_HARD_BLOCK / USB_BT_HARD_BLOCK_IDS keys in-place,
   # preserving unrelated lines and file ownership/mode.
@@ -8311,6 +8387,37 @@ update_usb_bt_hard_block_conf_values() {
       }
       if (!done_ids) {
         print "USB_BT_HARD_BLOCK_IDS=\"" ids_val "\""
+      }
+    }
+  ' "$conf" >"$tmp"
+
+  file_mode="$(stat -c '%a' "$conf" 2>/dev/null || echo 644)"
+  file_owner="$(stat -c '%u' "$conf" 2>/dev/null || id -u)"
+  file_group="$(stat -c '%g' "$conf" 2>/dev/null || id -g)"
+  install -o "$file_owner" -g "$file_group" -m "$file_mode" "$tmp" "$conf"
+  rm -f "$tmp" || true
+  return 0
+}
+update_usb_bt_service_guard_conf_value() {
+  # Update USB_BT_STOP_BLUETOOTH_SERVICE key in-place, preserving unrelated
+  # lines and file ownership/mode.
+  local conf="$1" service_guard_value="$2"
+  [[ -n "$conf" ]] || return 1
+  [[ -f "$conf" ]] || return 1
+
+  local tmp file_mode file_owner file_group
+  tmp="$(mktemp)"
+  awk -v guard_val="$service_guard_value" '
+    BEGIN { done_guard=0 }
+    /^USB_BT_STOP_BLUETOOTH_SERVICE=/ {
+      print "USB_BT_STOP_BLUETOOTH_SERVICE=\"" guard_val "\""
+      done_guard=1
+      next
+    }
+    { print }
+    END {
+      if (!done_guard) {
+        print "USB_BT_STOP_BLUETOOTH_SERVICE=\"" guard_val "\""
       }
     }
   ' "$conf" >"$tmp"
@@ -8512,6 +8619,53 @@ configure_usb_bt_ethernet_eee_interactive() {
   USB_BT_ETH_EEE_CHANGED=1
   say "Configured USB Ethernet EEE-off IDs: $target_ids"
 }
+configure_usb_bt_service_guard_interactive() {
+  # Configure whether mitigation stop/start hooks manage bluetooth.service.
+  USB_BT_SERVICE_GUARD_CHANGED=0
+  local conf="$USB_BT_MATCH_CONF"
+  if [[ ! -f "$conf" ]]; then
+    if ! ensure_usb_bt_match_conf_present "$conf"; then
+      note "No USB Bluetooth match config available at $conf; skipping bluetooth.service guard tuning."
+      return 0
+    fi
+  fi
+
+  local current_stop_service target_value default_choice
+  current_stop_service="$(awk -F= '/^USB_BT_STOP_BLUETOOTH_SERVICE=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  current_stop_service="$(normalize_usb_bt_boolean_flag "$current_stop_service")"
+
+  say
+  hdr "USB mitigation bluetooth.service guard"
+  note "When enabled, mitigation stops bluetooth.service before disable flow and starts it again in enable flow."
+  note "Disable this only if you want mitigation to leave bluetooth.service untouched."
+
+  default_choice="Y"
+  if [[ "$current_stop_service" != "1" ]]; then
+    default_choice="N"
+  fi
+  if prompt_yn "Enable bluetooth.service stop/start integration?" "$default_choice" "USB bluetooth service guard"; then
+    target_value="1"
+  else
+    target_value="0"
+  fi
+
+  if [[ "$target_value" == "$current_stop_service" ]]; then
+    note "bluetooth.service integration unchanged."
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY RUN: would set USB_BT_STOP_BLUETOOTH_SERVICE=\"$target_value\" in $conf"
+    USB_BT_SERVICE_GUARD_CHANGED=1
+    return 0
+  fi
+  update_usb_bt_service_guard_conf_value "$conf" "$target_value"
+  USB_BT_SERVICE_GUARD_CHANGED=1
+  if [[ "$target_value" == "1" ]]; then
+    say "Configured bluetooth.service stop/start integration: <enabled>"
+  else
+    say "Configured bluetooth.service stop/start integration: <disabled>"
+  fi
+}
 configure_usb_bt_hard_block_interactive() {
   # Configure optional aggressive USB authorized=0/1 fallback policy.
   USB_BT_HARD_BLOCK_CHANGED=0
@@ -8608,6 +8762,87 @@ configure_usb_bt_hard_block_interactive() {
   else
     say "Configured aggressive USB hard-block IDs: <all matched targets>"
   fi
+}
+print_usb_bt_mitigation_target_summary() {
+  # Print a concrete per-device view of which USB devices are currently
+  # considered mitigation targets under the active match-policy config.
+  local conf="$USB_BT_MATCH_CONF"
+  [[ -f "$conf" ]] || {
+    note "USB mitigation target summary unavailable (missing config: $conf)."
+    return 0
+  }
+
+  local match_mode include_ids exclude_ids stop_service hard_block hard_block_ids eee_off eee_ids
+  match_mode="$(awk -F= '/^MATCH_MODE=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  include_ids="$(awk -F= '/^INCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  exclude_ids="$(awk -F= '/^EXCLUDE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  stop_service="$(awk -F= '/^USB_BT_STOP_BLUETOOTH_SERVICE=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  hard_block="$(awk -F= '/^USB_BT_HARD_BLOCK=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  hard_block_ids="$(awk -F= '/^USB_BT_HARD_BLOCK_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  eee_off="$(awk -F= '/^USB_ETHERNET_EEE_OFF=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+  eee_ids="$(awk -F= '/^USB_ETHERNET_EEE_IDS=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
+
+  match_mode="${match_mode:-auto}"
+  case "$match_mode" in
+    auto|include_only) ;;
+    *) match_mode="auto" ;;
+  esac
+  stop_service="$(normalize_usb_bt_boolean_flag "$stop_service")"
+  hard_block="$(normalize_usb_bt_boolean_flag "$hard_block")"
+  eee_off="$(normalize_usb_ethernet_eee_flag "$eee_off")"
+
+  say
+  hdr "USB mitigation effective targets"
+  note "MATCH_MODE=$match_mode INCLUDE_IDS=${include_ids:-<empty>} EXCLUDE_IDS=${exclude_ids:-<empty>}"
+  note "USB_BT_STOP_BLUETOOTH_SERVICE=${stop_service}"
+  note "USB_BT_HARD_BLOCK=${hard_block} USB_BT_HARD_BLOCK_IDS=${hard_block_ids:-<all matched targets>}"
+  note "USB_ETHERNET_EEE_OFF=${eee_off} USB_ETHERNET_EEE_IDS=${eee_ids:-<none>}"
+  note "Legend: [MITIGATE]=detach target [HOST-BOUND]=not detached [HARD-BLOCK]=authorized 0/1 target [EEE-OFF]=USB ethernet ethtool target"
+
+  local usb_devices_glob dev name vid pid manufacturer product desc tags
+  local scanned matched hard_matched eee_matched
+  scanned=0
+  matched=0
+  hard_matched=0
+  eee_matched=0
+  usb_devices_glob="${VFIO_USB_SYSFS_GLOB:-/sys/bus/usb/devices/*}"
+  for dev in $usb_devices_glob; do
+    [[ -f "$dev/idVendor" && -f "$dev/idProduct" ]] || continue
+    name="$(basename "$dev")"
+    [[ "$name" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || continue
+    vid="$(tr -d '\n' <"$dev/idVendor" 2>/dev/null | tr 'A-F' 'a-f')"
+    pid="$(tr -d '\n' <"$dev/idProduct" 2>/dev/null | tr 'A-F' 'a-f')"
+    [[ -n "$vid" && -n "$pid" ]] || continue
+    manufacturer="$(cat "$dev/manufacturer" 2>/dev/null || true)"
+    product="$(cat "$dev/product" 2>/dev/null || true)"
+    desc="$(trim "$manufacturer $product")"
+    scanned=$((scanned + 1))
+
+    if usb_bt_device_matches_policy_from_conf "$dev" "$match_mode" "$include_ids" "$exclude_ids"; then
+      tags="[MITIGATE]"
+      matched=$((matched + 1))
+    else
+      tags="[HOST-BOUND]"
+    fi
+    if usb_bt_device_matches_hard_block_scope_from_conf "$dev" "$hard_block" "$hard_block_ids"; then
+      tags="${tags}[HARD-BLOCK]"
+      hard_matched=$((hard_matched + 1))
+    fi
+    if usb_bt_device_matches_eee_scope_from_conf "$dev" "$eee_off" "$eee_ids"; then
+      tags="${tags}[EEE-OFF]"
+      eee_matched=$((eee_matched + 1))
+    fi
+    if [[ -n "$desc" ]]; then
+      note "  - ${tags} ${name} ${vid}:${pid} ${desc}"
+    else
+      note "  - ${tags} ${name} ${vid}:${pid}"
+    fi
+  done
+  if (( scanned == 0 )); then
+    note "No USB devices detected for target summary."
+    return 0
+  fi
+  note "Summary totals: scanned=$scanned mitigate=$matched hard-block=$hard_matched eee-off=$eee_matched"
 }
 configure_usb_bt_policy_mode_interactive() {
   # Prompt for default Bluetooth-only mode vs advanced include_only mode.
@@ -9147,6 +9382,7 @@ install_usb_bluetooth_disable() {
   local had_unit had_match_conf should_start_now usb_bt_artifacts_changed
   local existing_match_mode existing_include_ids existing_exclude_ids existing_eee_off existing_eee_ids
   local existing_stop_bt_service existing_hard_block existing_hard_block_ids exclusions_preconfigured
+  USB_BT_SERVICE_GUARD_CHANGED=0
   USB_BT_HARD_BLOCK_CHANGED=0
   USB_BT_POLICY_CHANGED=0
   had_unit=0
@@ -9264,7 +9500,7 @@ id_in_csv() {
 # - interface driver bound to btusb (covers vendor-specific interfaces).
 usb_device_is_bluetooth() {
   local dev="$1"
-  local intf cls sub drv
+  local intf cls sub drv text_hint
 
   shopt -s nullglob
   for intf in "$dev":*; do
@@ -9286,6 +9522,10 @@ usb_device_is_bluetooth() {
     fi
   done
   shopt -u nullglob
+  text_hint="$(printf '%s %s' "$(cat "$dev/manufacturer" 2>/dev/null || true)" "$(cat "$dev/product" 2>/dev/null || true)" | tr '[:upper:]' '[:lower:]')"
+  if grep -Eq '(bluetooth)' <<<"$text_hint"; then
+    return 0
+  fi
 
   return 1
 }
@@ -9584,15 +9824,17 @@ EOF
     if prompt_yn "Existing USB Bluetooth exclusions/policy detected. Reconfigure now?" N "USB Bluetooth exclusions"; then
       configure_usb_bt_policy_mode_interactive "$USB_BT_MATCH_CONF"
       configure_usb_bt_exclude_ids_interactive
+      configure_usb_bt_service_guard_interactive
       configure_usb_bt_ethernet_eee_interactive
       configure_usb_bt_hard_block_interactive
-      if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "${USB_BT_ETH_EEE_CHANGED:-0}" == "0" && "${USB_BT_HARD_BLOCK_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
+      if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "${USB_BT_SERVICE_GUARD_CHANGED:-0}" == "0" && "${USB_BT_ETH_EEE_CHANGED:-0}" == "0" && "${USB_BT_HARD_BLOCK_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
         should_start_now=0
       fi
     else
       note "Keeping existing USB Bluetooth exclusions/policy without reconfiguration."
       USB_BT_EXCLUDE_CHANGED=0
       USB_BT_POLICY_CHANGED=0
+      USB_BT_SERVICE_GUARD_CHANGED=0
       USB_BT_ETH_EEE_CHANGED=0
       USB_BT_HARD_BLOCK_CHANGED=0
       if [[ "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
@@ -9602,14 +9844,16 @@ EOF
   elif prompt_yn "Configure mitigation policy mode and review USB devices now?" Y "USB Bluetooth exclusions"; then
     configure_usb_bt_policy_mode_interactive "$USB_BT_MATCH_CONF"
     configure_usb_bt_exclude_ids_interactive
+    configure_usb_bt_service_guard_interactive
     configure_usb_bt_ethernet_eee_interactive
     configure_usb_bt_hard_block_interactive
-    if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "${USB_BT_ETH_EEE_CHANGED:-0}" == "0" && "${USB_BT_HARD_BLOCK_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
+    if [[ "${USB_BT_EXCLUDE_CHANGED:-0}" == "0" && "${USB_BT_POLICY_CHANGED:-0}" == "0" && "${USB_BT_SERVICE_GUARD_CHANGED:-0}" == "0" && "${USB_BT_ETH_EEE_CHANGED:-0}" == "0" && "${USB_BT_HARD_BLOCK_CHANGED:-0}" == "0" && "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
       should_start_now=0
     fi
   else
     note "Keeping EXCLUDE_IDS empty (no explicit USB exclusions)."
     USB_BT_POLICY_CHANGED=0
+    USB_BT_SERVICE_GUARD_CHANGED=0
     USB_BT_ETH_EEE_CHANGED=0
     USB_BT_HARD_BLOCK_CHANGED=0
     if [[ "$had_unit" -eq 1 && "$usb_bt_artifacts_changed" -eq 0 ]]; then
@@ -9661,6 +9905,7 @@ EOF
   else
     say "Configured USB Ethernet EEE-off IDs: <disabled>"
   fi
+  print_usb_bt_mitigation_target_summary
 }
 
 # Install a small helper that dumps the current boot's VFIO-related logs to the

@@ -25,6 +25,9 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
 - Added USB mitigation support for optional USB Ethernet EEE-off targeting (per selected USB NIC VID:PID IDs) with USB-only safeguards.
+- Expanded USB Bluetooth mitigation advanced policy controls with additive config keys:
+  - `USB_BT_STOP_BLUETOOTH_SERVICE` to gate temporary `bluetooth.service` stop/start around mitigation actions.
+  - `USB_BT_HARD_BLOCK` and `USB_BT_HARD_BLOCK_IDS` for optional aggressive USB `authorized` 0/1 toggling on selected IDs.
 - Added `--reset-usb-mitigation` mode to remove only USB mitigation artifacts/config (including USB Ethernet EEE-off settings) without touching core VFIO GPU passthrough setup.
 - Updated CLI/help/completion coverage to include `--reset-usb-mitigation` consistently across fish/bash/zsh completion output paths.
 - Added `--remove-bootlog` as an additive convenience alias of `--disable-bootlog` so install/remove bootlog flows read naturally (`--install-bootlog` vs `--remove-bootlog`).

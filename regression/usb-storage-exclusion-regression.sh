@@ -498,6 +498,16 @@ assert_contains_text "case13 helper uses generic driver unbind path" "/sys/bus/u
 assert_contains_text "case13 helper uses generic USB drivers_probe rebind path" "/sys/bus/usb/drivers_probe" "$case13_helper_text"
 assert_contains_text "case13 helper keeps include_only detach gate" "[[ \"\$MATCH_MODE\" == \"include_only\" ]]" "$case13_helper_text"
 assert_contains_text "case13 helper emits scope marker for matched devices" "scope=\${target_scope}" "$case13_helper_text"
+assert_contains_text "case13 helper normalizes bluetooth-service toggle flag" "USB_BT_STOP_BLUETOOTH_SERVICE=\"\$(normalize_bool_flag \"\${USB_BT_STOP_BLUETOOTH_SERVICE:-1}\")\"" "$case13_helper_text"
+assert_contains_text "case13 helper normalizes hard-block toggle flag" "USB_BT_HARD_BLOCK=\"\$(normalize_bool_flag \"\${USB_BT_HARD_BLOCK:-0}\")\"" "$case13_helper_text"
+assert_contains_text "case13 helper includes hard-block policy matcher" "device_matches_usb_bt_hard_block_policy()" "$case13_helper_text"
+assert_contains_text "case13 helper includes USB authorized-state helper" "set_usb_device_authorized_state()" "$case13_helper_text"
+assert_contains_text "case13 helper includes bluetooth service transition helper" "maybe_toggle_bluetooth_service()" "$case13_helper_text"
+assert_contains_text "case13 helper emits hard_block state marker for matched devices" "hard_block=\${hard_block_state}" "$case13_helper_text"
+case13_conf_text_after_first="$(cat "$case13_conf")"
+assert_contains_text "case13 match config includes stop-bluetooth-service key" "USB_BT_STOP_BLUETOOTH_SERVICE=\"1\"" "$case13_conf_text_after_first"
+assert_contains_text "case13 match config includes hard-block key" "USB_BT_HARD_BLOCK=\"0\"" "$case13_conf_text_after_first"
+assert_contains_text "case13 match config includes hard-block IDs key" "USB_BT_HARD_BLOCK_IDS=\"\"" "$case13_conf_text_after_first"
 case13_helper_write_count_after_first="$(grep -Fc -- "$case13_helper" "$case13_write_log" || true)"
 case13_unit_write_count_after_first="$(grep -Fc -- "$case13_unit" "$case13_write_log" || true)"
 case13_rule_write_count_after_first="$(grep -Fc -- "$case13_rule" "$case13_write_log" || true)"
@@ -505,7 +515,10 @@ assert_eq "case13 first run writes helper once" "1" "$case13_helper_write_count_
 assert_eq "case13 first run writes unit once" "1" "$case13_unit_write_count_after_first"
 assert_eq "case13 first run writes udev rule once" "1" "$case13_rule_write_count_after_first"
 case13_run1_log_text="$(cat "$case13_run_log")"
+case13_run1_stdout_text="$(cat "$case13_run1_stdout")"
 assert_contains_text "case13 first run enables and starts service" "systemctl enable --now vfio-disable-usb-bluetooth.service" "$case13_run1_log_text"
+assert_contains_text "case13 first run prints bluetooth-service integration summary" "Configured bluetooth.service stop/start integration: <enabled>" "$case13_run1_stdout_text"
+assert_contains_text "case13 first run prints hard-block summary" "Configured aggressive USB hard-block IDs: <disabled>" "$case13_run1_stdout_text"
 # Seed a preconfigured exclusion policy to simulate real rerun state.
 make_match_conf "$case13_conf" "auto" "" "aaaa:0001"
 
@@ -531,6 +544,78 @@ assert_contains_text "case13 second run prints unchanged-start skip note" "USB B
 assert_contains_text "case13 second run detects existing preconfigured policy" "Detected existing USB Bluetooth mitigation configuration in:" "$case13_run2_stdout_text"
 assert_contains_text "case13 second run keeps preconfigured policy when reconfigure declined" "Keeping existing USB Bluetooth exclusions/policy without reconfiguration." "$case13_run2_stdout_text"
 assert_not_contains_text "case13 second run does not enter picker when reconfigure declined" "USB Bluetooth mitigation exclusions" "$case13_run2_stdout_text"
+# Case 14: Hard-block interactive flow enables scoped VID:PID patterns and ignores invalid tokens.
+case14_conf="$tmp_dir/case14-hard-block.conf"
+case14_input="$tmp_dir/case14-hard-block-input.txt"
+case14_out="$tmp_dir/case14-hard-block-prompt.txt"
+case14_stdout="$tmp_dir/case14-hard-block-stdout.txt"
+case14_stderr="$tmp_dir/case14-hard-block-stderr.txt"
+cat >"$case14_conf" <<'EOF'
+MATCH_MODE="auto"
+INCLUDE_IDS=""
+EXCLUDE_IDS=""
+USB_BT_STOP_BLUETOOTH_SERVICE="1"
+USB_BT_HARD_BLOCK="0"
+USB_BT_HARD_BLOCK_IDS=""
+USB_ETHERNET_EEE_OFF="0"
+USB_ETHERNET_EEE_IDS=""
+EOF
+cat >"$case14_input" <<'EOF'
+aaaa:0001 bbbb:* invalid-token
+EOF
+USB_BT_MATCH_CONF="$case14_conf"
+VFIO_INTERACTIVE_IN="$case14_input"
+VFIO_INTERACTIVE_OUT="$case14_out"
+prompt_yn_calls=0
+confirm_phrase_calls=0
+PROMPT_RESPONSES=(0)
+CONFIRM_RESPONSES=()
+configure_usb_bt_hard_block_interactive >"$case14_stdout" 2>"$case14_stderr"
+case14_hard_block="$(awk -F= '/^USB_BT_HARD_BLOCK=/{gsub(/"/,"",$2); print $2; exit}' "$case14_conf")"
+case14_hard_block_ids="$(awk -F= '/^USB_BT_HARD_BLOCK_IDS=/{gsub(/"/,"",$2); print $2; exit}' "$case14_conf")"
+case14_stdout_text="$(cat "$case14_stdout")"
+case14_stderr_text="$(cat "$case14_stderr")"
+assert_eq "case14 hard-block interactive enables hard-block flag" "1" "$case14_hard_block"
+assert_eq "case14 hard-block interactive persists normalized scoped IDs" "aaaa:0001,bbbb:*" "$case14_hard_block_ids"
+assert_eq "case14 hard-block interactive marks changed state" "1" "${USB_BT_HARD_BLOCK_CHANGED:-}"
+assert_eq "case14 hard-block interactive uses one yes/no prompt" "1" "$prompt_yn_calls"
+assert_contains_text "case14 hard-block interactive prints configured scope summary" "Configured aggressive USB hard-block IDs: aaaa:0001,bbbb:*" "$case14_stdout_text"
+assert_contains_text "case14 hard-block interactive reports invalid token skip" "Ignoring invalid USB ID pattern: invalid-token" "$case14_stderr_text"
+
+# Case 15: Installer summary should reflect non-default bluetooth-service/hard-block policy values.
+case15_root="$tmp_dir/case15-installer-summary"
+case15_helper="$case15_root/vfio-usb-bluetooth.sh"
+case15_unit="$case15_root/vfio-disable-usb-bluetooth.service"
+case15_rule="$case15_root/99-vfio-disable-usb-bluetooth.rules"
+case15_conf="$case15_root/vfio-usb-bluetooth-match.conf"
+case15_stdout="$tmp_dir/case15-installer-stdout.txt"
+case15_stderr="$tmp_dir/case15-installer-stderr.txt"
+mkdir -p "$case15_root"
+cat >"$case15_conf" <<'EOF'
+MATCH_MODE="auto"
+INCLUDE_IDS=""
+EXCLUDE_IDS=""
+USB_BT_STOP_BLUETOOTH_SERVICE="0"
+USB_BT_HARD_BLOCK="1"
+USB_BT_HARD_BLOCK_IDS="aaaa:0001"
+USB_ETHERNET_EEE_OFF="0"
+USB_ETHERNET_EEE_IDS=""
+EOF
+touch "$case15_unit"
+USB_BT_SCRIPT="$case15_helper"
+USB_BT_SYSTEMD_UNIT="$case15_unit"
+USB_BT_UDEV_RULE="$case15_rule"
+USB_BT_MATCH_CONF="$case15_conf"
+prompt_yn_calls=0
+confirm_phrase_calls=0
+PROMPT_RESPONSES=(1)
+CONFIRM_RESPONSES=()
+install_usb_bluetooth_disable >"$case15_stdout" 2>"$case15_stderr"
+case15_stdout_text="$(cat "$case15_stdout")"
+assert_eq "case15 installer summary asks one reconfigure prompt when preconfigured policy exists" "1" "$prompt_yn_calls"
+assert_contains_text "case15 installer summary reports bluetooth.service integration disabled" "Configured bluetooth.service stop/start integration: <disabled>" "$case15_stdout_text"
+assert_contains_text "case15 installer summary reports scoped hard-block IDs" "Configured aggressive USB hard-block IDs: aaaa:0001" "$case15_stdout_text"
+assert_contains_text "case15 installer summary still reports EEE-off disabled state" "Configured USB Ethernet EEE-off IDs: <disabled>" "$case15_stdout_text"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

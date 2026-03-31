@@ -1,5 +1,10 @@
 # Changelog
 ## Unreleased
+- 2026-03-31 19:14 UTC: Expanded USB Bluetooth mitigation control surface in `vfio.sh`:
+  - mitigation match-policy defaults now include additive keys `USB_BT_STOP_BLUETOOTH_SERVICE`, `USB_BT_HARD_BLOCK`, and `USB_BT_HARD_BLOCK_IDS`,
+  - installer reruns now backfill missing advanced keys in existing `/etc/vfio-usb-bluetooth-match.conf` files and treat non-default advanced values as preconfigured policy,
+  - generated `vfio-usb-bluetooth.sh` now normalizes boolean flags, supports optional bluetooth service stop/start integration, and supports optional USB hard-block (`authorized` 0/1) for selected IDs,
+  - install output and mitigation explain text now document the new advanced knobs and conservative defaults.
 - 2026-03-28 21:13 UTC: Added additive bootlog removal alias support:
   - `vfio.sh` now accepts `--remove-bootlog` as an alias of `--disable-bootlog`,
   - updated usage/help and fish/bash/zsh completion generators to include the new alias,

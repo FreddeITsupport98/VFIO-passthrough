@@ -8630,14 +8630,19 @@ configure_usb_bt_service_guard_interactive() {
     fi
   fi
 
-  local current_stop_service target_value default_choice
+  local current_stop_service target_value default_choice current_status_label
   current_stop_service="$(awk -F= '/^USB_BT_STOP_BLUETOOTH_SERVICE=/{v=$2; gsub(/"/,"",v); gsub(/[[:space:]]/,"",v); print tolower(v); exit}' "$conf" 2>/dev/null || true)"
   current_stop_service="$(normalize_usb_bt_boolean_flag "$current_stop_service")"
+  current_status_label="disabled"
+  if [[ "$current_stop_service" == "1" ]]; then
+    current_status_label="enabled"
+  fi
 
   say
   hdr "USB mitigation bluetooth.service guard"
   note "When enabled, mitigation stops bluetooth.service before disable flow and starts it again in enable flow."
   note "Disable this only if you want mitigation to leave bluetooth.service untouched."
+  note "Current status: bluetooth.service stop/start integration is $current_status_label."
 
   default_choice="Y"
   if [[ "$current_stop_service" != "1" ]]; then
@@ -8650,7 +8655,7 @@ configure_usb_bt_service_guard_interactive() {
   fi
 
   if [[ "$target_value" == "$current_stop_service" ]]; then
-    note "bluetooth.service integration unchanged."
+    say "bluetooth.service stop/start integration remains <${current_status_label}>."
     return 0
   fi
   if (( DRY_RUN )); then

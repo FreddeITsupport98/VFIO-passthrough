@@ -1,5 +1,9 @@
 # Changelog
 ## Unreleased
+- 2026-03-31 20:00 UTC: Clarified USB mitigation bluetooth.service guard prompt/status messaging in `vfio.sh`:
+  - flow now prints explicit current status (`enabled`/`disabled`) before the yes/no prompt,
+  - unchanged branch now reports explicit final state (`bluetooth.service stop/start integration remains <enabled|disabled>`) instead of generic `unchanged`,
+  - added regression coverage (`case19`) in `regression/usb-storage-exclusion-regression.sh` for unchanged-status clarity output.
 - 2026-03-31 19:58 UTC: Corrected USB mitigation effective-target hard-block summary behavior in `vfio.sh`:
   - `[HARD-BLOCK]` tags/counts now apply only to devices that are mitigation targets under the active match policy,
   - prevents misleading `[HOST-BOUND][HARD-BLOCK]` summary lines in include-only targeting scenarios,

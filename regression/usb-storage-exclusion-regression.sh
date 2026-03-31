@@ -732,6 +732,36 @@ assert_contains_text "case18 summary keeps host-bound storage untagged by hard-b
 assert_not_contains_text "case18 summary does not emit host-bound hard-block tag" "[HOST-BOUND][HARD-BLOCK]" "$case18_stdout_text"
 assert_contains_text "case18 summary marks include-only target with mitigate+hard-block tags" "[MITIGATE][HARD-BLOCK] 1-2 bbbb:0002 Logitech USB Receiver" "$case18_stdout_text"
 assert_contains_text "case18 summary totals count only mitigation-scoped hard-block targets" "Summary totals: scanned=2 mitigate=1 hard-block=1 eee-off=0" "$case18_stdout_text"
+# Case 19: bluetooth.service guard unchanged branch should report explicit status.
+case19_conf="$tmp_dir/case19-service-guard-unchanged.conf"
+case19_input="$tmp_dir/case19-service-guard-input.txt"
+case19_out="$tmp_dir/case19-service-guard-prompt.txt"
+case19_stdout="$tmp_dir/case19-service-guard-stdout.txt"
+case19_stderr="$tmp_dir/case19-service-guard-stderr.txt"
+cat >"$case19_conf" <<'EOF'
+MATCH_MODE="auto"
+INCLUDE_IDS=""
+EXCLUDE_IDS=""
+USB_BT_STOP_BLUETOOTH_SERVICE="1"
+USB_BT_HARD_BLOCK="0"
+USB_BT_HARD_BLOCK_IDS=""
+USB_ETHERNET_EEE_OFF="0"
+USB_ETHERNET_EEE_IDS=""
+EOF
+: >"$case19_input"
+USB_BT_MATCH_CONF="$case19_conf"
+VFIO_INTERACTIVE_IN="$case19_input"
+VFIO_INTERACTIVE_OUT="$case19_out"
+prompt_yn_calls=0
+confirm_phrase_calls=0
+PROMPT_RESPONSES=(0)
+CONFIRM_RESPONSES=()
+configure_usb_bt_service_guard_interactive >"$case19_stdout" 2>"$case19_stderr"
+case19_stdout_text="$(cat "$case19_stdout")"
+assert_eq "case19 service-guard unchanged keeps changed flag cleared" "0" "${USB_BT_SERVICE_GUARD_CHANGED:-}"
+assert_eq "case19 service-guard unchanged uses one yes/no prompt" "1" "$prompt_yn_calls"
+assert_contains_text "case19 service-guard unchanged reports current enabled state" "Current status: bluetooth.service stop/start integration is enabled." "$case19_stdout_text"
+assert_contains_text "case19 service-guard unchanged reports explicit unchanged status" "bluetooth.service stop/start integration remains <enabled>." "$case19_stdout_text"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

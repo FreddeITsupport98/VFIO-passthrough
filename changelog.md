@@ -1,5 +1,9 @@
 # Changelog
 ## Unreleased
+- 2026-04-01 20:09 UTC: Clarified USB mitigation hard-block UX messaging in `vfio.sh`:
+  - hard-block interactive flow now explicitly warns that active `authorized=0` state blocks matched devices from VM USB passthrough attach,
+  - added explicit rationale text that hard-block exists as a last-resort fallback when detach-only mitigation cannot stop unstable USB reset/timeout loops,
+  - updated `regression/usb-storage-exclusion-regression.sh` (`case17`) to assert passthrough-impact and rationale messaging remains present.
 - 2026-04-01 19:49 UTC: Improved USB mitigation hard-block disable behavior in `vfio.sh`:
   - `configure_usb_bt_hard_block_interactive` now restores `authorized=1` for devices that matched the previously active hard-block policy when hard-block is turned off,
   - prevents stale `authorized=0` state after users disable hard-block, so devices are unblocked immediately without manual sysfs writes,

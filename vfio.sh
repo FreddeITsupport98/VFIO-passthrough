@@ -7995,6 +7995,8 @@ usb_bt_mitigation_explain() {
   note "Advanced fallback knobs in $USB_BT_MATCH_CONF:"
   note "  - USB_BT_STOP_BLUETOOTH_SERVICE=\"1\" (default): stop/start bluetooth.service with mitigation lifecycle"
   note "  - USB_BT_HARD_BLOCK=\"1\": additionally toggle USB authorized=0/1 on matched devices"
+  note "    While authorized=0, matched devices are unavailable to both host usage and VM USB passthrough attach."
+  note "    Use this only as a last-resort fallback when detach-only mitigation still cannot stop reset/timeout loops."
   note "  - USB_BT_HARD_BLOCK_IDS=\"vid:pid,...\": optional scope for hard-block targets"
 }
 usb_sysfs_device_is_bluetooth() {
@@ -8742,6 +8744,8 @@ configure_usb_bt_hard_block_interactive() {
   say
   hdr "USB mitigation hard-block fallback"
   note "Optional aggressive mode: toggles /sys/bus/usb/devices/*/authorized (0 on disable, 1 on enable)."
+  note "Passthrough impact: while authorized=0 is active, matched USB devices cannot be attached to VMs."
+  note "Why this exists: some unstable adapters keep reset/timeout looping even after detach-only mitigation."
   note "Use only when regular detach is not enough for unstable adapters."
 
   local default_choice
@@ -8749,7 +8753,7 @@ configure_usb_bt_hard_block_interactive() {
   if [[ "$current_hard_block" == "1" ]]; then
     default_choice="Y"
   fi
-  if ! prompt_yn "Enable aggressive USB hard-block fallback now?" "$default_choice" "USB hard-block"; then
+  if ! prompt_yn "Enable aggressive USB hard-block fallback now? (warning: active hard-block can block VM USB passthrough)" "$default_choice" "USB hard-block"; then
     if [[ "$current_hard_block" == "0" && -z "$current_hard_block_ids" ]]; then
       note "USB hard-block settings unchanged (disabled)."
       return 0

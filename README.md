@@ -24,6 +24,7 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 ## Unreleased
 - No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
+- USB mitigation hard-block prompt flow now explicitly warns that active `authorized=0` hard-blocking makes matched USB devices unavailable for VM USB passthrough, and explains this mode is a last-resort fallback for reset/timeout loops that persist after detach-only mitigation.
 - USB mitigation hard-block disable flow now automatically restores `authorized=1` for previously hard-blocked, policy-matched USB targets so turning hard-block off immediately unblocks those devices without requiring manual sysfs commands.
 - Colorized USB mitigation effective-target status tags and legend output (`[MITIGATE]`, `[HOST-BOUND]`, `[HARD-BLOCK]`, `[EEE-OFF]`) so summary-state rendering now matches the rest of the colored mitigation flow when `ENABLE_COLOR=1`, with plain-text fallback preserved when color is disabled.
 - Colorized USB mitigation effective-target summary totals counters (`mitigate`, `hard-block`, `eee-off`) to match state-tag colors when `ENABLE_COLOR=1`, while keeping plain numeric totals in no-color mode.

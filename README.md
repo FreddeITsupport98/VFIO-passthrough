@@ -4,6 +4,14 @@
   </a>
 </p>
 
+> 🖥️ **Step 2 — Looking Glass Setup**
+>
+> When you have completed the VFIO passthrough, the next step is to set up **Looking Glass**.
+>
+> 👉 [FreddeITsupport98/looking-glass-setup](https://github.com/FreddeITsupport98/looking-glass-setup)
+>
+> Use this repo — it auto-configures Looking Glass for you. Just follow the steps.
+
 # vfio.sh – Safe multi‑GPU VFIO passthrough helper
 
 > **Status:** This script is a highly defensive, feature‑rich VFIO helper that has been hardened for modern Fedora/RHEL/Arch‑style setups, AMD reset quirks, and boot‑VGA framebuffer conflicts. It is designed as a _host configuration wizard_, **not** a VM manager.

@@ -50,6 +50,8 @@ DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
 MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | disable-bootlog | install-bootlog | install-graphics-daemon | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
+AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
+AMD_NORETRY_OVERRIDE=""       # 1=force add, 0=force skip, empty=prompt (install mode only)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
 GRAPHICS_DAEMON_INTERVAL_DEFAULT=1
 GRAPHICS_WATCHDOG_RETENTION_DAYS_DEFAULT=10
@@ -603,6 +605,10 @@ complete -c $cmd -l boot-vga-policy -r -a 'auto strict' -d 'Install-mode Boot-VG
 complete -c $cmd -l graphics-protocol -r -a 'auto x11 wayland' -d 'Install-mode graphics protocol override'
 complete -c $cmd -l graphics-daemon-interval -r -d 'Set graphics daemon polling interval in seconds (1-3600)'
 complete -c $cmd -l no-graphics-daemon -d 'Do not install graphics protocol daemon service'
+complete -c $cmd -l amd-runpm -d 'Force-add amdgpu.runpm=0 for AMD guest GPU (skip prompt)'
+complete -c $cmd -l no-amd-runpm -d 'Skip amdgpu.runpm=0 for AMD guest GPU (skip prompt)'
+complete -c $cmd -l amd-noretry -d 'Force-add amdgpu.noretry=0 for AMD guest GPU (skip prompt)'
+complete -c $cmd -l no-amd-noretry -d 'Skip amdgpu.noretry=0 for AMD guest GPU (skip prompt)'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -641,7 +647,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -682,6 +688,10 @@ _vfio_sh_complete() {
     '--graphics-protocol=[Install-mode graphics protocol override]:protocol:(auto x11 wayland)' \\
     '--graphics-daemon-interval=[Set graphics daemon polling interval in seconds (1-3600)]:seconds:(5 10 15 30 60)' \\
     '--no-graphics-daemon[Do not install graphics protocol daemon service]' \\
+    '--amd-runpm[Force-add amdgpu.runpm=0 for AMD guest GPU (skip prompt)]' \\
+    '--no-amd-runpm[Skip amdgpu.runpm=0 for AMD guest GPU (skip prompt)]' \\
+    '--amd-noretry[Force-add amdgpu.noretry=0 for AMD guest GPU (skip prompt)]' \\
+    '--no-amd-noretry[Skip amdgpu.noretry=0 for AMD guest GPU (skip prompt)]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1318,6 +1328,10 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    (valid range: 1-3600, default: $GRAPHICS_DAEMON_INTERVAL_DEFAULT).
   --no-graphics-daemon
                    Skip installation of the independent graphics protocol daemon service.
+  --amd-runpm       Install-mode override: force-add amdgpu.runpm=0 for AMD guest GPUs (skip prompt).
+  --no-amd-runpm    Install-mode override: skip amdgpu.runpm=0 for AMD guest GPUs (skip prompt).
+  --amd-noretry     Install-mode override: force-add amdgpu.noretry=0 for AMD guest GPUs (skip prompt).
+  --no-amd-noretry  Install-mode override: skip amdgpu.noretry=0 for AMD guest GPUs (skip prompt).
   --verify          Do not change anything; validate an existing setup (reads $CONF_FILE).
   --detect          Print a detailed report of existing VFIO/passthrough configuration and exit.
   --sync-bls-only   Non-interactive mode: sync BLS entry options from /etc/kernel/cmdline, then run strict drift verification.
@@ -1451,8 +1465,20 @@ parse_args() {
       --graphics-daemon-interval=*)
         GRAPHICS_DAEMON_INTERVAL_OVERRIDE="$(normalize_graphics_daemon_interval_arg "${1#*=}")" || die "Invalid --graphics-daemon-interval value: ${1#*=} (expected integer range 1-3600)"
         ;;
-      --no-graphics-daemon)
+  --no-graphics-daemon)
         INSTALL_GRAPHICS_DAEMON=0
+        ;;
+      --amd-runpm)
+        AMD_RUNPM_OVERRIDE=1
+        ;;
+      --no-amd-runpm)
+        AMD_RUNPM_OVERRIDE=0
+        ;;
+      --amd-noretry)
+        AMD_NORETRY_OVERRIDE=1
+        ;;
+      --no-amd-noretry)
+        AMD_NORETRY_OVERRIDE=0
         ;;
       --verify)
         MODE="verify"
@@ -6255,6 +6281,36 @@ systemd_boot_add_kernel_params() {
       note "Keeping existing framebuffer settings. If you later see black screens or "Header type 127" when starting the VM, rerun and enable this option."
     fi
 
+    # Optional: AMD GPU stability workarounds (openSUSE persistence).
+    if [[ -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
+      say
+      hdr "AMD GPU stability workarounds (optional)"
+      note "These parameters address two different AMD GPU instability paths that can cascade to PCIe bus hangs (for example xHCI host controller death or USB disconnect storms)."
+      note ""
+      note "1) amdgpu.runpm=0  — disables runtime power management (D0<->D3 transitions)."
+      note "   What it does: prevents the GPU from entering low-power D-states automatically."
+      note "   Why it can help: aggressive power-state transitions are a frequent trigger for PCIe link dropouts and reset failures on some AMD cards under VFIO."
+      note ""
+      note "2) amdgpu.noretry=0 — disables GPU-initiated PCIe transaction retry loops."
+      note "   What it does: allows the driver to retry instead of the hardware, which can prevent a wedged GPU from locking up the shared PCIe bus."
+      note "   Why it can help: if the driver reports 'amdgpu: device lost from bus' or 'Pageflip timed out', the GPU may be retrying PCIe transactions indefinitely, which can cascade and kill other devices on the same bus (xHCI, USB, audio)."
+      note ""
+      note "Important: these are WORKAROUNDS, not solutions. They may reduce or eliminate symptoms, but they will NOT fix BIOS/firmware bugs, ReBAR quirks, or fundamental IOMMU group problems."
+      note "Trade-off: amdgpu.runpm=0 increases idle power usage and heat because the GPU stays at full power."
+      if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" ]]; then
+        note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
+        [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.runpm=0")"
+        [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.noretry=0")"
+      elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" ]]; then
+        note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry)."
+      elif prompt_yn "Add amdgpu.runpm=0 and amdgpu.noretry=0 to /etc/kernel/cmdline for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+        new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.runpm=0")"
+        new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.noretry=0")"
+      else
+        note "Skipping AMD GPU stability parameters. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
+      fi
+    fi
+
     # Optional: disable SELinux/AppArmor at the kernel level.
     # On openSUSE Tumbleweed with Btrfs rollbacks, enabling SELinux
     # or AppArmor on a rolled-back root can easily cause confusing
@@ -6530,6 +6586,36 @@ systemd_boot_add_kernel_params() {
   else
     note "Skipping USB/xHCI power workaround parameters for this entry."
   fi
+
+  # Optional: AMD GPU stability workarounds (generic systemd-boot).
+  if [[ -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
+    say
+    hdr "AMD GPU stability workarounds (optional)"
+    note "These parameters address two different AMD GPU instability paths that can cascade to PCIe bus hangs (for example xHCI host controller death or USB disconnect storms)."
+    note ""
+    note "1) amdgpu.runpm=0  — disables runtime power management (D0<->D3 transitions)."
+    note "   What it does: prevents the GPU from entering low-power D-states automatically."
+    note "   Why it can help: aggressive power-state transitions are a frequent trigger for PCIe link dropouts and reset failures on some AMD cards under VFIO."
+    note ""
+    note "2) amdgpu.noretry=0 — disables GPU-initiated PCIe transaction retry loops."
+    note "   What it does: allows the driver to retry instead of the hardware, which can prevent a wedged GPU from locking up the shared PCIe bus."
+    note "   Why it can help: if the driver reports 'amdgpu: device lost from bus' or 'Pageflip timed out', the GPU may be retrying PCIe transactions indefinitely, which can cascade and kill other devices on the same bus (xHCI, USB, audio)."
+    note ""
+    note "Important: these are WORKAROUNDS, not solutions. They may reduce or eliminate symptoms, but they will NOT fix BIOS/firmware bugs, ReBAR quirks, or fundamental IOMMU group problems."
+    note "Trade-off: amdgpu.runpm=0 increases idle power usage and heat because the GPU stays at full power."
+    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" ]]; then
+      note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
+      [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.runpm=0")"
+      [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.noretry=0")"
+    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" ]]; then
+      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry)."
+    elif prompt_yn "Add amdgpu.runpm=0 and amdgpu.noretry=0 to this boot entry for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+      new_opts="$(add_param_once "$new_opts" "amdgpu.runpm=0")"
+      new_opts="$(add_param_once "$new_opts" "amdgpu.noretry=0")"
+    else
+      note "Skipping AMD GPU stability parameters for this entry. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
+    fi
+  fi
   
   # If the user chose verbose boot in the persistence step, mirror that
   # here so the CURRENT entry immediately shows logs instead of splash.
@@ -6576,6 +6662,13 @@ print_manual_iommu_instructions() {
   say "  $param iommu=pt"
   say "Optional stability workaround for USB/xHCI crashes/freezes (only if needed):"
   say "  usbcore.autosuspend=-1 pcie_aspm=off"
+  say "Optional AMD-specific workarounds for PCIe dropouts / reset failures / bus cascades (only if guest GPU is AMD):"
+  say "  amdgpu.runpm=0"
+  say "    - Disables AMD GPU runtime power management (D0/D3 transitions)."
+  say "    - This is a workaround, not a solution; it increases idle power usage."
+  say "  amdgpu.noretry=0"
+  say "    - Disables GPU-initiated PCIe transaction retry loops."
+  say "    - Can prevent a wedged GPU from locking the shared PCIe bus and cascading to xHCI/USB/audio devices."
   say "Advanced (usually NOT recommended): pcie_acs_override=downstream,multifunction"
   say "  - Only consider this if your IOMMU groups are not isolated."
   say "  - It can reduce PCIe isolation and may cause instability on some systems."
@@ -6643,7 +6736,43 @@ grub_add_kernel_params() {
     new="$(add_param_once "$new" "video=vesafb:off")"
     new="$(add_param_once "$new" "initcall_blacklist=sysfb_init")"
   else
-    note "Leaving framebuffer parameters unchanged. If you later hit black screens at VM start, rerun and enable this option."
+    note "Keeping existing framebuffer parameters unchanged. If you later hit black screens at VM start, rerun and enable this option."
+  fi
+
+  # Optional: AMD GPU stability workarounds (GRUB).
+  # These address two different AMD GPU instability paths observed under VFIO:
+  # 1) Runtime PM (D0<->D3 transitions) causing PCIe link dropouts / reset failures.
+  # 2) GPU-initiated PCIe transaction retry loops wedging the shared bus and
+  #    cascading to other devices (xHCI death, USB disconnect storms, audio).
+  # This is AMD-specific and only offered when the guest GPU vendor is AMD.
+  if [[ -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
+    say
+    hdr "AMD GPU stability workarounds (optional)"
+    note "These parameters address two different AMD GPU instability paths that can cascade to PCIe bus hangs (for example xHCI host controller death or USB disconnect storms)."
+    note ""
+    note "1) amdgpu.runpm=0  — disables runtime power management (D0<->D3 transitions)."
+    note "   What it does: prevents the GPU from entering low-power D-states automatically."
+    note "   Why it can help: aggressive power-state transitions are a frequent trigger for PCIe link dropouts and reset failures on some AMD cards under VFIO."
+    note ""
+    note "2) amdgpu.noretry=0 — disables GPU-initiated PCIe transaction retry loops."
+    note "   What it does: allows the driver to retry instead of the hardware, which can prevent a wedged GPU from locking up the shared PCIe bus."
+    note "   Why it can help: if the driver reports 'amdgpu: device lost from bus' or 'Pageflip timed out', the GPU may be retrying PCIe transactions indefinitely, which can cascade and kill other devices on the same bus (xHCI, USB, audio)."
+    note ""
+    note "Important: these are WORKAROUNDS, not solutions. They may reduce or eliminate symptoms, but they will NOT fix BIOS/firmware bugs, ReBAR quirks, or fundamental IOMMU group problems."
+    note "Trade-off: amdgpu.runpm=0 increases idle power usage and heat because the GPU stays at full power."
+    note "If your AMD guest GPU works reliably without these, leaving the defaults enabled is preferred for lower power usage."
+    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" ]]; then
+      note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
+      [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.runpm=0")"
+      [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.noretry=0")"
+    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" ]]; then
+      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry)."
+    elif prompt_yn "Add amdgpu.runpm=0 and amdgpu.noretry=0 to GRUB kernel parameters for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+      new="$(add_param_once "$new" "amdgpu.runpm=0")"
+      new="$(add_param_once "$new" "amdgpu.noretry=0")"
+    else
+      note "Skipping AMD GPU stability parameters. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
+    fi
   fi
  
   # Optional: disable SELinux/AppArmor on GRUB-based systems as
@@ -11325,6 +11454,8 @@ reset_vfio_all() {
     new="$(remove_param_all "$new" "video=efifb:off")"
     new="$(remove_param_all "$new" "video=vesafb:off")"
     new="$(remove_param_all "$new" "initcall_blacklist=sysfb_init")"
+    new="$(remove_param_all "$new" "amdgpu.runpm=0")"
+    new="$(remove_param_all "$new" "amdgpu.noretry=0")"
 
     if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
       grub_write_cmdline_in_place "$key" "$new"
@@ -11371,6 +11502,8 @@ reset_vfio_all() {
     knew="$(remove_param_all "$knew" "video=efifb:off")"
     knew="$(remove_param_all "$knew" "video=vesafb:off")"
     knew="$(remove_param_all "$knew" "initcall_blacklist=sysfb_init")"
+    knew="$(remove_param_all "$knew" "amdgpu.runpm=0")"
+    knew="$(remove_param_all "$knew" "amdgpu.noretry=0")"
     if ! cmdline_get_key_value_token "$knew" "root" >/dev/null 2>&1; then
       local reset_recovered_opts reset_recovered_cmdline reset_recovered_root_tok
       reset_recovered_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"

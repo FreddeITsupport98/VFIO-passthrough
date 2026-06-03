@@ -1,5 +1,17 @@
 # Changelog
 ## Unreleased
+- 2026-06-03 19:21 UTC: Added CLI override flags for AMD GPU stability workarounds in `vfio.sh`:
+  - new flags: `--amd-runpm`, `--no-amd-runpm`, `--amd-noretry`, `--no-amd-noretry`,
+  - allow non-interactive install-mode re-runs by forcing or skipping the AMD workaround prompts,
+  - overrides are respected in GRUB, openSUSE BLS persistence, and generic systemd-boot paths,
+  - updated usage/help, fish/bash/zsh completions, and all three bootloader flow blocks.
+- 2026-06-03 19:16 UTC: Added AMD GPU stability workarounds (`amdgpu.runpm=0`, `amdgpu.noretry=0`) to install and reset flows in `vfio.sh`:
+  - offered interactively in GRUB, openSUSE BLS persistence, and generic systemd-boot paths when guest GPU vendor is AMD (`1002`),
+  - parameters are removed during `--reset` for both classic GRUB and openSUSE `/etc/kernel/cmdline` paths,
+  - detailed explanations explain what each parameter does, why it helps, and that these are **workarounds not solutions**,
+  - includes trade-off warnings (higher idle power/heat for `amdgpu.runpm=0`, and PCIe retry-loop behavior change for `amdgpu.noretry=0`),
+  - added to `print_manual_iommu_instructions()` for unsupported bootloaders,
+  - updated regression script assertions where applicable.
 - 2026-04-01 20:09 UTC: Clarified USB mitigation hard-block UX messaging in `vfio.sh`:
   - hard-block interactive flow now explicitly warns that active `authorized=0` state blocks matched devices from VM USB passthrough attach,
   - added explicit rationale text that hard-block exists as a last-resort fallback when detach-only mitigation cannot stop unstable USB reset/timeout loops,

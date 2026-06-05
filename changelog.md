@@ -1,5 +1,14 @@
 # Changelog
 ## Unreleased
+- 2026-06-05 19:04 UTC: Added Fedora-specific CachyOS kernel prompt for ACS override support in `vfio.sh`:
+  - detects Fedora-like systems via `/etc/os-release` `ID`/`ID_LIKE` (`fedora*`, `rhel*`) and `dnf` availability,
+  - only triggers for AMD guest GPUs (`1002`) when the guest GPU is not already bound to `vfio-pci`,
+  - checks if `pcie_acs_override` is already active in the running kernel or if the CachyOS kernel is already installed/running (`*cachyos*`),
+  - explains that the stock Fedora kernel does NOT include the ACS override patch, which can cause IOMMU group sharing and PCIe instability during long VFIO passthrough sessions (USB/xHCI crashes),
+  - offers to install `kernel-cachyos` + `kernel-cachyos-devel-matched` from the `bieszczaders/kernel-cachyos` COPR,
+  - defaults to `Y` when the guest GPU is currently driven by `amdgpu`, otherwise defaults to `N`,
+  - added `fedora_like_detection_reason()`, `is_fedora_like()`, and `maybe_offer_fedora_cachyos_kernel()` helpers,
+  - call site placed after `maybe_offer_kernel_longterm()` in the install flow so both openSUSE and Fedora kernel offers can coexist independently.
 - 2026-06-03 19:21 UTC: Added CLI override flags for AMD GPU stability workarounds in `vfio.sh`:
   - new flags: `--amd-runpm`, `--no-amd-runpm`, `--amd-noretry`, `--no-amd-noretry`,
   - allow non-interactive install-mode re-runs by forcing or skipping the AMD workaround prompts,

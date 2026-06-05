@@ -4047,6 +4047,84 @@ maybe_offer_kernel_longterm() {
   fi
 }
 
+# On Fedora systems, the stock Fedora kernel does not ship the ACS override patch.
+# This means pcie_acs_override=downstream,multifunction is silently ignored,
+# which can leave the guest GPU in the same IOMMU group as other devices (for
+# example the PCIe bridge or xHCI controller). Under sustained VFIO passthrough
+# load this can destabilize the shared PCIe root complex and cause USB/xHCI
+# crashes after long VM sessions. The CachyOS kernel (available via the
+# bieszczaders/kernel-cachyos COPR) includes ACS override support and has been
+# observed to properly isolate devices. This helper does NOT force a kernel
+# switch automatically, but offers to install the CachyOS kernel so the user can
+# choose that entry at boot.
+maybe_offer_fedora_cachyos_kernel() {
+  local guest_vendor_b10="$1" guest_gpu_bdf="$2"
+
+  # Only relevant on Fedora-like systems using dnf.
+  if ! is_fedora_like; then
+    return 0
+  fi
+  if ! have_cmd dnf; then
+    return 0
+  fi
+
+  # Only makes sense for AMD guest GPUs (the most common scenario where ACS
+  # override is needed on consumer AMD platforms).
+  if [[ "${guest_vendor_b10,,}" != "1002" ]]; then
+    return 0
+  fi
+
+  # If the guest GPU is already bound to vfio-pci on this boot, there is no
+  # need to suggest an alternative kernel.
+  if [[ "$(bdf_driver_name "$guest_gpu_bdf")" == "vfio-pci" ]]; then
+    return 0
+  fi
+
+  # If pcie_acs_override is already active in the running kernel, nothing
+  # to do.
+  if grep -q 'pcie_acs_override' /proc/cmdline 2>/dev/null; then
+    return 0
+  fi
+
+  # If the CachyOS kernel is already installed, nothing to do.
+  if rpm -q kernel-cachyos >/dev/null 2>&1; then
+    return 0
+  fi
+  # Also check if the running kernel already is a CachyOS kernel.
+  local krel="$(uname -r)"
+  if [[ "$krel" == *cachyos* ]]; then
+    return 0
+  fi
+
+  say
+  hdr "Optional: install CachyOS kernel for ACS override support"
+  note "The stock Fedora kernel does NOT include the ACS override patch."
+  note "When pcie_acs_override=downstream,multifunction is present in the kernel cmdline but the patch is missing, the parameter is silently ignored."
+  note "This can leave the guest GPU in the same IOMMU group as other devices (for example the PCIe bridge or xHCI controller), which may destabilize the shared PCIe root complex during long VFIO passthrough sessions and cause USB/xHCI crashes."
+  note "The CachyOS kernel (package: kernel-cachyos, COPR: bieszczaders/kernel-cachyos) includes ACS override support and has been observed to properly isolate devices into separate IOMMU groups."
+  note "Installing kernel-cachyos keeps your current kernel installed; at boot you can pick either the default Fedora kernel or the CachyOS kernel from the menu."
+
+  # If we detect that the guest GPU is still owned by amdgpu right now,
+  # strongly suggest installing the CachyOS kernel by making YES the
+  # default answer. Otherwise keep it as an opt-in.
+  local def="N"
+  if [[ "$(bdf_driver_name "$guest_gpu_bdf")" == "amdgpu" ]]; then
+    def="Y"
+    note "Right now the guest GPU ($guest_gpu_bdf) is driven by amdgpu; installing the CachyOS kernel is RECOMMENDED so vfio-pci can reliably bind it with proper IOMMU isolation."
+  else
+    note "If you later find that amdgpu still owns the guest GPU after enabling VFIO, or you experience USB/xHCI instability after long VM sessions, consider installing the CachyOS kernel manually:"
+    note "  sudo dnf copr enable bieszczaders/kernel-cachyos"
+    note "  sudo dnf install kernel-cachyos kernel-cachyos-devel-matched"
+  fi
+
+  if prompt_yn "Install the CachyOS kernel (kernel-cachyos) now via dnf from COPR bieszczaders/kernel-cachyos (optional, safe alongside the current kernel)?" "$def" "Kernel (optional)"; then
+    run dnf -y copr enable bieszczaders/kernel-cachyos || \
+      note "COPR enable failed; you can enable manually later with: sudo dnf copr enable bieszczaders/kernel-cachyos"
+    run dnf -y install kernel-cachyos kernel-cachyos-devel-matched || \
+      note "kernel-cachyos install via dnf failed; you can install it manually later with: sudo dnf install kernel-cachyos kernel-cachyos-devel-matched"
+  fi
+}
+
 install_dracut_config() {
   # Only applies on dracut-based systems.
   [[ -d /etc/dracut.conf.d ]] || return 0
@@ -4588,6 +4666,37 @@ opensuse_like_detection_reason() {
 # Return 0 if this looks like an openSUSE-like system (used to gate /etc/kernel/cmdline edits).
 is_opensuse_like() {
   opensuse_like_detection_reason >/dev/null
+}
+
+# Diagnostic string for Fedora-family detection used by --detect.
+# Example outputs:
+#   yes (ID=fedora matched fedora*)
+#   yes (ID_LIKE token rhel matched rhel*)
+#   no (ID=debian; ID_LIKE=debian)
+fedora_like_detection_reason() {
+  local pair os_id os_like tok
+  pair="$(os_release_id_and_like)"
+  os_id="${pair%%$'\t'*}"
+  os_like="${pair#*$'\t'}"
+  [[ "$os_like" == "$pair" ]] && os_like=""
+
+  if [[ "${os_id,,}" == fedora* ]]; then
+    printf 'yes (ID=%s matched fedora*)\n' "${os_id:-<empty>}"
+    return 0
+  fi
+  for tok in $os_like; do
+    if [[ "${tok,,}" == fedora* || "${tok,,}" == rhel* ]]; then
+      printf 'yes (ID_LIKE token %s matched fedora|rhel*)\n' "$tok"
+      return 0
+    fi
+  done
+  printf 'no (ID=%s; ID_LIKE=%s)\n' "${os_id:-<empty>}" "${os_like:-<empty>}"
+  return 1
+}
+
+# Return 0 if this looks like a Fedora-like system (used to gate CachyOS kernel offers).
+is_fedora_like() {
+  fedora_like_detection_reason >/dev/null
 }
 
 # Locate the systemd-boot / BLS entries directory (if any).
@@ -12162,6 +12271,13 @@ apply_configuration() {
   # current boot still shows amdgpu as the active driver for the guest
   # BDF, and in that case we default the prompt to YES.
   maybe_offer_kernel_longterm "$guest_vendor" "$guest_gpu"
+
+  # Optional: on Fedora offer to install the CachyOS kernel from COPR.
+  # The stock Fedora kernel does not include the ACS override patch, which
+  # can cause IOMMU group sharing and PCIe instability during long VFIO
+  # passthrough sessions. The CachyOS kernel includes this patch and has
+  # been observed to properly isolate devices.
+  maybe_offer_fedora_cachyos_kernel "$guest_vendor" "$guest_gpu"
 
   # EXTRA (advanced, openSUSE-only): if kernel-longterm is installed,
   # offer to UNINSTALL the default kernel package so only the long-term

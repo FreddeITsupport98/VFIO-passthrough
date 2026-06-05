@@ -4091,7 +4091,8 @@ maybe_offer_fedora_cachyos_kernel() {
     return 0
   fi
   # Also check if the running kernel already is a CachyOS kernel.
-  local krel="$(uname -r)"
+  local krel
+  krel="$(uname -r)"
   if [[ "$krel" == *cachyos* ]]; then
     return 0
   fi

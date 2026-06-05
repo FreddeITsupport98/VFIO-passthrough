@@ -1,5 +1,13 @@
 # Changelog
 ## Unreleased
+- 2026-06-05 20:16 UTC: Added USB mitigation reset-counter and `--usb-mitigation-status` reporting mode in `vfio.sh`:
+  - new constant `USB_BT_STATE_FILE="/var/lib/vfio-usb-bt-mitigation.state"` for persistent state tracking,
+  - generated `vfio-usb-bluetooth.sh` now writes a state entry (`timestamp=<ISO> mode=<disable|enable> targets=<bus-port:vid:pid,...>`) on every disable/enable run,
+  - new `usb_bt_mitigation_status()` function aggregates total runs, per-device counts, and last-run timestamp from the state file,
+  - kernel log scan (journalctl/dmesg) counts USB reset/timeout/enumeration/disconnect markers and prints a graded summary (`OK`/`WARN`),
+  - CLI parser and main dispatch now recognize `--usb-mitigation-status` as a dry-run reporting mode,
+  - updated usage/help, fish/bash/zsh completions, and `reset_usb_mitigation_only()` cleanup to include `USB_BT_STATE_FILE`,
+  - added `regression/usb-mitigation-status-regression.sh` with coverage for state-file parsing, missing-file handling, CLI dispatch, generated helper format, and reset-cleanup removal.
 - 2026-06-05 19:04 UTC: Added Fedora-specific CachyOS kernel prompt for ACS override support in `vfio.sh`:
   - detects Fedora-like systems via `/etc/os-release` `ID`/`ID_LIKE` (`fedora*`, `rhel*`) and `dnf` availability,
   - only triggers for AMD guest GPUs (`1002`) when the guest GPU is not already bound to `vfio-pci`,

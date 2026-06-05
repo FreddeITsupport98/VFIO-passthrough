@@ -35,6 +35,7 @@ USB_BT_SCRIPT="/usr/local/sbin/vfio-usb-bluetooth.sh"
 USB_BT_SYSTEMD_UNIT="/etc/systemd/system/vfio-disable-usb-bluetooth.service"
 USB_BT_UDEV_RULE="/etc/udev/rules.d/99-vfio-disable-usb-bluetooth.rules"
 USB_BT_MATCH_CONF="/etc/vfio-usb-bluetooth-match.conf"
+USB_BT_STATE_FILE="/var/lib/vfio-usb-bt-mitigation.state"
 LIGHTDM_FALLBACK_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-greeter-fallback.conf"
 XORG_HOST_GPU_CONF="/etc/X11/xorg.conf.d/20-vfio-host-gpu.conf"
 LIGHTDM_HOST_GPU_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf"
@@ -47,7 +48,7 @@ DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | disable-bootlog | install-bootlog | install-graphics-daemon | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -632,6 +633,7 @@ complete -c $cmd -l remove-bootlog -d 'Alias of --disable-bootlog'
 complete -c $cmd -l install-bootlog -d 'Install/reinstall only optional VFIO boot-log dumper'
 complete -c $cmd -l install-graphics-daemon -d 'Install/reinstall only VFIO graphics protocol daemon'
 complete -c $cmd -l install-usb-bt-mitigation -d 'Install only optional USB Bluetooth mitigation'
+complete -c $cmd -l usb-mitigation-status -d 'Show USB mitigation run counts and instability markers'
 complete -c $cmd -l print-fish-completion -d 'Print fish completion script'
 complete -c $cmd -l print-bash-completion -d 'Print bash completion script'
 complete -c $cmd -l print-zsh-completion -d 'Print zsh completion script'
@@ -647,7 +649,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -714,7 +716,8 @@ _vfio_sh_complete() {
     '--remove-bootlog[Alias of --disable-bootlog]' \
     '--install-bootlog[Install/reinstall only optional VFIO boot-log dumper]' \\
     '--install-graphics-daemon[Install/reinstall only VFIO graphics protocol daemon]' \\
-    '--install-usb-bt-mitigation[Install only optional USB Bluetooth mitigation]' \\
+    '--install-usb-bt-mitigation[Install only optional USB Bluetooth mitigation]' \
+    '--usb-mitigation-status[Show USB mitigation run counts and instability markers]' \\
     '--print-fish-completion[Print fish completion script]' \\
     '--print-bash-completion[Print bash completion script]' \\
     '--print-zsh-completion[Print zsh completion script]'
@@ -1312,7 +1315,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1376,6 +1379,9 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev).
                    Default behavior detaches USB Bluetooth adapters from host drivers while keeping devices VM-pass-through eligible.
                    Advanced behavior (MATCH_MODE=include_only with INCLUDE_IDS) can also detach explicitly selected non-Bluetooth USB IDs.
+  --usb-mitigation-status
+                   Show USB mitigation run counts and per-device kernel reset/timeout/unusual event counters.
+                   Reads the mitigation state file and scans recent kernel logs for USB instability markers.
   --print-fish-completion
                    Print fish completion script to stdout (no install required).
                    Example: source ($SCRIPT_NAME --print-fish-completion)
@@ -1554,6 +1560,9 @@ parse_args() {
       --install-usb-bt-mitigation)
         MODE="install-usb-bt-mitigation"
         ;;
+      --usb-mitigation-status)
+        MODE="usb-mitigation-status"
+        ;;
       --print-fish-completion)
         MODE="print-fish-completion"
         ;;
@@ -1575,7 +1584,7 @@ parse_args() {
   done
 
   # verify/detect/self-test/print-effective-config/completion modes imply dry-run
-  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "debug-cmdline-tokens" || "$MODE" == "verify-bls-sync" || "$MODE" == "verify-bls-nosnapper" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" || "$MODE" == "print-fish-completion" || "$MODE" == "print-bash-completion" || "$MODE" == "print-zsh-completion" ]]; then
+  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "debug-cmdline-tokens" || "$MODE" == "verify-bls-sync" || "$MODE" == "verify-bls-nosnapper" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" || "$MODE" == "print-fish-completion" || "$MODE" == "print-bash-completion" || "$MODE" == "print-zsh-completion" || "$MODE" == "usb-mitigation-status" ]]; then
     DRY_RUN=1
   fi
 
@@ -8218,6 +8227,99 @@ EOF
 
   say "Installed udev isolation rules to prevent the host UI from grabbing the guest GPU (and HDMI audio, if selected)."
 }
+usb_bt_mitigation_status() {
+  hdr "USB Mitigation Status"
+  local state_file="$USB_BT_STATE_FILE"
+
+  if [[ -f "$state_file" ]]; then
+    local total_runs=0
+    local last_run=""
+    local -A run_counts=()
+    local line ts mode targets
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      ts="$(printf "%s" "$line" | sed -n 's/^timestamp=\([^ ]*\) mode=.*/\1/p')"
+      mode="$(printf "%s" "$line" | sed -n 's/.*mode=\([^ ]*\) targets=.*/\1/p')"
+      targets="$(printf "%s" "$line" | sed -n 's/.*targets=\(.*\)/\1/p')"
+      [[ -n "$ts" ]] && last_run="$ts"
+      total_runs=$((total_runs + 1))
+      local dev_id
+      for dev_id in $(printf "%s" "$targets" | tr ',' '\n'); do
+        [[ -n "$dev_id" ]] || continue
+        run_counts["$dev_id"]=$((${run_counts[$dev_id]:-0} + 1))
+      done
+    done <"$state_file"
+
+    say "Mitigation state file: $state_file"
+    say "Total recorded runs: $total_runs"
+    [[ -n "$last_run" ]] && say "Last run: $last_run"
+    say
+
+    if (( ${#run_counts[@]} > 0 )); then
+      hdr "Per-device mitigation run counts"
+      local dev_id count
+      for dev_id in "${!run_counts[@]}"; do
+        count="${run_counts[$dev_id]}"
+        if (( ENABLE_COLOR )); then
+          say "  ${C_CYAN}$dev_id${C_RESET}: $count run(s)"
+        else
+          say "  $dev_id: $count run(s)"
+        fi
+      done
+    fi
+  else
+    note "No mitigation state file found ($state_file). Run the mitigation at least once to collect data."
+  fi
+
+  say
+  hdr "Recent kernel USB instability markers"
+  if ! have_cmd journalctl; then
+    note "journalctl not available; skipping kernel log scan."
+    return 0
+  fi
+
+  local log_data reset_count timeout_count enum_err_count disconnect_count
+  log_data="$(journalctl -k -b --no-pager 2>/dev/null || true)"
+  if [[ -z "$log_data" ]] && have_cmd dmesg; then
+    log_data="$(dmesg 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$log_data" ]]; then
+    note "No kernel log data available."
+    return 0
+  fi
+
+  reset_count="$(awk 'BEGIN{IGNORECASE=1} /reset (high-speed|full-speed|SuperSpeed) USB device/ {c++} END{print c+0}' <<<"$log_data")"
+  timeout_count="$(awk 'BEGIN{IGNORECASE=1} /tx timeout|Read reg16 failed|command 0x[0-9a-f]+ tx timeout/ {c++} END{print c+0}' <<<"$log_data")"
+  enum_err_count="$(awk 'BEGIN{IGNORECASE=1} /unable to enumerate USB device|device descriptor read\/64|can.t set config|can.t set address|over-current/ {c++} END{print c+0}' <<<"$log_data")"
+  disconnect_count="$(awk 'BEGIN{IGNORECASE=1} /USB disconnect, device number/ {c++} END{print c+0}' <<<"$log_data")"
+
+  print_kv "USB resets" "$reset_count"
+  print_kv "BT/USB timeouts" "$timeout_count"
+  print_kv "Enumeration errors" "$enum_err_count"
+  print_kv "Disconnect events" "$disconnect_count"
+
+  local score=0
+  if (( reset_count > 0 || timeout_count > 0 || enum_err_count > 0 || disconnect_count >= 8 )); then
+    score=1
+  fi
+
+  if (( score > 0 )); then
+    if (( ENABLE_COLOR )); then
+      say "${C_YELLOW}WARN${C_RESET}: Unstable USB devices detected; consider mitigation or EEE-off tuning."
+    else
+      say "WARN: Unstable USB devices detected; consider mitigation or EEE-off tuning."
+    fi
+  else
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}OK${C_RESET}: No obvious USB instability markers in current boot."
+    else
+      say "OK: No obvious USB instability markers in current boot."
+    fi
+  fi
+}
+
+
 usb_bt_mitigation_explain() {
   note "This optional feature targets USB Bluetooth timeout/reset storms that can destabilize other USB devices and hurt passthrough stability."
   note
@@ -9914,6 +10016,7 @@ USB_BT_HARD_BLOCK="0"
 USB_BT_HARD_BLOCK_IDS=""
 USB_ETHERNET_EEE_OFF="0"
 USB_ETHERNET_EEE_IDS=""
+STATE_FILE="/var/lib/vfio-usb-bt-mitigation.state"
 if [[ -r "$MATCH_CONF" ]]; then
   # shellcheck disable=SC1091
   source "$MATCH_CONF"
@@ -10193,6 +10296,8 @@ intf_enable() {
 
 changed=0
 policy_target_found=0
+target_count=0
+target_devices=""
 for dev in /sys/bus/usb/devices/*; do
   [[ -f "$dev/idVendor" && -f "$dev/idProduct" ]] || continue
   if device_matches_policy "$dev"; then
@@ -10238,6 +10343,8 @@ for dev in /sys/bus/usb/devices/*; do
       done
       shopt -u nullglob
       echo "vfio-usb-bluetooth: ${MODE}d $(basename "$dev") (${vid}:${pid}) mode=${MATCH_MODE} scope=${target_scope} hard_block=${hard_block_state}"
+      target_count=$((target_count + 1))
+      target_devices+="${target_devices:+,}$(basename "$dev"):${vid}:${pid}"
       changed=1
     fi
   fi
@@ -10254,6 +10361,12 @@ fi
 
 if (( ! changed )); then
   echo "vfio-usb-bluetooth: no matching USB mitigation targets found"
+fi
+# Write state file for run tracking
+if [[ -n "$target_devices" ]]; then
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+  printf "timestamp=%s mode=%s targets=%s
+" "$(date -Is)" "$MODE" "$target_devices" >>"$STATE_FILE" 2>/dev/null || true
 fi
 EOF
   then
@@ -11746,7 +11859,7 @@ reset_usb_mitigation_only() {
     run systemctl daemon-reload 2>/dev/null || true
   fi
 
-  run rm -f "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF" 2>/dev/null || true
+  run rm -f "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF" "$USB_BT_STATE_FILE" 2>/dev/null || true
   if have_cmd udevadm; then
     run udevadm control --reload-rules 2>/dev/null || true
     run udevadm trigger --subsystem-match=usb 2>/dev/null || true
@@ -12807,6 +12920,11 @@ main() {
     else
       die "Aborted by user"
     fi
+    exit 0
+  fi
+
+  if [[ "$MODE" == "usb-mitigation-status" ]]; then
+    usb_bt_mitigation_status
     exit 0
   fi
 

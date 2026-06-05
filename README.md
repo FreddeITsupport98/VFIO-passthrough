@@ -181,7 +181,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
 
 ### Common flags
@@ -365,6 +365,20 @@ The script supports several modes controlled by flags. By default, without any f
     - If a non-default policy already exists, reruns ask whether to reconfigure; declining keeps existing config and skips the picker.
   - Safety interlock:
     - If storage-marked entries are not excluded, the picker requires an explicit danger confirmation before continuing.
+
+- `--usb-mitigation-status`
+  - Prints a read-only status report for the USB Bluetooth mitigation system.
+  - Reads the persistent state file at `/var/lib/vfio-usb-bt-mitigation.state` (written by the generated `vfio-usb-bluetooth.sh` helper on each disable/enable run).
+  - Report contents:
+    - Total mitigation runs (aggregated across all recorded entries).
+    - Per-device run counts and last-run timestamp.
+    - Kernel log scan for USB instability markers (resets, timeouts, enumeration errors, disconnect events) using `journalctl -k -b` with `dmesg` fallback.
+  - Grading:
+    - `OK` when no USB instability markers are detected.
+    - `WARN` when markers are found but no hard errors are present.
+    - Each section includes explicit `WARN`/`OK` labels so the report is scannable at a glance.
+  - Exit code is always `0` for this reporting mode; it is purely informational.
+  - This mode is treated as a dry-run: no files are written and no system state is modified.
 
 - `--print-fish-completion`
   - Prints fish completions to stdout without installing files.

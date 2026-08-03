@@ -488,6 +488,113 @@ else
   bad "Q3i2 explicit override did not allow (got: $resE)"
 fi
 
+# --- Smoke Q3l: libvirt_runtime_ok + _libvirt_unit_to_start logic ---
+# Inline the exact helper logic and drive it with fake virsh/systemctl binaries
+# whose behavior is controlled by env vars (mirrors how R6/R9/B2 smoke cases
+# exercise logic shape with mocked binaries).
+lvfake="$tmp/fakelvbin"
+mkdir -p "$lvfake"
+cat > "$lvfake/virsh" <<'VEOF'
+#!/usr/bin/env bash
+# Only the exact call we test: `virsh -c qemu:///system list`.
+if [[ "${VIRSH_OK:-0}" == "1" ]]; then
+  exit 0
+fi
+exit 1
+VEOF
+cat > "$lvfake/systemctl" <<'SEOF'
+#!/usr/bin/env bash
+case "$1" in
+  is-active)
+    # Args: is-active --quiet <unit>
+    unit="$3"
+    case "$unit" in
+      libvirtd)          [[ "${LIBVIRTD_ACTIVE:-0}" == "1" ]] && exit 0 || exit 3 ;;
+      virtqemud)         [[ "${VIRTQEMUD_ACTIVE:-0}" == "1" ]] && exit 0 || exit 3 ;;
+      libvirtd.socket)   [[ "${LIBVIRTD_SOCKET_ACTIVE:-0}" == "1" ]] && exit 0 || exit 3 ;;
+      virtqemud.socket)  [[ "${VIRTQEMUD_SOCKET_ACTIVE:-0}" == "1" ]] && exit 0 || exit 3 ;;
+      *) exit 3 ;;
+    esac
+    ;;
+  list-unit-files)
+    [[ "${LIST_VIRTQEMUD:-0}" == "1" ]] && echo "virtqemud.service   enabled"
+    [[ "${LIST_LIBVIRTD:-0}" == "1" ]]   && echo "libvirtd.service    enabled"
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+SEOF
+chmod +x "$lvfake/virsh" "$lvfake/systemctl"
+
+cat > "$tmp/smoke_lvok.sh" <<'LEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+libvirt_runtime_ok() {
+  if command -v virsh >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      if timeout 10 virsh -c qemu:///system list >/dev/null 2>&1; then
+        return 0
+      fi
+    elif virsh -c qemu:///system list >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet libvirtd 2>/dev/null \
+      || systemctl is-active --quiet virtqemud 2>/dev/null \
+      || systemctl is-active --quiet libvirtd.socket 2>/dev/null \
+      || systemctl is-active --quiet virtqemud.socket 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+_libvirt_unit_to_start() {
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^virtqemud\.service'; then
+      echo "virtqemud"
+      return 0
+    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^libvirtd\.service'; then
+      echo "libvirtd"
+      return 0
+    fi
+  fi
+  return 1
+}
+mode="$1"
+case "$mode" in
+  runtime_ok)
+    if libvirt_runtime_ok; then echo "OK"; else echo "NOT_OK"; fi
+    ;;
+  unit)
+    if u="$(_libvirt_unit_to_start 2>/dev/null)"; then echo "$u"; else echo "NONE"; fi
+    ;;
+esac
+LEOF
+
+# Case 1: virsh can connect -> OK (end-to-end path)
+r1="$(PATH="$lvfake:$PATH" VIRSH_OK=1 bash "$tmp/smoke_lvok.sh" runtime_ok)"
+if [[ "$r1" == "OK" ]]; then ok "Q3l libvirt_runtime_ok OK when virsh connects (VIRSH_OK=1)"; else bad "Q3l virsh-connect path failed (got: $r1)"; fi
+# Case 2: virsh fails, virtqemud.socket active -> OK (socket-activated)
+r2="$(PATH="$lvfake:$PATH" VIRSH_OK=0 VIRTQEMUD_SOCKET_ACTIVE=1 bash "$tmp/smoke_lvok.sh" runtime_ok)"
+if [[ "$r2" == "OK" ]]; then ok "Q3l libvirt_runtime_ok OK for socket-activated virtqemud.socket"; else bad "Q3l socket-activated path failed (got: $r2)"; fi
+# Case 3: virsh fails, all inactive -> NOT_OK
+r3="$(PATH="$lvfake:$PATH" VIRSH_OK=0 bash "$tmp/smoke_lvok.sh" runtime_ok)"
+if [[ "$r3" == "NOT_OK" ]]; then ok "Q3l libvirt_runtime_ok NOT_OK when nothing active"; else bad "Q3l nothing-active path returned OK (got: $r3)"; fi
+# Case 4: virsh fails, libvirtd.service active -> OK via is-active fallback
+r4="$(PATH="$lvfake:$PATH" VIRSH_OK=0 LIBVIRTD_ACTIVE=1 bash "$tmp/smoke_lvok.sh" runtime_ok)"
+if [[ "$r4" == "OK" ]]; then ok "Q3l libvirt_runtime_ok OK via libvirtd is-active fallback"; else bad "Q3l libvirtd-active fallback failed (got: $r4)"; fi
+# Case 5: unit detection prefers virtqemud over libvirtd
+r5="$(PATH="$lvfake:$PATH" LIST_VIRTQEMUD=1 LIST_LIBVIRTD=1 bash "$tmp/smoke_lvok.sh" unit)"
+if [[ "$r5" == "virtqemud" ]]; then ok "Q3l _libvirt_unit_to_start prefers virtqemud"; else bad "Q3l unit detection did not prefer virtqemud (got: $r5)"; fi
+# Case 6: unit detection falls back to libvirtd when virtqemud absent
+r6="$(PATH="$lvfake:$PATH" LIST_VIRTQEMUD=0 LIST_LIBVIRTD=1 bash "$tmp/smoke_lvok.sh" unit)"
+if [[ "$r6" == "libvirtd" ]]; then ok "Q3l _libvirt_unit_to_start falls back to libvirtd"; else bad "Q3l unit fallback failed (got: $r6)"; fi
+# Case 7: neither unit listed -> NONE
+r7="$(PATH="$lvfake:$PATH" LIST_VIRTQEMUD=0 LIST_LIBVIRTD=0 bash "$tmp/smoke_lvok.sh" unit)"
+if [[ "$r7" == "NONE" ]]; then ok "Q3l _libvirt_unit_to_start returns NONE when no unit installed"; else bad "Q3l unit detection did not return NONE (got: $r7)"; fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

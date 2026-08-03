@@ -8704,6 +8704,53 @@ apply_binding_cmdline_change() {
   fi
 }
 
+# Returns 0 if libvirt is reachable for dynamic binding, 1 otherwise.
+# Robust to the classic monolithic libvirtd AND the modular virtqemud, and to
+# socket-activated setups where the .service stays inactive until first use (the
+# .socket is "active" while it is listening). Primary test: can virsh connect to
+# qemu:///system (root can always connect) — that is the actual end-to-end path
+# the libvirt qemu hook relies on. Fallback when virsh is absent: check the
+# daemon/socket units directly via systemctl is-active. Bounded by `timeout`
+# when available so a wedged libvirt cannot hang the wizard.
+libvirt_runtime_ok() {
+  if command -v virsh >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      if timeout 10 virsh -c qemu:///system list >/dev/null 2>&1; then
+        return 0
+      fi
+    elif virsh -c qemu:///system list >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet libvirtd 2>/dev/null \
+      || systemctl is-active --quiet virtqemud 2>/dev/null \
+      || systemctl is-active --quiet libvirtd.socket 2>/dev/null \
+      || systemctl is-active --quiet virtqemud.socket 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Detect which libvirt systemd unit to enable/start. Prefers the modular
+# virtqemud when its unit file exists (openSUSE / modern Fedora), else the
+# classic libvirtd. Prints the unit name (without .service) and returns 0, or
+# returns 1 if neither unit file is installed.
+_libvirt_unit_to_start() {
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^virtqemud\.service'; then
+      echo "virtqemud"
+      return 0
+    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^libvirtd\.service'; then
+      echo "libvirtd"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 install_dynamic_binding_from_existing_config() {
   readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run the full installer first."
 
@@ -8730,11 +8777,40 @@ install_dynamic_binding_from_existing_config() {
   note "  - The vfio-bind-selected-gpu.service unit (becomes a no-op at boot in dynamic mode)"
   say
 
+  # Libvirt presence + liveness check. Dynamic binding only works for
+  # libvirt-managed VMs: the qemu hook is invoked by libvirt, not by raw qemu.
+  # Stage 1: is any libvirt binary installed at all? (soft warning + continue.)
   if ! have_cmd libvirtd && ! have_cmd virtqemud && ! have_cmd virsh; then
     note "WARN: no libvirt daemon (libvirtd/virtqemud/virsh) detected."
     note "      Dynamic binding only works for libvirt-managed VMs."
     if ! prompt_yn "Continue anyway?" N "Dynamic binding"; then
       die "Aborted by user"
+    fi
+  elif ! libvirt_runtime_ok; then
+    # Stage 2: a libvirt binary is installed but no daemon/socket is reachable.
+    # This usually means the service was never enabled/started (common after a
+    # fresh libvirt install). Offer to fix it so the qemu hook actually fires
+    # when a VM starts; declining is non-fatal (user may start it manually).
+    note "WARN: libvirt is installed but no libvirt daemon/socket is active"
+    note "      (neither libvirtd nor virtqemud is running or socket-activated)."
+    note "      The qemu hook only fires if libvirt is running when a VM starts."
+    if prompt_yn "Enable + start the libvirt daemon now?" Y "Dynamic binding"; then
+      local _lv_unit
+      _lv_unit="$(_libvirt_unit_to_start || true)"
+      if [[ -n "$_lv_unit" ]]; then
+        run systemctl enable --now "$_lv_unit" 2>/dev/null || true
+        if libvirt_runtime_ok; then
+          say "libvirt daemon started ($_lv_unit)."
+        else
+          note "WARN: attempted to start $_lv_unit but libvirt is still not reachable."
+          note "      Start it manually (e.g. 'sudo systemctl enable --now $_lv_unit') before launching a VM."
+        fi
+      else
+        note "WARN: could not detect a libvirtd/virtqemud systemd unit to start."
+        note "      Start libvirt manually before launching a VM."
+      fi
+    else
+      note "libvirt not started; the qemu hook will not fire until libvirt is running."
     fi
   fi
 

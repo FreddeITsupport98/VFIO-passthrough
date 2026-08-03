@@ -661,6 +661,42 @@ else
   record_failure "Q3k install-early-binding calls install_bind_script"
 fi
 
+# --- Functional Q3l: libvirt liveness check in install-dynamic-binding ---
+# The dynamic-binding installer must verify libvirt is not merely installed but
+# actually reachable (running service OR socket-activated OR virsh can connect
+# to qemu:///system), and offer to start/enable it when a binary is present but
+# inactive. This catches the "virsh installed but libvirtd never enabled" case
+# where the qemu hook would silently never fire.
+assert_contains_file \
+  "Q3l libvirt_runtime_ok helper defined" \
+  "libvirt_runtime_ok()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3l _libvirt_unit_to_start helper defined" \
+  "_libvirt_unit_to_start()" \
+  "$VFIO_SCRIPT"
+_lv_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3l install-dynamic-binding calls libvirt_runtime_ok" \
+  "libvirt_runtime_ok" \
+  "$_lv_fn"
+assert_contains_text \
+  "Q3l install-dynamic-binding offers to start libvirt" \
+  "Enable + start the libvirt daemon now?" \
+  "$_lv_fn"
+assert_contains_text \
+  "Q3l install-dynamic-binding runs systemctl enable --now" \
+  "systemctl enable --now" \
+  "$_lv_fn"
+assert_contains_file \
+  "Q3l libvirt_runtime_ok tests virsh qemu:///system" \
+  'virsh -c qemu:///system list' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3l libvirt_runtime_ok checks socket-activated virtqemud.socket" \
+  "virtqemud.socket" \
+  "$VFIO_SCRIPT"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

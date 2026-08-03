@@ -170,13 +170,140 @@ else
   bad "fix #2 hook did not log failure / exit non-zero (got: $(printf '%s' "$out" | tr '\n' '|'))"
 fi
 
-# --- Smoke fix #5: reprobe_to_host leaves d3cold_allowed untouched ---
-# Strip comment lines so the explanatory comment (which mentions d3cold_allowed)
-# does not count as a write.
-if ! grep -Fq 'd3cold_allowed' <(sed -n '/^reprobe_to_host()/,/^}/p' "$tmp/gen_bind.sh" | grep -v '^[[:space:]]*#'); then
-  ok "fix #5 reprobe_to_host does not touch d3cold_allowed"
+# --- Smoke fix #5: reprobe_to_host d3cold write is opt-in guarded ---
+# reprobe_to_host now CAN write d3cold_allowed, but only inside the
+# VFIO_RESTORE_D3COLD_ON_RELEASE=1 guard. Verify the write is gated.
+_rep_body="$(sed -n '/^reprobe_to_host()/,/^}/p' "$tmp/gen_bind.sh" | grep -v '^[[:space:]]*#')"
+if grep -Fq 'VFIO_RESTORE_D3COLD_ON_RELEASE' <<<"$_rep_body" && grep -Fq 'echo 1 >"$sys/d3cold_allowed"' <<<"$_rep_body"; then
+  ok "fix #5 reprobe_to_host d3cold write is opt-in guarded"
 else
-  bad "fix #5 reprobe_to_host writes d3cold_allowed (should not)"
+  bad "fix #5 reprobe_to_host d3cold write not guarded by VFIO_RESTORE_D3COLD_ON_RELEASE"
+fi
+
+# --- Smoke R6: opt-in PCI reset gating (flag off -> no reset; flag on -> reset) ---
+rfake="$tmp/sysreset"
+mkdir -p "$rfake/0000:06:00.0"
+printf '0' > "$rfake/0000:06:00.0/reset"
+cat > "$tmp/smoke_reset.sh" <<'SEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sys="$SYSROOT/$DEV"
+if [[ "${VFIO_DYNAMIC_PCI_RESET:-0}" == "1" && -w "$sys/reset" ]]; then
+  echo 1 >"$sys/reset" 2>/dev/null || true
+fi
+SEOF
+VFIO_DYNAMIC_PCI_RESET=0 SYSROOT="$rfake" DEV="0000:06:00.0" bash "$tmp/smoke_reset.sh"
+if [[ "$(cat "$rfake/0000:06:00.0/reset")" == "0" ]]; then
+  ok "R6 reset NOT attempted when VFIO_DYNAMIC_PCI_RESET=0"
+else
+  bad "R6 reset attempted when flag off"
+fi
+VFIO_DYNAMIC_PCI_RESET=1 SYSROOT="$rfake" DEV="0000:06:00.0" bash "$tmp/smoke_reset.sh"
+if [[ "$(cat "$rfake/0000:06:00.0/reset")" == "1" ]]; then
+  ok "R6 reset attempted when VFIO_DYNAMIC_PCI_RESET=1 and reset file writable"
+else
+  bad "R6 reset not attempted when flag on"
+fi
+
+# --- Smoke R7: jlog routes unbind + verified messages to logger -t vfio-dynamic ---
+mkdir -p "$tmp/fakebin"
+cat > "$tmp/fakebin/logger" <<'LEOF'
+#!/usr/bin/env bash
+printf 'logger called: %s\n' "$*" >> "$LOGGER_REC"
+LEOF
+chmod +x "$tmp/fakebin/logger"
+cat > "$tmp/smoke_jlog.sh" <<'JEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+jlog() {
+  command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true
+}
+jlog "0000:06:00.0: unbind from amdgpu"
+jlog "0000:06:00.0: bound to vfio-pci (verified)"
+JEOF
+rm -f "$tmp/logger_rec"
+LOGGER_REC="$tmp/logger_rec" PATH="$tmp/fakebin:$PATH" bash "$tmp/smoke_jlog.sh"
+if grep -Fq 'logger called: -t vfio-dynamic -- 0000:06:00.0: unbind from amdgpu' "$tmp/logger_rec" 2>/dev/null \
+  && grep -Fq 'logger called: -t vfio-dynamic -- 0000:06:00.0: bound to vfio-pci (verified)' "$tmp/logger_rec" 2>/dev/null; then
+  ok "R7 jlog routes unbind + verified messages to logger -t vfio-dynamic"
+else
+  bad "R7 jlog did not route to logger (rec: $(cat "$tmp/logger_rec" 2>/dev/null | tr '\n' '|'))"
+fi
+
+# --- Smoke R8: actionable bind-failure error message ---
+if grep -Fq 'Next steps:' "$tmp/gen_bind.sh" \
+  && grep -Fq 'dmesg | tail -n 50' "$tmp/gen_bind.sh" \
+  && grep -Fq 'vfio.sh --install-early-binding' "$tmp/gen_bind.sh"; then
+  ok "R8 bind failure message has actionable next steps"
+else
+  bad "R8 bind failure message missing actionable next steps"
+fi
+
+# --- Smoke R9: bounded timeout around --bind-now (kills hung bind, passes fast) ---
+cat > "$tmp/fakebind.sh" <<'BEOF'
+#!/usr/bin/env bash
+sleep 3
+BEOF
+chmod +x "$tmp/fakebind.sh"
+cat > "$tmp/smoke_timeout.sh" <<'TEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+_bind_now() {
+  local _to="${VFIO_HOOK_BIND_TIMEOUT:-20}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_to" "$BIND_SCRIPT" --bind-now
+  else
+    "$BIND_SCRIPT" --bind-now
+  fi
+}
+if _bind_now; then
+  echo "rc=0"
+else
+  _rc=$?
+  echo "rc=$_rc"
+fi
+TEOF
+tout="$(VFIO_HOOK_BIND_TIMEOUT=1 BIND_SCRIPT="$tmp/fakebind.sh" bash "$tmp/smoke_timeout.sh" 2>&1 || true)"
+if [[ "$tout" == "rc=124" ]]; then
+  ok "R9 timeout kills a hung bind (rc=124)"
+else
+  bad "R9 timeout did not kill hung bind (got: $tout)"
+fi
+cat > "$tmp/fakebind_fast.sh" <<'BEOF'
+#!/usr/bin/env bash
+exit 0
+BEOF
+chmod +x "$tmp/fakebind_fast.sh"
+tout2="$(VFIO_HOOK_BIND_TIMEOUT=5 BIND_SCRIPT="$tmp/fakebind_fast.sh" bash "$tmp/smoke_timeout.sh" 2>&1 || true)"
+if [[ "$tout2" == "rc=0" ]]; then
+  ok "R9 timeout passes a fast bind (rc=0)"
+else
+  bad "R9 timeout broke a fast bind (got: $tout2)"
+fi
+
+# --- Smoke R10: opt-in d3cold restore on host rebind ---
+dfake="$tmp/sysd3cold"
+mkdir -p "$dfake/0000:06:00.0"
+printf '0' > "$dfake/0000:06:00.0/d3cold_allowed"
+cat > "$tmp/smoke_d3cold_restore.sh" <<'DEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+sys="$SYSROOT/$DEV"
+if [[ "${VFIO_RESTORE_D3COLD_ON_RELEASE:-0}" == "1" ]]; then
+  echo 1 >"$sys/d3cold_allowed" 2>/dev/null || true
+fi
+DEOF
+VFIO_RESTORE_D3COLD_ON_RELEASE=0 SYSROOT="$dfake" DEV="0000:06:00.0" bash "$tmp/smoke_d3cold_restore.sh"
+if [[ "$(cat "$dfake/0000:06:00.0/d3cold_allowed")" == "0" ]]; then
+  ok "R10 d3cold NOT restored when VFIO_RESTORE_D3COLD_ON_RELEASE=0"
+else
+  bad "R10 d3cold restored when flag off"
+fi
+VFIO_RESTORE_D3COLD_ON_RELEASE=1 SYSROOT="$dfake" DEV="0000:06:00.0" bash "$tmp/smoke_d3cold_restore.sh"
+if [[ "$(cat "$dfake/0000:06:00.0/d3cold_allowed")" == "1" ]]; then
+  ok "R10 d3cold restored when VFIO_RESTORE_D3COLD_ON_RELEASE=1"
+else
+  bad "R10 d3cold not restored when flag on"
 fi
 
 if (( fail != 0 )); then

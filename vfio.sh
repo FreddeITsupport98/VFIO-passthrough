@@ -4111,6 +4111,24 @@ VFIO_DYNAMIC_REBIND_HOST="0"
 # - 1: allow binding a Boot-VGA guest GPU at VM start (advanced single-GPU/headless setups
 #   where losing the host display during the VM session is intentional).
 VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
+# Dynamic-mode optional PCI function-level reset before bind (advanced):
+# - 0 (default): do NOT reset the device before binding. A reset on a healthy
+#   card is unnecessary, and on a mid-reset card it can worsen the state.
+# - 1: after unbind and before the vfio-pci bind, attempt writing 1 to
+#   /sys/bus/pci/devices/<BDF>/reset (only if the sysfs reset file is writable).
+#   This can clear residual amdgpu state on RX 9070 / RDNA4 that otherwise makes
+#   the first vfio-pci bind fail with "Unknown PCI header type 127". Enable only
+#   if you repeatedly hit bind failures after amdgpu teardown.
+VFIO_DYNAMIC_PCI_RESET="0"
+# Dynamic-mode d3cold_allowed restore on host rebind (advanced):
+# - 0 (default): keep d3cold_allowed=0 after --release even when
+#   VFIO_DYNAMIC_REBIND_HOST=1 rebinds the GPU to the host driver. The RX 9070 /
+#   RDNA4 reset bug means D3cold exit can drop the card off the bus on the host
+#   too, so D3cold stays disabled. Safer default.
+# - 1: restore d3cold_allowed=1 when handing the card back to the host, for lower
+#   host idle power between VM sessions. Only enable if you never hit the reset
+#   bug on the host.
+VFIO_RESTORE_D3COLD_ON_RELEASE="0"
 EOF
 }
 
@@ -7310,6 +7328,12 @@ die() {
   exit 1
 }
 
+# Best-effort journal tagging so the unbind -> bind -> verify sequence is traceable
+# in the system journal (journalctl -t vfio-dynamic). Failures to log are silent.
+jlog() {
+  command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true
+}
+
 [[ -f "$CONF_FILE" ]] || die "Missing $CONF_FILE"
 # shellcheck disable=SC1090
 . "$CONF_FILE"
@@ -7403,8 +7427,21 @@ bind_one() {
     drv="$(basename "$(readlink "$sys/driver")")"
     if [[ -w "/sys/bus/pci/drivers/$drv/unbind" ]]; then
       echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" || true
+      jlog "$dev: unbind from $drv"
     fi
     sleep 0.3
+  fi
+
+  # Optional function-level reset before bind (opt-in via VFIO_DYNAMIC_PCI_RESET=1).
+  # On RX 9070 / RDNA4 a reset after amdgpu teardown can clear residual device
+  # state that otherwise makes the first vfio-pci bind fail with "Unknown PCI
+  # header type 127". Only attempted when the sysfs reset file is writable (the
+  # device must be unbound). Default OFF: a reset on a healthy card is unnecessary
+  # and on a mid-reset card can worsen the state; enable only on repeated failures.
+  if [[ "${VFIO_DYNAMIC_PCI_RESET:-0}" == "1" && -w "$sys/reset" ]]; then
+    echo 1 >"$sys/reset" 2>/dev/null || true
+    jlog "$dev: pci reset attempted"
+    sleep 0.1
   fi
 
   echo vfio-pci >"$sys/driver_override"
@@ -7430,9 +7467,18 @@ bind_one() {
   # the libvirt hook (--bind-now) aborts the VM start cleanly instead of letting
   # libvirt continue with a device that is not bound to the passthrough driver.
   if [[ "$_drv" != "vfio-pci" ]]; then
-    say "ERROR: $dev failed to bind to vfio-pci (got: ${_drv:-none}). Aborting VM start." >&2
+    jlog "$dev: FAILED to bind to vfio-pci (got: ${_drv:-none}) after $_max_attempts attempts"
+    say "ERROR: $dev failed to bind to vfio-pci (got: ${_drv:-none}) after $_max_attempts attempts." >&2
+    say "ERROR: Aborting VM start. Next steps:" >&2
+    say "  - check dmesg:        dmesg | tail -n 50" >&2
+    say "  - check libvirt:      journalctl -u libvirtd --no-pager | tail -n 50" >&2
+    say "  - confirm device:     lspci -nnk -s $dev" >&2
+    say "  - try a manual reset: echo 1 > /sys/bus/pci/devices/$dev/reset" >&2
+    say "  - or switch to early: vfio.sh --install-early-binding" >&2
     return 1
   fi
+
+  jlog "$dev: bound to vfio-pci (verified)"
 }
 
 clear_override() {
@@ -7448,9 +7494,10 @@ reprobe_to_host() {
   # generic driver re-probe so the normal host driver (amdgpu/snd) can reclaim
   # the device. Used by --release when VFIO_DYNAMIC_REBIND_HOST=1.
   #
-  # NOTE: d3cold_allowed is deliberately left at 0 here. The RX 9070 / RDNA4
-  # reset bug means the card can fall off the bus on D3cold exit even on the
-  # host, so D3cold must stay disabled after release. Do NOT "restore" it to 1.
+  # NOTE: d3cold_allowed is deliberately left at 0 by default here. The RX 9070 /
+  # RDNA4 reset bug means the card can fall off the bus on D3cold exit even on the
+  # host, so D3cold stays disabled after release. Do NOT restore it to 1 unless you
+  # opt in via VFIO_RESTORE_D3COLD_ON_RELEASE=1 (see the guarded restore below).
   local dev="$1"
   [[ -n "$dev" ]] || return 0
   local sys="/sys/bus/pci/devices/$dev"
@@ -7465,6 +7512,13 @@ reprobe_to_host() {
   echo "" >"$sys/driver_override" 2>/dev/null || true
   if [[ -w /sys/bus/pci/drivers_probe ]]; then
     echo "$dev" >/sys/bus/pci/drivers_probe 2>/dev/null || true
+  fi
+  # Optional: restore d3cold_allowed=1 when handing the card back to the host.
+  # OFF by default because the RX 9070 / RDNA4 reset bug means D3cold exit can drop
+  # the card off the bus even on the host; enable only if you never hit that bug
+  # and want lower host idle power between VM sessions (VFIO_RESTORE_D3COLD_ON_RELEASE=1).
+  if [[ "${VFIO_RESTORE_D3COLD_ON_RELEASE:-0}" == "1" ]]; then
+    echo 1 >"$sys/d3cold_allowed" 2>/dev/null || true
   fi
 }
 
@@ -7737,6 +7791,20 @@ guest_gpu_on_vfio() {
   [[ "$drv" == "vfio-pci" ]]
 }
 
+# Run --bind-now under a bounded timeout so a hung sysfs write cannot hang the
+# libvirt prepare phase indefinitely. Default 20s leaves margin under libvirt's
+# ~30s hook timeout; override with VFIO_HOOK_BIND_TIMEOUT. Falls back to a plain
+# call if `timeout` (coreutils) is unavailable. `timeout` returns 124 on timeout,
+# which the caller logs and propagates as a VM-start abort.
+_bind_now() {
+  local _to="${VFIO_HOOK_BIND_TIMEOUT:-20}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_to" "$BIND_SCRIPT" --bind-now
+  else
+    "$BIND_SCRIPT" --bind-now
+  fi
+}
+
 case "$PHASE" in
   prepare)
     # VM is about to start. Only bind if this VM has the guest GPU attached.
@@ -7748,7 +7816,7 @@ case "$PHASE" in
       hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
       # Run under `if` so set -e does not kill the hook before we can log the
       # failure. We still exit non-zero to abort the VM start (see comment above).
-      if "$BIND_SCRIPT" --bind-now; then
+      if _bind_now; then
         hook_log "action=bind-now-done rc=0"
       else
         _rc=$?

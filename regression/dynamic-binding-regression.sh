@@ -665,7 +665,7 @@ assert_contains_text \
   "$bind_block"
 assert_contains_text \
   "R4 reprobe_to_host warns not to restore d3cold" \
-  'Do NOT "restore" it to 1' \
+  'Do NOT restore it to 1' \
   "$bind_block"
 
 # --- Functional R5: hook logs bind-now failure before aborting VM start ---
@@ -683,6 +683,92 @@ if grep -Fq 'hook_log "action=bind-now-done rc=$?"' <<<"$hook_block"; then
 else
   printf 'PASS: R5 old uncaptured bind-now-done log removed\n'
 fi
+
+# --- Functional R6: opt-in PCI function-level reset before bind ---
+assert_contains_text \
+  "R6 bind_one gates reset on VFIO_DYNAMIC_PCI_RESET" \
+  'VFIO_DYNAMIC_PCI_RESET' \
+  "$bind_block"
+assert_contains_text \
+  "R6 bind_one reset only when sysfs reset file writable" \
+  '-w "$sys/reset"' \
+  "$bind_block"
+assert_contains_text \
+  "R6 bind_one writes reset" \
+  'echo 1 >"$sys/reset"' \
+  "$bind_block"
+assert_contains_file \
+  "R6 write_conf persists VFIO_DYNAMIC_PCI_RESET" \
+  'VFIO_DYNAMIC_PCI_RESET="0"' \
+  "$VFIO_SCRIPT"
+
+# --- Functional R7: journal logging of the bind sequence (jlog helper) ---
+assert_contains_text \
+  "R7 bind script has jlog helper" \
+  "jlog()" \
+  "$bind_block"
+assert_contains_text \
+  "R7 jlog uses logger -t vfio-dynamic" \
+  "logger -t vfio-dynamic" \
+  "$bind_block"
+assert_contains_text \
+  "R7 jlog logs unbind" \
+  'jlog "$dev: unbind from $drv"' \
+  "$bind_block"
+assert_contains_text \
+  "R7 jlog logs verified bind" \
+  'jlog "$dev: bound to vfio-pci (verified)"' \
+  "$bind_block"
+
+# --- Functional R8: actionable bind-failure error message ---
+assert_contains_text \
+  "R8 bind failure message lists next steps" \
+  "Next steps:" \
+  "$bind_block"
+assert_contains_text \
+  "R8 bind failure suggests dmesg" \
+  "dmesg | tail -n 50" \
+  "$bind_block"
+assert_contains_text \
+  "R8 bind failure suggests journalctl libvirtd" \
+  "journalctl -u libvirtd --no-pager" \
+  "$bind_block"
+assert_contains_text \
+  "R8 bind failure suggests --install-early-binding" \
+  "vfio.sh --install-early-binding" \
+  "$bind_block"
+
+# --- Functional R9: bounded timeout around --bind-now in the hook ---
+assert_contains_text \
+  "R9 hook has _bind_now helper" \
+  "_bind_now()" \
+  "$hook_block"
+assert_contains_text \
+  "R9 hook _bind_now uses timeout" \
+  'command -v timeout' \
+  "$hook_block"
+assert_contains_text \
+  "R9 hook _bind_now honors VFIO_HOOK_BIND_TIMEOUT" \
+  "VFIO_HOOK_BIND_TIMEOUT" \
+  "$hook_block"
+assert_contains_text \
+  "R9 hook prepare calls _bind_now" \
+  "if _bind_now; then" \
+  "$hook_block"
+
+# --- Functional R10: opt-in d3cold restore on host rebind ---
+assert_contains_text \
+  "R10 reprobe_to_host gates d3cold restore on VFIO_RESTORE_D3COLD_ON_RELEASE" \
+  'VFIO_RESTORE_D3COLD_ON_RELEASE' \
+  "$bind_block"
+assert_contains_text \
+  "R10 reprobe_to_host restores d3cold_allowed=1 when opted in" \
+  'echo 1 >"$sys/d3cold_allowed"' \
+  "$bind_block"
+assert_contains_file \
+  "R10 write_conf persists VFIO_RESTORE_D3COLD_ON_RELEASE" \
+  'VFIO_RESTORE_D3COLD_ON_RELEASE="0"' \
+  "$VFIO_SCRIPT"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

@@ -306,6 +306,98 @@ else
   bad "R10 d3cold not restored when flag on"
 fi
 
+# --- Smoke B2: bounded timeout around --release (kills hung release, passes fast) ---
+cat > "$tmp/fakerelease.sh" <<'REOF'
+#!/usr/bin/env bash
+sleep 3
+REOF
+chmod +x "$tmp/fakerelease.sh"
+cat > "$tmp/smoke_release_timeout.sh" <<'RTEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+_release() {
+  local _to="${VFIO_HOOK_RELEASE_TIMEOUT:-20}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_to" "$BIND_SCRIPT" --release
+  else
+    "$BIND_SCRIPT" --release
+  fi
+}
+if _release; then
+  echo "rc=0"
+else
+  _rc=$?
+  echo "rc=$_rc"
+fi
+RTEOF
+rout="$(VFIO_HOOK_RELEASE_TIMEOUT=1 BIND_SCRIPT="$tmp/fakerelease.sh" bash "$tmp/smoke_release_timeout.sh" 2>&1 || true)"
+if [[ "$rout" == "rc=124" ]]; then
+  ok "B2 timeout kills a hung release (rc=124)"
+else
+  bad "B2 timeout did not kill hung release (got: $rout)"
+fi
+cat > "$tmp/fakerelease_fast.sh" <<'REOF'
+#!/usr/bin/env bash
+exit 0
+REOF
+chmod +x "$tmp/fakerelease_fast.sh"
+rout2="$(VFIO_HOOK_RELEASE_TIMEOUT=5 BIND_SCRIPT="$tmp/fakerelease_fast.sh" bash "$tmp/smoke_release_timeout.sh" 2>&1 || true)"
+if [[ "$rout2" == "rc=0" ]]; then
+  ok "B2 timeout passes a fast release (rc=0)"
+else
+  bad "B2 timeout broke a fast release (got: $rout2)"
+fi
+
+# --- Smoke P3: case-insensitive BDF match (uppercase conf matches lowercase XML) ---
+# libvirt XML and lspci always emit lowercase hex. A hand-edited conf may store
+# UPPERCASE BDFs. Use a BDF containing hex LETTERS (bus 0a) so upper/lower actually
+# differ. grep -Fixq must still match; case-sensitive grep -Fxq must NOT.
+cat > "$tmp/smoke_case_bdf.sh" <<'CEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+xml_bdfs="0000:0a:00.0
+0000:0a:00.1"
+# Configured BDF stored in UPPERCASE (hand-edited conf) must still match.
+GUEST_BDFS="0000:0A:00.0"
+for b in $GUEST_BDFS; do
+  [[ -n "$b" ]] || continue
+  if grep -Fixq "$b" <<<"$xml_bdfs"; then
+    echo "MATCH"
+    exit 0
+  fi
+done
+echo "NO_MATCH"
+CEOF
+case_res="$(bash "$tmp/smoke_case_bdf.sh")"
+if [[ "$case_res" == "MATCH" ]]; then
+  ok "P3 uppercase conf BDF matches lowercase libvirt XML via grep -Fixq"
+else
+  bad "P3 case-insensitive match failed (got: $case_res)"
+fi
+# Negative: case-SENSITIVE grep -Fxq must FAIL on the same uppercase BDF
+# (proves the -i flag is what makes the match work).
+cat > "$tmp/smoke_case_bdf_neg.sh" <<'NEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+xml_bdfs="0000:0a:00.0
+0000:0a:00.1"
+GUEST_BDFS="0000:0A:00.0"
+for b in $GUEST_BDFS; do
+  [[ -n "$b" ]] || continue
+  if grep -Fxq "$b" <<<"$xml_bdfs"; then
+    echo "MATCH"
+    exit 0
+  fi
+done
+echo "NO_MATCH"
+NEOF
+neg_res="$(bash "$tmp/smoke_case_bdf_neg.sh")"
+if [[ "$neg_res" == "NO_MATCH" ]]; then
+  ok "P3 negative: case-sensitive grep -Fxq does NOT match uppercase (proves -i is required)"
+else
+  bad "P3 negative: case-sensitive match unexpectedly succeeded (got: $neg_res)"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

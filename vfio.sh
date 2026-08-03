@@ -4097,12 +4097,18 @@ VFIO_GRAPHICS_AUTO_X11_PINNING="1"
 #   vfio-pci only when a VM that has the GPU attached is started. More reliable for
 #   RX 9070 / RDNA4 cards that hit the "Unknown PCI header type 127" reset bug when
 #   bound to vfio-pci too early. Requires libvirt-managed VMs.
+# WHY this value: set by the wizard (or --install-dynamic-binding / --binding-mode).
+# dynamic is recommended for RX 9070 / RDNA4 to avoid the reset bug; early works for
+# raw qemu and older AMD cards that bind cleanly at boot.
 VFIO_BINDING_MODE="$binding_mode"
 # Dynamic-mode post-VM-stop behavior:
 # - 0 (default): leave the guest GPU on vfio-pci after the VM stops (safer for the
 #   RX 9070 reset bug; the host cannot use the GPU between VM sessions without reboot
 #   or a manual rebind).
 # - 1: rebind the guest GPU back to its normal host driver (amdgpu/snd) on VM stop.
+# WHY this value: 0 keeps the RX 9070 parked on vfio-pci so it cannot fall off the
+# bus on a D3cold exit between sessions. Set 1 only on cards that have NEVER hit
+# the reset bug AND where you want the host to reuse the GPU between VM runs.
 VFIO_DYNAMIC_REBIND_HOST="0"
 # Dynamic-mode Boot-VGA safety for --bind-now (libvirt hook):
 # - 0 (default): if the guest GPU is Boot VGA, refuse to bind it at VM start
@@ -4110,6 +4116,9 @@ VFIO_DYNAMIC_REBIND_HOST="0"
 #   The hook aborts the VM start cleanly so the host display stays alive.
 # - 1: allow binding a Boot-VGA guest GPU at VM start (advanced single-GPU/headless setups
 #   where losing the host display during the VM session is intentional).
+# WHY this value: 0 protects single-GPU/headless-style setups from a mid-session
+# black screen. Set 1 only if you intentionally pass your only GPU to the VM and
+# do not need the host display while the VM runs.
 VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 # Dynamic-mode optional PCI function-level reset before bind (advanced):
 # - 0 (default): do NOT reset the device before binding. A reset on a healthy
@@ -4119,6 +4128,10 @@ VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 #   This can clear residual amdgpu state on RX 9070 / RDNA4 that otherwise makes
 #   the first vfio-pci bind fail with "Unknown PCI header type 127". Enable only
 #   if you repeatedly hit bind failures after amdgpu teardown.
+# WHY this value: 0 avoids a needless reset on a healthy card and a harmful reset
+# on a card that is already mid-reset. Set 1 only if you repeatedly see bind
+# failures with "header type 127" after amdgpu teardown and a plain retry does not
+# recover it.
 VFIO_DYNAMIC_PCI_RESET="0"
 # Dynamic-mode d3cold_allowed restore on host rebind (advanced):
 # - 0 (default): keep d3cold_allowed=0 after --release even when
@@ -4128,7 +4141,21 @@ VFIO_DYNAMIC_PCI_RESET="0"
 # - 1: restore d3cold_allowed=1 when handing the card back to the host, for lower
 #   host idle power between VM sessions. Only enable if you never hit the reset
 #   bug on the host.
+# WHY this value: 0 prevents the RX 9070 from dropping off the bus on a D3cold
+# exit while the host owns it. Set 1 only if your card has NEVER hit the reset bug
+# and you want lower host idle power between VM sessions (do NOT enable just
+# because a guide suggests restoring D3cold — that reintroduces the reset bug).
 VFIO_RESTORE_D3COLD_ON_RELEASE="0"
+# Dynamic-mode libvirt-hook bind timeout (seconds, read by the hook at runtime):
+# - default 20 leaves margin under libvirt's ~30s qemu hook timeout.
+# - if the vfio-pci bind + verify takes longer than this, the hook aborts the VM
+#   start (timeout returns 124) so a hung sysfs write cannot hang libvirt.
+# - falls back to a plain call if 'timeout' (coreutils) is unavailable.
+# WHY this value: 20s is well above any observed healthy bind (<2s) yet under the
+# libvirt hook deadline, so a healthy VM start is never affected and only a truly
+# hung bind is aborted. Lower it only if your hook deadline is shorter; raise it
+# only if a legitimately slow bind keeps getting aborted (rare).
+VFIO_HOOK_BIND_TIMEOUT="20"
 EOF
 }
 
@@ -7415,6 +7442,7 @@ bind_one() {
     local _already_drv
     _already_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
     if [[ "$_already_drv" == "vfio-pci" ]]; then
+      jlog "$dev: already on vfio-pci, skipping rebind"
       return 0
     fi
   fi
@@ -7456,6 +7484,7 @@ bind_one() {
     echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" 2>/dev/null || true
     _drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
     if [[ "$_drv" == "vfio-pci" ]]; then
+      jlog "$dev: bound on attempt $_attempt"
       break
     fi
     if (( _attempt < _max_attempts )); then
@@ -7553,6 +7582,7 @@ do_bind() {
 
   # Post-check: verify guest GPU is bound to vfio-pci.
   if [[ -L "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" ]]; then
+    local drv
     drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver")")"
     [[ "$drv" == "vfio-pci" ]] || die "Guest GPU driver is '$drv' (expected vfio-pci)."
   fi
@@ -7776,7 +7806,10 @@ vm_uses_guest_gpu() {
   local IFS=','
   for b in $GUEST_BDFS; do
     [[ -n "$b" ]] || continue
-    if grep -Fxq "$b" <<<"$xml_bdfs"; then
+    # Case-insensitive match: libvirt XML and lspci emit lowercase hex, but a
+    # hand-edited conf may store uppercase BDFs. -F (fixed) + -i keeps it exact
+    # yet case-insensitive so a case mismatch never silently skips the bind.
+    if grep -Fixq "$b" <<<"$xml_bdfs"; then
       return 0
     fi
   done
@@ -7802,6 +7835,19 @@ _bind_now() {
     timeout "$_to" "$BIND_SCRIPT" --bind-now
   else
     "$BIND_SCRIPT" --bind-now
+  fi
+}
+
+# Run --release under a bounded timeout for the same reason as --bind-now: a hung
+# re-probe (/sys/bus/pci/drivers_probe) must not hang the libvirt stopped/release
+# phase. Default 20s; override with VFIO_HOOK_RELEASE_TIMEOUT. Falls back to a
+# plain call if `timeout` is unavailable.
+_release() {
+  local _to="${VFIO_HOOK_RELEASE_TIMEOUT:-20}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_to" "$BIND_SCRIPT" --release
+  else
+    "$BIND_SCRIPT" --release
   fi
 }
 
@@ -7834,7 +7880,7 @@ case "$PHASE" in
     if guest_gpu_on_vfio; then
       say "vfio-libvirt-hook: VM '$DOMAIN' stopped; releasing guest GPU."
       hook_log "action=release gpu=$GUEST_GPU_BDF rebind=${VFIO_DYNAMIC_REBIND_HOST:-0}"
-      "$BIND_SCRIPT" --release
+      _release
     else
       hook_log "action=stopped-noop gpu-not-on-vfio"
     fi

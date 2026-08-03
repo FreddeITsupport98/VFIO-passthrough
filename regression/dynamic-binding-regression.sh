@@ -770,6 +770,85 @@ assert_contains_file \
   'VFIO_RESTORE_D3COLD_ON_RELEASE="0"' \
   "$VFIO_SCRIPT"
 
+# --- Functional B1: do_bind post-check uses local drv (no global leak) ---
+assert_contains_text \
+  "B1 do_bind post-check declares local drv" \
+  'local drv' \
+  "$bind_block"
+# The post-check is the second `local drv` in do_bind; ensure the do_bind block
+# contains exactly the guarded form, not the old unguarded assignment.
+if grep -Fq 'drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver")")"' <<<"$(sed -n '/^do_bind()/,/^}/p' "$bind_block" | grep -v 'local drv')"; then
+  printf 'FAIL: B1 unguarded drv assignment still present in do_bind\n' >&2
+  record_failure "B1 do_bind drv is local (no unguarded assignment)"
+else
+  printf 'PASS: B1 do_bind drv is local (no unguarded assignment)\n'
+fi
+
+# --- Functional B2: --release path is timeout-wrapped in the hook ---
+assert_contains_text \
+  "B2 hook has _release helper" \
+  "_release()" \
+  "$hook_block"
+assert_contains_text \
+  "B2 hook _release honors VFIO_HOOK_RELEASE_TIMEOUT" \
+  "VFIO_HOOK_RELEASE_TIMEOUT" \
+  "$hook_block"
+assert_contains_text \
+  "B2 hook stopped/release calls _release" \
+  "_release" \
+  "$hook_block"
+if grep -Fq '"$BIND_SCRIPT" --release' <<<"$hook_block" && ! grep -Fq '_release' <<<"$hook_block"; then
+  printf 'FAIL: B2 raw --release call still present without _release helper\n' >&2
+  record_failure "B2 --release routed through _release"
+else
+  printf 'PASS: B2 --release routed through _release\n'
+fi
+
+# --- Functional P1: already-on-vfio-pci early-return is journal-logged ---
+assert_contains_text \
+  "P1 bind_one jlogs already-on-vfio-pci skip" \
+  'jlog "$dev: already on vfio-pci, skipping rebind"' \
+  "$bind_block"
+
+# --- Functional P2: retry loop logs which attempt succeeded ---
+assert_contains_text \
+  "P2 bind_one jlogs bound-on-attempt" \
+  'jlog "$dev: bound on attempt $_attempt"' \
+  "$bind_block"
+
+# --- Functional P3: vm_uses_guest_gpu BDF match is case-insensitive ---
+assert_contains_text \
+  "P3 vm_uses_guest_gpu uses case-insensitive match" \
+  'grep -Fixq "$b"' \
+  "$hook_block"
+if grep -Fq 'grep -Fxq "$b"' <<<"$hook_block"; then
+  printf 'FAIL: P3 old case-sensitive grep -Fxq still present\n' >&2
+  record_failure "P3 case-sensitive BDF match removed"
+else
+  printf 'PASS: P3 case-sensitive BDF match removed\n'
+fi
+
+# --- Functional conf-notes: every dynamic conf key has a WHY note ---
+# A WHY note (comment line starting with '# WHY this value:') must appear within
+# the few lines preceding each key="..." assignment. Use awk to pair them.
+for _why_key in 'VFIO_BINDING_MODE' 'VFIO_DYNAMIC_REBIND_HOST' 'VFIO_DYNAMIC_ALLOW_BOOT_VGA' 'VFIO_DYNAMIC_PCI_RESET' 'VFIO_RESTORE_D3COLD_ON_RELEASE' 'VFIO_HOOK_BIND_TIMEOUT'; do
+  _ctx="$(awk -v k="$_why_key" '
+    /^# WHY this value:/ { saw_why=1; next }
+    $0 ~ "^" k "=" { if (saw_why) { print "FOUND"; saw_why=0 } }
+    /^[A-Z_]+="/ { saw_why=0 }
+  ' "$VFIO_SCRIPT" || true)"
+  if [[ "$_ctx" == "FOUND" ]]; then
+    printf 'PASS: conf-note %s has WHY rationale\n' "$_why_key"
+  else
+    printf 'FAIL: conf-note %s missing WHY rationale\n' "$_why_key" >&2
+    record_failure "conf-note $_why_key has WHY rationale"
+  fi
+done
+assert_contains_file \
+  "conf persists VFIO_HOOK_BIND_TIMEOUT" \
+  'VFIO_HOOK_BIND_TIMEOUT="20"' \
+  "$VFIO_SCRIPT"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

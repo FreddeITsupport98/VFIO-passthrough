@@ -642,6 +642,25 @@ assert_contains_text \
   "For dual-GPU: set HOST_GPU_BDF" \
   "$bind_block"
 
+# --- Functional Q3k: --install-dynamic-binding / --install-early-binding regenerate the bind script ---
+# Both switch helpers must call install_bind_script so bind-script fixes (e.g.
+# the Boot-VGA host-assisted escape) deploy via `sudo ./vfio.sh --install-dynamic-binding`
+# (or --install-early-binding) without forcing a full wizard re-run.
+_dyn_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'install_bind_script' <<<"$_dyn_fn"; then
+  printf 'PASS: Q3k install-dynamic-binding calls install_bind_script\n'
+else
+  printf 'FAIL: Q3k install-dynamic-binding does not call install_bind_script\n' >&2
+  record_failure "Q3k install-dynamic-binding calls install_bind_script"
+fi
+_early_fn="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'install_bind_script' <<<"$_early_fn"; then
+  printf 'PASS: Q3k install-early-binding calls install_bind_script\n'
+else
+  printf 'FAIL: Q3k install-early-binding does not call install_bind_script\n' >&2
+  record_failure "Q3k install-early-binding calls install_bind_script"
+fi
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

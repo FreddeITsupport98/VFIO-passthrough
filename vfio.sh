@@ -8717,10 +8717,11 @@ install_dynamic_binding_from_existing_config() {
   say
   note "What this will do:"
   note "  1. Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
-  note "  2. Install the libvirt qemu hook ($LIBVIRT_HOOK_SCRIPT + $LIBVIRT_HOOK_ENTRY)"
-  note "  3. Strip vfio-pci.ids= and rd.driver.pre=vfio-pci from the kernel cmdline"
+  note "  2. Regenerate $BIND_SCRIPT (deploys the latest bind/hook-runtime logic)"
+  note "  3. Install the libvirt qemu hook ($LIBVIRT_HOOK_SCRIPT + $LIBVIRT_HOOK_ENTRY)"
+  note "  4. Strip vfio-pci.ids= and rd.driver.pre=vfio-pci from the kernel cmdline"
   note "     (so amdgpu is allowed to claim the guest GPU at boot)"
-  note "  4. Sync BLS boot entries to the updated cmdline"
+  note "  5. Sync BLS boot entries to the updated cmdline"
   say
   note "What stays unchanged:"
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"
@@ -8741,10 +8742,16 @@ install_dynamic_binding_from_existing_config() {
   rewrite_conf_key "VFIO_BINDING_MODE" "dynamic"
   say "Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
 
-  # 2. Install the libvirt hook.
+  # 2. Regenerate the bind script so the latest bind/hook-runtime logic (e.g.
+  #    Boot-VGA host-assisted escape, d3cold pinning, retry/jlog behavior) is
+  #    deployed without needing a full wizard re-run.
+  install_bind_script
+  say "Regenerated $BIND_SCRIPT"
+
+  # 3. Install the libvirt hook.
   install_libvirt_hook
 
-  # 3. Strip early-binding tokens from the kernel cmdline.
+  # 4. Strip early-binding tokens from the kernel cmdline.
   if [[ -f /etc/kernel/cmdline ]]; then
     local kcur knew
     kcur="$(cat /etc/kernel/cmdline 2>/dev/null || true)"
@@ -8792,16 +8799,22 @@ install_early_binding_from_existing_config() {
   say
   note "What this will do:"
   note "  1. Set VFIO_BINDING_MODE=early in $CONF_FILE"
-  note "  2. Remove the libvirt qemu hook (restoring any pre-existing hook from backup)"
-  note "  3. Re-add vfio-pci.ids=<guest IDs> and rd.driver.pre=vfio-pci to the kernel cmdline"
-  note "  4. Sync BLS boot entries to the updated cmdline"
+  note "  2. Regenerate $BIND_SCRIPT (deploys the latest bind/boot-time logic)"
+  note "  3. Remove the libvirt qemu hook (restoring any pre-existing hook from backup)"
+  note "  4. Re-add vfio-pci.ids=<guest IDs> and rd.driver.pre=vfio-pci to the kernel cmdline"
+  note "  5. Sync BLS boot entries to the updated cmdline"
   say
 
   # 1. Flip the conf key.
   rewrite_conf_key "VFIO_BINDING_MODE" "early"
   say "Set VFIO_BINDING_MODE=early in $CONF_FILE"
 
-  # 2. Remove the libvirt hook (restore pre-existing qemu hook or remove).
+  # 2. Regenerate the bind script so the latest bind/boot-time logic is deployed
+  #    without needing a full wizard re-run.
+  install_bind_script
+  say "Regenerated $BIND_SCRIPT"
+
+  # 3. Remove the libvirt hook (restore pre-existing qemu hook or remove).
   if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
     local _hook_bak="" _hb
     for _hb in "${LIBVIRT_HOOK_ENTRY}".bak.*; do
@@ -8820,7 +8833,7 @@ install_early_binding_from_existing_config() {
   run rm -f "$LIBVIRT_HOOK_SCRIPT"
   say "Removed libvirt qemu hook."
 
-  # 3. Re-add early-binding tokens to the kernel cmdline.
+  # 4. Re-add early-binding tokens to the kernel cmdline.
   local guest_ids
   guest_ids="$(build_vfio_pci_ids_from_conf)"
   if [[ -z "$guest_ids" ]]; then

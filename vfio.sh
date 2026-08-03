@@ -7332,10 +7332,27 @@ case "$binding_mode" in
   *) binding_mode="EARLY" ;;
 esac
 
-# In dynamic mode the boot invocation is a no-op: amdgpu keeps the card until
-# the libvirt hook requests --bind-now at VM start.
+# In dynamic mode the boot invocation does NOT bind (amdgpu keeps the card until
+# the libvirt hook requests --bind-now at VM start), but it still pins
+# d3cold_allowed=0 on the configured guest BDFs so the card cannot enter D3cold
+# during the amdgpu phase between boot and VM start (RX 9070 / RDNA4 reset bug).
 if [[ "$ACTION" == "boot" && "$binding_mode" == "DYNAMIC" ]]; then
-  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start)."
+  set_d3cold_for_guest_bdfs() {
+    local _bdf _sys
+    for _bdf in "$GUEST_GPU_BDF" $(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}"); do
+      [[ -n "$_bdf" ]] || continue
+      _sys="/sys/bus/pci/devices/$_bdf"
+      [[ -d "$_sys" ]] || continue
+      echo 0 >"$_sys/d3cold_allowed" 2>/dev/null || true
+    done
+  }
+  # csv_to_array is defined below; guard in case of unexpected ordering.
+  if command -v csv_to_array >/dev/null 2>&1; then
+    set_d3cold_for_guest_bdfs
+  else
+    echo 0 >"/sys/bus/pci/devices/$GUEST_GPU_BDF/d3cold_allowed" 2>/dev/null || true
+  fi
+  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start); pinned d3cold_allowed=0 on guest BDFs."
   exit 0
 fi
 
@@ -7358,28 +7375,47 @@ bind_one() {
   local sys="/sys/bus/pci/devices/$dev"
   [[ -d "$sys" ]] || die "PCI device not present in sysfs: $dev"
 
-  # Unbind from current driver if any.
+  # Prevent D3cold entry (RX 9070 / RDNA4 reset bug: card falls off bus on D3cold exit).
+  # This is set both at bind time and (in dynamic mode) by the boot unit so the card
+  # cannot enter D3cold even while it is still on amdgpu, before VM start.
+  echo 0 >"$sys/d3cold_allowed" 2>/dev/null || true
+
+  # Unbind from current driver if any (amdgpu/snd), then wait briefly for the
+  # driver teardown to settle. Some AMD cards need a short delay between unbind
+  # and the vfio-pci bind attempt or the first bind races the async teardown.
   if [[ -L "$sys/driver" ]]; then
     local drv
     drv="$(basename "$(readlink "$sys/driver")")"
     if [[ -w "/sys/bus/pci/drivers/$drv/unbind" ]]; then
       echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" || true
     fi
+    sleep 0.3
   fi
 
-  # Prevent D3cold entry (RX 9070 / RDNA4 reset bug: card falls off bus on D3cold exit).
-  echo 0 >"$sys/d3cold_allowed" 2>/dev/null || true
-
   echo vfio-pci >"$sys/driver_override"
-  echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" || true
+
+  # Retry the bind a few times. On the RX 9070 the amdgpu -> vfio-pci handoff
+  # can fail transiently even though a retry a moment later succeeds. Total
+  # retry budget stays well under libvirt's default hook timeout.
+  local _attempt _max_attempts _drv
+  _max_attempts=3
+  _drv=""
+  for _attempt in $(seq 1 "$_max_attempts"); do
+    echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" 2>/dev/null || true
+    _drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+    if [[ "$_drv" == "vfio-pci" ]]; then
+      break
+    fi
+    if (( _attempt < _max_attempts )); then
+      sleep 0.2
+    fi
+  done
 
   # Verify the device actually landed on vfio-pci. Return non-zero on failure so
   # the libvirt hook (--bind-now) aborts the VM start cleanly instead of letting
   # libvirt continue with a device that is not bound to the passthrough driver.
-  local _drv
-  _drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
   if [[ "$_drv" != "vfio-pci" ]]; then
-    say "ERROR: $dev failed to bind to vfio-pci (got: ${_drv:-none})" >&2
+    say "ERROR: $dev failed to bind to vfio-pci (got: ${_drv:-none}). Aborting VM start." >&2
     return 1
   fi
 }
@@ -7664,6 +7700,9 @@ guest_gpu_on_vfio() {
 case "$PHASE" in
   prepare)
     # VM is about to start. Only bind if this VM has the guest GPU attached.
+    # A non-zero exit from --bind-now is INTENTIONAL and will abort the VM start
+    # cleanly (libvirt treats a non-zero qemu hook exit as a fatal error), so a
+    # broken/mid-reset device does not get attached to the VM.
     if vm_uses_guest_gpu; then
       say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
       "$BIND_SCRIPT" --bind-now

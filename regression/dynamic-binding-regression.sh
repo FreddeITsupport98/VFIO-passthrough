@@ -540,6 +540,44 @@ assert_contains_text \
   'bind_one "$dev" || die' \
   "$bind_block"
 
+# --- Functional Q3d: clearer post-bind error message ---
+assert_contains_text \
+  "Q3d bind_one error message says Aborting VM start" \
+  "Aborting VM start." \
+  "$bind_block"
+
+# --- Functional Q3e: small sleep between unbind and bind (AMD teardown race) ---
+assert_contains_text \
+  "Q3e bind_one sleeps after unbind before bind" \
+  "sleep 0.3" \
+  "$bind_block"
+
+# --- Functional Q3f: bind retry loop (transient handoff race) ---
+assert_contains_text \
+  "Q3f bind_one has bounded retry loop" \
+  "_max_attempts=3" \
+  "$bind_block"
+assert_contains_text \
+  "Q3f bind_one retry uses 0.2s backoff" \
+  "sleep 0.2" \
+  "$bind_block"
+
+# --- Functional Q3g: D3cold pinned early in dynamic boot no-op (covers amdgpu phase) ---
+assert_contains_text \
+  "Q3g dynamic boot no-op pins d3cold_allowed=0 on guest BDFs" \
+  "set_d3cold_for_guest_bdfs" \
+  "$bind_block"
+assert_contains_text \
+  "Q3g dynamic boot no-op logs d3cold pinning" \
+  "pinned d3cold_allowed=0 on guest BDFs" \
+  "$bind_block"
+
+# --- Functional Q3h: hook non-zero-exit comment (intentional fail-fast) ---
+assert_contains_text \
+  "Q3h hook documents non-zero exit aborts VM start" \
+  "INTENTIONAL and will abort the VM start" \
+  "$hook_block"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

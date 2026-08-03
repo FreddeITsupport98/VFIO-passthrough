@@ -1008,6 +1008,124 @@ assert_not_contains_file \
   "Skipping vfio-pci.ids for" \
   "$VFIO_SCRIPT"
 
+# --- AMD d3/portpm stability workarounds (vfio-pci.disable_idle_d3=1, pcie_port_pm=off) ---
+assert_contains_file \
+  "AMD d3 override var declared" \
+  "AMD_D3_OVERRIDE=" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "AMD portpm override var declared" \
+  "AMD_PORTPM_OVERRIDE=" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --amd-disable-idle-d3" \
+  "--amd-disable-idle-d3)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --no-amd-disable-idle-d3" \
+  "--no-amd-disable-idle-d3)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --amd-pcie-port-pm-off" \
+  "--amd-pcie-port-pm-off)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --no-amd-pcie-port-pm-off" \
+  "--no-amd-pcie-port-pm-off)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "4-flag override condition references AMD_D3_OVERRIDE" \
+  "\${AMD_D3_OVERRIDE:-}" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "4-flag override condition references AMD_PORTPM_OVERRIDE" \
+  "\${AMD_PORTPM_OVERRIDE:-}" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "4-flag skip-all message includes new no-flags" \
+  "--no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE AMD block adds vfio-pci.disable_idle_d3=1" \
+  "add_param_once \"\$new_cmdline\" \"vfio-pci.disable_idle_d3=1\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE AMD block adds pcie_port_pm=off" \
+  "add_param_once \"\$new_cmdline\" \"pcie_port_pm=off\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "systemd-boot AMD block adds vfio-pci.disable_idle_d3=1" \
+  "add_param_once \"\$new_opts\" \"vfio-pci.disable_idle_d3=1\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "systemd-boot AMD block adds pcie_port_pm=off" \
+  "add_param_once \"\$new_opts\" \"pcie_port_pm=off\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "GRUB AMD block adds vfio-pci.disable_idle_d3=1" \
+  "add_param_once \"\$new\" \"vfio-pci.disable_idle_d3=1\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "GRUB AMD block adds pcie_port_pm=off" \
+  "add_param_once \"\$new\" \"pcie_port_pm=off\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "GRUB reset removes vfio-pci.disable_idle_d3=1" \
+  "remove_param_all \"\$new\" \"vfio-pci.disable_idle_d3=1\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "GRUB reset removes pcie_port_pm=off" \
+  "remove_param_all \"\$new\" \"pcie_port_pm=off\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE cmdline reset removes vfio-pci.disable_idle_d3=1" \
+  "remove_param_all \"\$knew\" \"vfio-pci.disable_idle_d3=1\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE cmdline reset removes pcie_port_pm=off" \
+  "remove_param_all \"\$knew\" \"pcie_port_pm=off\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "usage help documents --amd-disable-idle-d3" \
+  "--amd-disable-idle-d3" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "usage help documents --amd-pcie-port-pm-off" \
+  "--amd-pcie-port-pm-off" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "fish completion includes --amd-disable-idle-d3" \
+  "complete -c \$cmd -l amd-disable-idle-d3" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "fish completion includes --amd-pcie-port-pm-off" \
+  "complete -c \$cmd -l amd-pcie-port-pm-off" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "bash completion opts include --amd-disable-idle-d3" \
+  "--amd-disable-idle-d3 --no-amd-disable-idle-d3" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "bash completion opts include --amd-pcie-port-pm-off" \
+  "--amd-pcie-port-pm-off --no-amd-pcie-port-pm-off" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "zsh completion includes --amd-disable-idle-d3" \
+  "'--amd-disable-idle-d3" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "zsh completion includes --amd-pcie-port-pm-off" \
+  "'--amd-pcie-port-pm-off" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "manual instructions mention vfio-pci.disable_idle_d3=1" \
+  "vfio-pci.disable_idle_d3=1" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "manual instructions mention pcie_port_pm=off" \
+  "pcie_port_pm=off" \
+  "$VFIO_SCRIPT"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

@@ -53,6 +53,8 @@ BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_NORETRY_OVERRIDE=""       # 1=force add, 0=force skip, empty=prompt (install mode only)
+AMD_D3_OVERRIDE=""            # 1=force add, 0=force skip, empty=prompt (install mode only)
+AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install mode only)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
 GRAPHICS_DAEMON_INTERVAL_DEFAULT=1
 GRAPHICS_WATCHDOG_RETENTION_DAYS_DEFAULT=10
@@ -610,6 +612,10 @@ complete -c $cmd -l amd-runpm -d 'Force-add amdgpu.runpm=0 for AMD guest GPU (sk
 complete -c $cmd -l no-amd-runpm -d 'Skip amdgpu.runpm=0 for AMD guest GPU (skip prompt)'
 complete -c $cmd -l amd-noretry -d 'Force-add amdgpu.noretry=0 for AMD guest GPU (skip prompt)'
 complete -c $cmd -l no-amd-noretry -d 'Skip amdgpu.noretry=0 for AMD guest GPU (skip prompt)'
+complete -c $cmd -l amd-disable-idle-d3 -d 'Force-add vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)'
+complete -c $cmd -l no-amd-disable-idle-d3 -d 'Skip vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)'
+complete -c $cmd -l amd-pcie-port-pm-off -d 'Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)'
+complete -c $cmd -l no-amd-pcie-port-pm-off -d 'Skip pcie_port_pm=off for AMD guest GPU (skip prompt)'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -649,7 +655,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -694,6 +700,10 @@ _vfio_sh_complete() {
     '--no-amd-runpm[Skip amdgpu.runpm=0 for AMD guest GPU (skip prompt)]' \\
     '--amd-noretry[Force-add amdgpu.noretry=0 for AMD guest GPU (skip prompt)]' \\
     '--no-amd-noretry[Skip amdgpu.noretry=0 for AMD guest GPU (skip prompt)]' \\
+    '--amd-disable-idle-d3[Force-add vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)]' \\
+    '--no-amd-disable-idle-d3[Skip vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)]' \\
+    '--amd-pcie-port-pm-off[Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
+    '--no-amd-pcie-port-pm-off[Skip pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1335,6 +1345,14 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
   --no-amd-runpm    Install-mode override: skip amdgpu.runpm=0 for AMD guest GPUs (skip prompt).
   --amd-noretry     Install-mode override: force-add amdgpu.noretry=0 for AMD guest GPUs (skip prompt).
   --no-amd-noretry  Install-mode override: skip amdgpu.noretry=0 for AMD guest GPUs (skip prompt).
+  --amd-disable-idle-d3
+                   Install-mode override: force-add vfio-pci.disable_idle_d3=1 for AMD guest GPUs (skip prompt).
+  --no-amd-disable-idle-d3
+                   Install-mode override: skip vfio-pci.disable_idle_d3=1 for AMD guest GPUs (skip prompt).
+  --amd-pcie-port-pm-off
+                   Install-mode override: force-add pcie_port_pm=off for AMD guest GPUs (skip prompt).
+  --no-amd-pcie-port-pm-off
+                   Install-mode override: skip pcie_port_pm=off for AMD guest GPUs (skip prompt).
   --verify          Do not change anything; validate an existing setup (reads $CONF_FILE).
   --detect          Print a detailed report of existing VFIO/passthrough configuration and exit.
   --sync-bls-only   Non-interactive mode: sync BLS entry options from /etc/kernel/cmdline, then run strict drift verification.
@@ -1485,6 +1503,18 @@ parse_args() {
         ;;
       --no-amd-noretry)
         AMD_NORETRY_OVERRIDE=0
+        ;;
+      --amd-disable-idle-d3)
+        AMD_D3_OVERRIDE=1
+        ;;
+      --no-amd-disable-idle-d3)
+        AMD_D3_OVERRIDE=0
+        ;;
+      --amd-pcie-port-pm-off)
+        AMD_PORTPM_OVERRIDE=1
+        ;;
+      --no-amd-pcie-port-pm-off)
+        AMD_PORTPM_OVERRIDE=0
         ;;
       --verify)
         MODE="verify"
@@ -6416,15 +6446,27 @@ systemd_boot_add_kernel_params() {
       note ""
       note "Important: these are WORKAROUNDS, not solutions. They may reduce or eliminate symptoms, but they will NOT fix BIOS/firmware bugs, ReBAR quirks, or fundamental IOMMU group problems."
       note "Trade-off: amdgpu.runpm=0 increases idle power usage and heat because the GPU stays at full power."
-      if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" ]]; then
+      note ""
+      note "3) vfio-pci.disable_idle_d3=1 — keeps the vfio-pci-bound GPU out of D3hot idle."
+      note "   What it does: prevents the bound GPU from entering D3hot when idle, avoiding D3 entry/exit races."
+      note "   Why it can help: D3 entry/exit races during VM start/stop reset are a known source of reset failures and black screens on some AMD cards under VFIO."
+      note ""
+      note "4) pcie_port_pm=off — disables PCIe port power management."
+      note "   What it does: prevents PCIe port runtime power-state transitions on the guest GPU path."
+      note "   Why it can help: PCIe port PM can cause link drops on the guest GPU path, contributing to 'device lost from bus' cascades."
+      if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" ]]; then
         note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
         [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.runpm=0")"
         [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.noretry=0")"
-      elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" ]]; then
-        note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry)."
-      elif prompt_yn "Add amdgpu.runpm=0 and amdgpu.noretry=0 to /etc/kernel/cmdline for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+        [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
+        [[ "${AMD_PORTPM_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
+      elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" ]]; then
+        note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off)."
+      elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1 and pcie_port_pm=off to /etc/kernel/cmdline for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
         new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.runpm=0")"
         new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.noretry=0")"
+        new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
+        new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
       else
         note "Skipping AMD GPU stability parameters. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
       fi
@@ -6722,15 +6764,27 @@ systemd_boot_add_kernel_params() {
     note ""
     note "Important: these are WORKAROUNDS, not solutions. They may reduce or eliminate symptoms, but they will NOT fix BIOS/firmware bugs, ReBAR quirks, or fundamental IOMMU group problems."
     note "Trade-off: amdgpu.runpm=0 increases idle power usage and heat because the GPU stays at full power."
-    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" ]]; then
+    note ""
+    note "3) vfio-pci.disable_idle_d3=1 — keeps the vfio-pci-bound GPU out of D3hot idle."
+    note "   What it does: prevents the bound GPU from entering D3hot when idle, avoiding D3 entry/exit races."
+    note "   Why it can help: D3 entry/exit races during VM start/stop reset are a known source of reset failures and black screens on some AMD cards under VFIO."
+    note ""
+    note "4) pcie_port_pm=off — disables PCIe port power management."
+    note "   What it does: prevents PCIe port runtime power-state transitions on the guest GPU path."
+    note "   Why it can help: PCIe port PM can cause link drops on the guest GPU path, contributing to 'device lost from bus' cascades."
+    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" ]]; then
       note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
       [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.runpm=0")"
       [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.noretry=0")"
-    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" ]]; then
-      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry)."
-    elif prompt_yn "Add amdgpu.runpm=0 and amdgpu.noretry=0 to this boot entry for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+      [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
+      [[ "${AMD_PORTPM_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
+    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" ]]; then
+      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off)."
+    elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1 and pcie_port_pm=off to this boot entry for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
       new_opts="$(add_param_once "$new_opts" "amdgpu.runpm=0")"
       new_opts="$(add_param_once "$new_opts" "amdgpu.noretry=0")"
+      new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
+      new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
     else
       note "Skipping AMD GPU stability parameters for this entry. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
     fi
@@ -6788,6 +6842,10 @@ print_manual_iommu_instructions() {
   say "  amdgpu.noretry=0"
   say "    - Disables GPU-initiated PCIe transaction retry loops."
   say "    - Can prevent a wedged GPU from locking the shared PCIe bus and cascading to xHCI/USB/audio devices."
+  say "  vfio-pci.disable_idle_d3=1"
+  say "    - Keeps the vfio-pci-bound GPU out of D3hot idle to avoid D3 entry/exit races during VM start/stop reset."
+  say "  pcie_port_pm=off"
+  say "    - Disables PCIe port power management to prevent link drops on the guest GPU path."
   say "Advanced (usually NOT recommended): pcie_acs_override=downstream,multifunction"
   say "  - Only consider this if your IOMMU groups are not isolated."
   say "  - It can reduce PCIe isolation and may cause instability on some systems."
@@ -6879,16 +6937,28 @@ grub_add_kernel_params() {
     note ""
     note "Important: these are WORKAROUNDS, not solutions. They may reduce or eliminate symptoms, but they will NOT fix BIOS/firmware bugs, ReBAR quirks, or fundamental IOMMU group problems."
     note "Trade-off: amdgpu.runpm=0 increases idle power usage and heat because the GPU stays at full power."
+    note ""
+    note "3) vfio-pci.disable_idle_d3=1 — keeps the vfio-pci-bound GPU out of D3hot idle."
+    note "   What it does: prevents the bound GPU from entering D3hot when idle, avoiding D3 entry/exit races."
+    note "   Why it can help: D3 entry/exit races during VM start/stop reset are a known source of reset failures and black screens on some AMD cards under VFIO."
+    note ""
+    note "4) pcie_port_pm=off — disables PCIe port power management."
+    note "   What it does: prevents PCIe port runtime power-state transitions on the guest GPU path."
+    note "   Why it can help: PCIe port PM can cause link drops on the guest GPU path, contributing to 'device lost from bus' cascades."
     note "If your AMD guest GPU works reliably without these, leaving the defaults enabled is preferred for lower power usage."
-    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" ]]; then
+    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" ]]; then
       note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
       [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.runpm=0")"
       [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.noretry=0")"
-    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" ]]; then
-      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry)."
-    elif prompt_yn "Add amdgpu.runpm=0 and amdgpu.noretry=0 to GRUB kernel parameters for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+      [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
+      [[ "${AMD_PORTPM_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "pcie_port_pm=off")"
+    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" ]]; then
+      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off)."
+    elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1 and pcie_port_pm=off to GRUB kernel parameters for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
       new="$(add_param_once "$new" "amdgpu.runpm=0")"
       new="$(add_param_once "$new" "amdgpu.noretry=0")"
+      new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
+      new="$(add_param_once "$new" "pcie_port_pm=off")"
     else
       note "Skipping AMD GPU stability parameters. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
     fi
@@ -11679,6 +11749,8 @@ reset_vfio_all() {
     new="$(remove_param_all "$new" "initcall_blacklist=sysfb_init")"
     new="$(remove_param_all "$new" "amdgpu.runpm=0")"
     new="$(remove_param_all "$new" "amdgpu.noretry=0")"
+    new="$(remove_param_all "$new" "vfio-pci.disable_idle_d3=1")"
+    new="$(remove_param_all "$new" "pcie_port_pm=off")"
 
     if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
       grub_write_cmdline_in_place "$key" "$new"
@@ -11727,6 +11799,8 @@ reset_vfio_all() {
     knew="$(remove_param_all "$knew" "initcall_blacklist=sysfb_init")"
     knew="$(remove_param_all "$knew" "amdgpu.runpm=0")"
     knew="$(remove_param_all "$knew" "amdgpu.noretry=0")"
+    knew="$(remove_param_all "$knew" "vfio-pci.disable_idle_d3=1")"
+    knew="$(remove_param_all "$knew" "pcie_port_pm=off")"
     if ! cmdline_get_key_value_token "$knew" "root" >/dev/null 2>&1; then
       local reset_recovered_opts reset_recovered_cmdline reset_recovered_root_tok
       reset_recovered_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"

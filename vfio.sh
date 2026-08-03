@@ -42,6 +42,9 @@ LIGHTDM_HOST_GPU_CONF="/etc/lightdm/lightdm.conf.d/90-vfio-host-gpu.conf"
 GRAPHICS_DAEMON_SCRIPT="/usr/local/sbin/vfio-graphics-protocold.sh"
 GRAPHICS_DAEMON_UNIT="/etc/systemd/system/vfio-graphics-protocold.service"
 GRAPHICS_DAEMON_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/vfio-graphics-protocold.service"
+LIBVIRT_HOOK_DIR="/etc/libvirt/hooks"
+LIBVIRT_HOOK_ENTRY="$LIBVIRT_HOOK_DIR/qemu"
+LIBVIRT_HOOK_SCRIPT="/usr/local/sbin/vfio-libvirt-hook.sh"
 
 DEBUG=0
 DRY_RUN=0
@@ -55,6 +58,7 @@ AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install
 AMD_NORETRY_OVERRIDE=""       # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_D3_OVERRIDE=""            # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install mode only)
+BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
 GRAPHICS_DAEMON_INTERVAL_DEFAULT=1
 GRAPHICS_WATCHDOG_RETENTION_DAYS_DEFAULT=10
@@ -616,6 +620,7 @@ complete -c $cmd -l amd-disable-idle-d3 -d 'Force-add vfio-pci.disable_idle_d3=1
 complete -c $cmd -l no-amd-disable-idle-d3 -d 'Skip vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)'
 complete -c $cmd -l amd-pcie-port-pm-off -d 'Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)'
 complete -c $cmd -l no-amd-pcie-port-pm-off -d 'Skip pcie_port_pm=off for AMD guest GPU (skip prompt)'
+complete -c $cmd -l binding-mode -r -a 'early dynamic' -d 'Install-mode GPU binding strategy (early|dynamic)'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -655,7 +660,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -704,6 +709,7 @@ _vfio_sh_complete() {
     '--no-amd-disable-idle-d3[Skip vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)]' \\
     '--amd-pcie-port-pm-off[Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
     '--no-amd-pcie-port-pm-off[Skip pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
+    '--binding-mode=[Install-mode GPU binding strategy]:mode:(early dynamic)' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1325,7 +1331,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1353,6 +1359,12 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Install-mode override: force-add pcie_port_pm=off for AMD guest GPUs (skip prompt).
   --no-amd-pcie-port-pm-off
                    Install-mode override: skip pcie_port_pm=off for AMD guest GPUs (skip prompt).
+  --binding-mode early|dynamic
+                   Install-mode override for GPU binding strategy:
+                   early (default) forces the guest GPU onto vfio-pci at boot via vfio-pci.ids /
+                   rd.driver.pre=vfio-pci / the bind systemd unit. dynamic lets amdgpu load first
+                   and a libvirt qemu hook switches the GPU to vfio-pci only when a VM that has the
+                   GPU attached is started (more reliable for RX 9070 / RDNA4 reset-bug cards).
   --verify          Do not change anything; validate an existing setup (reads $CONF_FILE).
   --detect          Print a detailed report of existing VFIO/passthrough configuration and exit.
   --sync-bls-only   Non-interactive mode: sync BLS entry options from /etc/kernel/cmdline, then run strict drift verification.
@@ -1438,6 +1450,19 @@ normalize_graphics_protocol_arg() {
       ;;
   esac
 }
+normalize_binding_mode_arg() {
+  local raw="${1:-}" val
+  val="${raw^^}"
+  case "$val" in
+    EARLY|DYNAMIC)
+      printf '%s\n' "$val"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
 normalize_graphics_daemon_interval_arg() {
   local raw="${1:-}"
   [[ "$raw" =~ ^[0-9]+$ ]] || return 1
@@ -1515,6 +1540,14 @@ parse_args() {
         ;;
       --no-amd-pcie-port-pm-off)
         AMD_PORTPM_OVERRIDE=0
+        ;;
+      --binding-mode)
+        shift
+        (( $# > 0 )) || die "--binding-mode requires a value: early|dynamic"
+        BINDING_MODE_OVERRIDE="$(normalize_binding_mode_arg "$1")" || die "Invalid --binding-mode value: $1 (expected: early|dynamic)"
+        ;;
+      --binding-mode=*)
+        BINDING_MODE_OVERRIDE="$(normalize_binding_mode_arg "${1#*=}")" || die "Invalid --binding-mode value: ${1#*=} (expected: early|dynamic)"
         ;;
       --verify)
         MODE="verify"
@@ -3481,12 +3514,28 @@ detect_existing_vfio_report() {
     done
   fi
 
-  # Libvirt hook detection (common VFIO stage)
+  # GPU binding mode + libvirt hook detection (common VFIO stage)
   say
   if (( ENABLE_COLOR )); then
-    say "${C_CYAN}-- libvirt hook detection --${C_RESET}"
+    say "${C_CYAN}-- GPU binding mode + libvirt hook detection --${C_RESET}"
   else
-    say "-- libvirt hook detection --"
+    say "-- GPU binding mode + libvirt hook detection --"
+  fi
+  local _detect_binding_mode="early"
+  if readable_file "$CONF_FILE"; then
+    _detect_binding_mode="$(awk -F= '/^VFIO_BINDING_MODE=/{gsub(/"/,"",$2); print $2; exit}' "$CONF_FILE" 2>/dev/null || echo early)"
+  fi
+  _detect_binding_mode="${_detect_binding_mode:-early}"
+  print_kv "Binding mode" "$_detect_binding_mode"
+  if [[ -x "$LIBVIRT_HOOK_SCRIPT" ]]; then
+    print_kv "Libvirt hook script" "present ($LIBVIRT_HOOK_SCRIPT)"
+  else
+    print_kv "Libvirt hook script" "missing"
+  fi
+  if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+    print_kv "Libvirt qemu entry" "present ($LIBVIRT_HOOK_ENTRY)"
+  else
+    print_kv "Libvirt qemu entry" "missing"
   fi
   if [[ -d /etc/libvirt/hooks ]]; then
     print_kv "/etc/libvirt/hooks" "present"
@@ -3950,6 +3999,7 @@ write_conf() {
   local graphics_protocol_mode="${7:-AUTO}"
   local boot_vga_policy_mode="${8:-${BOOT_VGA_POLICY_OVERRIDE:-AUTO}}"
   local graphics_daemon_interval="${9:-${GRAPHICS_DAEMON_INTERVAL_OVERRIDE:-$GRAPHICS_DAEMON_INTERVAL_DEFAULT}}"
+  local binding_mode="${10:-${BINDING_MODE_OVERRIDE:-early}}"
   local boot_vga_host_assisted_default="0"
   graphics_protocol_mode="${graphics_protocol_mode^^}"
   if [[ "$graphics_protocol_mode" != "X11" && "$graphics_protocol_mode" != "WAYLAND" ]]; then
@@ -3963,6 +4013,11 @@ write_conf() {
   if [[ ! "$graphics_daemon_interval" =~ ^[0-9]+$ ]] || (( 10#$graphics_daemon_interval < 1 || 10#$graphics_daemon_interval > 3600 )); then
     graphics_daemon_interval="$GRAPHICS_DAEMON_INTERVAL_DEFAULT"
   fi
+  binding_mode="${binding_mode^^}"
+  case "$binding_mode" in
+    EARLY|DYNAMIC) ;;
+    *) binding_mode="early" ;;
+  esac
 
   boot_vga_host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
 
@@ -4012,6 +4067,20 @@ VFIO_GRAPHICS_WATCHDOG_MAX_LINES="5000"
 # - 0: keep AUTO conservative for active user sessions; pre-login safety pinning
 #      for X11 display managers still applies.
 VFIO_GRAPHICS_AUTO_X11_PINNING="1"
+# GPU binding strategy:
+# - early (default): force the guest GPU onto vfio-pci at boot via vfio-pci.ids /
+#   rd.driver.pre=vfio-pci / the vfio-bind-selected-gpu.service systemd unit.
+# - dynamic: let amdgpu load first; a libvirt qemu hook switches the guest GPU to
+#   vfio-pci only when a VM that has the GPU attached is started. More reliable for
+#   RX 9070 / RDNA4 cards that hit the "Unknown PCI header type 127" reset bug when
+#   bound to vfio-pci too early. Requires libvirt-managed VMs.
+VFIO_BINDING_MODE="$binding_mode"
+# Dynamic-mode post-VM-stop behavior:
+# - 0 (default): leave the guest GPU on vfio-pci after the VM stops (safer for the
+#   RX 9070 reset bug; the host cannot use the GPU between VM sessions without reboot
+#   or a manual rebind).
+# - 1: rebind the guest GPU back to its normal host driver (amdgpu/snd) on VM stop.
+VFIO_DYNAMIC_REBIND_HOST="0"
 EOF
 }
 
@@ -6380,6 +6449,11 @@ systemd_boot_add_kernel_params() {
       new_cmdline="$(add_param_once "$new_cmdline" "$p")"
     done
     new_cmdline="$(append_guest_vfio_ids_with_detect_fallback "$new_cmdline" "/etc/kernel/cmdline (persistence)")"
+    if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+      # Dynamic mode: strip any pre-existing vfio-pci.ids from a prior early-binding run.
+      new_cmdline="$(remove_param_prefix "$new_cmdline" "vfio-pci.ids=")"
+      note "Dynamic binding mode: skipping vfio-pci.ids (libvirt hook will bind at VM start)."
+    fi
     local boot_metadata_opts
     boot_metadata_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"
     if [[ -n "$boot_metadata_opts" ]]; then
@@ -6501,7 +6575,10 @@ systemd_boot_add_kernel_params() {
     # However, if the vfio-pci module is not present for this kernel,
     # forcing rd.driver.pre=vfio-pci would just cause dracut to fail a
     # modprobe very early in boot, so we skip it in that case.
-    if command -v dracut >/dev/null 2>&1 && vfio_pci_available; then
+    if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+      note "Dynamic binding mode: skipping rd.driver.pre=vfio-pci (libvirt hook will bind at VM start)."
+      new_cmdline="$(remove_param_all "$new_cmdline" "rd.driver.pre=vfio-pci")"
+    elif command -v dracut >/dev/null 2>&1 && vfio_pci_available; then
       say
       hdr "Initramfs early VFIO driver (recommended on openSUSE)"
       note "On openSUSE (dracut-based), rd.driver.pre=vfio-pci helps vfio-pci claim the guest GPU before amdgpu/nvidia/i915 inside the initramfs."
@@ -6734,6 +6811,10 @@ systemd_boot_add_kernel_params() {
     new_opts="$(add_param_once "$new_opts" "$p")"
   done
   new_opts="$(append_guest_vfio_ids_with_detect_fallback "$new_opts" "systemd-boot entry options")"
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    new_opts="$(remove_param_prefix "$new_opts" "vfio-pci.ids=")"
+    note "Dynamic binding mode: skipping vfio-pci.ids for this entry (libvirt hook will bind at VM start)."
+  fi
 
   # Optional: USB/xHCI stability workaround for the selected live entry.
   say
@@ -6881,6 +6962,10 @@ grub_add_kernel_params() {
     new="$(add_param_once "$new" "$p")"
   done
   new="$(append_guest_vfio_ids_with_detect_fallback "$new" "GRUB kernel cmdline")"
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    new="$(remove_param_prefix "$new" "vfio-pci.ids=")"
+    note "Dynamic binding mode: skipping vfio-pci.ids (libvirt hook will bind at VM start)."
+  fi
 
   # Optional USB/xHCI power-management workaround.
   say
@@ -7033,7 +7118,10 @@ grub_add_kernel_params() {
   # the race against amdgpu/nvidia/i915 when those are pulled into the
   # initramfs. It is still optional because misconfiguration can affect
   # boot if your host depends on those drivers very early.
-  if command -v dracut >/dev/null 2>&1 && vfio_pci_available; then
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    note "Dynamic binding mode: skipping rd.driver.pre=vfio-pci (libvirt hook will bind at VM start)."
+    new="$(remove_param_all "$new" "rd.driver.pre=vfio-pci")"
+  elif command -v dracut >/dev/null 2>&1 && vfio_pci_available; then
     say
     # On openSUSE (dracut-based), rd.driver.pre=vfio-pci is strongly
     # recommended; elsewhere we keep it as an advanced optional setting.
@@ -7201,56 +7289,31 @@ die() {
 # Basic sanity: ensure sysfs entries exist.
 [[ -d "/sys/bus/pci/devices/$GUEST_GPU_BDF" ]] || die "Guest GPU not present in sysfs: $GUEST_GPU_BDF"
 
-# Fail-safe: do not steal the active Boot VGA GPU during normal host boot
-# unless the host GPU is explicitly configured as a different non-Boot-VGA
-# adapter. Set VFIO_ALLOW_BOOT_VGA=1 to force binding unconditionally.
-if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
-  guest_boot_vga="$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
-  boot_vga_policy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
-  boot_vga_policy="${boot_vga_policy^^}"
-  case "$boot_vga_policy" in
-    AUTO|STRICT) ;;
-    *) boot_vga_policy="STRICT" ;;
+# This script is invoked two ways:
+#   1) by vfio-bind-selected-gpu.service at boot (no args) -> ACTION=boot
+#   2) by the libvirt qemu hook (vfio-libvirt-hook.sh) with --bind-now or --release
+ACTION="boot"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --bind-now) ACTION="bind-now" ;;
+    --release)  ACTION="release" ;;
+    *) die "Unknown argument: $1" ;;
   esac
-  if [[ "$guest_boot_vga" == "1" ]] && [[ "${VFIO_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
-    allow_boot_vga_bind=0
-    allow_boot_vga_reason="none"
-    host_assisted_boot_vga_bind=0
-    if [[ -n "${HOST_GPU_BDF:-}" ]] && [[ "$HOST_GPU_BDF" != "$GUEST_GPU_BDF" ]] && [[ -f "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" ]]; then
-      host_boot_vga="$(cat "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" 2>/dev/null || echo 1)"
-      if [[ "$host_boot_vga" == "0" ]]; then
-        host_assisted_boot_vga_bind=1
-        if [[ "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" == "1" ]]; then
-          allow_boot_vga_bind=1
-          allow_boot_vga_reason="explicit_opt_in"
-        fi
-        if [[ "$boot_vga_policy" == "AUTO" ]]; then
-          allow_boot_vga_bind=1
-          allow_boot_vga_reason="auto_detect"
-        fi
-      fi
-    fi
+  shift
+done
 
-    if [[ "$allow_boot_vga_bind" == "1" ]]; then
-      say "WARN: $GUEST_GPU_BDF is Boot VGA, and HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
-      if [[ "$allow_boot_vga_reason" == "auto_detect" ]]; then
-        say "INFO: VFIO_BOOT_VGA_POLICY=AUTO auto-detected a safe host-assisted topology; proceeding with vfio bind."
-        say "INFO: Set VFIO_BOOT_VGA_POLICY=STRICT to require explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1."
-      else
-        say "WARN: VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 is set; proceeding with host-assisted vfio bind."
-        say "INFO: Set VFIO_ALLOW_BOOT_VGA=1 to force this behavior without host GPU checks."
-      fi
-    else
-      say "WARN: $GUEST_GPU_BDF is Boot VGA; skipping vfio-pci bind to keep host graphics alive."
-      if [[ "$host_assisted_boot_vga_bind" == "1" ]]; then
-        say "INFO: HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
-        say "INFO: Set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 to allow host-assisted Boot VGA binding."
-      else
-        say "INFO: Set HOST_GPU_BDF to a different GPU (boot_vga=0) or set VFIO_ALLOW_BOOT_VGA=1 to force binding."
-      fi
-      exit 0
-    fi
-  fi
+binding_mode="${VFIO_BINDING_MODE:-early}"
+binding_mode="${binding_mode^^}"
+case "$binding_mode" in
+  EARLY|DYNAMIC) ;;
+  *) binding_mode="EARLY" ;;
+esac
+
+# In dynamic mode the boot invocation is a no-op: amdgpu keeps the card until
+# the libvirt hook requests --bind-now at VM start.
+if [[ "$ACTION" == "boot" && "$binding_mode" == "DYNAMIC" ]]; then
+  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start)."
+  exit 0
 fi
 
 modprobe vfio
@@ -7281,6 +7344,9 @@ bind_one() {
     fi
   fi
 
+  # Prevent D3cold entry (RX 9070 / RDNA4 reset bug: card falls off bus on D3cold exit).
+  echo 0 >"$sys/d3cold_allowed" 2>/dev/null || true
+
   echo vfio-pci >"$sys/driver_override"
   echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" || true
 }
@@ -7293,37 +7359,144 @@ clear_override() {
   echo "" >"$sys/driver_override" || true
 }
 
+reprobe_to_host() {
+  # Best-effort: unbind from vfio-pci, clear the driver_override, and trigger a
+  # generic driver re-probe so the normal host driver (amdgpu/snd) can reclaim
+  # the device. Used by --release when VFIO_DYNAMIC_REBIND_HOST=1.
+  local dev="$1"
+  [[ -n "$dev" ]] || return 0
+  local sys="/sys/bus/pci/devices/$dev"
+  [[ -d "$sys" ]] || return 0
+  if [[ -L "$sys/driver" ]]; then
+    local drv
+    drv="$(basename "$(readlink "$sys/driver")")"
+    if [[ "$drv" == "vfio-pci" ]] && [[ -w "/sys/bus/pci/drivers/$drv/unbind" ]]; then
+      echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" || true
+    fi
+  fi
+  echo "" >"$sys/driver_override" 2>/dev/null || true
+  if [[ -w /sys/bus/pci/drivers_probe ]]; then
+    echo "$dev" >/sys/bus/pci/drivers_probe 2>/dev/null || true
+  fi
+}
+
 # Safety: never bind host audio list.
 for dev in $(csv_to_array "${HOST_AUDIO_BDFS_CSV:-}"); do
   [[ "$dev" != "$GUEST_GPU_BDF" ]] || die "Refusing: guest GPU is also listed as host audio ($dev)"
   [[ "$dev" != "${GUEST_AUDIO_BDFS_CSV:-}" ]] || true
 done
 
-# Bind guest GPU first.
-bind_one "$GUEST_GPU_BDF"
+do_bind() {
+  # Bind guest GPU first.
+  bind_one "$GUEST_GPU_BDF"
 
-# Bind selected guest audio functions.
-while IFS= read -r dev; do
-  [[ -n "$dev" ]] || continue
-  # Do not bind if user accidentally selected same BDF for host audio.
-  if grep -Eq "(^|,)${dev}($|,)" <<<"${HOST_AUDIO_BDFS_CSV:-}"; then
-    die "Refusing to bind $dev: it is configured as host audio"
+  # Bind selected guest audio functions.
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    # Do not bind if user accidentally selected same BDF for host audio.
+    if grep -Eq "(^|,)${dev}($|,)" <<<"${HOST_AUDIO_BDFS_CSV:-}"; then
+      die "Refusing to bind $dev: it is configured as host audio"
+    fi
+    bind_one "$dev"
+  done < <(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}")
+
+  # Ensure host audio functions are NOT overridden.
+  while IFS= read -r dev; do
+    clear_override "$dev"
+  done < <(csv_to_array "${HOST_AUDIO_BDFS_CSV:-}")
+
+  # Post-check: verify guest GPU is bound to vfio-pci.
+  if [[ -L "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" ]]; then
+    drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver")")"
+    [[ "$drv" == "vfio-pci" ]] || die "Guest GPU driver is '$drv' (expected vfio-pci)."
   fi
-  bind_one "$dev"
-done < <(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}")
+}
 
-# Ensure host audio functions are NOT overridden.
-while IFS= read -r dev; do
-  clear_override "$dev"
-done < <(csv_to_array "${HOST_AUDIO_BDFS_CSV:-}")
+# Fail-safe: do not steal the active Boot VGA GPU during normal host boot
+# unless the host GPU is explicitly configured as a different non-Boot-VGA
+# adapter. Set VFIO_ALLOW_BOOT_VGA=1 to force binding unconditionally.
+# Only applied on the boot action path; --bind-now (libvirt hook) explicitly
+# skips this because the VM that has the GPU attached was just started.
+boot_vga_guard() {
+  if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
+    guest_boot_vga="$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
+    boot_vga_policy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+    boot_vga_policy="${boot_vga_policy^^}"
+    case "$boot_vga_policy" in
+      AUTO|STRICT) ;;
+      *) boot_vga_policy="STRICT" ;;
+    esac
+    if [[ "$guest_boot_vga" == "1" ]] && [[ "${VFIO_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
+      allow_boot_vga_bind=0
+      allow_boot_vga_reason="none"
+      host_assisted_boot_vga_bind=0
+      if [[ -n "${HOST_GPU_BDF:-}" ]] && [[ "$HOST_GPU_BDF" != "$GUEST_GPU_BDF" ]] && [[ -f "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" ]]; then
+        host_boot_vga="$(cat "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" 2>/dev/null || echo 1)"
+        if [[ "$host_boot_vga" == "0" ]]; then
+          host_assisted_boot_vga_bind=1
+          if [[ "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" == "1" ]]; then
+            allow_boot_vga_bind=1
+            allow_boot_vga_reason="explicit_opt_in"
+          fi
+          if [[ "$boot_vga_policy" == "AUTO" ]]; then
+            allow_boot_vga_bind=1
+            allow_boot_vga_reason="auto_detect"
+          fi
+        fi
+      fi
 
-# Post-check: verify guest GPU is bound to vfio-pci.
-if [[ -L "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" ]]; then
-  drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver")")"
-  [[ "$drv" == "vfio-pci" ]] || die "Guest GPU driver is '$drv' (expected vfio-pci)."
-fi
+      if [[ "$allow_boot_vga_bind" == "1" ]]; then
+        say "WARN: $GUEST_GPU_BDF is Boot VGA, and HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
+        if [[ "$allow_boot_vga_reason" == "auto_detect" ]]; then
+          say "INFO: VFIO_BOOT_VGA_POLICY=AUTO auto-detected a safe host-assisted topology; proceeding with vfio bind."
+          say "INFO: Set VFIO_BOOT_VGA_POLICY=STRICT to require explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1."
+        else
+          say "WARN: VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 is set; proceeding with host-assisted vfio bind."
+          say "INFO: Set VFIO_ALLOW_BOOT_VGA=1 to force this behavior without host GPU checks."
+        fi
+      else
+        say "WARN: $GUEST_GPU_BDF is Boot VGA; skipping vfio-pci bind to keep host graphics alive."
+        if [[ "$host_assisted_boot_vga_bind" == "1" ]]; then
+          say "INFO: HOST_GPU_BDF=${HOST_GPU_BDF:-} has boot_vga=0."
+          say "INFO: Set VFIO_BOOT_VGA_POLICY=AUTO (recommended) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 to allow host-assisted Boot VGA binding."
+        else
+          say "INFO: Set HOST_GPU_BDF to a different GPU (boot_vga=0) or set VFIO_ALLOW_BOOT_VGA=1 to force binding."
+        fi
+        exit 0
+      fi
+    fi
+  fi
+}
 
-say "vfio-pci binding complete: $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
+case "$ACTION" in
+  release)
+    if [[ "${VFIO_DYNAMIC_REBIND_HOST:-0}" == "1" ]]; then
+      reprobe_to_host "$GUEST_GPU_BDF"
+      while IFS= read -r dev; do
+        [[ -n "$dev" ]] || continue
+        reprobe_to_host "$dev"
+      done < <(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}")
+      say "Released guest devices back to host driver: $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
+    else
+      say "Dynamic release: leaving guest GPU on vfio-pci (VFIO_DYNAMIC_REBIND_HOST=0)."
+    fi
+    exit 0
+    ;;
+  bind-now)
+    # Forced bind requested by the libvirt hook (the VM has the GPU attached).
+    # Skip the Boot-VGA safety skip since the user explicitly started a VM that
+    # has this GPU attached.
+    do_bind
+    say "vfio-pci binding complete (--bind-now): $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
+    exit 0
+    ;;
+  boot)
+    # Early-binding boot path: respect Boot-VGA safety skip, then bind.
+    boot_vga_guard
+    do_bind
+    say "vfio-pci binding complete: $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
+    ;;
+esac
 EOF
 }
 
@@ -7352,6 +7525,145 @@ EOF
 
   run systemctl daemon-reload
   run systemctl enable vfio-bind-selected-gpu.service
+}
+install_libvirt_hook() {
+  # Installs a generic libvirt qemu hook for dynamic GPU binding.
+  # No hardcoded VM/domain names: the hook reads the VM XML from stdin and only
+  # switches the guest GPU to vfio-pci when that VM actually has the GPU attached.
+  if (( ! DRY_RUN )); then
+    mkdir -p "$LIBVIRT_HOOK_DIR"
+  fi
+
+  # Preserve a pre-existing user-managed qemu hook so --reset can restore it.
+  # Skip the backup if the existing entry is already our managed file.
+  if [[ -f "$LIBVIRT_HOOK_ENTRY" && ! -f "$LIBVIRT_HOOK_ENTRY.bak.$RUN_TS" ]]; then
+    if ! grep -Fq "# Managed by vfio.sh" "$LIBVIRT_HOOK_ENTRY" 2>/dev/null; then
+      run cp -a "$LIBVIRT_HOOK_ENTRY" "$LIBVIRT_HOOK_ENTRY.bak.$RUN_TS"
+      note "Backed up existing libvirt qemu hook to $LIBVIRT_HOOK_ENTRY.bak.$RUN_TS"
+    fi
+  fi
+
+  backup_file "$LIBVIRT_HOOK_SCRIPT"
+
+  write_file_atomic "$LIBVIRT_HOOK_SCRIPT" 0755 "root:root" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Managed by vfio.sh — libvirt qemu hook for dynamic GPU binding.
+# Invoked by libvirt as: /etc/libvirt/hooks/qemu <domain> <phase> <...>
+# with the VM domain XML piped on stdin (for most phases).
+
+CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
+
+say() { printf '%s\n' "$*"; }
+
+[[ -f "$CONF_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+. "$CONF_FILE"
+
+[[ -x "$BIND_SCRIPT" ]] || { say "vfio-libvirt-hook: $BIND_SCRIPT missing or not executable; skipping." >&2; exit 0; }
+
+DOMAIN="${1:-}"
+PHASE="${2:-}"
+
+# Comma-separated set of configured guest BDFs (GPU + audio) we care about.
+GUEST_BDFS="$GUEST_GPU_BDF"
+if [[ -n "${GUEST_AUDIO_BDFS_CSV:-}" ]]; then
+  GUEST_BDFS="$GUEST_BDFS,$GUEST_AUDIO_BDFS_CSV"
+fi
+
+# Parse libvirt domain XML from stdin and print one BDF per line for every PCI
+# <hostdev> address. The "." in the regexes matches either single or double
+# quotes around attribute values (libvirt uses ' by default, some tools use ").
+extract_hostdev_bdfs() {
+  awk '
+    /<hostdev/ { in_hostdev=1; is_pci=0 }
+    in_hostdev && /type=.pci./ { is_pci=1 }
+    in_hostdev && is_pci && /<address/ {
+      line=$0; dom=""; bus=""; slot=""; fn=""
+      if (match(line, /domain=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^domain=./, "", s); sub(/^0x/, "", s); dom=s
+      }
+      if (match(line, /bus=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^bus=./, "", s); sub(/^0x/, "", s); bus=s
+      }
+      if (match(line, /slot=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^slot=./, "", s); sub(/^0x/, "", s); slot=s
+      }
+      if (match(line, /function=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^function=./, "", s); sub(/^0x/, "", s); fn=s
+      }
+      if (dom != "" && bus != "" && slot != "" && fn != "") {
+        while (length(dom) < 4) dom = "0" dom
+        while (length(bus) < 2) bus = "0" bus
+        while (length(slot) < 2) slot = "0" slot
+        printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+      }
+    }
+    /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+  '
+}
+
+# Return 0 if any configured guest BDF appears in the VM's PCI hostdev list.
+vm_uses_guest_gpu() {
+  local xml_bdfs b
+  xml_bdfs="$(extract_hostdev_bdfs)"
+  [[ -n "$xml_bdfs" ]] || return 1
+  local IFS=','
+  for b in $GUEST_BDFS; do
+    [[ -n "$b" ]] || continue
+    if grep -Fxq "$b" <<<"$xml_bdfs"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Return 0 if the configured guest GPU is currently bound to vfio-pci.
+guest_gpu_on_vfio() {
+  [[ -L "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" ]] || return 1
+  local drv
+  drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver")" 2>/dev/null || echo "")"
+  [[ "$drv" == "vfio-pci" ]]
+}
+
+case "$PHASE" in
+  prepare)
+    # VM is about to start. Only bind if this VM has the guest GPU attached.
+    if vm_uses_guest_gpu; then
+      say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
+      "$BIND_SCRIPT" --bind-now
+    else
+      : # unrelated VM; let libvirt proceed untouched.
+    fi
+    ;;
+  stopped|release)
+    # VM stopped. If the guest GPU is currently on vfio-pci (we bound it), release
+    # it back to the host driver per VFIO_DYNAMIC_REBIND_HOST. No-op otherwise.
+    if guest_gpu_on_vfio; then
+      say "vfio-libvirt-hook: VM '$DOMAIN' stopped; releasing guest GPU."
+      "$BIND_SCRIPT" --release
+    fi
+    ;;
+  *)
+    : # ignore start/started/reconnect/etc.
+    ;;
+esac
+
+exit 0
+EOF
+
+  write_file_atomic "$LIBVIRT_HOOK_ENTRY" 0755 "root:root" <<'EOF'
+#!/usr/bin/env bash
+# Managed by vfio.sh — do not edit; this file is regenerated on reinstall.
+# Generic libvirt qemu hook entry point (no hardcoded VM names).
+exec /usr/local/sbin/vfio-libvirt-hook.sh "$@"
+EOF
+
+  say "Installed libvirt qemu hook: $LIBVIRT_HOOK_ENTRY"
+  say "Installed libvirt hook script: $LIBVIRT_HOOK_SCRIPT"
+  note "Dynamic binding switches the guest GPU to vfio-pci only when a VM that has it attached is started."
 }
 ensure_graphics_daemon_deployment_safety() {
   # Guardrail for partial/failed deployments:
@@ -10765,6 +11077,7 @@ verify_setup() {
   say "  Guest GPU:   ${GUEST_GPU_BDF:-<missing>}"
   say "  Guest audio: ${GUEST_AUDIO_BDFS_CSV:-<none>}"
   say "  Host audio:  ${HOST_AUDIO_BDFS_CSV:-<none>}"
+  say "  Binding mode: ${VFIO_BINDING_MODE:-early}"
 
   # Basic sanity
   if [[ -z "${GUEST_GPU_BDF:-}" ]]; then
@@ -10775,14 +11088,24 @@ verify_setup() {
     fi
     ok=0
   else
-    if [[ "$(bdf_driver_name "$GUEST_GPU_BDF")" != "vfio-pci" ]]; then
-      if (( ENABLE_COLOR )); then
-        say "${C_RED}✖ FAIL${C_RESET}: Guest GPU $GUEST_GPU_BDF is not bound to vfio-pci (driver: $(bdf_driver_name "$GUEST_GPU_BDF"))"
+    local guest_drv
+    guest_drv="$(bdf_driver_name "$GUEST_GPU_BDF")"
+    if [[ "$guest_drv" != "vfio-pci" ]]; then
+      if [[ "${VFIO_BINDING_MODE:-early}" == "DYNAMIC" ]]; then
+        if (( ENABLE_COLOR )); then
+          say "${C_GREEN}✔ OK${C_RESET}: Guest GPU $GUEST_GPU_BDF on host driver '$guest_drv' (dynamic binding — hook switches at VM start)"
+        else
+          say "OK: Guest GPU $GUEST_GPU_BDF on host driver '$guest_drv' (dynamic binding — hook switches at VM start)"
+        fi
       else
-        say "FAIL: Guest GPU $GUEST_GPU_BDF is not bound to vfio-pci (driver: $(bdf_driver_name "$GUEST_GPU_BDF"))"
+        if (( ENABLE_COLOR )); then
+          say "${C_RED}✖ FAIL${C_RESET}: Guest GPU $GUEST_GPU_BDF is not bound to vfio-pci (driver: $guest_drv)"
+        else
+          say "FAIL: Guest GPU $GUEST_GPU_BDF is not bound to vfio-pci (driver: $guest_drv)"
+        fi
+        note "This is expected BEFORE reboot (or if the vfio bind service isn't enabled)."
+        ok=0
       fi
-      note "This is expected BEFORE reboot (or if the vfio bind service isn't enabled)."
-      ok=0
     else
       if (( ENABLE_COLOR )); then
         say "${C_GREEN}✔ OK${C_RESET}: Guest GPU $GUEST_GPU_BDF bound to vfio-pci"
@@ -10796,13 +11119,23 @@ verify_setup() {
     local IFS=','
     for dev in $GUEST_AUDIO_BDFS_CSV; do
       [[ -n "$dev" ]] || continue
-      if [[ "$(bdf_driver_name "$dev")" != "vfio-pci" ]]; then
-        if (( ENABLE_COLOR )); then
-          say "${C_RED}✖ FAIL${C_RESET}: Guest audio $dev is not bound to vfio-pci (driver: $(bdf_driver_name "$dev"))"
+      local aud_drv
+      aud_drv="$(bdf_driver_name "$dev")"
+      if [[ "$aud_drv" != "vfio-pci" ]]; then
+        if [[ "${VFIO_BINDING_MODE:-early}" == "DYNAMIC" ]]; then
+          if (( ENABLE_COLOR )); then
+            say "${C_GREEN}✔ OK${C_RESET}: Guest audio $dev on host driver '$aud_drv' (dynamic binding)"
+          else
+            say "OK: Guest audio $dev on host driver '$aud_drv' (dynamic binding)"
+          fi
         else
-          say "FAIL: Guest audio $dev is not bound to vfio-pci (driver: $(bdf_driver_name "$dev"))"
+          if (( ENABLE_COLOR )); then
+            say "${C_RED}✖ FAIL${C_RESET}: Guest audio $dev is not bound to vfio-pci (driver: $aud_drv)"
+          else
+            say "FAIL: Guest audio $dev is not bound to vfio-pci (driver: $aud_drv)"
+          fi
+          ok=0
         fi
-        ok=0
       else
         if (( ENABLE_COLOR )); then
           say "${C_GREEN}✔ OK${C_RESET}: Guest audio $dev bound to vfio-pci"
@@ -10870,6 +11203,44 @@ verify_setup() {
       say "${C_YELLOW}WARN${C_RESET}: Systemd unit missing: $SYSTEMD_UNIT"
     else
       say "WARN: Systemd unit missing: $SYSTEMD_UNIT"
+    fi
+  fi
+
+  # Dynamic binding: check libvirt hook script + qemu entry presence.
+  if [[ "${VFIO_BINDING_MODE:-early}" == "DYNAMIC" ]]; then
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_CYAN}Dynamic binding hook check:${C_RESET}"
+    else
+      say "Dynamic binding hook check:"
+    fi
+    if [[ -x "$LIBVIRT_HOOK_SCRIPT" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: Libvirt hook script present: $LIBVIRT_HOOK_SCRIPT"
+      else
+        say "OK: Libvirt hook script present: $LIBVIRT_HOOK_SCRIPT"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_RED}✖ FAIL${C_RESET}: Libvirt hook script missing: $LIBVIRT_HOOK_SCRIPT"
+      else
+        say "FAIL: Libvirt hook script missing: $LIBVIRT_HOOK_SCRIPT"
+      fi
+      ok=0
+    fi
+    if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: Libvirt qemu hook entry present: $LIBVIRT_HOOK_ENTRY"
+      else
+        say "OK: Libvirt qemu hook entry present: $LIBVIRT_HOOK_ENTRY"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_RED}✖ FAIL${C_RESET}: Libvirt qemu hook entry missing: $LIBVIRT_HOOK_ENTRY"
+      else
+        say "FAIL: Libvirt qemu hook entry missing: $LIBVIRT_HOOK_ENTRY"
+      fi
+      ok=0
     fi
   fi
 
@@ -11069,11 +11440,10 @@ generate_rollback_script() {
     "$SOFTDEP_FILE"
     "$BIND_SCRIPT"
     "$GRAPHICS_DAEMON_SCRIPT"
-    "$AUDIO_SCRIPT"
-    "$OPENBOX_MONITOR_SCRIPT"
-    "$SYSTEMD_UNIT"
     "$GRAPHICS_DAEMON_UNIT"
     "$UDEV_ISOLATION_RULE"
+    "$LIBVIRT_HOOK_SCRIPT"
+    "$LIBVIRT_HOOK_ENTRY"
     "$USB_BT_SCRIPT"
     "$USB_BT_SYSTEMD_UNIT"
     "$USB_BT_UDEV_RULE"
@@ -11670,8 +12040,26 @@ reset_vfio_all() {
   local bootlog_bin
   bootlog_bin="$(bootlog_bin_path)"
 
+  # Libvirt hook cleanup: restore pre-existing user-managed qemu hook or remove our managed entry.
+  if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+    local _hook_bak="" _hb
+    for _hb in "${LIBVIRT_HOOK_ENTRY}".bak.*; do
+      [[ -f "$_hb" ]] || continue
+      if [[ -z "$_hook_bak" || "$_hb" -nt "$_hook_bak" ]]; then
+        _hook_bak="$_hb"
+      fi
+    done
+    if [[ -n "$_hook_bak" ]]; then
+      note "Reset mode: restoring pre-existing libvirt qemu hook from $(basename "$_hook_bak")"
+      run cp -a "$_hook_bak" "$LIBVIRT_HOOK_ENTRY"
+    else
+      run rm -f "$LIBVIRT_HOOK_ENTRY"
+    fi
+  fi
+
   run rm -f "$SYSTEMD_UNIT" "$BIND_SCRIPT" "$AUDIO_SCRIPT" \
            "$OPENBOX_MONITOR_SCRIPT" \
+           "$LIBVIRT_HOOK_SCRIPT" \
            "$CONF_FILE" "$MODULES_LOAD" "$BLACKLIST_FILE" \
            "$SOFTDEP_FILE" "$DRACUT_VFIO_CONF" \
            "$UDEV_ISOLATION_RULE" \
@@ -12448,7 +12836,45 @@ apply_configuration() {
     done
   fi
 
-  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode" "$boot_vga_policy_mode" "$graphics_daemon_interval"
+  # Determine GPU binding mode (early vs dynamic).
+  # early: force the guest GPU onto vfio-pci at boot (current default behavior).
+  # dynamic: let amdgpu load first; a libvirt qemu hook switches the GPU to
+  # vfio-pci only when a VM that has it attached is started. More reliable for
+  # RX 9070 / RDNA4 cards that hit the "Unknown PCI header type 127" reset bug.
+  local binding_mode="${BINDING_MODE_OVERRIDE:-}"
+  if [[ -n "$binding_mode" ]]; then
+    binding_mode="${binding_mode^^}"
+    note "CLI override applied: --binding-mode ${binding_mode,,}"
+  else
+    say
+    hdr "GPU binding mode"
+    note "early: force the guest GPU onto vfio-pci at boot (vfio-pci.ids + rd.driver.pre + systemd unit)."
+    note "dynamic: let amdgpu load first; a libvirt qemu hook switches the GPU to vfio-pci only when a VM that has it attached starts."
+    note "dynamic is currently more reliable for RX 9070 / RDNA4 cards that hit the \"Unknown PCI header type 127\" reset bug when bound too early."
+    local binding_default="N"
+    if [[ "${guest_vendor,,}" == "1002" ]]; then
+      local guest_drv
+      guest_drv="$(bdf_driver_name "$guest_gpu" 2>/dev/null || echo "")"
+      if [[ "$guest_drv" == "amdgpu" ]]; then
+        binding_default="Y"
+        note "AMD guest GPU is currently on amdgpu; defaulting to dynamic binding."
+      fi
+    fi
+    if prompt_yn "Use dynamic binding (libvirt hook switches GPU at VM start) instead of early binding?" "$binding_default" "GPU binding mode"; then
+      binding_mode="DYNAMIC"
+    else
+      binding_mode="EARLY"
+    fi
+  fi
+  if [[ "$binding_mode" == "DYNAMIC" ]]; then
+    if ! have_cmd libvirtd && ! have_cmd virtqemud && ! have_cmd virsh; then
+      note "WARN: dynamic binding was selected but no libvirt daemon (libvirtd/virtqemud/virsh) was detected."
+      note "      Dynamic binding only works for libvirt-managed VMs. If you use raw qemu, choose early binding instead."
+    fi
+  fi
+  CTX[binding_mode]="$binding_mode"
+
+  write_conf "$host_gpu" "$host_audio_bdfs_csv" "$host_audio_node_name" "$guest_gpu" "$guest_audio_csv" "$guest_vendor" "$graphics_protocol_mode" "$boot_vga_policy_mode" "$graphics_daemon_interval" "$binding_mode"
   install_vfio_modules_load
 
   # Optional: on openSUSE Tumbleweed offer to install the distribution's
@@ -12557,6 +12983,9 @@ apply_configuration() {
 
   install_bind_script
   install_systemd_unit
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    install_libvirt_hook
+  fi
   if (( INSTALL_GRAPHICS_DAEMON )); then
     install_graphics_protocol_daemon "$graphics_daemon_interval"
   else
@@ -12579,7 +13008,9 @@ apply_configuration() {
   hdr "Display manager / seat isolation (optional)"
   note "A udev rule can remove the guest GPU (and its HDMI audio) from the host seat so the display manager does not grab it."
   note "This is usually helpful on multi-GPU systems where the host desktop should ignore the passthrough card."
-  if prompt_yn "Install udev rule to isolate the guest GPU from the host seat? (recommended)" Y "Seat isolation"; then
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    note "Skipping udev seat isolation in dynamic binding mode (the host display manager may use the guest GPU until VM start)."
+  elif prompt_yn "Install udev rule to isolate the guest GPU from the host seat? (recommended)" Y "Seat isolation"; then
     install_udev_isolation "$guest_gpu" "$guest_audio_csv"
   else
     note "Skipping udev isolation; the host display manager may still see the guest GPU."

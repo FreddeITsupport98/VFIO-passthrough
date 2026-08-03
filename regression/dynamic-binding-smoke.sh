@@ -649,7 +649,10 @@ _wayland_compositor_uses_bdf() {
       for _fd in /proc/"$_pid"/fd/*; do
         [[ -L "$_fd" ]] || continue
         _tgt="$(readlink "$_fd" 2>/dev/null || true)"
-        [[ "$_tgt" == "$_render" ]] && return 0
+        if [[ "$_tgt" == "$_render" ]]; then
+          printf '%s\n' "$_comp"
+          return 0
+        fi
       done
     done
   done
@@ -657,7 +660,7 @@ _wayland_compositor_uses_bdf() {
 }
 case "${1:-}" in
   map)  _bdf_to_drm_card "$2" ;;
-  uses) if _wayland_compositor_uses_bdf "$2"; then echo "USES"; else echo "NOT_USES"; fi ;;
+  uses) if _name="$(_wayland_compositor_uses_bdf "$2")"; then echo "USES:$_name"; else echo "NOT_USES"; fi ;;
 esac
 DEOF
 
@@ -690,6 +693,26 @@ if grep -Fq 'boot_vga"' <<<"$_inst_fn" && grep -Fq 'Guest GPU is not Boot VGA; s
   ok "Q3m installer is gated on guest boot_vga=1"
 else
   bad "Q3m installer missing boot_vga=1 gate"
+fi
+# Case 8 (Q3m-wlr): installer also writes export WLR_DRM_DEVICES to WLR_RENDER_PIN_FILE
+if grep -Fq 'export WLR_DRM_DEVICES=' <<<"$_inst_fn" && grep -Fq 'WLR_RENDER_PIN_FILE' <<<"$_inst_fn"; then
+  ok "Q3m-wlr installer writes export WLR_DRM_DEVICES to WLR_RENDER_PIN_FILE"
+else
+  bad "Q3m-wlr installer env file content missing WLR_DRM_DEVICES"
+fi
+# Case 9 (Q3m-wlr): generated bind script maps compositor -> env var (case statement)
+# $tmp/gen_bind.sh was extracted from the heredoc at the top of the smoke.
+if grep -Fq '_envvar="WLR_DRM_DEVICES"' "$tmp/gen_bind.sh"; then
+  ok "Q3m-wlr bind-now guard maps wlroots compositor to WLR_DRM_DEVICES"
+else
+  bad "Q3m-wlr bind-now guard missing compositor->WLR_DRM_DEVICES mapping"
+fi
+# Case 10 (Q3m-wlr): _wayland_compositor_uses_bdf echoes compositor name on match
+# The echo line is `printf '%s\n' "$_comp"`; match the printf + the quoted $_comp.
+if grep -Fq "printf '%s" "$tmp/gen_bind.sh" && grep -Fq '"$_comp"' "$tmp/gen_bind.sh"; then
+  ok "Q3m-wlr _wayland_compositor_uses_bdf echoes compositor name on match"
+else
+  bad "Q3m-wlr _wayland_compositor_uses_bdf does not echo compositor name"
 fi
 
 if (( fail != 0 )); then

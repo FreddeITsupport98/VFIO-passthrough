@@ -730,15 +730,15 @@ assert_contains_text \
   "$bind_block"
 assert_contains_text \
   "Q3m bind-now guard refuses when compositor renders on guest" \
-  "Wayland compositor is rendering on it" \
+  'compositor ($_comp) is rendering on it' \
   "$bind_block"
 assert_contains_text \
-  "Q3m bind-now guard jlogs the refusal" \
-  "refused --bind-now — Wayland compositor is rendering on the guest" \
+  "Q3m bind-now guard jlogs the refusal (compositor-aware)" \
+  'refused --bind-now — $_comp is rendering on the guest' \
   "$bind_block"
 assert_contains_text \
-  "Q3m bind-now guard message suggests KWIN_DRM_DEVICES" \
-  "KWIN_DRM_DEVICES=" \
+  "Q3m bind-now guard message names a render-device env var" \
+  'KWIN_DRM_DEVICES' \
   "$bind_block"
 assert_contains_text \
   "Q3m bind-now guard message suggests --install-dynamic-binding" \
@@ -765,6 +765,42 @@ assert_contains_text \
   "Q3m install-early-binding calls remove_wayland_render_device_pin" \
   "remove_wayland_render_device_pin" \
   "$_early_fn2"
+
+# --- Functional Q3m-wlr: wlroots compositor support (WLR_DRM_DEVICES) ---
+# The installer must also cover wlroots-based compositors (sway/hyprland/labwc/
+# wlroots), not just KDE/KWin: write a /etc/profile.d drop-in exporting
+# WLR_DRM_DEVICES (and KWIN_DRM_DEVICES). The bind-now guard must be
+# compositor-aware: name the detected compositor + its correct env var
+# (KWIN_DRM_DEVICES for kwin, WLR_DRM_DEVICES for sway/hyprland/labwc/wlroots).
+assert_contains_file \
+  "Q3m-wlr WLR_RENDER_PIN_FILE constant defined" \
+  "WLR_RENDER_PIN_FILE=" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3m-wlr installer exports WLR_DRM_DEVICES" \
+  "export WLR_DRM_DEVICES=" \
+  "$VFIO_SCRIPT"
+_inst_fn="$(sed -n '/^install_wayland_render_device_pin()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3m-wlr remove_wayland_render_device_pin removes WLR_RENDER_PIN_FILE" \
+  'WLR_RENDER_PIN_FILE' \
+  "$_inst_fn"
+assert_contains_text \
+  "Q3m-wlr reset removes WLR_RENDER_PIN_FILE" \
+  'WLR_RENDER_PIN_FILE' \
+  "$_reset_fn"
+assert_contains_text \
+  "Q3m-wlr bind-now guard maps wlroots compositor to WLR_DRM_DEVICES" \
+  '_envvar="WLR_DRM_DEVICES"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3m-wlr bind-now guard message names the detected compositor" \
+  'compositor ($_comp) is rendering on it' \
+  "$bind_block"
+assert_contains_text \
+  "Q3m-wlr _wayland_compositor_uses_bdf echoes compositor name on match" \
+  "printf '%s\\n' \"\$_comp\"" \
+  "$bind_block"
 
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \

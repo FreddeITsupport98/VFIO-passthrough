@@ -51,6 +51,12 @@ LIBVIRT_HOOK_SCRIPT="/usr/local/sbin/vfio-libvirt-hook.sh"
 # vfio-pci at VM start crashes the compositor mid-frame (kwin_wayland SEGV in
 # GLVertexBuffer::endOfFrame). See install_wayland_render_device_pin().
 KWIN_RENDER_PIN_FILE="/etc/xdg/plasma-workspace/env/vfio-kwin-render-device.sh"
+# Generic login-shell env drop-in (sourced by /etc/profile.d) that pins BOTH
+# KWin (KWIN_DRM_DEVICES) and wlroots-based compositors (WLR_DRM_DEVICES:
+# sway/hyprland/labwc/wlroots) to the HOST GPU. Covers compositors launched
+# from a login shell (TTY start); the Plasma drop-in above covers DM-launched
+# Plasma. Same rationale as KWIN_RENDER_PIN_FILE.
+WLR_RENDER_PIN_FILE="/etc/profile.d/vfio-wayland-render-device.sh"
 
 DEBUG=0
 DRY_RUN=0
@@ -7622,7 +7628,9 @@ _bdf_to_drm_card() {
 # wlroots / labwc / hyprland) currently has the render node of the given BDF
 # open — i.e. it is rendering on that GPU, so binding that GPU to vfio-pci
 # would crash the compositor mid-frame (kwin_wayland SEGV in
-# GLVertexBuffer::endOfFrame). Returns 1 otherwise (safe to bind).
+# GLVertexBuffer::endOfFrame). On match, prints the compositor name to stdout
+# (so the caller can name the correct render-device env var in its message).
+# Returns 1 otherwise (safe to bind), printing nothing.
 _wayland_compositor_uses_bdf() {
   local _bdf="$1"
   [[ -n "$_bdf" ]] || return 1
@@ -7643,7 +7651,10 @@ _wayland_compositor_uses_bdf() {
       for _fd in /proc/"$_pid"/fd/*; do
         [[ -L "$_fd" ]] || continue
         _tgt="$(readlink "$_fd" 2>/dev/null || true)"
-        [[ "$_tgt" == "$_render" ]] && return 0
+        if [[ "$_tgt" == "$_render" ]]; then
+          printf '%s\n' "$_comp"
+          return 0
+        fi
       done
     done
   done
@@ -7764,13 +7775,21 @@ case "$ACTION" in
           # compositor currently has the guest GPU's render node open, refuse
           # with an actionable fix instead of letting the compositor segfault.
           # (VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 bypasses this whole block.)
-          if _wayland_compositor_uses_bdf "$GUEST_GPU_BDF"; then
+          if _comp="$(_wayland_compositor_uses_bdf "$GUEST_GPU_BDF")"; then
             _host_card=""
             if [[ -n "${HOST_GPU_BDF:-}" ]]; then
               _host_card="$(_bdf_to_drm_card "$HOST_GPU_BDF" 2>/dev/null || true)"
             fi
-            say "ERROR: $GUEST_GPU_BDF is Boot VGA and the active Wayland compositor is rendering on it; binding it to vfio-pci now would crash the host desktop (kwin_wayland SEGV mid-frame). Fix: pin the compositor to the host GPU — run 'sudo $SCRIPT_NAME --install-dynamic-binding' (writes KWIN_DRM_DEVICES=${_host_card:-/dev/dri/cardN} to the Plasma session env), or set KWIN_DRM_DEVICES=${_host_card:-/dev/dri/cardN} manually, or set the host GPU as Primary Display in BIOS. Then log out and back in (or reboot) and start the VM. Aborting VM start." >&2
-            jlog "$GUEST_GPU_BDF: refused --bind-now — Wayland compositor is rendering on the guest (Boot VGA) GPU"
+            # Map the detected compositor to its render-device env var so the
+            # fix message names the right knob (KWin vs wlroots-based).
+            case "$_comp" in
+              kwin_wayland)            _envvar="KWIN_DRM_DEVICES" ;;
+              sway|wlroots|labwc|hyprland) _envvar="WLR_DRM_DEVICES" ;;
+              weston)                   _envvar="WESTON_DRM_DEVICE" ;;
+              *)                        _envvar="KWIN_DRM_DEVICES / WLR_DRM_DEVICES" ;;
+            esac
+            say "ERROR: $GUEST_GPU_BDF is Boot VGA and the active Wayland compositor ($_comp) is rendering on it; binding it to vfio-pci now would crash the host desktop (compositor SEGV mid-frame). Fix: pin $_comp to the host GPU — run 'sudo $SCRIPT_NAME --install-dynamic-binding' (writes $_envvar=${_host_card:-/dev/dri/cardN} to the session env), or set $_envvar=${_host_card:-/dev/dri/cardN} manually before starting the compositor, or set the host GPU as Primary Display in BIOS. Then log out and back in (or reboot) and start the VM. Aborting VM start." >&2
+            jlog "$GUEST_GPU_BDF: refused --bind-now — $_comp is rendering on the guest (Boot VGA) GPU"
             exit 1
           fi
           jlog "$GUEST_GPU_BDF: Boot VGA but host-assisted (HOST_GPU_BDF=$HOST_GPU_BDF boot_vga=0, reason=$_bn_reason); allowing --bind-now"
@@ -8842,17 +8861,47 @@ install_wayland_render_device_pin() {
 export KWIN_DRM_DEVICES="$_host_card"
 EOF
   say "Pinned KDE/KWin Wayland render device to the host GPU ($_host_card) via $KWIN_RENDER_PIN_FILE."
-  note "This takes effect on next login (or reboot). The compositor will render on the host GPU"
+
+  # Generic login-shell drop-in for wlroots-based compositors (sway / hyprland /
+  # labwc / wlroots) AND kwin launched from a shell. Sourced by /etc/profile.d.
+  # Exports both vars so whatever compositor the user starts from a login shell
+  # renders on the host GPU.
+  local _wlr_dir
+  _wlr_dir="$(dirname "$WLR_RENDER_PIN_FILE")"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$_wlr_dir" 2>/dev/null || true
+  fi
+  backup_file "$WLR_RENDER_PIN_FILE"
+  write_file_atomic "$WLR_RENDER_PIN_FILE" 0644 "root:root" <<EOF
+# Managed by $SCRIPT_NAME. Pins Wayland compositors to the HOST GPU so the
+# compositor never renders on the guest (Boot VGA) GPU. Without this, binding
+# the guest GPU to vfio-pci at VM start crashes the compositor mid-frame.
+# Covers: KWin (KWIN_DRM_DEVICES) and wlroots-based compositors (WLR_DRM_DEVICES:
+# sway / hyprland / labwc / wlroots). Sourced by login shells via /etc/profile.d.
+# Takes effect on next login / reboot.
+# Remove via: sudo $SCRIPT_NAME --reset  (or sudo $SCRIPT_NAME --install-early-binding)
+export KWIN_DRM_DEVICES="$_host_card"
+export WLR_DRM_DEVICES="$_host_card"
+EOF
+  say "Pinned Wayland compositors (KWin + wlroots: sway/hyprland/labwc) to the host GPU ($_host_card) via $WLR_RENDER_PIN_FILE."
+  note "These take effect on next login (or reboot). The compositor will render on the host GPU"
   note "instead of the guest (Boot VGA) GPU, so VM start will not crash the host desktop."
 }
 
-# Remove the KWIN_DRM_DEVICES pin installed by install_wayland_render_device_pin.
+# Remove the render-device pins installed by install_wayland_render_device_pin.
 remove_wayland_render_device_pin() {
+  local _removed=0
   if [[ -f "$KWIN_RENDER_PIN_FILE" ]]; then
     backup_file "$KWIN_RENDER_PIN_FILE"
     run rm -f "$KWIN_RENDER_PIN_FILE"
-    note "Removed KDE/KWin Wayland render-device pin ($KWIN_RENDER_PIN_FILE)."
+    _removed=1
   fi
+  if [[ -f "$WLR_RENDER_PIN_FILE" ]]; then
+    backup_file "$WLR_RENDER_PIN_FILE"
+    run rm -f "$WLR_RENDER_PIN_FILE"
+    _removed=1
+  fi
+  (( _removed )) && note "Removed Wayland render-device pins ($KWIN_RENDER_PIN_FILE, $WLR_RENDER_PIN_FILE)."
 }
 
 # Returns 0 if libvirt is reachable for dynamic binding, 1 otherwise.
@@ -8920,8 +8969,9 @@ install_dynamic_binding_from_existing_config() {
   note "  4. Strip vfio-pci.ids= and rd.driver.pre=vfio-pci from the kernel cmdline"
   note "     (so amdgpu is allowed to claim the guest GPU at boot)"
   note "  5. Sync BLS boot entries to the updated cmdline"
-  note "  6. Pin KDE/KWin Wayland to the HOST GPU (so binding the guest GPU does"
-  note "     not crash the host compositor when the guest is Boot VGA)"
+  note "  6. Pin Wayland compositors (KDE/KWin + wlroots: sway/hyprland/labwc) to the"
+  note "     HOST GPU so binding the guest GPU does not crash the host compositor"
+  note "     when the guest is Boot VGA)"
   say
   note "What stays unchanged:"
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"
@@ -9040,9 +9090,9 @@ install_early_binding_from_existing_config() {
   note "  3. Remove the libvirt qemu hook (restoring any pre-existing hook from backup)"
   note "  4. Re-add vfio-pci.ids=<guest IDs> and rd.driver.pre=vfio-pci to the kernel cmdline"
   note "  5. Sync BLS boot entries to the updated cmdline"
-  note "  6. Remove the KDE/KWin Wayland HOST-GPU render-device pin (early binding"
-  note "     binds the guest GPU at boot, before the compositor starts, so the pin"
-  note "     is no longer needed)"
+  note "  6. Remove the Wayland HOST-GPU render-device pins (early binding binds the"
+  note "     guest GPU at boot, before the compositor starts, so the pins are no"
+  note "     longer needed)"
   say
 
   # 1. Flip the conf key.
@@ -12917,7 +12967,7 @@ reset_vfio_all() {
            "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF" \
            "$GRAPHICS_DAEMON_SCRIPT" "$GRAPHICS_DAEMON_UNIT" \
            "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
-           "$KWIN_RENDER_PIN_FILE" \
+           "$KWIN_RENDER_PIN_FILE" "$WLR_RENDER_PIN_FILE" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook

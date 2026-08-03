@@ -697,6 +697,75 @@ assert_contains_file \
   "virtqemud.socket" \
   "$VFIO_SCRIPT"
 
+# --- Functional Q3m: Wayland render-device safety (compositor-on-guest guard) ---
+# When the guest GPU is Boot VGA, KWin/Wayland renders on it by default; binding
+# it to vfio-pci at VM start crashes the compositor mid-frame. Two defenses:
+# (1) the generated bind script refuses --bind-now if a Wayland compositor has
+# the guest GPU render node open, with an actionable KWIN_DRM_DEVICES message;
+# (2) the installer writes a Plasma session env pin (KWIN_DRM_DEVICES=host card)
+# so the compositor renders on the host GPU instead. Reset removes the pin.
+assert_contains_file \
+  "Q3m KWIN_RENDER_PIN_FILE constant defined" \
+  "KWIN_RENDER_PIN_FILE=" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3m install_wayland_render_device_pin defined" \
+  "install_wayland_render_device_pin()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3m remove_wayland_render_device_pin defined" \
+  "remove_wayland_render_device_pin()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3m installer writes KWIN_DRM_DEVICES env pin" \
+  "export KWIN_DRM_DEVICES=" \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "Q3m generated bind script has _bdf_to_drm_card helper" \
+  "_bdf_to_drm_card()" \
+  "$bind_block"
+assert_contains_text \
+  "Q3m generated bind script has _wayland_compositor_uses_bdf helper" \
+  "_wayland_compositor_uses_bdf()" \
+  "$bind_block"
+assert_contains_text \
+  "Q3m bind-now guard refuses when compositor renders on guest" \
+  "Wayland compositor is rendering on it" \
+  "$bind_block"
+assert_contains_text \
+  "Q3m bind-now guard jlogs the refusal" \
+  "refused --bind-now — Wayland compositor is rendering on the guest" \
+  "$bind_block"
+assert_contains_text \
+  "Q3m bind-now guard message suggests KWIN_DRM_DEVICES" \
+  "KWIN_DRM_DEVICES=" \
+  "$bind_block"
+assert_contains_text \
+  "Q3m bind-now guard message suggests --install-dynamic-binding" \
+  "--install-dynamic-binding" \
+  "$bind_block"
+# Installer wiring: both the wizard dynamic branch and --install-dynamic-binding
+# must call install_wayland_render_device_pin; reset must remove the pin file.
+_apply_fn="$(sed -n "/^apply_configuration()/,/^}/p" "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3m wizard dynamic branch calls install_wayland_render_device_pin" \
+  "install_wayland_render_device_pin" \
+  "$_apply_fn"
+assert_contains_text \
+  "Q3m install-dynamic-binding calls install_wayland_render_device_pin" \
+  "install_wayland_render_device_pin" \
+  "$_lv_fn"
+_reset_fn="$(sed -n "/^reset_vfio_all()/,/^}/p" "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3m reset removes KWIN_RENDER_PIN_FILE" \
+  "\$KWIN_RENDER_PIN_FILE" \
+  "$_reset_fn"
+_early_fn2="$(sed -n "/^install_early_binding_from_existing_config()/,/^}/p" "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3m install-early-binding calls remove_wayland_render_device_pin" \
+  "remove_wayland_render_device_pin" \
+  "$_early_fn2"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

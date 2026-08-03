@@ -593,7 +593,104 @@ r6="$(PATH="$lvfake:$PATH" LIST_VIRTQEMUD=0 LIST_LIBVIRTD=1 bash "$tmp/smoke_lvo
 if [[ "$r6" == "libvirtd" ]]; then ok "Q3l _libvirt_unit_to_start falls back to libvirtd"; else bad "Q3l unit fallback failed (got: $r6)"; fi
 # Case 7: neither unit listed -> NONE
 r7="$(PATH="$lvfake:$PATH" LIST_VIRTQEMUD=0 LIST_LIBVIRTD=0 bash "$tmp/smoke_lvok.sh" unit)"
-if [[ "$r7" == "NONE" ]]; then ok "Q3l _libvirt_unit_to_start returns NONE when no unit installed"; else bad "Q3l unit detection did not return NONE (got: $r7)"; fi
+if [[ "$r7" == "NONE" ]]; then
+  ok "Q3l _libvirt_unit_to_start returns NONE when no unit installed"
+else
+  bad "Q3l unit detection did not return NONE (got: $r7)"
+fi
+
+# --- Smoke Q3m: _bdf_to_drm_card + _wayland_compositor_uses_bdf + installer env ---
+# Mock /sys/class/drm with two cards (host=06:00.0 -> card1, guest=0e:00.0 ->
+# card2) plus a connector entry (card2-DP-1) that must be skipped, and a render
+# node for the guest. Verify the BDF->card mapping and that with no compositor
+# running the guard reports NOT_USES (safe to bind).
+qfake="$tmp/sysdrm"
+mkdir -p "$qfake/0000:06:00.0" "$qfake/0000:0e:00.0" \
+        "$qfake/card1" "$qfake/card2" "$qfake/card2-DP-1" \
+        "$qfake/renderD129"
+ln -s "$qfake/0000:06:00.0" "$qfake/card1/device"
+ln -s "$qfake/0000:0e:00.0" "$qfake/card2/device"
+ln -s "$qfake/0000:0e:00.0" "$qfake/card2-DP-1/device"
+ln -s "$qfake/0000:0e:00.0" "$qfake/renderD129/device"
+
+cat > "$tmp/smoke_drm.sh" <<'DEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SYSROOT="${SYSROOT:-/sys/class/drm}"
+_bdf_to_drm_card() {
+  local _bdf="$1" _card _dev_bdf
+  [[ -n "$_bdf" ]] || return 1
+  for _card in "$SYSROOT"/card[0-9]*; do
+    [[ -e "$_card" ]] || continue
+    case "$(basename "$_card")" in card[0-9]*-*) continue ;; esac
+    _dev_bdf="$(basename "$(readlink -f "$_card/device" 2>/dev/null)" 2>/dev/null || true)"
+    if [[ "$_dev_bdf" == "$_bdf" ]]; then
+      printf '/dev/dri/%s\n' "$(basename "$_card")"
+      return 0
+    fi
+  done
+  return 1
+}
+_wayland_compositor_uses_bdf() {
+  local _bdf="$1"
+  [[ -n "$_bdf" ]] || return 1
+  local _render="" _rcard
+  for _rcard in "$SYSROOT"/renderD[0-9]*; do
+    [[ -e "$_rcard" ]] || continue
+    if [[ "$(basename "$(readlink -f "$_rcard/device" 2>/dev/null)" 2>/dev/null || true)" == "$_bdf" ]]; then
+      _render="/dev/$(basename "$_rcard")"
+      break
+    fi
+  done
+  [[ -n "$_render" ]] || return 1
+  local _comp _pid _fd _tgt
+  for _comp in kwin_wayland sway weston wlroots labwc hyprland; do
+    for _pid in $(pgrep -x "$_comp" 2>/dev/null || true); do
+      for _fd in /proc/"$_pid"/fd/*; do
+        [[ -L "$_fd" ]] || continue
+        _tgt="$(readlink "$_fd" 2>/dev/null || true)"
+        [[ "$_tgt" == "$_render" ]] && return 0
+      done
+    done
+  done
+  return 1
+}
+case "${1:-}" in
+  map)  _bdf_to_drm_card "$2" ;;
+  uses) if _wayland_compositor_uses_bdf "$2"; then echo "USES"; else echo "NOT_USES"; fi ;;
+esac
+DEOF
+
+# Case 1: host BDF -> /dev/dri/card1
+m1="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" map 0000:06:00.0)"
+if [[ "$m1" == "/dev/dri/card1" ]]; then ok "Q3m _bdf_to_drm_card maps host BDF to card1"; else bad "Q3m host map wrong (got: $m1)"; fi
+# Case 2: guest BDF -> /dev/dri/card2 (skips card2-DP-1 connector entry)
+m2="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" map 0000:0e:00.0)"
+if [[ "$m2" == "/dev/dri/card2" ]]; then ok "Q3m _bdf_to_drm_card maps guest BDF to card2 (skips connector entry)"; else bad "Q3m guest map wrong (got: $m2)"; fi
+# Case 3: unknown BDF -> returns 1 (no output)
+if ! SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" map 0000:ff:00.0 >/dev/null 2>&1; then ok "Q3m _bdf_to_drm_card returns 1 for unknown BDF"; else bad "Q3m unknown BDF unexpectedly mapped"; fi
+# Case 4: no compositor running -> NOT_USES (safe to bind; the positive/USES
+# path requires a real render node + compositor fd and is covered by the live
+# bind-now guard in production)
+u4="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" uses 0000:0e:00.0)"
+if [[ "$u4" == "NOT_USES" ]]; then ok "Q3m compositor-uses-bdf NOT_USES when no compositor runs"; else bad "Q3m false positive with no compositor (got: $u4)"; fi
+# Case 5: unknown BDF -> NOT_USES (no render node found -> safe)
+u5="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" uses 0000:ff:00.0)"
+if [[ "$u5" == "NOT_USES" ]]; then ok "Q3m compositor-uses-bdf NOT_USES for unknown BDF (no render node)"; else bad "Q3m unknown BDF unexpectedly USES (got: $u5)"; fi
+
+# Case 6: installer env file writes export KWIN_DRM_DEVICES to KWIN_RENDER_PIN_FILE
+_inst_fn="$(sed -n '/^install_wayland_render_device_pin()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'export KWIN_DRM_DEVICES=' <<<"$_inst_fn" && grep -Fq 'KWIN_RENDER_PIN_FILE' <<<"$_inst_fn"; then
+  ok "Q3m installer writes export KWIN_DRM_DEVICES to KWIN_RENDER_PIN_FILE"
+else
+  bad "Q3m installer env file content missing KWIN_DRM_DEVICES"
+fi
+# Case 7: installer is gated on guest boot_vga=1 (no-op otherwise)
+if grep -Fq 'boot_vga"' <<<"$_inst_fn" && grep -Fq 'Guest GPU is not Boot VGA; skipping Wayland render-device pin' <<<"$_inst_fn"; then
+  ok "Q3m installer is gated on guest boot_vga=1"
+else
+  bad "Q3m installer missing boot_vga=1 gate"
+fi
 
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2

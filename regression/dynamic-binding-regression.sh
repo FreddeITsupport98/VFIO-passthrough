@@ -610,6 +610,80 @@ assert_contains_text \
   "action=release" \
   "$hook_block"
 
+# --- Functional R1: csv_to_array defined BEFORE dynamic boot block (audio D3cold pin) ---
+# csv_to_array must be defined above the dynamic boot block so audio BDFs are
+# pinned too; the old ordering silently fell back to GPU-only pinning.
+_csv_line=$(grep -Fn 'csv_to_array() {' <<<"$bind_block" | head -n1 | cut -d: -f1)
+_dyn_line=$(grep -Fn 'if [[ "$ACTION" == "boot" && "$binding_mode" == "DYNAMIC" ]]; then' <<<"$bind_block" | head -n1 | cut -d: -f1)
+if [[ -n "$_csv_line" && -n "$_dyn_line" ]] && (( _csv_line < _dyn_line )); then
+  printf 'PASS: R1 csv_to_array defined before dynamic boot block\n'
+else
+  printf 'FAIL: R1 csv_to_array must be defined before the dynamic boot block (csv=%s dyn=%s)\n' "$_csv_line" "$_dyn_line" >&2
+  record_failure "R1 csv_to_array defined before dynamic boot block"
+fi
+if grep -Fq 'command -v csv_to_array' <<<"$bind_block"; then
+  printf 'FAIL: R1 broken csv_to_array guard still present\n' >&2
+  record_failure "R1 broken csv_to_array guard removed"
+else
+  printf 'PASS: R1 broken csv_to_array guard removed\n'
+fi
+assert_contains_text \
+  "R1 dynamic boot pins GPU + audio" \
+  "pinned d3cold_allowed=0 on guest BDFs (GPU + audio)" \
+  "$bind_block"
+
+# --- Functional R2: bind_one skips rebind when already on vfio-pci ---
+assert_contains_text \
+  "R2 bind_one has already-on-vfio-pci early return" \
+  "Already on vfio-pci: nothing to do" \
+  "$bind_block"
+assert_contains_text \
+  "R2 bind_one early-return checks driver symlink" \
+  'if [[ "$_already_drv" == "vfio-pci" ]]; then' \
+  "$bind_block"
+
+# --- Functional R3: host-audio safety pre-flight uses real membership test ---
+assert_contains_text \
+  "R3 host-audio pre-flight checks guest audio membership" \
+  'grep -Eq "(^|,)${dev}($|,)" <<<"${GUEST_AUDIO_BDFS_CSV:-}"' \
+  "$bind_block"
+assert_contains_text \
+  "R3 host-audio pre-flight dies on overlap" \
+  'Refusing: guest audio $dev is also listed as host audio' \
+  "$bind_block"
+if grep -Fq '[[ "$dev" != "${GUEST_AUDIO_BDFS_CSV:-}" ]] || true' <<<"$bind_block"; then
+  printf 'FAIL: R3 dead host-audio no-op check still present\n' >&2
+  record_failure "R3 dead host-audio no-op check removed"
+else
+  printf 'PASS: R3 dead host-audio no-op check removed\n'
+fi
+
+# --- Functional R4: reprobe_to_host documents D3cold intentionally kept at 0 ---
+assert_contains_text \
+  "R4 reprobe_to_host documents d3cold left at 0" \
+  "d3cold_allowed is deliberately left at 0" \
+  "$bind_block"
+assert_contains_text \
+  "R4 reprobe_to_host warns not to restore d3cold" \
+  'Do NOT "restore" it to 1' \
+  "$bind_block"
+
+# --- Functional R5: hook logs bind-now failure before aborting VM start ---
+assert_contains_text \
+  "R5 hook logs bind-now-failed on failure" \
+  'action=bind-now-failed rc=$_rc' \
+  "$hook_block"
+assert_contains_text \
+  "R5 hook exits non-zero on bind failure" \
+  'exit "$_rc"' \
+  "$hook_block"
+if grep -Fq 'hook_log "action=bind-now-done rc=$?"' <<<"$hook_block"; then
+  printf 'FAIL: R5 old uncaptured bind-now-done rc=$? log still present\n' >&2
+  record_failure "R5 old uncaptured bind-now-done log removed"
+else
+  printf 'PASS: R5 old uncaptured bind-now-done log removed\n'
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

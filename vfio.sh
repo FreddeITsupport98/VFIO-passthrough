@@ -7339,10 +7339,20 @@ case "$binding_mode" in
   *) binding_mode="EARLY" ;;
 esac
 
+csv_to_array() {
+  local csv="${1:-}"; shift || true
+  local -a out=()
+  local IFS=','
+  read -r -a out <<<"$csv"
+  printf '%s\n' "${out[@]}"
+}
+
 # In dynamic mode the boot invocation does NOT bind (amdgpu keeps the card until
 # the libvirt hook requests --bind-now at VM start), but it still pins
-# d3cold_allowed=0 on the configured guest BDFs so the card cannot enter D3cold
-# during the amdgpu phase between boot and VM start (RX 9070 / RDNA4 reset bug).
+# d3cold_allowed=0 on the configured guest BDFs (GPU and audio) so the card
+# cannot enter D3cold during the amdgpu phase between boot and VM start
+# (RX 9070 / RDNA4 reset bug). csv_to_array is defined above so ALL configured
+# guest BDFs (GPU + audio functions) are pinned, not just the GPU.
 if [[ "$ACTION" == "boot" && "$binding_mode" == "DYNAMIC" ]]; then
   set_d3cold_for_guest_bdfs() {
     local _bdf _sys
@@ -7353,27 +7363,14 @@ if [[ "$ACTION" == "boot" && "$binding_mode" == "DYNAMIC" ]]; then
       echo 0 >"$_sys/d3cold_allowed" 2>/dev/null || true
     done
   }
-  # csv_to_array is defined below; guard in case of unexpected ordering.
-  if command -v csv_to_array >/dev/null 2>&1; then
-    set_d3cold_for_guest_bdfs
-  else
-    echo 0 >"/sys/bus/pci/devices/$GUEST_GPU_BDF/d3cold_allowed" 2>/dev/null || true
-  fi
-  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start); pinned d3cold_allowed=0 on guest BDFs."
+  set_d3cold_for_guest_bdfs
+  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start); pinned d3cold_allowed=0 on guest BDFs (GPU + audio)."
   exit 0
 fi
 
 modprobe vfio
 modprobe vfio-pci
 modprobe vfio_iommu_type1
-
-csv_to_array() {
-  local csv="${1:-}"; shift || true
-  local -a out=()
-  local IFS=','
-  read -r -a out <<<"$csv"
-  printf '%s\n' "${out[@]}"
-}
 
 bind_one() {
   local dev="$1"
@@ -7386,6 +7383,17 @@ bind_one() {
   # This is set both at bind time and (in dynamic mode) by the boot unit so the card
   # cannot enter D3cold even while it is still on amdgpu, before VM start.
   echo 0 >"$sys/d3cold_allowed" 2>/dev/null || true
+
+  # Already on vfio-pci: nothing to do. Avoids a wasteful unbind -> sleep -> rebind
+  # cycle (and a brief unbound window) on a rapid VM stop/start, where prepare fires
+  # again while the device is still bound to vfio-pci from the previous VM session.
+  if [[ -L "$sys/driver" ]]; then
+    local _already_drv
+    _already_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+    if [[ "$_already_drv" == "vfio-pci" ]]; then
+      return 0
+    fi
+  fi
 
   # Unbind from current driver if any (amdgpu/snd), then wait briefly for the
   # driver teardown to settle. Some AMD cards need a short delay between unbind
@@ -7439,6 +7447,10 @@ reprobe_to_host() {
   # Best-effort: unbind from vfio-pci, clear the driver_override, and trigger a
   # generic driver re-probe so the normal host driver (amdgpu/snd) can reclaim
   # the device. Used by --release when VFIO_DYNAMIC_REBIND_HOST=1.
+  #
+  # NOTE: d3cold_allowed is deliberately left at 0 here. The RX 9070 / RDNA4
+  # reset bug means the card can fall off the bus on D3cold exit even on the
+  # host, so D3cold must stay disabled after release. Do NOT "restore" it to 1.
   local dev="$1"
   [[ -n "$dev" ]] || return 0
   local sys="/sys/bus/pci/devices/$dev"
@@ -7456,10 +7468,14 @@ reprobe_to_host() {
   fi
 }
 
-# Safety: never bind host audio list.
+# Safety pre-flight: refuse if the guest GPU or any guest audio BDF is also
+# listed as host audio. do_bind re-checks each bind, but failing early gives a
+# clearer error before any sysfs writes happen.
 for dev in $(csv_to_array "${HOST_AUDIO_BDFS_CSV:-}"); do
   [[ "$dev" != "$GUEST_GPU_BDF" ]] || die "Refusing: guest GPU is also listed as host audio ($dev)"
-  [[ "$dev" != "${GUEST_AUDIO_BDFS_CSV:-}" ]] || true
+  if grep -Eq "(^|,)${dev}($|,)" <<<"${GUEST_AUDIO_BDFS_CSV:-}"; then
+    die "Refusing: guest audio $dev is also listed as host audio"
+  fi
 done
 
 do_bind() {
@@ -7730,8 +7746,15 @@ case "$PHASE" in
     if vm_uses_guest_gpu; then
       say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
       hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
-      "$BIND_SCRIPT" --bind-now
-      hook_log "action=bind-now-done rc=$?"
+      # Run under `if` so set -e does not kill the hook before we can log the
+      # failure. We still exit non-zero to abort the VM start (see comment above).
+      if "$BIND_SCRIPT" --bind-now; then
+        hook_log "action=bind-now-done rc=0"
+      else
+        _rc=$?
+        hook_log "action=bind-now-failed rc=$_rc"
+        exit "$_rc"
+      fi
     else
       hook_log "action=skip-not-attached"
       : # unrelated VM; let libvirt proceed untouched.

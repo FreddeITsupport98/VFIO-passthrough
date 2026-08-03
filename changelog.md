@@ -1,5 +1,24 @@
 # Changelog
 ## Unreleased
+- 2026-08-03 20:42 UTC: Added optional dynamic (libvirt-hook) GPU binding mode and standalone binding-mode switchers in `vfio.sh`:
+  - new `VFIO_BINDING_MODE` config key (`early` default | `dynamic`) persisted via `write_conf()`, plus `VFIO_DYNAMIC_REBIND_HOST` (default `0`) to optionally rebind the guest GPU back to the host driver on VM stop,
+  - new `--binding-mode early|dynamic` install-mode override flag with `normalize_binding_mode_arg()`, `parse_args` cases, usage/help, and fish/bash/zsh completions,
+  - new constants `LIBVIRT_HOOK_DIR`/`LIBVIRT_HOOK_ENTRY`/`LIBVIRT_HOOK_SCRIPT` and `install_libvirt_hook()` that writes a generic `/etc/libvirt/hooks/qemu` entry point plus a standalone `vfio-libvirt-hook.sh` with NO hardcoded VM/domain names,
+  - the hook reads the VM domain XML from stdin, extracts PCI `<hostdev>` addresses with an awk parser (`extract_hostdev_bdfs()`), and only switches the guest GPU to vfio-pci (`--bind-now`) when the configured guest GPU BDF is actually attached to that VM; unrelated VMs pass through untouched,
+  - generated `vfio-bind-selected-gpu.sh` refactored with `--bind-now`/`--release` arg parsing and a dynamic-mode boot no-op guard so the existing systemd unit stays harmless in dynamic mode,
+  - `bind_one()` now sets `d3cold_allowed=0` per-device (RX 9070 / RDNA4 reset-bug fix) and verifies the device actually landed on vfio-pci after bind, returning non-zero on failure so the libvirt hook aborts the VM start cleanly; `do_bind()` propagates the failure for both the guest GPU and audio functions,
+  - dynamic mode skips/strips `vfio-pci.ids=` and `rd.driver.pre=vfio-pci` from the kernel cmdline in all 3 bootloader paths (openSUSE `/etc/kernel/cmdline`, systemd-boot entry, GRUB) while keeping IOMMU and AMD stability params,
+  - new standalone CLI modes `--install-dynamic-binding` and `--install-early-binding` (mirror `--install-graphics-daemon`) to switch an existing setup between binding modes without re-running the full wizard: flip the conf key, install/remove the hook, strip/re-add early-binding cmdline tokens, sync BLS,
+  - new `maybe_offer_detect_dynamic_binding()` detect-mode remediation that offers to switch to dynamic binding when an AMD guest GPU is still on amdgpu with reset-bug markers in kernel logs and the current mode is early,
+  - `--verify` no longer fails the guest-GPU-not-on-vfio-pci check in dynamic mode (expected on amdgpu until VM start) and instead checks the hook script + qemu entry presence; `--detect` reports binding mode and libvirt hook status,
+  - `--reset` and rollback now remove/restore the libvirt qemu hook (restoring any pre-existing user-managed hook from `.bak` backup),
+  - wizard binding-mode prompt now shows a readable early-vs-dynamic comparison column (trade-offs) and defaults to dynamic when an AMD guest GPU is currently on amdgpu,
+  - added `regression/dynamic-binding-regression.sh` with static wiring + functional assertions (VM-XML detection, dynamic cmdline stripping, unbind/bind flow, post-bind verification, failure propagation) ending with a FAIL SUMMARY block.
+- 2026-08-03 20:42 UTC: Added AMD GPU stability kernel parameters `vfio-pci.disable_idle_d3=1` and `pcie_port_pm=off` in `vfio.sh`:
+  - both added to the AMD-gated stability workaround blocks in all 3 bootloader paths (openSUSE `/etc/kernel/cmdline`, systemd-boot entry, GRUB) alongside the existing `amdgpu.runpm=0`/`amdgpu.noretry=0`, with explanatory notes (D3 entry/exit reset races and PCIe port PM link drops),
+  - new override flags `--amd-disable-idle-d3`/`--no-amd-disable-idle-d3` and `--amd-pcie-port-pm-off`/`--no-amd-pcie-port-pm-off` (var declarations, `parse_args`, usage/help, fish/bash/zsh completions) extending the 4-flag override pattern,
+  - both parameters added to `print_manual_iommu_instructions()` for unsupported bootloaders and removed by both `--reset` cleanup paths (classic GRUB and openSUSE `/etc/kernel/cmdline`),
+  - extended `regression/custom-kernel-params-regression.sh` with 28 assertions covering all 3 AMD stability blocks, override parsing, reset removal, usage, and completions.
 - 2026-06-05 20:16 UTC: Added USB mitigation reset-counter and `--usb-mitigation-status` reporting mode in `vfio.sh`:
   - new constant `USB_BT_STATE_FILE="/var/lib/vfio-usb-bt-mitigation.state"` for persistent state tracking,
   - generated `vfio-usb-bluetooth.sh` now writes a state entry (`timestamp=<ISO> mode=<disable|enable> targets=<bus-port:vid:pid,...>`) on every disable/enable run,

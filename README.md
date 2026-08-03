@@ -56,6 +56,20 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 - Extended focused regression coverage for:
   - USB Ethernet EEE-off picker plain-text fallback output when color is disabled (`ENABLE_COLOR=0`),
   - top-level `main --reset-usb-mitigation` parser/dispatch path (including safety-gate wiring) in addition to direct helper-path behavior.
+- Added optional **dynamic (libvirt-hook) GPU binding mode** as a more reliable alternative to early binding for RX 9070 / RDNA4 cards that hit the `Unknown PCI header type 127` reset bug when bound to vfio-pci too early:
+  - new `VFIO_BINDING_MODE` config key (`early` default | `dynamic`) and `--binding-mode early|dynamic` install-mode override flag,
+  - `dynamic` lets `amdgpu` load first and a generic libvirt `qemu` hook switches the guest GPU to vfio-pci only when a VM that has it attached is started (no hardcoded VM/domain names — the hook reads the VM XML from stdin and matches PCI `<hostdev>` addresses),
+  - the hook's `--bind-now` path sets `d3cold_allowed=0` per-device and verifies the device actually landed on vfio-pci, aborting the VM start cleanly on failure,
+  - `--release` leaves the GPU on vfio-pci by default (safer for RX 9070) or rebinds to the host driver when `VFIO_DYNAMIC_REBIND_HOST=1`,
+  - dynamic mode skips/strips `vfio-pci.ids=` and `rd.driver.pre=vfio-pci` from the kernel cmdline while keeping IOMMU and AMD stability params.
+- Added standalone binding-mode switchers so you can flip modes without re-running the full wizard:
+  - `--install-dynamic-binding` — sets `VFIO_BINDING_MODE=dynamic`, installs the libvirt hook, strips early-binding cmdline tokens, syncs BLS.
+  - `--install-early-binding` — sets `VFIO_BINDING_MODE=early`, removes the hook (restoring any pre-existing qemu hook), re-adds early-binding cmdline tokens, syncs BLS.
+- Added `--detect` remediation offer (`maybe_offer_detect_dynamic_binding`) that suggests switching to dynamic binding when an AMD guest GPU is still on `amdgpu` with reset-bug markers in kernel logs and the current mode is `early`.
+- Made `--verify` and `--detect` binding-mode aware: dynamic mode no longer fails the guest-GPU-not-on-vfio-pci check at boot (expected on `amdgpu` until VM start) and instead checks the hook script + qemu entry presence; `--detect` reports binding mode and libvirt hook status.
+- Confirmed `--reset` and rollback now remove/restore the libvirt qemu hook (restoring any pre-existing user-managed hook from `.bak` backup).
+- Added AMD GPU stability kernel parameters `vfio-pci.disable_idle_d3=1` and `pcie_port_pm=off` to the AMD-gated stability blocks in all 3 bootloader paths, with new override flags `--amd-disable-idle-d3`/`--no-amd-disable-idle-d3` and `--amd-pcie-port-pm-off`/`--no-amd-pcie-port-pm-off` (extending the 4-flag AMD override pattern); both are removed by `--reset` and documented in manual instructions for unsupported bootloaders.
+- Added `regression/dynamic-binding-regression.sh` with static wiring + functional assertions (VM-XML detection, dynamic cmdline stripping, unbind/bind flow, post-bind verification, failure propagation) ending with a FAIL SUMMARY block, and extended `regression/custom-kernel-params-regression.sh` with 28 assertions for the new AMD stability params.
 
 ---
 
@@ -91,8 +105,12 @@ The script uses the following paths on the host:
   - `/etc/vfio-gpu-passthrough.conf` – main configuration file (host/guest BDFs, audio, vendor, PipeWire node name).
 
 - **Core VFIO binding logic**
-  - `/usr/local/sbin/vfio-bind-selected-gpu.sh` – run early at boot by systemd; binds only the configured devices to `vfio-pci`.
+  - `/usr/local/sbin/vfio-bind-selected-gpu.sh` – run early at boot by systemd; binds only the configured devices to `vfio-pci`. In dynamic binding mode it is a no-op at boot and is instead invoked with `--bind-now`/`--release` by the libvirt hook at VM start/stop.
   - `/etc/systemd/system/vfio-bind-selected-gpu.service` – system service that runs the bind script before the display manager and libvirt/qemu.
+
+- **Dynamic binding (libvirt hook, optional)**
+  - `/usr/local/sbin/vfio-libvirt-hook.sh` – generic libvirt `qemu` hook that switches the guest GPU to `vfio-pci` only when a VM that has it attached is started (reads VM XML from stdin; no hardcoded VM names).
+  - `/etc/libvirt/hooks/qemu` – libvirt hook entry point that execs the hook script above.
 
 - **Modules / blacklists**
   - `/etc/modules-load.d/vfio.conf` – ensures `vfio`, `vfio_pci`, `vfio_iommu_type1`, `vfio_virqfd` are loaded at boot.
@@ -181,7 +199,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
 
 ### Common flags
@@ -199,6 +217,13 @@ The script supports several modes controlled by flags. By default, without any f
   - Install-mode override for the generated Boot-VGA host-assisted policy in `/etc/vfio-gpu-passthrough.conf`.
   - `auto`: dynamic host-assisted topology checks (recommended/default).
   - `strict`: requires explicit `VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1` to allow host-assisted Boot-VGA binding.
+
+- `--amd-disable-idle-d3` / `--no-amd-disable-idle-d3`
+  - Install-mode override for the `vfio-pci.disable_idle_d3=1` kernel parameter (AMD guest GPUs only). Force-add or skip without prompting.
+  - Keeps the vfio-pci-bound GPU out of D3hot idle to avoid D3 entry/exit reset races.
+- `--amd-pcie-port-pm-off` / `--no-amd-pcie-port-pm-off`
+  - Install-mode override for the `pcie_port_pm=off` kernel parameter (AMD guest GPUs only). Force-add or skip without prompting.
+  - Disables PCIe port power management to prevent link drops on the guest GPU path.
 
 - `--json`
   - Valid with `--detect` to output machine-readable JSON only.
@@ -345,6 +370,32 @@ The script supports several modes controlled by flags. By default, without any f
   - Installs/reinstalls only the graphics protocol daemon (`vfio-graphics-protocold`) and its systemd unit.
   - Reads persisted daemon/watchdog settings from `/etc/vfio-gpu-passthrough.conf` and keeps activation deferred to next boot (unit is enabled, not started immediately).
   - Useful for rolling out protocol-policy/watchdog updates without rerunning the full installer wizard.
+
+### GPU binding mode (early vs dynamic)
+
+The script supports two strategies for handing the guest GPU to the VM:
+
+- **early binding** (default): forces the guest GPU onto `vfio-pci` at boot via `vfio-pci.ids` + `rd.driver.pre=vfio-pci` + the `vfio-bind-selected-gpu.service` systemd unit. The GPU is **not** usable by the host between reboots. Works with raw qemu too.
+- **dynamic binding**: lets `amdgpu` load first, and a generic **libvirt `qemu` hook** switches the guest GPU to `vfio-pci` only when a VM that has it attached is started. The GPU stays usable by the host until VM start (and after VM stop if `VFIO_DYNAMIC_REBIND_HOST=1`, otherwise it stays on `vfio-pci` — the safer default for RX 9070). Requires libvirt-managed VMs.
+
+Dynamic binding is currently the **recommended default for RX 9070 / RDNA4** cards that hit the `Unknown PCI header type 127` reset bug when bound to `vfio-pci` too early. Both modes keep the `vfio-pci.disable_idle_d3=1` and `pcie_port_pm=off` kernel parameters.
+
+The hook has **no hardcoded VM/domain names** — it reads the VM domain XML from stdin, extracts PCI `<hostdev>` addresses, and only binds when the configured guest GPU BDF is actually attached to that VM. The `--bind-now` path sets `d3cold_allowed=0` per-device and verifies the device landed on `vfio-pci`, aborting the VM start cleanly on failure.
+
+Flags:
+
+- `--binding-mode early|dynamic`
+  - Install-mode override for the GPU binding strategy (see above). Skips the interactive binding-mode prompt.
+- `--install-dynamic-binding`
+  - Switches an existing early-binding setup to dynamic binding **without re-running the full wizard**.
+  - Sets `VFIO_BINDING_MODE=dynamic` in `/etc/vfio-gpu-passthrough.conf`, installs the libvirt `qemu` hook (`/usr/local/sbin/vfio-libvirt-hook.sh` + `/etc/libvirt/hooks/qemu`), strips `vfio-pci.ids=` and `rd.driver.pre=vfio-pci` from the kernel cmdline (and syncs BLS entries), and warns if no libvirt daemon is detected.
+  - Keeps IOMMU and AMD stability params unchanged; the `vfio-bind-selected-gpu.service` unit becomes a no-op at boot in dynamic mode.
+  - Recommended for RX 9070 / RDNA4 cards that hit the `Unknown PCI header type 127` reset bug.
+- `--install-early-binding`
+  - Switches a dynamic-binding setup **back** to early binding.
+  - Sets `VFIO_BINDING_MODE=early`, removes the libvirt `qemu` hook (restoring any pre-existing user-managed hook from `.bak` backup), re-adds `vfio-pci.ids=<guest IDs>` and `rd.driver.pre=vfio-pci` to the kernel cmdline (and syncs BLS entries).
+
+`--detect` also offers to switch to dynamic binding when it detects an AMD guest GPU still on `amdgpu` with reset-bug markers in kernel logs and the current mode is `early`.
 
 - `--install-usb-bt-mitigation`
   - Installs only the optional USB Bluetooth mitigation (`vfio-usb-bluetooth` helper + systemd + udev + match-policy config).

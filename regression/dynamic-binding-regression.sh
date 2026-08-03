@@ -516,6 +516,30 @@ assert_contains_text \
   "d3cold_allowed" \
   "$bind_block"
 
+# --- Functional Q3b: post-bind driver verification (fail hard if not on vfio-pci) ---
+assert_contains_text \
+  "Q3b bind_one verifies driver is vfio-pci after bind" \
+  "failed to bind to vfio-pci" \
+  "$bind_block"
+assert_contains_text \
+  "Q3b bind_one returns 1 on bind failure" \
+  "return 1" \
+  "$bind_block"
+assert_contains_text \
+  "Q3b bind_one reads driver via readlink after bind" \
+  'readlink "$sys/driver"' \
+  "$bind_block"
+
+# --- Functional Q3c: do_bind propagates bind_one failure (die on failure) ---
+assert_contains_text \
+  "Q3c do_bind GPU call propagates failure" \
+  'bind_one "$GUEST_GPU_BDF" || die' \
+  "$bind_block"
+assert_contains_text \
+  "Q3c do_bind audio loop propagates failure" \
+  'bind_one "$dev" || die' \
+  "$bind_block"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

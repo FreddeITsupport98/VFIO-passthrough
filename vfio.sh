@@ -7372,6 +7372,16 @@ bind_one() {
 
   echo vfio-pci >"$sys/driver_override"
   echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" || true
+
+  # Verify the device actually landed on vfio-pci. Return non-zero on failure so
+  # the libvirt hook (--bind-now) aborts the VM start cleanly instead of letting
+  # libvirt continue with a device that is not bound to the passthrough driver.
+  local _drv
+  _drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+  if [[ "$_drv" != "vfio-pci" ]]; then
+    say "ERROR: $dev failed to bind to vfio-pci (got: ${_drv:-none})" >&2
+    return 1
+  fi
 }
 
 clear_override() {
@@ -7411,7 +7421,7 @@ done
 
 do_bind() {
   # Bind guest GPU first.
-  bind_one "$GUEST_GPU_BDF"
+  bind_one "$GUEST_GPU_BDF" || die "Guest GPU $GUEST_GPU_BDF failed to bind to vfio-pci"
 
   # Bind selected guest audio functions.
   while IFS= read -r dev; do
@@ -7420,7 +7430,7 @@ do_bind() {
     if grep -Eq "(^|,)${dev}($|,)" <<<"${HOST_AUDIO_BDFS_CSV:-}"; then
       die "Refusing to bind $dev: it is configured as host audio"
     fi
-    bind_one "$dev"
+    bind_one "$dev" || die "Guest audio $dev failed to bind to vfio-pci"
   done < <(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}")
 
   # Ensure host audio functions are NOT overridden.

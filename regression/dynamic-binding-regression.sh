@@ -616,6 +616,32 @@ assert_contains_file \
   'VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"' \
   "$VFIO_SCRIPT"
 
+# --- Functional Q3i2: bind-now host-assisted escape (dual-GPU Boot-VGA) ---
+# bind-now must mirror boot_vga_guard(): allow a Boot-VGA guest GPU when a
+# different HOST_GPU_BDF has boot_vga=0 (host display on the other GPU), honored
+# via VFIO_BOOT_VGA_POLICY=AUTO or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1. Without
+# this, a dual-GPU passthrough setup is blocked by a false-positive Boot-VGA refuse.
+assert_contains_text \
+  "Q3i2 bind-now host-assisted escape allows dual-GPU topology" \
+  "Allowing --bind-now (reason=" \
+  "$bind_block"
+assert_contains_text \
+  "Q3i2 bind-now host-assisted escape jlogs host-assisted decision" \
+  'jlog "$GUEST_GPU_BDF: Boot VGA but host-assisted' \
+  "$bind_block"
+assert_contains_text \
+  "Q3i2 bind-now host-assisted escape reads HOST_GPU_BDF boot_vga" \
+  '_hbv="$(cat "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3i2 bind-now host-assisted escape honors VFIO_BOOT_VGA_POLICY" \
+  '_bpolicy="${VFIO_BOOT_VGA_POLICY:-STRICT}"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3i2 bind-now refuse message suggests dual-GPU fix" \
+  "For dual-GPU: set HOST_GPU_BDF" \
+  "$bind_block"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

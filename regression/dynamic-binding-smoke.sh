@@ -398,6 +398,96 @@ else
   bad "P3 negative: case-sensitive match unexpectedly succeeded (got: $neg_res)"
 fi
 
+# --- Smoke Q3i2: bind-now host-assisted Boot-VGA escape (dual-GPU allow) ---
+# Mock two PCI devices: guest boot_vga=1, host boot_vga=0. The host-assisted
+# decision logic must ALLOW under AUTO (and explicit opt-in), and REFUSE when
+# STRICT without opt-in, when the host GPU is also boot_vga=1 (single-GPU), and
+# allow unconditionally when VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 is set.
+bfake="$tmp/sysbootvga"
+mkdir -p "$bfake/0000:0e:00.0" "$bfake/0000:06:00.0"
+printf '1' > "$bfake/0000:0e:00.0/boot_vga"   # guest = Boot VGA
+printf '0' > "$bfake/0000:06:00.0/boot_vga"   # host = not Boot VGA
+cat > "$tmp/smoke_hostassisted.sh" <<'HEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
+GUEST_GPU_BDF="${GUEST_GPU_BDF:-0000:0e:00.0}"
+HOST_GPU_BDF="${HOST_GPU_BDF:-0000:06:00.0}"
+VFIO_DYNAMIC_ALLOW_BOOT_VGA="${VFIO_DYNAMIC_ALLOW_BOOT_VGA:-0}"
+VFIO_BOOT_VGA_POLICY="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU="${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}"
+decision="allow:default"
+if [[ -f "$SYSROOT/$GUEST_GPU_BDF/boot_vga" ]]; then
+  _bv="$(cat "$SYSROOT/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
+  if [[ "$_bv" == "1" && "${VFIO_DYNAMIC_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
+    _bn_allow=0
+    _bn_reason=""
+    if [[ -n "${HOST_GPU_BDF:-}" ]] && [[ "$HOST_GPU_BDF" != "$GUEST_GPU_BDF" ]] && [[ -f "$SYSROOT/$HOST_GPU_BDF/boot_vga" ]]; then
+      _hbv="$(cat "$SYSROOT/$HOST_GPU_BDF/boot_vga" 2>/dev/null || echo 1)"
+      if [[ "$_hbv" == "0" ]]; then
+        _bpolicy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+        _bpolicy="${_bpolicy^^}"
+        case "$_bpolicy" in AUTO|STRICT) ;; *) _bpolicy="STRICT" ;; esac
+        if [[ "$_bpolicy" == "AUTO" ]]; then
+          _bn_allow=1
+          _bn_reason="auto_detect"
+        elif [[ "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" == "1" ]]; then
+          _bn_allow=1
+          _bn_reason="explicit_opt_in"
+        fi
+      fi
+    fi
+    if [[ "$_bn_allow" == "1" ]]; then
+      decision="allow:$_bn_reason"
+    else
+      decision="refuse"
+    fi
+  else
+    decision="allow:override_or_notbootvga"
+  fi
+fi
+echo "$decision"
+[[ "$decision" == "refuse" ]] && exit 1
+exit 0
+HEOF
+# Case A: dual-GPU, AUTO -> allow (auto_detect)
+resA="$(SYSROOT="$bfake" VFIO_BOOT_VGA_POLICY=AUTO bash "$tmp/smoke_hostassisted.sh" || true)"
+if [[ "$resA" == "allow:auto_detect" ]]; then
+  ok "Q3i2 host-assisted ALLOWS dual-GPU (guest boot_vga=1, host boot_vga=0, AUTO)"
+else
+  bad "Q3i2 host-assisted did not allow dual-GPU AUTO (got: $resA)"
+fi
+# Case B: dual-GPU, STRICT + IF_HOST_GPU=1 -> allow (explicit_opt_in)
+resB="$(SYSROOT="$bfake" VFIO_BOOT_VGA_POLICY=STRICT VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1 bash "$tmp/smoke_hostassisted.sh" || true)"
+if [[ "$resB" == "allow:explicit_opt_in" ]]; then
+  ok "Q3i2 host-assisted ALLOWS dual-GPU (STRICT + VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1)"
+else
+  bad "Q3i2 host-assisted did not allow with explicit opt-in (got: $resB)"
+fi
+# Case C: dual-GPU, STRICT + IF_HOST_GPU=0 -> refuse
+resC="$(SYSROOT="$bfake" VFIO_BOOT_VGA_POLICY=STRICT VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=0 bash "$tmp/smoke_hostassisted.sh" || true)"
+if [[ "$resC" == "refuse" ]]; then
+  ok "Q3i2 host-assisted REFUSES dual-GPU when STRICT and no opt-in"
+else
+  bad "Q3i2 host-assisted did not refuse under STRICT no-opt-in (got: $resC)"
+fi
+# Case D: host GPU also boot_vga=1 (single-GPU-ish), AUTO -> refuse
+printf '1' > "$bfake/0000:06:00.0/boot_vga"
+resD="$(SYSROOT="$bfake" VFIO_BOOT_VGA_POLICY=AUTO bash "$tmp/smoke_hostassisted.sh" || true)"
+if [[ "$resD" == "refuse" ]]; then
+  ok "Q3i2 host-assisted REFUSES when host GPU also boot_vga=1 (true single-GPU)"
+else
+  bad "Q3i2 host-assisted did not refuse single-GPU (got: $resD)"
+fi
+# Case E: explicit VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 overrides refuse
+printf '0' > "$bfake/0000:06:00.0/boot_vga"
+resE="$(SYSROOT="$bfake" VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 VFIO_BOOT_VGA_POLICY=STRICT bash "$tmp/smoke_hostassisted.sh" || true)"
+if [[ "$resE" == "allow:override_or_notbootvga" ]]; then
+  ok "Q3i2 explicit VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 overrides Boot-VGA refuse"
+else
+  bad "Q3i2 explicit override did not allow (got: $resE)"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

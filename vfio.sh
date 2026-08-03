@@ -4112,13 +4112,19 @@ VFIO_BINDING_MODE="$binding_mode"
 VFIO_DYNAMIC_REBIND_HOST="0"
 # Dynamic-mode Boot-VGA safety for --bind-now (libvirt hook):
 # - 0 (default): if the guest GPU is Boot VGA, refuse to bind it at VM start
-#   because that would kill the host display mid-session in a single-GPU topology.
-#   The hook aborts the VM start cleanly so the host display stays alive.
-# - 1: allow binding a Boot-VGA guest GPU at VM start (advanced single-GPU/headless setups
-#   where losing the host display during the VM session is intentional).
+#   UNLESS a host-assisted dual-GPU topology is detected (a different HOST_GPU_BDF
+#   with boot_vga=0). Host-assisted is honored when VFIO_BOOT_VGA_POLICY=AUTO
+#   (default) or VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1, mirroring the early-binding
+#   boot_vga_guard() so dynamic and early paths treat this topology the same way.
+#   In a true single-GPU topology (no host GPU / host GPU also boot_vga=1) the hook
+#   aborts the VM start cleanly so the host display stays alive.
+# - 1: allow binding a Boot-VGA guest GPU at VM start unconditionally (advanced
+#   single-GPU/headless setups where losing the host display during the VM session
+#   is intentional).
 # WHY this value: 0 protects single-GPU/headless-style setups from a mid-session
-# black screen. Set 1 only if you intentionally pass your only GPU to the VM and
-# do not need the host display while the VM runs.
+# black screen while still allowing the normal dual-GPU passthrough case (host
+# display on a second GPU). Set 1 only if you intentionally pass your only GPU to
+# the VM and do not need the host display while the VM runs.
 VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 # Dynamic-mode optional PCI function-level reset before bind (advanced):
 # - 0 (default): do NOT reset the device before binding. A reset on a healthy
@@ -7660,15 +7666,47 @@ case "$ACTION" in
     ;;
   bind-now)
     # Forced bind requested by the libvirt hook (the VM has the GPU attached).
-    # Boot-VGA safety for single-GPU topologies: if the guest GPU is Boot VGA,
-    # binding it to vfio-pci at VM start would kill the host display mid-session.
-    # Refuse unless VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 is explicitly set (the hook then
-    # aborts the VM start cleanly so the host display stays alive).
+    # Boot-VGA safety: if the guest GPU is Boot VGA (boot_vga=1), binding it to
+    # vfio-pci at VM start would kill the host display mid-session in a
+    # SINGLE-GPU topology. Three ways through:
+    #   (a) host-assisted (dual-GPU, the normal case): a different HOST_GPU_BDF
+    #       with boot_vga=0 is configured and the host display runs on it.
+    #       Honored when VFIO_BOOT_VGA_POLICY=AUTO (default) OR
+    #       VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1, mirroring the early-binding
+    #       boot_vga_guard() so dynamic and early paths treat this topology the
+    #       same way. The host display is on the other GPU, so no black screen.
+    #   (b) explicit override: VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 forces the bind
+    #       unconditionally (advanced single-GPU/headless setups where losing the
+    #       host display during the VM session is intentional).
+    #   (c) otherwise refuse (exit 1) so libvirt aborts the VM start cleanly and
+    #       the host display stays alive.
     if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
       _bv="$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
       if [[ "$_bv" == "1" && "${VFIO_DYNAMIC_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
-        say "ERROR: $GUEST_GPU_BDF is Boot VGA; refusing --bind-now to keep host display alive. Set VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 to override. Aborting VM start." >&2
-        exit 1
+        _bn_allow=0
+        _bn_reason=""
+        if [[ -n "${HOST_GPU_BDF:-}" ]] && [[ "$HOST_GPU_BDF" != "$GUEST_GPU_BDF" ]] && [[ -f "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" ]]; then
+          _hbv="$(cat "/sys/bus/pci/devices/$HOST_GPU_BDF/boot_vga" 2>/dev/null || echo 1)"
+          if [[ "$_hbv" == "0" ]]; then
+            _bpolicy="${VFIO_BOOT_VGA_POLICY:-STRICT}"
+            _bpolicy="${_bpolicy^^}"
+            case "$_bpolicy" in AUTO|STRICT) ;; *) _bpolicy="STRICT" ;; esac
+            if [[ "$_bpolicy" == "AUTO" ]]; then
+              _bn_allow=1
+              _bn_reason="auto_detect"
+            elif [[ "${VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU:-0}" == "1" ]]; then
+              _bn_allow=1
+              _bn_reason="explicit_opt_in"
+            fi
+          fi
+        fi
+        if [[ "$_bn_allow" == "1" ]]; then
+          jlog "$GUEST_GPU_BDF: Boot VGA but host-assisted (HOST_GPU_BDF=$HOST_GPU_BDF boot_vga=0, reason=$_bn_reason); allowing --bind-now"
+          say "WARN: $GUEST_GPU_BDF is Boot VGA, but HOST_GPU_BDF=$HOST_GPU_BDF has boot_vga=0 (host display stays on the host GPU). Allowing --bind-now (reason=$_bn_reason)."
+        else
+          say "ERROR: $GUEST_GPU_BDF is Boot VGA; refusing --bind-now to keep host display alive. For dual-GPU: set HOST_GPU_BDF to a different GPU with boot_vga=0 and VFIO_BOOT_VGA_POLICY=AUTO. For single-GPU/headless: set VFIO_DYNAMIC_ALLOW_BOOT_VGA=1. Aborting VM start." >&2
+          exit 1
+        fi
       fi
     fi
     do_bind

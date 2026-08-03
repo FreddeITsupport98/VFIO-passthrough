@@ -4104,6 +4104,13 @@ VFIO_BINDING_MODE="$binding_mode"
 #   or a manual rebind).
 # - 1: rebind the guest GPU back to its normal host driver (amdgpu/snd) on VM stop.
 VFIO_DYNAMIC_REBIND_HOST="0"
+# Dynamic-mode Boot-VGA safety for --bind-now (libvirt hook):
+# - 0 (default): if the guest GPU is Boot VGA, refuse to bind it at VM start
+#   because that would kill the host display mid-session in a single-GPU topology.
+#   The hook aborts the VM start cleanly so the host display stays alive.
+# - 1: allow binding a Boot-VGA guest GPU at VM start (advanced single-GPU/headless setups
+#   where losing the host display during the VM session is intentional).
+VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 EOF
 }
 
@@ -7553,8 +7560,17 @@ case "$ACTION" in
     ;;
   bind-now)
     # Forced bind requested by the libvirt hook (the VM has the GPU attached).
-    # Skip the Boot-VGA safety skip since the user explicitly started a VM that
-    # has this GPU attached.
+    # Boot-VGA safety for single-GPU topologies: if the guest GPU is Boot VGA,
+    # binding it to vfio-pci at VM start would kill the host display mid-session.
+    # Refuse unless VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 is explicitly set (the hook then
+    # aborts the VM start cleanly so the host display stays alive).
+    if [[ -f "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" ]]; then
+      _bv="$(cat "/sys/bus/pci/devices/$GUEST_GPU_BDF/boot_vga" 2>/dev/null || echo 0)"
+      if [[ "$_bv" == "1" && "${VFIO_DYNAMIC_ALLOW_BOOT_VGA:-0}" != "1" ]]; then
+        say "ERROR: $GUEST_GPU_BDF is Boot VGA; refusing --bind-now to keep host display alive. Set VFIO_DYNAMIC_ALLOW_BOOT_VGA=1 to override. Aborting VM start." >&2
+        exit 1
+      fi
+    fi
     do_bind
     say "vfio-pci binding complete (--bind-now): $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
     exit 0
@@ -7626,6 +7642,14 @@ CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
 
 say() { printf '%s\n' "$*"; }
+
+# Best-effort append-only hook log so dynamic-binding VM start/stop actions are
+# traceable without digging through libvirt logs. Failures to write are silent.
+HOOK_LOG="/var/log/vfio-libvirt-hook.log"
+hook_log() {
+  local _msg="$1"
+  printf '%s domain=%s phase=%s %s\n' "$(date -Is 2>/dev/null || date)" "${DOMAIN:-}" "${PHASE:-}" "$_msg" >>"$HOOK_LOG" 2>/dev/null || true
+}
 
 [[ -f "$CONF_FILE" ]] || exit 0
 # shellcheck disable=SC1090
@@ -7705,8 +7729,11 @@ case "$PHASE" in
     # broken/mid-reset device does not get attached to the VM.
     if vm_uses_guest_gpu; then
       say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
+      hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
       "$BIND_SCRIPT" --bind-now
+      hook_log "action=bind-now-done rc=$?"
     else
+      hook_log "action=skip-not-attached"
       : # unrelated VM; let libvirt proceed untouched.
     fi
     ;;
@@ -7715,7 +7742,10 @@ case "$PHASE" in
     # it back to the host driver per VFIO_DYNAMIC_REBIND_HOST. No-op otherwise.
     if guest_gpu_on_vfio; then
       say "vfio-libvirt-hook: VM '$DOMAIN' stopped; releasing guest GPU."
+      hook_log "action=release gpu=$GUEST_GPU_BDF rebind=${VFIO_DYNAMIC_REBIND_HOST:-0}"
       "$BIND_SCRIPT" --release
+    else
+      hook_log "action=stopped-noop gpu-not-on-vfio"
     fi
     ;;
   *)

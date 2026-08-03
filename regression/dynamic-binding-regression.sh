@@ -578,6 +578,38 @@ assert_contains_text \
   "INTENTIONAL and will abort the VM start" \
   "$hook_block"
 
+# --- Functional Q3i: Boot-VGA guard for bind-now (single-GPU protection) ---
+assert_contains_text \
+  "Q3i bind-now refuses Boot-VGA guest without override" \
+  "VFIO_DYNAMIC_ALLOW_BOOT_VGA" \
+  "$bind_block"
+assert_contains_text \
+  "Q3i bind-now Boot-VGA guard aborts VM start" \
+  "refusing --bind-now to keep host display alive" \
+  "$bind_block"
+assert_contains_file \
+  "Q3i write_conf persists VFIO_DYNAMIC_ALLOW_BOOT_VGA" \
+  'VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"' \
+  "$VFIO_SCRIPT"
+
+# --- Functional Q3j: dedicated hook log ---
+assert_contains_text \
+  "Q3j hook has dedicated log file" \
+  "/var/log/vfio-libvirt-hook.log" \
+  "$hook_block"
+assert_contains_text \
+  "Q3j hook has hook_log helper function" \
+  "hook_log()" \
+  "$hook_block"
+assert_contains_text \
+  "Q3j hook logs bind-now action" \
+  "action=bind-now" \
+  "$hook_block"
+assert_contains_text \
+  "Q3j hook logs release action" \
+  "action=release" \
+  "$hook_block"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

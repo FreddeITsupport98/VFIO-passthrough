@@ -13405,18 +13405,32 @@ apply_configuration() {
     hdr "GPU binding mode"
     note "Choose how the guest GPU is handed to the VM:"
     say
-    say "  early                         | dynamic (libvirt hook)"
-    say "  ----------------------------- + ------------------------------------------"
-    say "  vfio-pci claims the GPU at    | amdgpu loads first; a libvirt qemu hook"
-    say "  boot (vfio-pci.ids +          | switches the GPU to vfio-pci only when a"
-    say "  rd.driver.pre + systemd unit) | VM that has it attached is started"
-    say "  GPU is NOT usable by host     | GPU stays usable by host until VM start"
-    say "  between reboots               | (and after VM stop if REBIND_HOST=1)"
-    say "  works with raw qemu too       | requires libvirt-managed VMs"
-    say "  can trigger \"header type 127\"| more reliable for RX 9070 / RDNA4 reset bug"
-    say "  on some AMD cards             |"
+    # Two labeled bullet blocks are easier to scan than a cramped two-column
+    # table whose cells wrap mid-phrase. One complete thought per bullet, and
+    # bold mode labels (with a plain-text fallback when color is disabled).
+    local _early_lbl _dyn_lbl
+    if (( ENABLE_COLOR )); then
+      _early_lbl="${C_BOLD}early binding${C_RESET}"
+      _dyn_lbl="${C_BOLD}dynamic binding${C_RESET} ${C_DIM}(libvirt hook)${C_RESET}"
+    else
+      _early_lbl="early binding"
+      _dyn_lbl="dynamic binding (libvirt hook)"
+    fi
+    say "  $_early_lbl"
+    say "    - vfio-pci claims the GPU at boot (vfio-pci.ids + rd.driver.pre + systemd unit)"
+    say "    - GPU is NOT usable by the host between reboots"
+    say "    - works with raw qemu too"
+    say "    - can trigger \"header type 127\" on some AMD cards"
+    say
+    say "  $_dyn_lbl"
+    say "    - amdgpu loads first; a libvirt qemu hook switches the GPU to vfio-pci"
+    say "      only when a VM that has it attached is started"
+    say "    - GPU stays usable by the host until VM start (and after VM stop if REBIND_HOST=1)"
+    say "    - requires libvirt-managed VMs"
+    say "    - more reliable for RX 9070 / RDNA4 reset bug"
+    say
     note "Both modes keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off."
-    note "dynamic is currently the recommended default for RX 9070 / RDNA4 cards."
+    note "dynamic is the recommended default for RX 9070 / RDNA4 cards."
     local binding_default="N"
     if [[ "${guest_vendor,,}" == "1002" ]]; then
       local guest_drv

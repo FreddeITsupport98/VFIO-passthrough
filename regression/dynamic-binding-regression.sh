@@ -445,10 +445,34 @@ assert_contains_file \
   "dynamic installer installs libvirt hook" \
   'install_libvirt_hook' \
   "$VFIO_SCRIPT"
+# binding-mode prompt: two labeled bullet blocks (early / dynamic) with the
+# key trade-off lines. The old cramped two-column table was replaced for
+# readability; assert the new layout is present.
 assert_contains_file \
-  "binding-mode prompt has comparison column" \
-  "early                         | dynamic (libvirt hook)" \
+  "binding-mode prompt has early binding block label" \
+  "early binding" \
   "$VFIO_SCRIPT"
+assert_contains_file \
+  "binding-mode prompt has dynamic binding block label" \
+  "dynamic binding (libvirt hook)" \
+  "$VFIO_SCRIPT"
+# The source line escapes the inner quotes (\"header type 127\") inside the
+# double-quoted say string, so match the literal escaped form with grep -F.
+assert_contains_file \
+  "binding-mode prompt lists header type 127 trade-off" \
+  'can trigger \"header type 127\" on some AMD cards' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "binding-mode prompt lists dynamic VM-start behavior" \
+  "only when a VM that has it attached is started" \
+  "$VFIO_SCRIPT"
+# The old two-column table line must be gone so we do not regress back to it.
+if grep -Fq 'early                         | dynamic (libvirt hook)' "$VFIO_SCRIPT"; then
+  printf 'FAIL: old two-column binding-mode table still present\n' >&2
+  record_failure "old two-column binding-mode table removed"
+else
+  printf 'PASS: old two-column binding-mode table removed\n'
+fi
 
 # --- Functional Q1: install_libvirt_hook writes a working libvirt hook ---
 # The generated hook script was already extracted into gen_hook; verify it is valid.

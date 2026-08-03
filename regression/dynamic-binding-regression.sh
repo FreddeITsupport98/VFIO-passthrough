@@ -362,6 +362,160 @@ assert_eq \
 0000:06:00.1" \
   "$awk_output"
 
+# --- Static wiring: --install-dynamic-binding / --install-early-binding CLI modes ---
+assert_contains_file \
+  "parse_args handles --install-dynamic-binding" \
+  "--install-dynamic-binding)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --install-early-binding" \
+  "--install-early-binding)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "usage help documents --install-dynamic-binding" \
+  "--install-dynamic-binding" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "usage help documents --install-early-binding" \
+  "--install-early-binding" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "fish completion includes --install-dynamic-binding" \
+  "complete -c \$cmd -l install-dynamic-binding" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "fish completion includes --install-early-binding" \
+  "complete -c \$cmd -l install-early-binding" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "bash completion opts include --install-dynamic-binding" \
+  "--install-dynamic-binding --install-early-binding" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "zsh completion includes --install-dynamic-binding" \
+  "'--install-dynamic-binding[" \
+  "$VFIO_SCRIPT"
+
+# --- Static wiring: installer functions + dispatch + detect offer ---
+assert_contains_file \
+  "install_dynamic_binding_from_existing_config exists" \
+  "install_dynamic_binding_from_existing_config()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "install_early_binding_from_existing_config exists" \
+  "install_early_binding_from_existing_config()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "maybe_offer_detect_dynamic_binding exists" \
+  "maybe_offer_detect_dynamic_binding()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "rewrite_conf_key helper exists" \
+  "rewrite_conf_key()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "build_vfio_pci_ids_from_conf helper exists" \
+  "build_vfio_pci_ids_from_conf()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "strip_early_binding_tokens helper exists" \
+  "strip_early_binding_tokens()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "main dispatch wires install-dynamic-binding" \
+  '[[ "$MODE" == "install-dynamic-binding" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "main dispatch wires install-early-binding" \
+  '[[ "$MODE" == "install-early-binding" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "detect report calls maybe_offer_detect_dynamic_binding" \
+  "maybe_offer_detect_dynamic_binding" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "dynamic installer flips VFIO_BINDING_MODE=dynamic" \
+  'rewrite_conf_key "VFIO_BINDING_MODE" "dynamic"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "early installer flips VFIO_BINDING_MODE=early" \
+  'rewrite_conf_key "VFIO_BINDING_MODE" "early"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "dynamic installer installs libvirt hook" \
+  'install_libvirt_hook' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "binding-mode prompt has comparison column" \
+  "early                         | dynamic (libvirt hook)" \
+  "$VFIO_SCRIPT"
+
+# --- Functional Q1: install_libvirt_hook writes a working libvirt hook ---
+# The generated hook script was already extracted into gen_hook; verify it is valid.
+if bash -n "$gen_hook"; then
+  printf 'PASS: Q1 generated libvirt hook script is syntactically valid bash\n'
+else
+  printf 'FAIL: Q1 generated libvirt hook script has syntax errors\n' >&2
+  record_failure "Q1 generated libvirt hook is valid bash"
+fi
+assert_contains_text \
+  "Q1 generated hook has vm_uses_guest_gpu + --bind-now" \
+  "vm_uses_guest_gpu" \
+  "$hook_block"
+assert_contains_text \
+  "Q1 generated hook calls --bind-now" \
+  "--bind-now" \
+  "$hook_block"
+
+# --- Functional Q2: dynamic mode avoids vfio-pci.ids= and rd.driver.pre=vfio-pci ---
+# Source the cmdline helper functions and verify stripping works.
+source_helpers_q2="${tmp_dir}/helpers_q2.sh"
+{
+  sed -n '/^add_param_once()/,/^}/p' "$VFIO_SCRIPT"
+  sed -n '/^remove_param_all()/,/^}/p' "$VFIO_SCRIPT"
+  sed -n '/^remove_param_prefix()/,/^}/p' "$VFIO_SCRIPT"
+  sed -n '/^trim()/,/^}/p' "$VFIO_SCRIPT"
+} > "$source_helpers_q2"
+# shellcheck disable=SC1091
+# shellcheck disable=SC1090
+source "$source_helpers_q2"
+sample_q2="amd_iommu=on iommu=pt vfio-pci.ids=1002:7550 rd.driver.pre=vfio-pci amdgpu.runpm=0"
+stripped_q2="$sample_q2"
+stripped_q2="$(remove_param_prefix "$stripped_q2" "vfio-pci.ids=")"
+stripped_q2="$(remove_param_all "$stripped_q2" "rd.driver.pre=vfio-pci")"
+if ! grep -Fq "vfio-pci.ids=" <<<"$stripped_q2" && ! grep -Fq "rd.driver.pre=vfio-pci" <<<"$stripped_q2"; then
+  printf 'PASS: Q2 dynamic stripping removes vfio-pci.ids + rd.driver.pre (result: %s)\n' "$stripped_q2"
+else
+  printf 'FAIL: Q2 dynamic stripping did not remove early-binding tokens (result: %s)\n' "$stripped_q2" >&2
+  record_failure "Q2 dynamic stripping removes early-binding tokens"
+fi
+if grep -Fq "amd_iommu=on" <<<"$stripped_q2" && grep -Fq "amdgpu.runpm=0" <<<"$stripped_q2"; then
+  printf 'PASS: Q2 dynamic stripping preserves IOMMU + amdgpu params\n'
+else
+  printf 'FAIL: Q2 dynamic stripping over-stripped IOMMU/amdgpu params (result: %s)\n' "$stripped_q2" >&2
+  record_failure "Q2 dynamic stripping preserves IOMMU/amdgpu params"
+fi
+
+# --- Functional Q3: hook unbinds amdgpu -> binds vfio-pci on VM start (--bind-now) ---
+# The generated bind script was already verified to have ACTION=boot/--bind-now/do_bind;
+# verify bind_one does unbind -> driver_override=vfio-pci -> bind + d3cold_allowed.
+assert_contains_text \
+  "Q3 bind_one unbinds from current driver (amdgpu)" \
+  "/unbind" \
+  "$bind_block"
+assert_contains_text \
+  "Q3 bind_one sets driver_override=vfio-pci" \
+  'driver_override' \
+  "$bind_block"
+assert_contains_text \
+  "Q3 bind_one binds to vfio-pci" \
+  "vfio-pci/bind" \
+  "$bind_block"
+assert_contains_text \
+  "Q3 bind_one sets d3cold_allowed=0 (RX 9070 reset-bug fix)" \
+  "d3cold_allowed" \
+  "$bind_block"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

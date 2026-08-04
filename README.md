@@ -14,6 +14,18 @@
 
 # vfio.sh – Safe multi‑GPU VFIO passthrough helper
 
+## Quick links
+
+- [What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning](#whats-new--rx-9070--rdna4-dynamic-binding--wayland-render-device-pinning)
+- [Why this matters for newer AMD cards](#why-this-matters-for-newer-amd-cards)
+- [The two-mode choice (early vs dynamic)](#the-two-mode-choice-early-vs-dynamic)
+- [How the host desktop stays alive (3 defenses)](#how-the-host-desktop-stays-alive-3-defenses)
+- [Decision diagram (bind-now guard)](#decision-diagram-bind-now-guard)
+- [Full VM-start flow diagram](#full-vm-start-flow-diagram)
+- [Install / switch commands](#install--switch-commands)
+- [GPU binding mode (early vs dynamic) — CLI reference](#gpu-binding-mode-early-vs-dynamic)
+- [Unreleased / changelog](#unreleased)
+
 > **Status:** This script is a highly defensive, feature‑rich VFIO helper that has been hardened for modern Fedora/RHEL/Arch‑style setups, AMD reset quirks, and boot‑VGA framebuffer conflicts. It is designed as a _host configuration wizard_, **not** a VM manager.
 
 This repository contains a single, self‑contained Bash script, `vfio.sh`, that guides you through setting up **GPU passthrough with VFIO** in a way that is:
@@ -28,6 +40,134 @@ This repository contains a single, self‑contained Bash script, `vfio.sh`, that
 The script is designed to be **interactive, defensive and reversible**, so that you are much less likely to soft‑brick your desktop or leave your host without graphics/audio.
 
 > **Important:** This script does *not* create or modify VMs. It only prepares your host so that a hypervisor (libvirt/qemu, etc.) can passthrough the selected PCI devices.
+
+## What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning
+
+vfio 6.0 adds reliable passthrough for **RDNA4 / RX 9070** and other cards that hit the `Unknown PCI header type 127` reset bug, plus automatic Wayland render-device pinning so your host desktop no longer crashes when the VM starts. No BIOS visit required on a dual-GPU setup.
+
+### Why this matters for newer AMD cards
+
+Newer AMD cards (RX 9070 / RX 9070 XT / RX 9070 GRE, Navi 48, RDNA4) have a reset bug: binding the guest GPU to `vfio-pci` **too early** (at host boot) can make the card fall off the PCI bus on a D3cold exit, and the first bind fails with `amdgpu: Unknown PCI header type 127`. The classic early-binding setup (`vfio-pci.ids=...` + `rd.driver.pre=vfio-pci` at boot) is exactly the path that triggers this.
+
+A common dual-GPU topology also makes the obvious workaround dangerous: your firmware POSTs the RX 9070 as Boot VGA (`boot_vga=1`) because it is in the primary slot, while your host display is physically on a second, weaker GPU (e.g. an RX 6400 with `boot_vga=0`). On KDE Plasma Wayland, KWin renders on the `boot_vga=1` card by default — on the RX 9070, not on the card your monitor is cabled to. Binding the RX 9070 to vfio-pci at VM start then rips the GL context out from under the compositor, `kwin_wayland` segfaults mid-frame (`GLVertexBuffer::endOfFrame`), and the whole host desktop dies. vfio 6.0 solves both.
+
+### The two-mode choice (early vs dynamic)
+
+- **early binding** (classic, boot-time): `vfio-pci` claims the guest GPU at boot via `vfio-pci.ids` + `rd.driver.pre=vfio-pci` + a systemd unit. Works with raw qemu. Triggers the RX 9070 / RDNA4 reset bug on affected cards, and the guest GPU is not usable by the host between reboots.
+- **dynamic binding** (libvirt hook, **recommended for RDNA4**): `amdgpu` loads first and the host can use the card; a libvirt qemu hook switches the guest GPU to `vfio-pci` only when a VM that has it attached is started. Avoids the reset bug (the card never sits on vfio-pci at boot), the guest GPU stays usable by the host until VM start, more reliable for RX 9070 / RDNA4. Requires libvirt-managed VMs.
+
+Both modes keep `vfio-pci.disable_idle_d3=1` and `pcie_port_pm=off` on the kernel cmdline (these prevent the D3cold exit that drops the card off the bus).
+
+### How the host desktop stays alive (3 defenses)
+
+1. **Boot-VGA host-assisted escape (bind-time)**: when the VM starts, the bind script checks whether a different `HOST_GPU_BDF` has `boot_vga=0`; if so it allows the bind (mirroring the early-binding `boot_vga_guard()`). A true single-GPU topology is still hard-refused. Override: `VFIO_DYNAMIC_ALLOW_BOOT_VGA=1`.
+2. **Wayland render-device pinning (install-time, durable)**: the installer writes a session env drop-in that pins the compositor to the **host** GPU so it never renders on the guest (Boot VGA) GPU — `KWIN_DRM_DEVICES` for KDE/KWin and `WLR_DRM_DEVICES` for sway/hyprland/labwc/wlroots. No-op unless the guest is `boot_vga=1`; removed by `--reset` and `--install-early-binding`.
+3. **compositor-aware bind-now guard (runtime, point-in-time)**: even with the pin, if a Wayland compositor is still rendering on the guest GPU when the VM starts (e.g. you started the VM before re-logging in), the bind script refuses with an actionable message naming the detected compositor and its correct env var instead of letting kwin segfault. The guard checks the compositor's **KMS card node** (the device it holds DRM master on), not the render node (Mesa opens every render node for EGL/PRIME sharing, so a render-node check would false-positive on a healthy dual-GPU setup).
+
+### Decision diagram (bind-now guard)
+
+The flow below shows what the generated bind script decides at VM start (`--bind-now`). Green nodes allow the bind, red nodes refuse it cleanly so libvirt aborts the VM start and the host display stays alive, blue nodes are the safety checks.
+
+```mermaid
+flowchart TD
+    Start([VM start: libvirt hook calls bind script --bind-now]) --> BV{Guest GPU boot_vga is 1?}
+    BV -- no --> AllowSafe([Safe: bind to vfio-pci, host display unaffected])
+    BV -- yes --> Override{VFIO_DYNAMIC_ALLOW_BOOT_VGA is 1? explicit headless override}
+    Override -- yes --> AllowForce([Forced bind, host display may die, intentional])
+    Override -- no --> HostAssist{Different HOST_GPU_BDF with boot_vga 0 and AUTO policy or opt-in?}
+    HostAssist -- no --> RefuseSingle([REFUSE: true single-GPU, keep host display alive])
+    HostAssist -- yes --> WLGuard{Wayland compositor holds guest KMS card node open? card-node check not render node}
+    WLGuard -- "yes, compositor on guest" --> RefuseWL([REFUSE: actionable fix, name compositor and env var KWIN_DRM_DEVICES or WLR_DRM_DEVICES])
+    WLGuard -- "no, compositor on host" --> AllowHost([ALLOW: host-assisted bind, host desktop stays on host GPU])
+
+    AllowSafe --> Bind([GPU goes to vfio-pci, VM gets the GPU])
+    AllowForce --> Bind
+    AllowHost --> Bind
+    RefuseSingle --> Abort([VM start aborted cleanly, host display preserved])
+    RefuseWL --> Abort
+
+    classDef allow fill:#2d6a4f,stroke:#1b4332,color:#fff
+    classDef refuse fill:#9d0208,stroke:#6a040f,color:#fff
+    classDef check fill:#003566,stroke:#001233,color:#fff
+    classDef neutral fill:#3a3a3a,stroke:#111,color:#fff
+    class AllowSafe,AllowForce,AllowHost,Bind allow
+    class RefuseSingle,RefuseWL,Abort refuse
+    class BV,Override,HostAssist,WLGuard check
+    class Start neutral
+```
+
+### Full VM-start flow diagram
+
+The sequence below shows the complete VM-start flow on a dual-GPU setup with the RX 9070 as the guest (Boot VGA) GPU. At boot amdgpu owns the 9070 and KWin is pinned to the host GPU via `KWIN_DRM_DEVICES`; the host desktop stays alive on the host GPU throughout.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as You
+    participant V as virt-manager or virsh
+    participant L as libvirt (virtqemud)
+    participant H as libvirt qemu hook
+    participant B as bind script --bind-now
+    participant K as KWin on host GPU
+    participant G as RX 9070 guest boot_vga 1
+
+    Note over K,G: At boot: amdgpu owns the 9070. KWin pinned to host GPU via KWIN_DRM_DEVICES.
+    U->>V: Start win11
+    V->>L: virDomainCreate
+    L->>H: qemu hook prepare, VM XML on stdin
+    H->>H: vm_uses_guest_gpu, parse XML BDFs
+    H->>B: --bind-now, timeout-wrapped
+    B->>B: guest boot_vga 1, host boot_vga 0, host-assisted allow
+    B->>B: Wayland compositor on guest card node, no, KWin on host, safe
+    B->>G: unbind from amdgpu, jlog
+    B->>B: pin d3cold_allowed 0, RX 9070 reset-bug fix
+    B->>B: optional PCI reset if VFIO_DYNAMIC_PCI_RESET 1
+    B->>G: driver_override vfio-pci, bind, retry 3x, jlog
+    B->>B: verify driver is vfio-pci
+    B-->>H: rc 0
+    H-->>L: ok
+    L->>L: launch qemu with the GPU assigned
+    L-->>V: domain running
+    V-->>U: win11 booted on the RX 9070
+    Note over K: Host desktop stays alive on the host GPU.
+```
+
+### Install / switch commands
+
+```fish path=null start=null
+# Full guided install (picks a binding mode, installs the render-device pin
+# automatically if the guest is Boot VGA):
+sudo ./vfio.sh
+
+# Switch an existing setup to dynamic binding (RX 9070 / RDNA4 recommended):
+#   regenerates the bind script with the latest guard, reinstalls the hook,
+#   writes the KWIN_DRM_DEVICES / WLR_DRM_DEVICES pin.
+sudo ./vfio.sh --install-dynamic-binding
+
+# Switch back to early binding (also removes the render-device pin):
+sudo ./vfio.sh --install-early-binding
+
+# Full cleanup / undo everything:
+sudo ./vfio.sh --reset
+```
+
+After `--install-dynamic-binding`, log out and back in (or reboot) so the compositor picks up the render-device pin, then start the VM.
+
+**Verification cheat-sheet** (fish):
+```fish path=null start=null
+# which GPU is which
+lspci -nn | grep -iE 'VGA|3D'
+for f in /sys/bus/pci/devices/*/boot_vga; echo (basename (dirname $f)) boot_vga=(cat $f); end
+
+# which card is KWin rendering on? (should be the HOST card)
+sudo ls -l /proc/(pgrep -x kwin_wayland)/fd | grep -oE '/dev/dri/card[0-9]+' | sort -u
+
+# is the render-device pin in kwin's env?
+sudo grep -ao 'KWIN_DRM_DEVICES=[^[:cntrl:]]*' /proc/(pgrep -x kwin_wayland)/environ
+
+# follow the bind sequence live
+journalctl -t vfio-dynamic -f
+```
 
 ## Unreleased
 - No pending unreleased README notes.

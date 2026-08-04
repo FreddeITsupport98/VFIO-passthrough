@@ -875,6 +875,60 @@ assert_contains_text \
   'bound to vfio-pci (verified, alive)' \
   "$bind_block"
 
+# --- Functional Q3o: rapid stop/start cooldown guard (proactive reset-bug prevention) ---
+# The alive-check (Q3n) is REACTIVE -- it catches a dead card AFTER it falls off
+# the bus. The cooldown is PROACTIVE -- it refuses a --bind-now within
+# VFIO_DYNAMIC_COOLDOWN_SECONDS of the last --release (VM stop) so the rapid
+# stop/start that drops the RX 9070 / RDNA4 off the bus never happens in the
+# first place. The bind script writes a stop-timestamp on --release and checks
+# it at the start of --bind-now (before any sysfs writes / boot-vga checks).
+assert_contains_text \
+  "Q3o bind script defines COOLDOWN_TS_FILE" \
+  'COOLDOWN_TS_FILE=' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o bind-now reads VFIO_DYNAMIC_COOLDOWN_SECONDS" \
+  'VFIO_DYNAMIC_COOLDOWN_SECONDS' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o bind-now refuses with wait-seconds message" \
+  'Wait ~${_remaining}s' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o bind-now refuse mentions rapid restart reset bug" \
+  'rapid restart can drop the RX 9070 / RDNA4' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o bind-now jlogs cooldown refusal" \
+  'cooldown not elapsed' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o release writes stop timestamp" \
+  'date +%s >"$COOLDOWN_TS_FILE"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o release cooldown notice tells user to wait" \
+  'wait before restarting' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o post-bind die hints at cooldown" \
+  'keep VFIO_DYNAMIC_COOLDOWN_SECONDS (default 10) above 0' \
+  "$bind_block"
+assert_contains_file \
+  "Q3o write_conf persists VFIO_DYNAMIC_COOLDOWN_SECONDS" \
+  'VFIO_DYNAMIC_COOLDOWN_SECONDS="10"' \
+  "$VFIO_SCRIPT"
+# Ordering: the cooldown check must run BEFORE the boot-vga check in --bind-now
+# so a too-soon restart is refused before any sysfs writes / topology checks.
+_cooldown_line=$(grep -Fn 'cooldown not elapsed' <<<"$bind_block" | head -n1 | cut -d: -f1)
+_bootvga_line=$(grep -Fn 'refusing --bind-now to keep host display alive' <<<"$bind_block" | head -n1 | cut -d: -f1)
+if [[ -n "$_cooldown_line" && -n "$_bootvga_line" ]] && (( _cooldown_line < _bootvga_line )); then
+  printf 'PASS: Q3o cooldown check runs before boot-vga check in bind-now\n'
+else
+  printf 'FAIL: Q3o cooldown check must run before boot-vga check (cooldown=%s bootvga=%s)\n' "$_cooldown_line" "$_bootvga_line" >&2
+  record_failure "Q3o cooldown check runs before boot-vga check"
+fi
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \
@@ -1114,7 +1168,7 @@ fi
 # --- Functional conf-notes: every dynamic conf key has a WHY note ---
 # A WHY note (comment line starting with '# WHY this value:') must appear within
 # the few lines preceding each key="..." assignment. Use awk to pair them.
-for _why_key in 'VFIO_BINDING_MODE' 'VFIO_DYNAMIC_REBIND_HOST' 'VFIO_DYNAMIC_ALLOW_BOOT_VGA' 'VFIO_DYNAMIC_PCI_RESET' 'VFIO_RESTORE_D3COLD_ON_RELEASE' 'VFIO_HOOK_BIND_TIMEOUT'; do
+for _why_key in 'VFIO_BINDING_MODE' 'VFIO_DYNAMIC_REBIND_HOST' 'VFIO_DYNAMIC_ALLOW_BOOT_VGA' 'VFIO_DYNAMIC_PCI_RESET' 'VFIO_DYNAMIC_COOLDOWN_SECONDS' 'VFIO_RESTORE_D3COLD_ON_RELEASE' 'VFIO_HOOK_BIND_TIMEOUT'; do
   _ctx="$(awk -v k="$_why_key" '
     /^# WHY this value:/ { saw_why=1; next }
     $0 ~ "^" k "=" { if (saw_why) { print "FOUND"; saw_why=0 } }

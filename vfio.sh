@@ -4151,6 +4151,20 @@ VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 # failures with "header type 127" after amdgpu teardown and a plain retry does not
 # recover it.
 VFIO_DYNAMIC_PCI_RESET="0"
+# Dynamic-mode rapid stop/start cooldown (seconds, read by the bind script at VM start):
+# - 0: disable the cooldown (--bind-now proceeds immediately even right after a VM stop).
+# - N>0 (default 10): when the libvirt hook calls --bind-now within N seconds of the
+#   last --release (VM stop), refuse the bind with an actionable "wait N seconds"
+#   message so libvirt aborts the VM start cleanly. This is the PROACTIVE complement
+#   to the alive-check: it prevents the rapid stop -> start that drops the RX 9070 /
+#   RDNA4 off the PCI bus via the D3cold reset bug in the first place, instead of
+#   catching the dead card after the fact.
+# WHY this value: 10s is enough for the card to settle out of D3cold and for amdgpu /
+# vfio-pci teardown to finish, yet short enough not to get in the way of a normal
+# (non-rapid) restart. The alive-check still catches a dead card if the cooldown is
+# disabled or the card dies for another reason. Set 0 only if you never rapid-fire
+# stop/start and find the cooldown gets in the way.
+VFIO_DYNAMIC_COOLDOWN_SECONDS="10"
 # Dynamic-mode d3cold_allowed restore on host rebind (advanced):
 # - 0 (default): keep d3cold_allowed=0 after --release even when
 #   VFIO_DYNAMIC_REBIND_HOST=1 rebinds the GPU to the host driver. The RX 9070 /
@@ -7365,6 +7379,10 @@ install_bind_script() {
 set -euo pipefail
 
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+# Timestamp file for the rapid stop/start cooldown guard (dynamic binding mode).
+# Written on --release (VM stop), read on --bind-now (VM start) to refuse a
+# too-soon restart that can drop the RX 9070 / RDNA4 off the PCI bus.
+COOLDOWN_TS_FILE="/var/lib/vfio-dynamic/last-vm-stop.ts"
 
 say() { printf '%s\n' "$*"; }
 
@@ -7577,6 +7595,7 @@ bind_one() {
     say "  - reboot the host (the card needs a cold reset to come back on the bus)" >&2
     say "  - then start the VM; avoid rapid stop/start cycles" >&2
     say "  - if it recurs, enable VFIO_DYNAMIC_PCI_RESET=1 in /etc/vfio-gpu-passthrough.conf" >&2
+    say "  - keep VFIO_DYNAMIC_COOLDOWN_SECONDS (default 10) above 0 to prevent rapid stop/start" >&2
     return 1
   fi
 
@@ -7785,9 +7804,46 @@ case "$ACTION" in
     else
       say "Dynamic release: leaving guest GPU on vfio-pci (VFIO_DYNAMIC_REBIND_HOST=0)."
     fi
+    # Record the VM-stop timestamp for the cooldown guard on the next --bind-now.
+    # Rapid VM stop -> start can drop the RX 9070 / RDNA4 off the PCI bus via the
+    # D3cold reset bug; the cooldown refuses a too-soon restart with an actionable
+    # "wait N seconds" message instead of letting qemu hit a dead card.
+    _cooldown_seconds="${VFIO_DYNAMIC_COOLDOWN_SECONDS:-10}"
+    if [[ ! "$_cooldown_seconds" =~ ^[0-9]+$ ]]; then
+      _cooldown_seconds="10"
+    fi
+    if (( _cooldown_seconds > 0 )); then
+      mkdir -p "$(dirname "$COOLDOWN_TS_FILE")" 2>/dev/null || true
+      date +%s >"$COOLDOWN_TS_FILE" 2>/dev/null || true
+      jlog "VM stopped; cooldown ${_cooldown_seconds}s active -- wait before restarting to avoid the RX 9070 / RDNA4 reset bug (rapid stop/start can drop the card off the bus)"
+      say "VM stopped. The guest GPU needs ~${_cooldown_seconds}s to settle out of D3cold; wait before restarting to avoid the reset bug (VFIO_DYNAMIC_COOLDOWN_SECONDS=${_cooldown_seconds})."
+    fi
     exit 0
     ;;
   bind-now)
+    # Cooldown guard: rapid VM stop -> start can drop the RX 9070 / RDNA4 off
+    # the PCI bus via the D3cold reset bug. If the VM was stopped less than
+    # VFIO_DYNAMIC_COOLDOWN_SECONDS ago, refuse the bind with an actionable
+    # "wait N seconds" message so libvirt aborts the VM start cleanly BEFORE
+    # any sysfs writes (and before the reactive _pci_dev_alive check has to
+    # catch a dead card). This is the PROACTIVE complement to the alive-check.
+    _cooldown_seconds="${VFIO_DYNAMIC_COOLDOWN_SECONDS:-10}"
+    if [[ ! "$_cooldown_seconds" =~ ^[0-9]+$ ]]; then
+      _cooldown_seconds="10"
+    fi
+    if (( _cooldown_seconds > 0 )) && [[ -f "$COOLDOWN_TS_FILE" ]]; then
+      _last_stop="$(cat "$COOLDOWN_TS_FILE" 2>/dev/null || echo 0)"
+      if [[ "$_last_stop" =~ ^[0-9]+$ ]]; then
+        _now="$(date +%s)"
+        _elapsed=$(( _now - _last_stop ))
+        if (( _elapsed < _cooldown_seconds )); then
+          _remaining=$(( _cooldown_seconds - _elapsed ))
+          say "ERROR: VM stopped only ${_elapsed}s ago. The guest GPU needs ~${_cooldown_seconds}s to settle out of D3cold after a VM stop; a rapid restart can drop the RX 9070 / RDNA4 off the PCI bus (Unknown PCI header type 127). Wait ~${_remaining}s and start the VM again. (cooldown: VFIO_DYNAMIC_COOLDOWN_SECONDS=${_cooldown_seconds}; set 0 to disable). Aborting VM start." >&2
+          jlog "$GUEST_GPU_BDF: refused --bind-now -- cooldown not elapsed (${_elapsed}s < ${_cooldown_seconds}s); rapid stop/start reset-bug prevention"
+          exit 1
+        fi
+      fi
+    fi
     # Forced bind requested by the libvirt hook (the VM has the GPU attached).
     # Boot-VGA safety: if the guest GPU is Boot VGA (boot_vga=1), binding it to
     # vfio-pci at VM start would kill the host display mid-session in a

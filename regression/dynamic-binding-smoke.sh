@@ -774,6 +774,66 @@ else
   bad "Q3n bind script missing _pci_dev_alive calls in early-return or post-bind"
 fi
 
+# --- Smoke Q3o: rapid stop/start cooldown guard ---
+# The cooldown refuses a --bind-now within VFIO_DYNAMIC_COOLDOWN_SECONDS of the
+# last --release (VM stop), preventing the rapid stop/start that drops the RX 9070
+# / RDNA4 off the PCI bus. Test the guard logic with a fake timestamp file.
+cat > "$tmp/smoke_cooldown.sh" <<'COOLEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+COOLDOWN_TS_FILE="${COOLDOWN_TS_FILE:-/var/lib/vfio-dynamic/last-vm-stop.ts}"
+say() { printf '%s\n' "$*"; }
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true; }
+GUEST_GPU_BDF="0000:0e:00.0"
+_cooldown_seconds="${VFIO_DYNAMIC_COOLDOWN_SECONDS:-10}"
+if [[ ! "$_cooldown_seconds" =~ ^[0-9]+$ ]]; then
+  _cooldown_seconds="10"
+fi
+if (( _cooldown_seconds > 0 )) && [[ -f "$COOLDOWN_TS_FILE" ]]; then
+  _last_stop="$(cat "$COOLDOWN_TS_FILE" 2>/dev/null || echo 0)"
+  if [[ "$_last_stop" =~ ^[0-9]+$ ]]; then
+    _now="$(date +%s)"
+    _elapsed=$(( _now - _last_stop ))
+    if (( _elapsed < _cooldown_seconds )); then
+      _remaining=$(( _cooldown_seconds - _elapsed ))
+      say "COOLDOWN_REFUSE:elapsed=${_elapsed}s:remaining=${_remaining}s"
+      exit 1
+    fi
+  fi
+fi
+say "COOLDOWN_PASS"
+COOLEOF
+# Case 1: stopped 3s ago, cooldown=10 -> refuse
+ts1=$(( $(date +%s) - 3 ))
+printf '%s' "$ts1" > "$tmp/last-vm-stop.ts"
+c1="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c1" | grep -Fq 'COOLDOWN_REFUSE'; then ok "Q3o cooldown refuses when elapsed (3s) < cooldown (10s)"; else bad "Q3o cooldown did not refuse (got: $c1)"; fi
+# Case 2: stopped 100s ago, cooldown=10 -> pass
+ts2=$(( $(date +%s) - 100 ))
+printf '%s' "$ts2" > "$tmp/last-vm-stop.ts"
+c2="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c2" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o cooldown passes when elapsed (100s) > cooldown (10s)"; else bad "Q3o cooldown did not pass (got: $c2)"; fi
+# Case 3: cooldown=0 (disabled) -> pass even if stopped 1s ago
+ts3=$(( $(date +%s) - 1 ))
+printf '%s' "$ts3" > "$tmp/last-vm-stop.ts"
+c3="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=0 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c3" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o cooldown disabled when VFIO_DYNAMIC_COOLDOWN_SECONDS=0"; else bad "Q3o cooldown not disabled (got: $c3)"; fi
+# Case 4: no timestamp file -> pass (first start after boot)
+c4="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop-missing.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c4" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o cooldown passes when no timestamp file (first start)"; else bad "Q3o cooldown did not pass on first start (got: $c4)"; fi
+# Case 5 (static): generated bind script defines COOLDOWN_TS_FILE + reads cooldown key
+if grep -Fq 'COOLDOWN_TS_FILE=' "$tmp/gen_bind.sh" && grep -Fq 'VFIO_DYNAMIC_COOLDOWN_SECONDS' "$tmp/gen_bind.sh"; then
+  ok "Q3o generated bind script defines COOLDOWN_TS_FILE + reads VFIO_DYNAMIC_COOLDOWN_SECONDS"
+else
+  bad "Q3o generated bind script missing COOLDOWN_TS_FILE or VFIO_DYNAMIC_COOLDOWN_SECONDS"
+fi
+# Case 6 (static): release writes stop timestamp + bind-now jlogs cooldown refusal
+if grep -Fq 'date +%s >"$COOLDOWN_TS_FILE"' "$tmp/gen_bind.sh" && grep -Fq 'cooldown not elapsed' "$tmp/gen_bind.sh"; then
+  ok "Q3o release writes stop timestamp + bind-now jlogs cooldown refusal"
+else
+  bad "Q3o release timestamp write or bind-now refusal missing"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

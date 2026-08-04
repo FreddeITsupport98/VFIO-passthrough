@@ -876,6 +876,97 @@ else
   bad "Q3o release timestamp write or failed-probe jlog missing"
 fi
 
+# --- Smoke Q3p: ensure_amd_reset_bug_params (non-interactive AMD reset-bug params) ---
+# The standalone binding-mode switchers must also deploy vfio-pci.disable_idle_d3=1
+# and pcie_port_pm=off when the guest GPU is AMD, non-interactively. Test the
+# helper with a fake conf pointing CONF_FILE at a temp file.
+qpfake="$tmp/amd_conf"
+mkdir -p "$qpfake"
+cat > "$tmp/smoke_amdparams.sh" <<'QPEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+say() { printf '%s\n' "$*"; }
+note() { say "$*"; }
+trim() { local s="$1"; s="$(echo "$s" | sed -e 's/^[[:space:]]\+//' -e 's/[[:space:]]\+$//')"; printf '%s' "$s"; }
+add_param_once() {
+  local cmdline="$1" param="$2"
+  if grep -Eq "(^|[[:space:]])${param//./\\.}([[:space:]]|$)" <<<"$cmdline"; then
+    echo "$cmdline"
+  else
+    trim "$cmdline $param"
+  fi
+}
+ensure_amd_reset_bug_params() {
+  local cmdline="$1"
+  if [[ ! -f "$CONF_FILE" ]]; then
+    printf '%s' "$(trim "$cmdline")"
+    return 0
+  fi
+  local _vendor
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -z "$_vendor" || "${_vendor,,}" != "1002" ]]; then
+    printf '%s' "$(trim "$cmdline")"
+    return 0
+  fi
+  local _before="$cmdline"
+  if [[ "${AMD_D3_OVERRIDE:-}" != "0" ]]; then
+    cmdline="$(add_param_once "$cmdline" "vfio-pci.disable_idle_d3=1")"
+  fi
+  if [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]]; then
+    cmdline="$(add_param_once "$cmdline" "pcie_port_pm=off")"
+  fi
+  if [[ "$cmdline" != "$_before" ]]; then
+    note "AMD: ensured reset-bug params" >&2
+  fi
+  printf '%s' "$(trim "$cmdline")"
+}
+ensure_amd_reset_bug_params "$1"
+QPEOF
+# Case 1: AMD vendor + no params present -> both added
+printf 'GUEST_GPU_VENDOR_ID="1002"\n' > "$qpfake/conf"
+p1="$(CONF_FILE="$qpfake/conf" bash "$tmp/smoke_amdparams.sh" 'amd_iommu=on iommu=pt root=UUID=abc' 2>/dev/null || true)"
+if echo "$p1" | grep -Fq 'vfio-pci.disable_idle_d3=1' && echo "$p1" | grep -Fq 'pcie_port_pm=off'; then
+  ok "Q3p AMD vendor: ensure_amd_reset_bug_params adds both reset-bug params"
+else
+  bad "Q3p AMD vendor case failed (got: $p1)"
+fi
+# Case 2: non-AMD vendor (NVIDIA 10de) -> unchanged
+printf 'GUEST_GPU_VENDOR_ID="10de"\n' > "$qpfake/conf"
+p2="$(CONF_FILE="$qpfake/conf" bash "$tmp/smoke_amdparams.sh" 'amd_iommu=on iommu=pt root=UUID=abc' 2>/dev/null || true)"
+if ! echo "$p2" | grep -Fq 'vfio-pci.disable_idle_d3=1'; then
+  ok "Q3p non-AMD vendor: ensure_amd_reset_bug_params leaves cmdline unchanged"
+else
+  bad "Q3p non-AMD vendor case added AMD params (got: $p2)"
+fi
+# Case 3: AMD vendor but params already present -> idempotent (no duplicate, unchanged)
+printf 'GUEST_GPU_VENDOR_ID="1002"\n' > "$qpfake/conf"
+_in='amd_iommu=on iommu=pt vfio-pci.disable_idle_d3=1 pcie_port_pm=off root=UUID=abc'
+p3="$(CONF_FILE="$qpfake/conf" bash "$tmp/smoke_amdparams.sh" "$_in" 2>/dev/null || true)"
+_d3count=$(echo "$p3" | tr ' ' '\n' | grep -Fc 'vfio-pci.disable_idle_d3=1')
+if [[ "$_d3count" == "1" ]] && echo "$p3" | grep -Fq 'pcie_port_pm=off'; then
+  ok "Q3p AMD vendor with params already present: idempotent (no duplicate)"
+else
+  bad "Q3p idempotent case failed (d3 count=$_d3count, got: $p3)"
+fi
+# Case 4: AMD vendor + AMD_D3_OVERRIDE=0 -> d3 skipped, portpm still added
+printf 'GUEST_GPU_VENDOR_ID="1002"\n' > "$qpfake/conf"
+p4="$(CONF_FILE="$qpfake/conf" AMD_D3_OVERRIDE=0 bash "$tmp/smoke_amdparams.sh" 'amd_iommu=on root=UUID=abc' 2>/dev/null || true)"
+if ! echo "$p4" | grep -Fq 'vfio-pci.disable_idle_d3=1' && echo "$p4" | grep -Fq 'pcie_port_pm=off'; then
+  ok "Q3p AMD_D3_OVERRIDE=0 skips d3 but still adds pcie_port_pm=off"
+else
+  bad "Q3p AMD_D3_OVERRIDE=0 case failed (got: $p4)"
+fi
+# Case 5 (static): generated vfio.sh defines the helper + both switchers call it
+_q3p_dyn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_q3p_early="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'ensure_amd_reset_bug_params()' "$VFIO_SCRIPT" \
+  && grep -Fq 'ensure_amd_reset_bug_params' <<<"$_q3p_dyn" \
+  && grep -Fq 'ensure_amd_reset_bug_params' <<<"$_q3p_early"; then
+  ok "Q3p vfio.sh defines helper + both binding-mode switchers call it"
+else
+  bad "Q3p vfio.sh missing helper or switcher call"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

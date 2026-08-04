@@ -8898,6 +8898,46 @@ strip_early_binding_tokens() {
   printf '%s' "$(trim "$cmdline")"
 }
 
+# Ensure the AMD reset-bug-critical kernel params are present on a cmdline string:
+# vfio-pci.disable_idle_d3=1 and pcie_port_pm=off. These prevent the RX 9070 /
+# RDNA4 D3cold reset bug (card falls off the bus on a D3cold exit, config space
+# all 0xff, qemu reports "Unknown PCI header type 127") and are promised "kept on
+# the kernel cmdline for both modes" in the release note / README.
+# Non-interactive (NO prompt): used by the standalone binding-mode switchers
+# (--install-dynamic-binding / --install-early-binding) so a quick mode switch
+# also deploys them without re-running the full wizard's interactive AMD prompt.
+# Only the two reset-bug-critical params are force-added; amdgpu.runpm=0 /
+# amdgpu.noretry=0 stay optional (power tradeoff) and are NOT forced here.
+# Honors --no-amd-disable-idle-d3 / --no-amd-pcie-port-pm-off (AMD_D3_OVERRIDE=0 /
+# AMD_PORTPM_OVERRIDE=0) so an explicit opt-out is respected.
+# Reads GUEST_GPU_VENDOR_ID from $CONF_FILE. Prints the (possibly augmented)
+# cmdline on stdout; emits a `note` on stderr when a param was actually added, so
+# the note never pollutes command-substitution stdout.
+ensure_amd_reset_bug_params() {
+  local cmdline="$1"
+  if [[ ! -f "$CONF_FILE" ]]; then
+    printf '%s' "$(trim "$cmdline")"
+    return 0
+  fi
+  local _vendor
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -z "$_vendor" || "${_vendor,,}" != "1002" ]]; then
+    printf '%s' "$(trim "$cmdline")"
+    return 0
+  fi
+  local _before="$cmdline"
+  if [[ "${AMD_D3_OVERRIDE:-}" != "0" ]]; then
+    cmdline="$(add_param_once "$cmdline" "vfio-pci.disable_idle_d3=1")"
+  fi
+  if [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]]; then
+    cmdline="$(add_param_once "$cmdline" "pcie_port_pm=off")"
+  fi
+  if [[ "$cmdline" != "$_before" ]]; then
+    note "AMD guest GPU: ensured vfio-pci.disable_idle_d3=1 and pcie_port_pm=off are on the kernel cmdline (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both binding modes)." >&2
+  fi
+  printf '%s' "$(trim "$cmdline")"
+}
+
 # Map a PCI BDF to its primary DRM card device path (e.g. /dev/dri/card1) by
 # walking /sys/class/drm/card*/device symlinks. Prints the /dev/dri/cardN path
 # and returns 0 on match, returns 1 if no DRM card is bound to that BDF.
@@ -9101,6 +9141,9 @@ install_dynamic_binding_from_existing_config() {
   note "  3. Install the libvirt qemu hook ($LIBVIRT_HOOK_SCRIPT + $LIBVIRT_HOOK_ENTRY)"
   note "  4. Strip vfio-pci.ids= and rd.driver.pre=vfio-pci from the kernel cmdline"
   note "     (so amdgpu is allowed to claim the guest GPU at boot)"
+  note "  4b. Ensure the AMD reset-bug kernel params (vfio-pci.disable_idle_d3=1,"
+  note "      pcie_port_pm=off) are on the cmdline when the guest GPU is AMD"
+  note "      (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both modes)"
   note "  5. Sync BLS boot entries to the updated cmdline"
   note "  6. Pin Wayland compositors (KDE/KWin + wlroots: sway/hyprland/labwc) to the"
   note "     HOST GPU so binding the guest GPU does not crash the host compositor"
@@ -9108,8 +9151,8 @@ install_dynamic_binding_from_existing_config() {
   say
   note "What stays unchanged:"
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"
-  note "  - AMD stability params (amdgpu.runpm=0, amdgpu.noretry=0,"
-  note "    vfio-pci.disable_idle_d3=1, pcie_port_pm=off)"
+  note "  - Optional AMD power-tradeoff params (amdgpu.runpm=0, amdgpu.noretry=0)"
+  note "    are left as-is; only the reset-bug-critical pair is ensured (step 4b)"
   note "  - The vfio-bind-selected-gpu.service unit (becomes a no-op at boot in dynamic mode)"
   say
 
@@ -9176,6 +9219,7 @@ install_dynamic_binding_from_existing_config() {
     local kcur knew
     kcur="$(cat /etc/kernel/cmdline 2>/dev/null || true)"
     knew="$(strip_early_binding_tokens "$kcur")"
+    knew="$(ensure_amd_reset_bug_params "$knew")"
     apply_binding_cmdline_change "$knew" ""
   elif [[ -f /etc/default/grub ]]; then
     # Classic GRUB only.
@@ -9185,6 +9229,7 @@ install_dynamic_binding_from_existing_config() {
     if [[ -n "$key" ]]; then
       current="$(grub_read_cmdline "$key" 2>/dev/null || true)"
       new="$(strip_early_binding_tokens "$current")"
+      new="$(ensure_amd_reset_bug_params "$new")"
       if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
         grub_write_cmdline_in_place "$key" "$(trim "$new")"
         if command -v update-grub >/dev/null 2>&1; then
@@ -9222,6 +9267,9 @@ install_early_binding_from_existing_config() {
   note "  2. Regenerate $BIND_SCRIPT (deploys the latest bind/boot-time logic)"
   note "  3. Remove the libvirt qemu hook (restoring any pre-existing hook from backup)"
   note "  4. Re-add vfio-pci.ids=<guest IDs> and rd.driver.pre=vfio-pci to the kernel cmdline"
+  note "  4b. Ensure the AMD reset-bug kernel params (vfio-pci.disable_idle_d3=1,"
+  note "      pcie_port_pm=off) are on the cmdline when the guest GPU is AMD"
+  note "      (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both modes)"
   note "  5. Sync BLS boot entries to the updated cmdline"
   note "  6. Remove the Wayland HOST-GPU render-device pins (early binding binds the"
   note "     guest GPU at boot, before the compositor starts, so the pins are no"
@@ -9279,6 +9327,7 @@ install_early_binding_from_existing_config() {
     if command -v dracut >/dev/null 2>&1 && vfio_pci_available; then
       knew="$(add_param_once "$knew" "rd.driver.pre=vfio-pci")"
     fi
+    knew="$(ensure_amd_reset_bug_params "$knew")"
     apply_binding_cmdline_change "$knew" ""
   elif [[ -f /etc/default/grub ]]; then
     backup_file /etc/default/grub
@@ -9293,6 +9342,7 @@ install_early_binding_from_existing_config() {
       if command -v dracut >/dev/null 2>&1 && vfio_pci_available; then
         new="$(add_param_once "$new" "rd.driver.pre=vfio-pci")"
       fi
+      new="$(ensure_amd_reset_bug_params "$new")"
       if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
         grub_write_cmdline_in_place "$key" "$(trim "$new")"
         if command -v update-grub >/dev/null 2>&1; then

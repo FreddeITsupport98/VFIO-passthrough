@@ -933,6 +933,58 @@ else
   record_failure "Q3o readiness probe runs before boot-vga check"
 fi
 
+# --- Functional Q3p: ensure_amd_reset_bug_params (non-interactive AMD reset-bug params) ---
+# The standalone binding-mode switchers (--install-dynamic-binding /
+# --install-early-binding) must also deploy the AMD reset-bug-critical kernel
+# params (vfio-pci.disable_idle_d3=1, pcie_port_pm=off) non-interactively, not
+# just strip early-binding tokens. The release note / README promise these are
+# "kept on the kernel cmdline for both modes", so a quick mode switch must
+# ensure them without re-running the full wizard's interactive AMD prompt.
+assert_contains_file \
+  "Q3p ensure_amd_reset_bug_params helper defined" \
+  "ensure_amd_reset_bug_params()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p helper reads GUEST_GPU_VENDOR_ID from conf" \
+  '/^GUEST_GPU_VENDOR_ID=/' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p helper adds vfio-pci.disable_idle_d3=1" \
+  'add_param_once "$cmdline" "vfio-pci.disable_idle_d3=1"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p helper adds pcie_port_pm=off" \
+  'add_param_once "$cmdline" "pcie_port_pm=off"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p helper honors AMD_D3_OVERRIDE=0 opt-out" \
+  '"${AMD_D3_OVERRIDE:-}" != "0"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p helper honors AMD_PORTPM_OVERRIDE=0 opt-out" \
+  '"${AMD_PORTPM_OVERRIDE:-}" != "0"' \
+  "$VFIO_SCRIPT"
+# Both standalone switchers must call the helper (non-interactive deploy).
+_dyn_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3p install-dynamic-binding calls ensure_amd_reset_bug_params" \
+  'ensure_amd_reset_bug_params' \
+  "$_dyn_fn"
+_early_fn3="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3p install-early-binding calls ensure_amd_reset_bug_params" \
+  'ensure_amd_reset_bug_params' \
+  "$_early_fn3"
+# The dynamic switcher's 'What this will do' note must document step 4b.
+assert_contains_text \
+  "Q3p dynamic note documents step 4b AMD reset-bug params" \
+  'Ensure the AMD reset-bug kernel params' \
+  "$_dyn_fn"
+assert_contains_text \
+  "Q3p early note documents step 4b AMD reset-bug params" \
+  'Ensure the AMD reset-bug kernel params' \
+  "$_early_fn3"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

@@ -7625,33 +7625,34 @@ _bdf_to_drm_card() {
 }
 
 # Returns 0 if a running Wayland compositor (kwin_wayland / sway / weston /
-# wlroots / labwc / hyprland) currently has the render node of the given BDF
-# open — i.e. it is rendering on that GPU, so binding that GPU to vfio-pci
-# would crash the compositor mid-frame (kwin_wayland SEGV in
-# GLVertexBuffer::endOfFrame). On match, prints the compositor name to stdout
-# (so the caller can name the correct render-device env var in its message).
-# Returns 1 otherwise (safe to bind), printing nothing.
+# wlroots / labwc / hyprland) currently has the KMS card node (/dev/dri/cardN)
+# of the given BDF open — i.e. it is DRM master / scanning out to that GPU, so
+# binding that GPU to vfio-pci would crash the compositor mid-frame
+# (kwin_wayland SEGV in GLVertexBuffer::endOfFrame). On match, prints the
+# compositor name to stdout (so the caller can name the correct render-device
+# env var in its message). Returns 1 otherwise (safe to bind), printing nothing.
+#
+# NOTE: we check the KMS *card* node, NOT the render node. Mesa opens every
+# renderDNN on the system for EGL/PRIME buffer sharing even when the compositor's
+# display is on a different GPU, so a render-node check would false-positive on a
+# healthy dual-GPU setup. The card node is the device the compositor actually
+# holds DRM master on and scans out to — that is the real "display lives here"
+# signal.
 _wayland_compositor_uses_bdf() {
   local _bdf="$1"
   [[ -n "$_bdf" ]] || return 1
-  # Map the BDF to its DRM render node (renderDNN), if any.
-  local _render="" _rcard
-  for _rcard in /sys/class/drm/renderD[0-9]*; do
-    [[ -e "$_rcard" ]] || continue
-    if [[ "$(basename "$(readlink -f "$_rcard/device" 2>/dev/null)" 2>/dev/null || true)" == "$_bdf" ]]; then
-      _render="/dev/$(basename "$_rcard")"
-      break
-    fi
-  done
-  [[ -n "$_render" ]] || return 1
-  # Find running Wayland compositors and check their open fds for that render node.
+  # Map the BDF to its primary KMS card node (/dev/dri/cardN), if any.
+  local _card=""
+  _card="$(_bdf_to_drm_card "$_bdf" 2>/dev/null || true)"
+  [[ -n "$_card" ]] || return 1
+  # Find running Wayland compositors and check their open fds for that card node.
   local _comp _pid _fd _tgt
   for _comp in kwin_wayland sway weston wlroots labwc hyprland; do
     for _pid in $(pgrep -x "$_comp" 2>/dev/null || true); do
       for _fd in /proc/"$_pid"/fd/*; do
         [[ -L "$_fd" ]] || continue
         _tgt="$(readlink "$_fd" 2>/dev/null || true)"
-        if [[ "$_tgt" == "$_render" ]]; then
+        if [[ "$_tgt" == "$_card" ]]; then
           printf '%s\n' "$_comp"
           return 0
         fi

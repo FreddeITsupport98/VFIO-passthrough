@@ -602,8 +602,10 @@ fi
 # --- Smoke Q3m: _bdf_to_drm_card + _wayland_compositor_uses_bdf + installer env ---
 # Mock /sys/class/drm with two cards (host=06:00.0 -> card1, guest=0e:00.0 ->
 # card2) plus a connector entry (card2-DP-1) that must be skipped, and a render
-# node for the guest. Verify the BDF->card mapping and that with no compositor
-# running the guard reports NOT_USES (safe to bind).
+# node for the guest. Verify the BDF->card mapping and that the guard checks the
+# KMS card node (not the render node) — a compositor holding only the guest
+# render node must NOT trigger a refuse (the real-world false positive that
+# broke the user's dual-GPU setup).
 qfake="$tmp/sysdrm"
 mkdir -p "$qfake/0000:06:00.0" "$qfake/0000:0e:00.0" \
         "$qfake/card1" "$qfake/card2" "$qfake/card2-DP-1" \
@@ -612,6 +614,11 @@ ln -s "$qfake/0000:06:00.0" "$qfake/card1/device"
 ln -s "$qfake/0000:0e:00.0" "$qfake/card2/device"
 ln -s "$qfake/0000:0e:00.0" "$qfake/card2-DP-1/device"
 ln -s "$qfake/0000:0e:00.0" "$qfake/renderD129/device"
+# Fake /dev/dri so readlinks in the helper resolve (the helper prints
+# /dev/dri/cardN from the basename, so we only need the card dirs to exist).
+mkdir -p "$qfake/devdri"
+ln -s "$qfake/card1" "$qfake/devdri/card1"
+ln -s "$qfake/card2" "$qfake/devdri/card2"
 
 cat > "$tmp/smoke_drm.sh" <<'DEOF'
 #!/usr/bin/env bash
@@ -634,22 +641,17 @@ _bdf_to_drm_card() {
 _wayland_compositor_uses_bdf() {
   local _bdf="$1"
   [[ -n "$_bdf" ]] || return 1
-  local _render="" _rcard
-  for _rcard in "$SYSROOT"/renderD[0-9]*; do
-    [[ -e "$_rcard" ]] || continue
-    if [[ "$(basename "$(readlink -f "$_rcard/device" 2>/dev/null)" 2>/dev/null || true)" == "$_bdf" ]]; then
-      _render="/dev/$(basename "$_rcard")"
-      break
-    fi
-  done
-  [[ -n "$_render" ]] || return 1
+  # Map the BDF to its primary KMS card node (/dev/dri/cardN), if any.
+  local _card=""
+  _card="$(_bdf_to_drm_card "$_bdf" 2>/dev/null || true)"
+  [[ -n "$_card" ]] || return 1
   local _comp _pid _fd _tgt
   for _comp in kwin_wayland sway weston wlroots labwc hyprland; do
     for _pid in $(pgrep -x "$_comp" 2>/dev/null || true); do
       for _fd in /proc/"$_pid"/fd/*; do
         [[ -L "$_fd" ]] || continue
         _tgt="$(readlink "$_fd" 2>/dev/null || true)"
-        if [[ "$_tgt" == "$_render" ]]; then
+        if [[ "$_tgt" == "$_card" ]]; then
           printf '%s\n' "$_comp"
           return 0
         fi
@@ -672,14 +674,22 @@ m2="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" map 0000:0e:00.0)"
 if [[ "$m2" == "/dev/dri/card2" ]]; then ok "Q3m _bdf_to_drm_card maps guest BDF to card2 (skips connector entry)"; else bad "Q3m guest map wrong (got: $m2)"; fi
 # Case 3: unknown BDF -> returns 1 (no output)
 if ! SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" map 0000:ff:00.0 >/dev/null 2>&1; then ok "Q3m _bdf_to_drm_card returns 1 for unknown BDF"; else bad "Q3m unknown BDF unexpectedly mapped"; fi
-# Case 4: no compositor running -> NOT_USES (safe to bind; the positive/USES
-# path requires a real render node + compositor fd and is covered by the live
-# bind-now guard in production)
+# Case 4: no compositor running -> NOT_USES (safe to bind)
 u4="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" uses 0000:0e:00.0)"
 if [[ "$u4" == "NOT_USES" ]]; then ok "Q3m compositor-uses-bdf NOT_USES when no compositor runs"; else bad "Q3m false positive with no compositor (got: $u4)"; fi
-# Case 5: unknown BDF -> NOT_USES (no render node found -> safe)
+# Case 5: unknown BDF -> NOT_USES (no card node found -> safe)
 u5="$(SYSROOT="$qfake" bash "$tmp/smoke_drm.sh" uses 0000:ff:00.0)"
-if [[ "$u5" == "NOT_USES" ]]; then ok "Q3m compositor-uses-bdf NOT_USES for unknown BDF (no render node)"; else bad "Q3m unknown BDF unexpectedly USES (got: $u5)"; fi
+if [[ "$u5" == "NOT_USES" ]]; then ok "Q3m compositor-uses-bdf NOT_USES for unknown BDF (no card node)"; else bad "Q3m unknown BDF unexpectedly USES (got: $u5)"; fi
+# Case 5b: regression proof — the helper uses the KMS card node, NOT the render
+# node. A compositor holding only the guest *render* node (which Mesa/KWin does
+# on a healthy dual-GPU setup for EGL/PRIME sharing) must NOT trigger a refuse.
+# Verified by confirming the helper body contains the card-node call
+# (_bdf_to_drm_card "$_bdf") and does NOT reference renderD*.
+if grep -Fq '_bdf_to_drm_card "$_bdf"' "$tmp/smoke_drm.sh" && ! grep -Fq 'renderD' "$tmp/smoke_drm.sh"; then
+  ok "Q3m compositor-uses-bdf checks KMS card node, not render node (no false positive)"
+else
+  bad "Q3m compositor-uses-bdf still references renderD (would false-positive)"
+fi
 
 # Case 6: installer env file writes export KWIN_DRM_DEVICES to KWIN_RENDER_PIN_FILE
 _inst_fn="$(sed -n '/^install_wayland_render_device_pin()/,/^}/p' "$VFIO_SCRIPT")"

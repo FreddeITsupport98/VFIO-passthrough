@@ -802,6 +802,25 @@ assert_contains_text \
   "printf '%s\\n' \"\$_comp\"" \
   "$bind_block"
 
+# --- Functional Q3m-fix: guard checks KMS card node, not render node ---
+# The original guard checked the guest GPU's *render* node (renderDNN), but Mesa
+# opens every renderDNN on the system for EGL/PRIME buffer sharing even when the
+# compositor's display is on a different GPU — so on a healthy dual-GPU setup
+# (KWin display on the host 6400, renderD129 of the guest 9070 open for PRIME)
+# the guard false-refused and required VFIO_DYNAMIC_ALLOW_BOOT_VGA=1. The fix:
+# check the KMS *card* node (/dev/dri/cardN), which is the device the compositor
+# actually holds DRM master on and scans out to.
+assert_contains_text \
+  "Q3m-fix guard uses _bdf_to_drm_card (KMS card node)" \
+  '_card="$(_bdf_to_drm_card "$_bdf" 2>/dev/null || true)"' \
+  "$bind_block"
+if grep -Fq 'renderD[0-9]*' <<<"$bind_block"; then
+  printf 'FAIL: Q3m-fix guard still references renderD* nodes (would false-positive)\n' >&2
+  record_failure "Q3m-fix guard does not reference renderD nodes"
+else
+  printf 'PASS: Q3m-fix guard does not reference renderD nodes\n'
+fi
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

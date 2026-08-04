@@ -774,17 +774,36 @@ else
   bad "Q3n bind script missing _pci_dev_alive calls in early-return or post-bind"
 fi
 
-# --- Smoke Q3o: rapid stop/start cooldown guard ---
-# The cooldown refuses a --bind-now within VFIO_DYNAMIC_COOLDOWN_SECONDS of the
-# last --release (VM stop), preventing the rapid stop/start that drops the RX 9070
-# / RDNA4 off the PCI bus. Test the guard logic with a fake timestamp file.
+# --- Smoke Q3o: rapid stop/start cooldown readiness probe ---
+# The cooldown now ACTIVELY probes card liveness instead of a dumb time gate.
+# Within the cooldown window it polls _pci_dev_alive until alive or the window
+# expires; if still dead it dies with a "reboot" message. Mock /sys/bus/pci/devices
+# with a controllable vendor/config to simulate alive/dead.
+pcfake2="$tmp/syspci_cd"
+mkdir -p "$pcfake2/0000:0e:00.0"
+printf '0x1002' > "$pcfake2/0000:0e:00.0/vendor"
+printf '\x02\x10\x50\x75' > "$pcfake2/0000:0e:00.0/config"
 cat > "$tmp/smoke_cooldown.sh" <<'COOLEOF'
 #!/usr/bin/env bash
 set -euo pipefail
 COOLDOWN_TS_FILE="${COOLDOWN_TS_FILE:-/var/lib/vfio-dynamic/last-vm-stop.ts}"
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
 say() { printf '%s\n' "$*"; }
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true; }
 GUEST_GPU_BDF="0000:0e:00.0"
+_pci_dev_alive() {
+  local _bdf="$1" _sys _vendor _cfg
+  [[ -n "$_bdf" ]] || return 1
+  _sys="$SYSROOT/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d " \n")"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]] || return 1
+  return 0
+}
 _cooldown_seconds="${VFIO_DYNAMIC_COOLDOWN_SECONDS:-10}"
 if [[ ! "$_cooldown_seconds" =~ ^[0-9]+$ ]]; then
   _cooldown_seconds="10"
@@ -795,43 +814,66 @@ if (( _cooldown_seconds > 0 )) && [[ -f "$COOLDOWN_TS_FILE" ]]; then
     _now="$(date +%s)"
     _elapsed=$(( _now - _last_stop ))
     if (( _elapsed < _cooldown_seconds )); then
-      _remaining=$(( _cooldown_seconds - _elapsed ))
-      say "COOLDOWN_REFUSE:elapsed=${_elapsed}s:remaining=${_remaining}s"
-      exit 1
+      while (( _elapsed < _cooldown_seconds )); do
+        if _pci_dev_alive "$GUEST_GPU_BDF"; then
+          say "COOLDOWN_ALIVE:elapsed=${_elapsed}s"
+          break
+        fi
+        sleep 1
+        _now="$(date +%s)"
+        _elapsed=$(( _now - _last_stop ))
+      done
+      if ! _pci_dev_alive "$GUEST_GPU_BDF"; then
+        say "COOLDOWN_DEAD:elapsed=${_elapsed}s"
+        exit 1
+      fi
     fi
   fi
 fi
 say "COOLDOWN_PASS"
 COOLEOF
-# Case 1: stopped 3s ago, cooldown=10 -> refuse
-ts1=$(( $(date +%s) - 3 ))
+# Case 1: within window + card ALIVE -> proceeds immediately (no sleep)
+ts1=$(( $(date +%s) - 1 ))
 printf '%s' "$ts1" > "$tmp/last-vm-stop.ts"
-c1="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
-if echo "$c1" | grep -Fq 'COOLDOWN_REFUSE'; then ok "Q3o cooldown refuses when elapsed (3s) < cooldown (10s)"; else bad "Q3o cooldown did not refuse (got: $c1)"; fi
-# Case 2: stopped 100s ago, cooldown=10 -> pass
-ts2=$(( $(date +%s) - 100 ))
+c1="$(SYSROOT="$pcfake2" COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c1" | grep -Fq 'COOLDOWN_ALIVE'; then ok "Q3o probe proceeds immediately when card alive within cooldown window"; else bad "Q3o alive-within-window case failed (got: $c1)"; fi
+# Case 2: within window + card DEAD -> dies with reboot message after window (short cooldown to keep test fast)
+printf '0xffff' > "$pcfake2/0000:0e:00.0/vendor"
+ts2=$(( $(date +%s) - 1 ))
 printf '%s' "$ts2" > "$tmp/last-vm-stop.ts"
-c2="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
-if echo "$c2" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o cooldown passes when elapsed (100s) > cooldown (10s)"; else bad "Q3o cooldown did not pass (got: $c2)"; fi
-# Case 3: cooldown=0 (disabled) -> pass even if stopped 1s ago
-ts3=$(( $(date +%s) - 1 ))
+c2="$(SYSROOT="$pcfake2" COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=2 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c2" | grep -Fq 'COOLDOWN_DEAD'; then ok "Q3o probe dies with COOLDOWN_DEAD when card still dead after window"; else bad "Q3o dead-within-window case failed (got: $c2)"; fi
+# Case 3: outside window -> skip probe, pass (no polling)
+printf '0x1002' > "$pcfake2/0000:0e:00.0/vendor"
+ts3=$(( $(date +%s) - 100 ))
 printf '%s' "$ts3" > "$tmp/last-vm-stop.ts"
-c3="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=0 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
-if echo "$c3" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o cooldown disabled when VFIO_DYNAMIC_COOLDOWN_SECONDS=0"; else bad "Q3o cooldown not disabled (got: $c3)"; fi
-# Case 4: no timestamp file -> pass (first start after boot)
-c4="$(COOLDOWN_TS_FILE="$tmp/last-vm-stop-missing.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
-if echo "$c4" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o cooldown passes when no timestamp file (first start)"; else bad "Q3o cooldown did not pass on first start (got: $c4)"; fi
-# Case 5 (static): generated bind script defines COOLDOWN_TS_FILE + reads cooldown key
+c3="$(SYSROOT="$pcfake2" COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c3" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o probe skips when outside cooldown window"; else bad "Q3o outside-window case failed (got: $c3)"; fi
+# Case 4: cooldown=0 (disabled) -> pass even if stopped 1s ago
+ts4=$(( $(date +%s) - 1 ))
+printf '%s' "$ts4" > "$tmp/last-vm-stop.ts"
+c4="$(SYSROOT="$pcfake2" COOLDOWN_TS_FILE="$tmp/last-vm-stop.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=0 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c4" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o probe disabled when VFIO_DYNAMIC_COOLDOWN_SECONDS=0"; else bad "Q3o not disabled (got: $c4)"; fi
+# Case 5: no timestamp file -> pass (first start after boot)
+c5="$(SYSROOT="$pcfake2" COOLDOWN_TS_FILE="$tmp/last-vm-stop-missing.ts" VFIO_DYNAMIC_COOLDOWN_SECONDS=10 bash "$tmp/smoke_cooldown.sh" 2>&1 || true)"
+if echo "$c5" | grep -Fq 'COOLDOWN_PASS'; then ok "Q3o probe passes when no timestamp file (first start)"; else bad "Q3o first-start case failed (got: $c5)"; fi
+# Case 6 (static): generated bind script defines COOLDOWN_TS_FILE + reads cooldown key
 if grep -Fq 'COOLDOWN_TS_FILE=' "$tmp/gen_bind.sh" && grep -Fq 'VFIO_DYNAMIC_COOLDOWN_SECONDS' "$tmp/gen_bind.sh"; then
   ok "Q3o generated bind script defines COOLDOWN_TS_FILE + reads VFIO_DYNAMIC_COOLDOWN_SECONDS"
 else
   bad "Q3o generated bind script missing COOLDOWN_TS_FILE or VFIO_DYNAMIC_COOLDOWN_SECONDS"
 fi
-# Case 6 (static): release writes stop timestamp + bind-now jlogs cooldown refusal
-if grep -Fq 'date +%s >"$COOLDOWN_TS_FILE"' "$tmp/gen_bind.sh" && grep -Fq 'cooldown not elapsed' "$tmp/gen_bind.sh"; then
-  ok "Q3o release writes stop timestamp + bind-now jlogs cooldown refusal"
+# Case 7 (static): generated bind script probes readiness + dies with reboot message
+if grep -Fq 'probing card readiness' "$tmp/gen_bind.sh" && grep -Fq 'card needs a host reboot to come back on the bus' "$tmp/gen_bind.sh"; then
+  ok "Q3o generated bind script probes readiness + dies with reboot message"
 else
-  bad "Q3o release timestamp write or bind-now refusal missing"
+  bad "Q3o generated bind script missing readiness probe or reboot message"
+fi
+# Case 8 (static): release writes stop timestamp + bind-now jlogs failed probe
+if grep -Fq 'date +%s >"$COOLDOWN_TS_FILE"' "$tmp/gen_bind.sh" && grep -Fq 'FAILED cooldown readiness probe' "$tmp/gen_bind.sh"; then
+  ok "Q3o release writes stop timestamp + bind-now jlogs failed readiness probe"
+else
+  bad "Q3o release timestamp write or failed-probe jlog missing"
 fi
 
 if (( fail != 0 )); then

@@ -4154,16 +4154,20 @@ VFIO_DYNAMIC_PCI_RESET="0"
 # Dynamic-mode rapid stop/start cooldown (seconds, read by the bind script at VM start):
 # - 0: disable the cooldown (--bind-now proceeds immediately even right after a VM stop).
 # - N>0 (default 10): when the libvirt hook calls --bind-now within N seconds of the
-#   last --release (VM stop), refuse the bind with an actionable "wait N seconds"
-#   message so libvirt aborts the VM start cleanly. This is the PROACTIVE complement
-#   to the alive-check: it prevents the rapid stop -> start that drops the RX 9070 /
-#   RDNA4 off the PCI bus via the D3cold reset bug in the first place, instead of
-#   catching the dead card after the fact.
+#   last --release (VM stop), ACTIVELY probe the guest GPU's liveness (vendor sysfs +
+#   live config space) instead of binding immediately. It polls until the card is
+#   alive OR the cooldown window expires. A card that recovers early proceeds
+#   immediately (no need to wait the full N seconds); a card that is still dead after
+#   the window fails with an actionable "card needs a host reboot" message so libvirt
+#   aborts the VM start cleanly. This is the PROACTIVE complement to the alive-check:
+#   it gives the card time to recover from a rapid stop/start D3cold exit, and only
+#   fails if it does NOT recover. Keep N below VFIO_HOOK_BIND_TIMEOUT (default 20).
 # WHY this value: 10s is enough for the card to settle out of D3cold and for amdgpu /
 # vfio-pci teardown to finish, yet short enough not to get in the way of a normal
-# (non-rapid) restart. The alive-check still catches a dead card if the cooldown is
-# disabled or the card dies for another reason. Set 0 only if you never rapid-fire
-# stop/start and find the cooldown gets in the way.
+# (non-rapid) restart and well under the 20s hook timeout. The alive-check still
+# catches a dead card if the cooldown is disabled or the card dies for another
+# reason. Set 0 only if you never rapid-fire stop/start and find the probe gets in
+# the way.
 VFIO_DYNAMIC_COOLDOWN_SECONDS="10"
 # Dynamic-mode d3cold_allowed restore on host rebind (advanced):
 # - 0 (default): keep d3cold_allowed=0 after --release even when
@@ -7821,12 +7825,18 @@ case "$ACTION" in
     exit 0
     ;;
   bind-now)
-    # Cooldown guard: rapid VM stop -> start can drop the RX 9070 / RDNA4 off
-    # the PCI bus via the D3cold reset bug. If the VM was stopped less than
-    # VFIO_DYNAMIC_COOLDOWN_SECONDS ago, refuse the bind with an actionable
-    # "wait N seconds" message so libvirt aborts the VM start cleanly BEFORE
-    # any sysfs writes (and before the reactive _pci_dev_alive check has to
-    # catch a dead card). This is the PROACTIVE complement to the alive-check.
+    # Readiness probe: rapid VM stop -> start can drop the RX 9070 / RDNA4 off
+    # the PCI bus via the D3cold reset bug. Instead of a dumb fixed-time gate,
+    # ACTIVELY probe whether the card is alive. If the VM was stopped less than
+    # VFIO_DYNAMIC_COOLDOWN_SECONDS ago, poll the card's liveness (vendor sysfs +
+    # live config space via _pci_dev_alive) until it is alive OR the cooldown
+    # window expires. A card that recovered early proceeds immediately (no need
+    # to wait the full window); a card that is still dead after the window fails
+    # with an actionable "card needs a host reboot" message so libvirt aborts the
+    # VM start cleanly. This is the PROACTIVE complement to the alive-check: it
+    # gives the card time to recover from a rapid stop/start D3cold exit and only
+    # fails if it does NOT recover. Keep the cooldown below VFIO_HOOK_BIND_TIMEOUT
+    # (default 20) so the probe cannot hit the hook deadline.
     _cooldown_seconds="${VFIO_DYNAMIC_COOLDOWN_SECONDS:-10}"
     if [[ ! "$_cooldown_seconds" =~ ^[0-9]+$ ]]; then
       _cooldown_seconds="10"
@@ -7837,10 +7847,21 @@ case "$ACTION" in
         _now="$(date +%s)"
         _elapsed=$(( _now - _last_stop ))
         if (( _elapsed < _cooldown_seconds )); then
-          _remaining=$(( _cooldown_seconds - _elapsed ))
-          say "ERROR: VM stopped only ${_elapsed}s ago. The guest GPU needs ~${_cooldown_seconds}s to settle out of D3cold after a VM stop; a rapid restart can drop the RX 9070 / RDNA4 off the PCI bus (Unknown PCI header type 127). Wait ~${_remaining}s and start the VM again. (cooldown: VFIO_DYNAMIC_COOLDOWN_SECONDS=${_cooldown_seconds}; set 0 to disable). Aborting VM start." >&2
-          jlog "$GUEST_GPU_BDF: refused --bind-now -- cooldown not elapsed (${_elapsed}s < ${_cooldown_seconds}s); rapid stop/start reset-bug prevention"
-          exit 1
+          jlog "$GUEST_GPU_BDF: --bind-now within cooldown window (${_elapsed}s < ${_cooldown_seconds}s); probing card readiness"
+          while (( _elapsed < _cooldown_seconds )); do
+            if _pci_dev_alive "$GUEST_GPU_BDF"; then
+              jlog "$GUEST_GPU_BDF: card alive during cooldown probe (elapsed ${_elapsed}s); proceeding with bind"
+              break
+            fi
+            sleep 1
+            _now="$(date +%s)"
+            _elapsed=$(( _now - _last_stop ))
+          done
+          if ! _pci_dev_alive "$GUEST_GPU_BDF"; then
+            say "ERROR: VM stopped ${_elapsed}s ago and the guest GPU ($GUEST_GPU_BDF) is still not alive after the cooldown window (${_cooldown_seconds}s). Its config space is unreadable (RX 9070 / RDNA4 reset bug: Unknown PCI header type 127). The card needs a host reboot to come back on the bus. Aborting VM start." >&2
+            jlog "$GUEST_GPU_BDF: FAILED cooldown readiness probe -- card still dead after ${_cooldown_seconds}s; needs host reboot"
+            exit 1
+          fi
         fi
       fi
     fi

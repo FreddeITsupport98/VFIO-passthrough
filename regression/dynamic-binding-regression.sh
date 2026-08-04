@@ -891,16 +891,20 @@ assert_contains_text \
   'VFIO_DYNAMIC_COOLDOWN_SECONDS' \
   "$bind_block"
 assert_contains_text \
-  "Q3o bind-now refuses with wait-seconds message" \
-  'Wait ~${_remaining}s' \
+  "Q3o bind-now probes card readiness with _pci_dev_alive" \
+  'if _pci_dev_alive "$GUEST_GPU_BDF"; then' \
   "$bind_block"
 assert_contains_text \
-  "Q3o bind-now refuse mentions rapid restart reset bug" \
-  'rapid restart can drop the RX 9070 / RDNA4' \
+  "Q3o bind-now die message says reboot when card still dead" \
+  'card needs a host reboot to come back on the bus' \
   "$bind_block"
 assert_contains_text \
-  "Q3o bind-now jlogs cooldown refusal" \
-  'cooldown not elapsed' \
+  "Q3o bind-now jlogs cooldown readiness probe" \
+  'probing card readiness' \
+  "$bind_block"
+assert_contains_text \
+  "Q3o bind-now jlogs card alive during probe" \
+  'card alive during cooldown probe' \
   "$bind_block"
 assert_contains_text \
   "Q3o release writes stop timestamp" \
@@ -918,15 +922,15 @@ assert_contains_file \
   "Q3o write_conf persists VFIO_DYNAMIC_COOLDOWN_SECONDS" \
   'VFIO_DYNAMIC_COOLDOWN_SECONDS="10"' \
   "$VFIO_SCRIPT"
-# Ordering: the cooldown check must run BEFORE the boot-vga check in --bind-now
-# so a too-soon restart is refused before any sysfs writes / topology checks.
-_cooldown_line=$(grep -Fn 'cooldown not elapsed' <<<"$bind_block" | head -n1 | cut -d: -f1)
+# Ordering: the readiness probe must run BEFORE the boot-vga check in --bind-now
+# so a too-soon restart is handled before any sysfs writes / topology checks.
+_cooldown_line=$(grep -Fn 'probing card readiness' <<<"$bind_block" | head -n1 | cut -d: -f1)
 _bootvga_line=$(grep -Fn 'refusing --bind-now to keep host display alive' <<<"$bind_block" | head -n1 | cut -d: -f1)
 if [[ -n "$_cooldown_line" && -n "$_bootvga_line" ]] && (( _cooldown_line < _bootvga_line )); then
-  printf 'PASS: Q3o cooldown check runs before boot-vga check in bind-now\n'
+  printf 'PASS: Q3o readiness probe runs before boot-vga check in bind-now\n'
 else
-  printf 'FAIL: Q3o cooldown check must run before boot-vga check (cooldown=%s bootvga=%s)\n' "$_cooldown_line" "$_bootvga_line" >&2
-  record_failure "Q3o cooldown check runs before boot-vga check"
+  printf 'FAIL: Q3o readiness probe must run before boot-vga check (probe=%s bootvga=%s)\n' "$_cooldown_line" "$_bootvga_line" >&2
+  record_failure "Q3o readiness probe runs before boot-vga check"
 fi
 
 # --- Functional Q3j: dedicated hook log ---

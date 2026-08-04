@@ -725,6 +725,55 @@ else
   bad "Q3m-wlr _wayland_compositor_uses_bdf does not echo compositor name"
 fi
 
+# --- Smoke Q3n: _pci_dev_alive (header type 127 / reset-bug liveness check) ---
+# Mock /sys/bus/pci/devices with a fake device dir whose `vendor` and `config`
+# files we control. Alive case: vendor=0x1002, config starts with a real id.
+# Dead case (card fell off bus): vendor=0xffff, config all 0xff.
+pcfake="$tmp/syspci"
+mkdir -p "$pcfake/0000:0e:00.0"
+printf '0x1002' > "$pcfake/0000:0e:00.0/vendor"
+printf '\x02\x10\x50\x75' > "$pcfake/0000:0e:00.0/config"
+cat > "$tmp/smoke_alive.sh" <<'AEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
+_pci_dev_alive() {
+  local _bdf="$1" _sys _vendor _cfg
+  [[ -n "$_bdf" ]] || return 1
+  _sys="$SYSROOT/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d " \n")"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]] || return 1
+  return 0
+}
+if _pci_dev_alive "$1"; then echo "ALIVE"; else echo "DEAD"; fi
+AEOF
+# Case 1: real vendor + real config -> ALIVE
+a1="$(SYSROOT="$pcfake" bash "$tmp/smoke_alive.sh" 0000:0e:00.0)"
+if [[ "$a1" == "ALIVE" ]]; then ok "Q3n _pci_dev_alive ALIVE for real vendor + config"; else bad "Q3n alive case failed (got: $a1)"; fi
+# Case 2: vendor 0xffff -> DEAD (kernel knows device is gone)
+printf '0xffff' > "$pcfake/0000:0e:00.0/vendor"
+a2="$(SYSROOT="$pcfake" bash "$tmp/smoke_alive.sh" 0000:0e:00.0)"
+if [[ "$a2" == "DEAD" ]]; then ok "Q3n _pci_dev_alive DEAD when vendor is 0xffff"; else bad "Q3n vendor-0xffff case failed (got: $a2)"; fi
+# Case 3: real vendor but config all 0xff -> DEAD (card gone but sysfs cached)
+printf '0x1002' > "$pcfake/0000:0e:00.0/vendor"
+printf '\xff\xff\xff\xff' > "$pcfake/0000:0e:00.0/config"
+a3="$(SYSROOT="$pcfake" bash "$tmp/smoke_alive.sh" 0000:0e:00.0)"
+if [[ "$a3" == "DEAD" ]]; then ok "Q3n _pci_dev_alive DEAD when config is all 0xff (header 127)"; else bad "Q3n all-ff config case failed (got: $a3)"; fi
+# Case 4: missing device dir -> DEAD
+a4="$(SYSROOT="$pcfake" bash "$tmp/smoke_alive.sh" 0000:ff:00.0)"
+if [[ "$a4" == "DEAD" ]]; then ok "Q3n _pci_dev_alive DEAD when device dir is missing"; else bad "Q3n missing-device case failed (got: $a4)"; fi
+# Case 5: generated bind script uses _pci_dev_alive in early-return + post-bind
+if grep -Fq 'if _pci_dev_alive "$dev"; then' "$tmp/gen_bind.sh" && grep -Fq 'if ! _pci_dev_alive "$dev"; then' "$tmp/gen_bind.sh"; then
+  ok "Q3n bind script calls _pci_dev_alive in early-return and post-bind verify"
+else
+  bad "Q3n bind script missing _pci_dev_alive calls in early-return or post-bind"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

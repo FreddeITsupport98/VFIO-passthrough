@@ -7441,6 +7441,31 @@ modprobe vfio
 modprobe vfio-pci
 modprobe vfio_iommu_type1
 
+# Returns 0 if the PCI device at $1 is actually alive (config space readable,
+# not all 0xff, vendor ID is a real value rather than 0xffff). Returns 1 if the
+# device has fallen off the bus / is in a bad reset state — the RX 9070 / RDNA4
+# reset bug where a D3cold exit drops the card and its config space reads as all
+# 0xff, which qemu surfaces as "Unknown PCI header type 127". A device in that
+# state may still show a vfio-pci driver symlink (cached), so the driver link
+# alone is NOT a reliable liveness signal.
+_pci_dev_alive() {
+  local _bdf="$1" _sys _vendor _cfg
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  # vendor sysfs is cached from enumeration; 0xffff means the kernel already
+  # knows the device is gone.
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  # Live config-space read is the real liveness test: all 0xff means the card
+  # is not responding on the bus even if sysfs still lists it.
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d " \n")"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]] || return 1
+  return 0
+}
+
 bind_one() {
   local dev="$1"
   [[ -n "$dev" ]] || return 0
@@ -7453,15 +7478,35 @@ bind_one() {
   # cannot enter D3cold even while it is still on amdgpu, before VM start.
   echo 0 >"$sys/d3cold_allowed" 2>/dev/null || true
 
-  # Already on vfio-pci: nothing to do. Avoids a wasteful unbind -> sleep -> rebind
-  # cycle (and a brief unbound window) on a rapid VM stop/start, where prepare fires
-  # again while the device is still bound to vfio-pci from the previous VM session.
+  # Already on vfio-pci: avoid a wasteful unbind -> sleep -> rebind cycle on a
+  # rapid VM stop/start. BUT verify the device is actually alive first — the
+  # RX 9070 / RDNA4 reset bug can drop the card off the bus between VM stop and
+  # the next start, leaving a vfio-pci driver symlink pointing at a dead device
+  # whose config space reads all 0xff (qemu then surfaces "Unknown PCI header
+  # type 127"). If the card is dead, do NOT report success: attempt a PCI
+  # function-level reset + re-probe, and if it is still dead, fail hard so
+  # libvirt aborts the VM start cleanly instead of qemu hitting a dead card.
   if [[ -L "$sys/driver" ]]; then
     local _already_drv
     _already_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
     if [[ "$_already_drv" == "vfio-pci" ]]; then
-      jlog "$dev: already on vfio-pci, skipping rebind"
-      return 0
+      if _pci_dev_alive "$dev"; then
+        jlog "$dev: already on vfio-pci (alive), skipping rebind"
+        return 0
+      fi
+      jlog "$dev: on vfio-pci but config space unreadable (header type 127 / card gone); attempting PCI reset + re-probe"
+      say "WARN: $dev is bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: card fell off the bus). Attempting a PCI function-level reset + re-probe." >&2
+      if [[ -w "$sys/reset" ]]; then
+        echo 1 >"$sys/reset" 2>/dev/null || true
+        sleep 0.3
+      fi
+      if _pci_dev_alive "$dev"; then
+        jlog "$dev: recovered after PCI reset (alive); keeping on vfio-pci"
+        return 0
+      fi
+      say "ERROR: $dev is bound to vfio-pci but is not alive (config space all 0xff, qemu would report "Unknown PCI header type 127"). A PCI reset did not recover it. The card needs a host reboot to come back. Aborting VM start so the host display stays alive." >&2
+      jlog "$dev: FAILED alive-check (header 127); PCI reset did not recover; aborting VM start"
+      return 1
     fi
   fi
 
@@ -7510,9 +7555,11 @@ bind_one() {
     fi
   done
 
-  # Verify the device actually landed on vfio-pci. Return non-zero on failure so
-  # the libvirt hook (--bind-now) aborts the VM start cleanly instead of letting
-  # libvirt continue with a device that is not bound to the passthrough driver.
+  # Verify the device actually landed on vfio-pci AND is alive. Return non-zero
+  # on failure so the libvirt hook (--bind-now) aborts the VM start cleanly
+  # instead of letting libvirt continue with a device that is not bound, or a
+  # device that is bound but dead (config space all 0xff, which qemu surfaces as
+  # "Unknown PCI header type 127").
   if [[ "$_drv" != "vfio-pci" ]]; then
     jlog "$dev: FAILED to bind to vfio-pci (got: ${_drv:-none}) after $_max_attempts attempts"
     say "ERROR: $dev failed to bind to vfio-pci (got: ${_drv:-none}) after $_max_attempts attempts." >&2
@@ -7524,8 +7571,16 @@ bind_one() {
     say "  - or switch to early: vfio.sh --install-early-binding" >&2
     return 1
   fi
+  if ! _pci_dev_alive "$dev"; then
+    jlog "$dev: bound to vfio-pci but config space unreadable (header type 127 / card gone) after bind"
+    say "ERROR: $dev bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: "Unknown PCI header type 127"). qemu would fail to start. Aborting VM start. Next steps:" >&2
+    say "  - reboot the host (the card needs a cold reset to come back on the bus)" >&2
+    say "  - then start the VM; avoid rapid stop/start cycles" >&2
+    say "  - if it recurs, enable VFIO_DYNAMIC_PCI_RESET=1 in /etc/vfio-gpu-passthrough.conf" >&2
+    return 1
+  fi
 
-  jlog "$dev: bound to vfio-pci (verified)"
+  jlog "$dev: bound to vfio-pci (verified, alive)"
 }
 
 clear_override() {

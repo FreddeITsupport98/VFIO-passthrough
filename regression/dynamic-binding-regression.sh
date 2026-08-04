@@ -821,6 +821,60 @@ else
   printf 'PASS: Q3m-fix guard does not reference renderD nodes\n'
 fi
 
+# --- Functional Q3n: PCI device alive-check (header type 127 / reset-bug fix) ---
+# The RX 9070 / RDNA4 reset bug can drop the card off the bus between a VM stop
+# and the next start, leaving a vfio-pci driver symlink pointing at a dead
+# device whose config space reads all 0xff (qemu surfaces "Unknown PCI header
+# type 127"). The old "already on vfio-pci, skipping rebind" early-return only
+# checked the driver symlink and returned success, so qemu hit the dead card.
+# Fix: _pci_dev_alive() reads vendor sysfs + live config space; the early-return
+# and the post-bind verify both require alive, else attempt a PCI reset and fail
+# hard so libvirt aborts the VM start cleanly.
+assert_contains_text \
+  "Q3n _pci_dev_alive helper defined" \
+  "_pci_dev_alive()" \
+  "$bind_block"
+assert_contains_text \
+  "Q3n _pci_dev_alive reads config space" \
+  'head -c 4 "$_sys/config"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n _pci_dev_alive rejects vendor 0xffff" \
+  '[[ "$_vendor" != "0xffff" ]]' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n _pci_dev_alive rejects all-ff config" \
+  '[[ "$_cfg" != "ffffffff" ]]' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n early-return verifies alive before skipping" \
+  'if _pci_dev_alive "$dev"; then' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n early-return attempts PCI reset when dead" \
+  'echo 1 >"$sys/reset" 2>/dev/null || true' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n early-return dies with header 127 message when unrecoverable" \
+  'Unknown PCI header type 127' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n early-return die message says reboot needed" \
+  'card needs a host reboot to come back' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n post-bind verify calls _pci_dev_alive" \
+  'if ! _pci_dev_alive "$dev"; then' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n post-bind verify die message mentions header 127" \
+  'Unknown PCI header type 127' \
+  "$bind_block"
+assert_contains_text \
+  "Q3n success log now says alive" \
+  'bound to vfio-pci (verified, alive)' \
+  "$bind_block"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \
@@ -864,7 +918,7 @@ assert_contains_text \
 # --- Functional R2: bind_one skips rebind when already on vfio-pci ---
 assert_contains_text \
   "R2 bind_one has already-on-vfio-pci early return" \
-  "Already on vfio-pci: nothing to do" \
+  "Already on vfio-pci: avoid a wasteful unbind" \
   "$bind_block"
 assert_contains_text \
   "R2 bind_one early-return checks driver symlink" \
@@ -946,7 +1000,7 @@ assert_contains_text \
   "$bind_block"
 assert_contains_text \
   "R7 jlog logs verified bind" \
-  'jlog "$dev: bound to vfio-pci (verified)"' \
+  'jlog "$dev: bound to vfio-pci (verified, alive)"' \
   "$bind_block"
 
 # --- Functional R8: actionable bind-failure error message ---
@@ -1033,10 +1087,10 @@ else
   printf 'PASS: B2 --release routed through _release\n'
 fi
 
-# --- Functional P1: already-on-vfio-pci early-return is journal-logged ---
+# --- Functional P1: already-on-vfio-pci early-return is journal-logged (alive) ---
 assert_contains_text \
   "P1 bind_one jlogs already-on-vfio-pci skip" \
-  'jlog "$dev: already on vfio-pci, skipping rebind"' \
+  'jlog "$dev: already on vfio-pci (alive), skipping rebind"' \
   "$bind_block"
 
 # --- Functional P2: retry loop logs which attempt succeeded ---

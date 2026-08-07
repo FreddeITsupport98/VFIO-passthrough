@@ -985,6 +985,57 @@ assert_contains_text \
   'Ensure the AMD reset-bug kernel params' \
   "$_early_fn3"
 
+# --- Functional Q3q: _pci_dev_remove_rescan (last-resort bus recovery) ---
+# When the alive-check (Q3n) catches a dead card and the soft PCI reset does not
+# recover it, the bind script now attempts a remove+rescan bus recovery as a
+# final step before telling the user to reboot. This forces the kernel to
+# re-enumerate the device, which can sometimes bring a borderline-dead card back.
+assert_contains_text \
+  "Q3q _pci_dev_remove_rescan helper defined" \
+  '_pci_dev_remove_rescan()' \
+  "$bind_block"
+assert_contains_text \
+  "Q3q helper writes to sysfs remove" \
+  'echo 1 >"$_sys/remove"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3q helper triggers PCI bus rescan" \
+  'echo 1 >/sys/bus/pci/rescan' \
+  "$bind_block"
+assert_contains_text \
+  "Q3q helper sets driver_override before bind" \
+  'echo vfio-pci >"$_sys/driver_override"' \
+  "$bind_block"
+assert_contains_text \
+  "Q3q helper verifies alive after recovery" \
+  'if _pci_dev_alive "$_bdf"; then' \
+  "$bind_block"
+# Both dead-card recovery paths must call remove+rescan before giving up.
+# Each path has a unique recovery-jlog string, so we assert those instead of
+# trying to extract the post-bind section with a fragile nested sed.
+assert_contains_text \
+  "Q3q early-return dead path calls _pci_dev_remove_rescan" \
+  'recovered after remove+rescan (alive); keeping on vfio-pci' \
+  "$bind_block"
+assert_contains_text \
+  "Q3q post-bind dead path calls _pci_dev_remove_rescan" \
+  'recovered after remove+rescan (alive) post-bind' \
+  "$bind_block"
+# The die messages must mention remove+rescan was attempted.
+assert_contains_text \
+  "Q3q early-return die mentions remove+rescan failed" \
+  'PCI reset + remove+rescan did not recover' \
+  "$bind_block"
+assert_contains_text \
+  "Q3q post-bind die mentions remove+rescan failed" \
+  'A PCI reset and a remove+rescan bus recovery both failed' \
+  "$bind_block"
+# The helper must check if the device came back after rescan (sysfs path check).
+assert_contains_text \
+  "Q3q helper checks device reappeared after rescan" \
+  'did not reappear after rescan' \
+  "$bind_block"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

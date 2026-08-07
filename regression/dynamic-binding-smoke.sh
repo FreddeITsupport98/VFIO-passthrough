@@ -967,6 +967,83 @@ else
   bad "Q3p vfio.sh missing helper or switcher call"
 fi
 
+# --- Smoke Q3q: _pci_dev_remove_rescan (last-resort bus recovery) ---
+# Test the remove+rescan recovery sequence with a mock sysfs. The helper should:
+# write to $sys/remove, write to /sys/bus/pci/rescan, set driver_override, bind,
+# and verify alive. We mock the sysfs paths via SYSROOT + RESCAN_FILE env vars.
+qfake="$tmp/syspci_qq"
+mkdir -p "$qfake/0000:0e:00.0" "$qfake/drivers/vfio-pci"
+printf '0x1002' > "$qfake/0000:0e:00.0/vendor"
+printf '\x02\x10\x50\x75' > "$qfake/0000:0e:00.0/config"
+printf '0' > "$qfake/0000:0e:00.0/remove"
+printf '0' > "$qfake/rescan"
+ln -s "$qfake/drivers/vfio-pci" "$qfake/0000:0e:00.0/driver"
+cat > "$tmp/smoke_rescan.sh" <<'QEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
+RESCAN_FILE="${RESCAN_FILE:-/sys/bus/pci/rescan}"
+say() { printf '%s\n' "$*"; }
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true; }
+_pci_dev_alive() {
+  local _bdf="$1" _sys _vendor _cfg
+  [[ -n "$_bdf" ]] || return 1
+  _sys="$SYSROOT/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d " \n")"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]] || return 1
+  return 0
+}
+_pci_dev_remove_rescan() {
+  local _bdf="$1" _sys
+  [[ -n "$_bdf" ]] || return 1
+  _sys="$SYSROOT/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  if [[ -w "$_sys/remove" ]]; then
+    echo 1 >"$_sys/remove" 2>/dev/null || true
+    sleep 0.1
+  fi
+  echo 1 >"$RESCAN_FILE" 2>/dev/null || true
+  sleep 0.1
+  [[ -d "$_sys" ]] || { echo "RESCAN_GONE"; return 1; }
+  echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+  if _pci_dev_alive "$_bdf"; then
+    echo "RESCAN_ALIVE"
+    return 0
+  fi
+  echo "RESCAN_DEAD"
+  return 1
+}
+_pci_dev_remove_rescan "$1"
+QEOF
+# Case 1: alive card -> remove+rescan -> still alive -> RESCAN_ALIVE
+r1="$(SYSROOT="$qfake" RESCAN_FILE="$qfake/rescan" bash "$tmp/smoke_rescan.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$r1" | grep -Fq 'RESCAN_ALIVE'; then ok "Q3q remove+rescan recovers alive card"; else bad "Q3q alive case failed (got: $r1)"; fi
+# Case 2: dead card (config all ff) -> remove+rescan -> still dead -> RESCAN_DEAD
+printf '\xff\xff\xff\xff' > "$qfake/0000:0e:00.0/config"
+r2="$(SYSROOT="$qfake" RESCAN_FILE="$qfake/rescan" bash "$tmp/smoke_rescan.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$r2" | grep -Fq 'RESCAN_DEAD'; then ok "Q3q remove+rescan reports DEAD when card stays dead"; else bad "Q3q dead case failed (got: $r2)"; fi
+# Case 3 (static): generated bind script defines helper + calls it in both dead paths
+if grep -Fq '_pci_dev_remove_rescan()' "$tmp/gen_bind.sh" \
+  && grep -Fq 'PCI reset + remove+rescan did not recover' "$tmp/gen_bind.sh" \
+  && grep -Fq 'A PCI reset and a remove+rescan bus recovery both failed' "$tmp/gen_bind.sh"; then
+  ok "Q3q generated bind script defines helper + both dead paths use it"
+else
+  bad "Q3q generated bind script missing helper or dead-path calls"
+fi
+# Case 4 (static): helper writes to remove + rescan + driver_override
+if grep -Fq 'echo 1 >"$_sys/remove"' "$tmp/gen_bind.sh" \
+  && grep -Fq 'echo 1 >/sys/bus/pci/rescan' "$tmp/gen_bind.sh" \
+  && grep -Fq 'echo vfio-pci >"$_sys/driver_override"' "$tmp/gen_bind.sh"; then
+  ok "Q3q helper writes remove + rescan + driver_override"
+else
+  bad "Q3q helper missing remove/rescan/driver_override writes"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

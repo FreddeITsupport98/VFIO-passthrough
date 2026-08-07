@@ -7488,6 +7488,50 @@ _pci_dev_alive() {
   return 0
 }
 
+# Last-resort recovery for a dead PCI device: remove it from the bus, rescan
+# the whole PCI bus to force re-enumeration, then re-bind to vfio-pci. This is
+# the final recovery step before telling the user to reboot the host. On RX
+# 9070 / RDNA4 the soft function-level reset often does NOT recover a card that
+# fell off the bus on a D3cold exit; remove+rescan forces the kernel to
+# re-enumerate the device, which can sometimes bring it back. Empirically this
+# does NOT always work on the RX 9070 (the GPU function may stay gone while the
+# audio function comes back), but it is worth attempting as a final step before
+# requiring a host reboot, since it recovers the card in some borderline cases.
+# Returns 0 if the device is alive and on vfio-pci after recovery, 1 otherwise.
+_pci_dev_remove_rescan() {
+  local _bdf="$1" _sys
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  jlog "$_bdf: attempting remove+rescan recovery (last resort before host reboot)"
+  say "WARN: $_bdf attempting remove+rescan bus recovery (last resort before requiring a host reboot)." >&2
+  # 1. Remove the device from the bus (forces the kernel to drop it).
+  if [[ -w "$_sys/remove" ]]; then
+    echo 1 >"$_sys/remove" 2>/dev/null || true
+    jlog "$_bdf: removed from PCI bus"
+    sleep 1
+  fi
+  # 2. Rescan the whole PCI bus to re-enumerate dropped devices.
+  echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+  jlog "$_bdf: PCI bus rescan triggered"
+  sleep 1
+  # 3. Check if the device came back at the same BDF. After remove, the sysfs
+  #    path is gone; after rescan it may or may not reappear.
+  [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after rescan"; return 1; }
+  # 4. Set driver_override so amdgpu does not grab the rescanned device first,
+  #    then bind to vfio-pci.
+  echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+  echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+  sleep 0.3
+  # 5. Verify it is alive now.
+  if _pci_dev_alive "$_bdf"; then
+    jlog "$_bdf: recovered after remove+rescan (alive)"
+    return 0
+  fi
+  jlog "$_bdf: still dead after remove+rescan"
+  return 1
+}
+
 bind_one() {
   local dev="$1"
   [[ -n "$dev" ]] || return 0
@@ -7526,8 +7570,13 @@ bind_one() {
         jlog "$dev: recovered after PCI reset (alive); keeping on vfio-pci"
         return 0
       fi
-      say "ERROR: $dev is bound to vfio-pci but is not alive (config space all 0xff, qemu would report "Unknown PCI header type 127"). A PCI reset did not recover it. The card needs a host reboot to come back. Aborting VM start so the host display stays alive." >&2
-      jlog "$dev: FAILED alive-check (header 127); PCI reset did not recover; aborting VM start"
+      # Last-resort: remove+rescan bus recovery before giving up.
+      if _pci_dev_remove_rescan "$dev"; then
+        jlog "$dev: recovered after remove+rescan (alive); keeping on vfio-pci"
+        return 0
+      fi
+      say "ERROR: $dev is bound to vfio-pci but is not alive (config space all 0xff, qemu would report "Unknown PCI header type 127"). A PCI reset and a remove+rescan bus recovery both failed to recover it. The card needs a host reboot to come back. Aborting VM start so the host display stays alive." >&2
+      jlog "$dev: FAILED alive-check (header 127); PCI reset + remove+rescan did not recover; aborting VM start"
       return 1
     fi
   fi
@@ -7594,13 +7643,17 @@ bind_one() {
     return 1
   fi
   if ! _pci_dev_alive "$dev"; then
-    jlog "$dev: bound to vfio-pci but config space unreadable (header type 127 / card gone) after bind"
-    say "ERROR: $dev bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: "Unknown PCI header type 127"). qemu would fail to start. Aborting VM start. Next steps:" >&2
-    say "  - reboot the host (the card needs a cold reset to come back on the bus)" >&2
-    say "  - then start the VM; avoid rapid stop/start cycles" >&2
-    say "  - if it recurs, enable VFIO_DYNAMIC_PCI_RESET=1 in /etc/vfio-gpu-passthrough.conf" >&2
-    say "  - keep VFIO_DYNAMIC_COOLDOWN_SECONDS (default 10) above 0 to prevent rapid stop/start" >&2
-    return 1
+    # Last-resort: remove+rescan bus recovery before giving up.
+    if _pci_dev_remove_rescan "$dev"; then
+      jlog "$dev: recovered after remove+rescan (alive) post-bind"
+    else
+      say "ERROR: $dev bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: "Unknown PCI header type 127"). qemu would fail to start. A PCI reset and a remove+rescan bus recovery both failed. Aborting VM start. Next steps:" >&2
+      say "  - reboot the host (the card needs a cold reset to come back on the bus)" >&2
+      say "  - then start the VM; avoid rapid stop/start cycles" >&2
+      say "  - if it recurs, enable VFIO_DYNAMIC_PCI_RESET=1 in /etc/vfio-gpu-passthrough.conf" >&2
+      say "  - keep VFIO_DYNAMIC_COOLDOWN_SECONDS (default 10) above 0 to prevent rapid stop/start" >&2
+      return 1
+    fi
   fi
 
   jlog "$dev: bound to vfio-pci (verified, alive)"

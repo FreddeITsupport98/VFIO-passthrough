@@ -8334,11 +8334,17 @@ while true; do
     continue
   fi
   timeout 86400 virsh -c qemu:///system event --all --loop 2>/dev/null | while IFS= read -r _line; do
-    # virsh event --all output: event '<type>' for domain <name>: <detail>
-    _dom="$(printf '%s' "$_line" | sed -n "s/.*for domain \([^:]*\):.*/\1/p" 2>/dev/null || true)"
+    # virsh event --all output: event '<type>' for domain <name>[: <detail>]
+    # NOTE: 'reboot' is a SEPARATE event type (not a lifecycle sub-event), and
+    # its format has NO colon after the domain name:
+    #   event 'reboot' for domain win11
+    # vs lifecycle which has a colon + detail:
+    #   event 'lifecycle' for domain win11: Rebooted
+    # The sed must handle BOTH (colon optional) or the reboot event is skipped.
+    _dom="$(printf '%s' "$_line" | sed -n 's/.*for domain \([^:]*\).*/\1/p' 2>/dev/null || true)"
     [[ -n "$_dom" ]] || continue
-    # Only act on lifecycle reboot events (case-insensitive). The 'reboot'
-    # substring matches the Rebooted lifecycle detail.
+    # Only act on reboot events (case-insensitive). Matches both the 'reboot'
+    # event type AND the 'Rebooted' lifecycle detail.
     if printf '%s' "$_line" | grep -qi 'reboot'; then
       if domain_has_gpu "$_dom"; then
         jlog "$GUEST_GPU_BDF: reboot lifecycle event for domain $_dom (has guest GPU); applying soft FLR to clear display wedge"

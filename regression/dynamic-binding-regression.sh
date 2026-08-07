@@ -1097,7 +1097,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "Q3s monitor script uses virsh event --all --loop" \
-  'virsh -c qemu:///system event --all --event lifecycle --loop' \
+  'virsh -c qemu:///system event --all --loop' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "Q3s monitor script does soft FLR via sysfs reset" \

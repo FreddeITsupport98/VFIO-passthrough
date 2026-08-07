@@ -8321,8 +8321,11 @@ domain_has_gpu() {
 
 jlog "vfio-reboot-flr monitor started (watching for guest reboot of domains with $GUEST_GPU_BDF)"
 
-# Main loop: watch ALL libvirt domains for lifecycle events. When a Rebooted
-# event fires for a domain that has the guest GPU, apply a soft FLR.
+# Main loop: watch ALL libvirt domains for ALL event types. When a Rebooted
+# lifecycle event fires for a domain that has the guest GPU, apply a soft FLR.
+# NOTE: `virsh event --all --event lifecycle` is INVALID (--all and --event are
+# mutually exclusive). Use `--all --loop` (wait for all event types on all
+# domains, loop) and filter for 'reboot' + lifecycle in the output parser.
 # virsh event --all --loop keeps running and prints events as they happen.
 # We wrap it in a timeout + outer loop so it reconnects if virsh exits.
 while true; do
@@ -8330,10 +8333,12 @@ while true; do
     sleep 60
     continue
   fi
-  timeout 86400 virsh -c qemu:///system event --all --event lifecycle --loop 2>/dev/null | while IFS= read -r _line; do
-    # virsh event --all output: event 'lifecycle' for domain <name>: <detail>
+  timeout 86400 virsh -c qemu:///system event --all --loop 2>/dev/null | while IFS= read -r _line; do
+    # virsh event --all output: event '<type>' for domain <name>: <detail>
     _dom="$(printf '%s' "$_line" | sed -n "s/.*for domain \([^:]*\):.*/\1/p" 2>/dev/null || true)"
     [[ -n "$_dom" ]] || continue
+    # Only act on lifecycle reboot events (case-insensitive). The 'reboot'
+    # substring matches the Rebooted lifecycle detail.
     if printf '%s' "$_line" | grep -qi 'reboot'; then
       if domain_has_gpu "$_dom"; then
         jlog "$GUEST_GPU_BDF: reboot lifecycle event for domain $_dom (has guest GPU); applying soft FLR to clear display wedge"

@@ -1174,7 +1174,7 @@ if echo "$s3" | grep -Fq 'NOT_REBOOT:win11'; then ok "Q3s non-reboot event -> no
 if grep -Fq 'REBOOT_FLR_SCRIPT=' "$VFIO_SCRIPT" \
   && grep -Fq 'install_reboot_flr_monitor()' "$VFIO_SCRIPT" \
   && grep -Fq 'remove_reboot_flr_monitor()' "$VFIO_SCRIPT" \
-  && grep -Fq 'virsh -c qemu:///system event --all --event lifecycle --loop' "$VFIO_SCRIPT" \
+  && grep -Fq 'virsh -c qemu:///system event --all --loop' "$VFIO_SCRIPT" \
   && grep -Fq 'Restart=always' "$VFIO_SCRIPT" \
   && grep -Fq 'vfio-reboot-flr.service' "$VFIO_SCRIPT"; then
   ok "Q3s vfio.sh defines monitor constants + functions + systemd unit + virsh event"

@@ -1044,6 +1044,74 @@ else
   bad "Q3q helper missing remove/rescan/driver_override writes"
 fi
 
+# --- Smoke Q3r: release-time zombie-card recovery ---
+# The release path must check if the card is dead at stop time and attempt
+# remove+rescan recovery immediately (only on dead cards). Test the release-path
+# zombie gate with a mock: dead card -> recovery attempted; healthy card -> skipped.
+cat > "$tmp/smoke_release_zombie.sh" <<'Q3REOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
+RESCAN_FILE="${RESCAN_FILE:-/sys/bus/pci/rescan}"
+GUEST_GPU_BDF="${GUEST_GPU_BDF:-0000:0e:00.0}"
+say() { printf '%s\n' "$*"; }
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true; }
+_pci_dev_alive() {
+  local _bdf="$1" _sys _vendor _cfg
+  [[ -n "$_bdf" ]] || return 1
+  _sys="$SYSROOT/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d " \n")"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]] || return 1
+  return 0
+}
+_pci_dev_remove_rescan() {
+  local _bdf="$1" _sys
+  _sys="$SYSROOT/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  echo 1 >"$_sys/remove" 2>/dev/null || true
+  echo 1 >"$RESCAN_FILE" 2>/dev/null || true
+  sleep 0.1
+  [[ -d "$_sys" ]] || return 1
+  echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+  if _pci_dev_alive "$_bdf"; then echo "RECOVERY_OK"; return 0; fi
+  echo "RECOVERY_FAIL"; return 1
+}
+# Release-path zombie gate (Q3r)
+RECOVERY_ATTEMPTED=0
+if ! _pci_dev_alive "$GUEST_GPU_BDF"; then
+  RECOVERY_ATTEMPTED=1
+  say "ZOMBIE_DETECTED"
+  _pci_dev_remove_rescan "$GUEST_GPU_BDF" || say "RECOVERY_FAILED"
+else
+  say "HEALTHY_SKIP"
+fi
+say "RECOVERY_ATTEMPTED=$RECOVERY_ATTEMPTED"
+Q3REOF
+# Case 1: dead card at release -> zombie detected, recovery attempted
+printf '0xffff' > "$qfake/0000:0e:00.0/vendor"
+printf '\xff\xff\xff\xff' > "$qfake/0000:0e:00.0/config"
+r1="$(SYSROOT="$qfake" RESCAN_FILE="$qfake/rescan" bash "$tmp/smoke_release_zombie.sh" 2>&1 || true)"
+if echo "$r1" | grep -Fq 'ZOMBIE_DETECTED' && echo "$r1" | grep -Fq 'RECOVERY_ATTEMPTED=1'; then ok "Q3r release path detects zombie and attempts recovery"; else bad "Q3r dead-card case failed (got: $r1)"; fi
+# Case 2: healthy card at release -> skipped (no recovery attempted)
+printf '0x1002' > "$qfake/0000:0e:00.0/vendor"
+printf '\x02\x10\x50\x75' > "$qfake/0000:0e:00.0/config"
+r2="$(SYSROOT="$qfake" RESCAN_FILE="$qfake/rescan" bash "$tmp/smoke_release_zombie.sh" 2>&1 || true)"
+if echo "$r2" | grep -Fq 'HEALTHY_SKIP' && echo "$r2" | grep -Fq 'RECOVERY_ATTEMPTED=0'; then ok "Q3r release path skips recovery for healthy card"; else bad "Q3r healthy-card case failed (got: $r2)"; fi
+# Case 3 (static): generated bind script has the release-path zombie gate
+_release_block="$(sed -n '/^  release)/,/^  bind-now)/p' "$tmp/gen_bind.sh")"
+if echo "$_release_block" | grep -Fq 'if ! _pci_dev_alive "$GUEST_GPU_BDF"; then' \
+  && echo "$_release_block" | grep -Fq 'zombie detected at release time' \
+  && echo "$_release_block" | grep -Fq '_pci_dev_remove_rescan "$GUEST_GPU_BDF"'; then
+  ok "Q3r generated bind script has release-path zombie gate + recovery"
+else
+  bad "Q3r generated bind script missing release-path zombie gate"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

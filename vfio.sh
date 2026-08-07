@@ -7861,6 +7861,27 @@ case "$ACTION" in
     else
       say "Dynamic release: leaving guest GPU on vfio-pci (VFIO_DYNAMIC_REBIND_HOST=0)."
     fi
+    # Zombie-card recovery at release time: the RX 9070 / RDNA4 reset bug can
+    # drop the guest GPU off the PCI bus on the D3cold exit that happens DURING
+    # the VM stop. Catching the death NOW (immediately after stop) and attempting
+    # a remove+rescan recovery may recover the card while it is in a fresher
+    # state than after sitting dead until the next --bind-now. ONLY acts when the
+    # card is actually dead — a healthy card is never reset (resetting a healthy
+    # card can itself trigger the reset bug, and remove+rescan would let amdgpu
+    # grab it back, breaking the parked-on-vfio-pci invariant). Non-fatal: even
+    # if recovery fails here, the next --bind-now will catch it and report that a
+    # host reboot is needed.
+    if ! _pci_dev_alive "$GUEST_GPU_BDF"; then
+      jlog "$GUEST_GPU_BDF: zombie detected at release time (config space unreadable); attempting immediate remove+rescan recovery"
+      say "WARN: $GUEST_GPU_BDF is dead at VM stop time (RX 9070 / RDNA4 reset bug). Attempting immediate remove+rescan recovery." >&2
+      if _pci_dev_remove_rescan "$GUEST_GPU_BDF"; then
+        jlog "$GUEST_GPU_BDF: recovered at release time after remove+rescan (alive)"
+        say "Recovered $GUEST_GPU_BDF after remove+rescan at release time."
+      else
+        jlog "$GUEST_GPU_BDF: still dead at release time after remove+rescan; next --bind-now will report it needs a host reboot"
+        say "WARN: $GUEST_GPU_BDF is still dead after remove+rescan at release time. The next VM start will report it needs a host reboot." >&2
+      fi
+    fi
     # Record the VM-stop timestamp for the cooldown guard on the next --bind-now.
     # Rapid VM stop -> start can drop the RX 9070 / RDNA4 off the PCI bus via the
     # D3cold reset bug; the cooldown refuses a too-soon restart with an actionable

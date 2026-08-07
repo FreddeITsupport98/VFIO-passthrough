@@ -1036,6 +1036,42 @@ assert_contains_text \
   'did not reappear after rescan' \
   "$bind_block"
 
+# --- Functional Q3r: release-time zombie-card recovery ---
+# The card dies on VM stop (D3cold exit during release), not on start. The bind
+# path (Q3n/Q3q) only catches the death at the NEXT --bind-now, after the card
+# has been sitting dead. Q3r adds a zombie check to the --release path itself:
+# if the card is dead at release time, attempt remove+rescan immediately (while
+# the card may be in a fresher, more recoverable state). ONLY acts on dead cards
+# — a healthy card is never reset (that would risk triggering the reset bug and
+# break the parked-on-vfio-pci invariant when REBIND_HOST=0).
+# The release-path zombie gate uses $GUEST_GPU_BDF (the bind-one paths use
+# $dev), so these strings are unique to the release path — assert against the
+# full bind_block without a fragile sed extraction.
+assert_contains_text \
+  "Q3r release path has zombie check (_pci_dev_alive gate)" \
+  'if ! _pci_dev_alive "$GUEST_GPU_BDF"; then' \
+  "$bind_block"
+assert_contains_text \
+  "Q3r release path calls _pci_dev_remove_rescan when dead" \
+  'if _pci_dev_remove_rescan "$GUEST_GPU_BDF"; then' \
+  "$bind_block"
+assert_contains_text \
+  "Q3r release path jlogs zombie detection" \
+  'zombie detected at release time' \
+  "$bind_block"
+assert_contains_text \
+  "Q3r release path logs recovery success" \
+  'recovered at release time after remove+rescan' \
+  "$bind_block"
+assert_contains_text \
+  "Q3r release path logs recovery failure (non-fatal)" \
+  'still dead at release time after remove+rescan' \
+  "$bind_block"
+assert_contains_text \
+  "Q3r release path does NOT unbind healthy cards" \
+  'a healthy card is never reset' \
+  "$bind_block"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

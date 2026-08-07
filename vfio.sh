@@ -8313,10 +8313,43 @@ do_flr() {
 }
 
 # Check if a libvirt domain has the guest GPU BDF in its PCI hostdev list.
+# virsh dumpxml stores PCI addresses as separate attributes
+# (domain='0x0000' bus='0x0e' slot='0x00' function='0x0'), NOT as the combined
+# BDF string '0000:0e:00.0'. So we must parse the address attributes out of the
+# XML and reconstruct the BDF, then compare. (Mirrors extract_hostdev_bdfs in
+# the libvirt hook script, which is already proven to handle this format.)
 domain_has_gpu() {
-  local _dom="$1" _xml
+  local _dom="$1" _xml _bdfs
   _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-  grep -Fixq "$GUEST_GPU_BDF" <<<"$_xml" 2>/dev/null
+  [[ -n "$_xml" ]] || return 1
+  _bdfs="$(printf '%s' "$_xml" | awk '
+    /<hostdev/ { in_hostdev=1; is_pci=0 }
+    in_hostdev && /type=.pci./ { is_pci=1 }
+    in_hostdev && is_pci && /<address/ {
+      line=$0; dom=""; bus=""; slot=""; fn=""
+      if (match(line, /domain=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^domain=./, "", s); sub(/^0x/, "", s); dom=s
+      }
+      if (match(line, /bus=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^bus=./, "", s); sub(/^0x/, "", s); bus=s
+      }
+      if (match(line, /slot=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^slot=./, "", s); sub(/^0x/, "", s); slot=s
+      }
+      if (match(line, /function=.0x[0-9a-fA-F]+/)) {
+        s=substr(line, RSTART, RLENGTH); sub(/^function=./, "", s); sub(/^0x/, "", s); fn=s
+      }
+      if (dom != "" && bus != "" && slot != "" && fn != "") {
+        while (length(dom) < 4) dom = "0" dom
+        while (length(bus) < 2) bus = "0" bus
+        while (length(slot) < 2) slot = "0" slot
+        printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+      }
+    }
+    /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+  ')"
+  [[ -n "$_bdfs" ]] || return 1
+  grep -Fixq "$GUEST_GPU_BDF" <<<"$_bdfs" 2>/dev/null
 }
 
 jlog "vfio-reboot-flr monitor started (watching for guest reboot of domains with $GUEST_GPU_BDF)"

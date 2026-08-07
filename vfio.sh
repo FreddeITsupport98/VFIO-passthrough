@@ -57,6 +57,18 @@ KWIN_RENDER_PIN_FILE="/etc/xdg/plasma-workspace/env/vfio-kwin-render-device.sh"
 # from a login shell (TTY start); the Plasma drop-in above covers DM-launched
 # Plasma. Same rationale as KWIN_RENDER_PIN_FILE.
 WLR_RENDER_PIN_FILE="/etc/profile.d/vfio-wayland-render-device.sh"
+# Reboot-FLR monitor: a systemd service that watches libvirt for guest reboot
+# lifecycle events and does a soft function-level reset on the guest GPU to
+# clear the display wedge that otherwise freezes the screen on a warm reboot
+# (on_reboot=restart). On RX 9070 / RDNA4 the card SURVIVES a warm reboot
+# (qemu never releases the vfio device, so the PCIe link stays up), but the
+# GPU's display engine wedges in the old guest's framebuffer and OVMF cannot
+# re-POST (frozen screen). A soft FLR clears the display wedge without
+# dropping the link, so OVMF can re-POST and the guest reboots cleanly.
+# Removed by --reset and by --install-early-binding (early binding doesn't
+# keep the VM running through a reboot the same way).
+REBOOT_FLR_SCRIPT="/usr/local/sbin/vfio-reboot-flr-monitor.sh"
+REBOOT_FLR_UNIT="/etc/systemd/system/vfio-reboot-flr.service"
 
 DEBUG=0
 DRY_RUN=0
@@ -8240,8 +8252,137 @@ EOF
   say "Installed libvirt hook script: $LIBVIRT_HOOK_SCRIPT"
   note "Dynamic binding switches the guest GPU to vfio-pci only when a VM that has it attached is started."
 }
+
+# Install the reboot-FLR monitor: a systemd service that watches libvirt for
+# guest reboot lifecycle events and does a soft function-level reset on the
+# guest GPU to clear the display wedge. On RX 9070 / RDNA4 with on_reboot=restart
+# (warm reboot), the card survives (qemu never releases the vfio device, link
+# stays up), but the GPU's display engine wedges and OVMF can't re-POST (frozen
+# screen). The soft FLR clears the display wedge so OVMF re-POSTs and the guest
+# reboots cleanly — no host reboot needed for a guest restart.
+install_reboot_flr_monitor() {
+  if ! have_cmd systemctl; then
+    note "systemctl not available; skipping reboot-FLR monitor installation."
+    return 0
+  fi
+  if ! have_cmd virsh; then
+    note "virsh not available; skipping reboot-FLR monitor installation (needs virsh event)."
+    return 0
+  fi
+
+  if (( ! DRY_RUN )); then
+    mkdir -p "$(dirname "$REBOOT_FLR_SCRIPT")" "$(dirname "$REBOOT_FLR_UNIT")"
+  fi
+
+  backup_file "$REBOOT_FLR_SCRIPT"
+  backup_file "$REBOOT_FLR_UNIT"
+
+  write_file_atomic "$REBOOT_FLR_SCRIPT" 0755 "root:root" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Managed by vfio.sh — reboot-FLR monitor for dynamic GPU binding.
+# Watches libvirt for guest reboot lifecycle events and does a soft
+# function-level reset on the guest GPU to clear the display wedge.
+# On RX 9070 / RDNA4 with on_reboot=restart (warm reboot), the card survives
+# (qemu never releases the vfio device, PCIe link stays up), but the GPU's
+# display engine wedges in the old guest's framebuffer and OVMF cannot re-POST
+# (frozen screen). A soft FLR (echo 1 > sys/reset) clears the display wedge
+# WITHOUT dropping the PCIe link, allowing OVMF to re-POST on the warm reboot.
+# Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --install-early-binding)
+
+CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+
+[[ -f "$CONF_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+. "$CONF_FILE"
+
+[[ -n "${GUEST_GPU_BDF:-}" ]] || exit 0
+
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-reboot-flr -- "$*" 2>/dev/null || true; }
+
+# Soft FLR: reset the GPU's display engine without dropping the PCIe link.
+do_flr() {
+  local _sys="/sys/bus/pci/devices/$GUEST_GPU_BDF"
+  if [[ -w "$_sys/reset" ]]; then
+    echo 1 >"$_sys/reset" 2>/dev/null || true
+    jlog "$GUEST_GPU_BDF: soft FLR applied after guest reboot (display wedge clear)"
+  else
+    jlog "$GUEST_GPU_BDF: reset sysfs not writable; cannot FLR after guest reboot"
+  fi
+}
+
+# Check if a libvirt domain has the guest GPU BDF in its PCI hostdev list.
+domain_has_gpu() {
+  local _dom="$1" _xml
+  _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+  grep -Fixq "$GUEST_GPU_BDF" <<<"$_xml" 2>/dev/null
+}
+
+jlog "vfio-reboot-flr monitor started (watching for guest reboot of domains with $GUEST_GPU_BDF)"
+
+# Main loop: watch ALL libvirt domains for lifecycle events. When a Rebooted
+# event fires for a domain that has the guest GPU, apply a soft FLR.
+# virsh event --all --loop keeps running and prints events as they happen.
+# We wrap it in a timeout + outer loop so it reconnects if virsh exits.
+while true; do
+  if ! command -v virsh >/dev/null 2>&1; then
+    sleep 60
+    continue
+  fi
+  timeout 86400 virsh -c qemu:///system event --all --event lifecycle --loop 2>/dev/null | while IFS= read -r _line; do
+    # virsh event --all output: event 'lifecycle' for domain <name>: <detail>
+    _dom="$(printf '%s' "$_line" | sed -n "s/.*for domain \([^:]*\):.*/\1/p" 2>/dev/null || true)"
+    [[ -n "$_dom" ]] || continue
+    if printf '%s' "$_line" | grep -qi 'reboot'; then
+      if domain_has_gpu "$_dom"; then
+        jlog "$GUEST_GPU_BDF: reboot lifecycle event for domain $_dom (has guest GPU); applying soft FLR to clear display wedge"
+        do_flr
+      else
+        jlog "reboot event for domain $_dom (no guest GPU); skipping FLR"
+      fi
+    fi
+  done
+  sleep 10  # reconnect after virsh event exits / times out
+  jlog "vfio-reboot-flr monitor reconnecting (virsh event exited)"
+done
+EOF
+
+  write_file_atomic "$REBOOT_FLR_UNIT" 0644 "root:root" <<EOF
+[Unit]
+Description=vfio reboot FLR monitor (clears GPU display wedge on guest warm reboot)
+After=libvirtd.service virtqemud.service libvirtd.socket virtqemud.socket
+
+[Service]
+Type=simple
+ExecStart=$REBOOT_FLR_SCRIPT
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  run systemctl daemon-reload 2>/dev/null || true
+  run systemctl enable vfio-reboot-flr.service 2>/dev/null || true
+  run systemctl start vfio-reboot-flr.service 2>/dev/null || true
+  say "Installed reboot-FLR monitor: $REBOOT_FLR_SCRIPT (service: $REBOOT_FLR_UNIT)"
+  note "On guest warm reboot (on_reboot=restart), the monitor does a soft FLR on the GPU"
+  note "to clear the display wedge so OVMF can re-POST without a host reboot."
+}
+
+# Remove the reboot-FLR monitor service + script.
+remove_reboot_flr_monitor() {
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl disable --now vfio-reboot-flr.service 2>/dev/null || true
+  fi
+  run rm -f "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" 2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl daemon-reload 2>/dev/null || true
+  fi
+}
+
 ensure_graphics_daemon_deployment_safety() {
-  # Guardrail for partial/failed deployments:
   # if a unit exists without its daemon script, disable and remove the stale unit.
   local changed=0
   local cond_line="ConditionPathExists=$GRAPHICS_DAEMON_SCRIPT"
@@ -9222,6 +9363,9 @@ install_dynamic_binding_from_existing_config() {
   note "  6. Pin Wayland compositors (KDE/KWin + wlroots: sway/hyprland/labwc) to the"
   note "     HOST GPU so binding the guest GPU does not crash the host compositor"
   note "     when the guest is Boot VGA)"
+  note "  7. Install the reboot-FLR monitor (a systemd service that watches for guest"
+  note "     warm reboot and does a soft FLR to clear the GPU display wedge so OVMF"
+  note "     can re-POST without needing a host reboot — set on_reboot=restart in VM XML)"
   say
   note "What stays unchanged:"
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"
@@ -9279,6 +9423,10 @@ install_dynamic_binding_from_existing_config() {
 
   # 3. Install the libvirt hook.
   install_libvirt_hook
+
+  # 3c. Install the reboot-FLR monitor (watches for guest warm reboot and does a
+  #     soft FLR to clear the display wedge so OVMF re-POSTs without a host reboot).
+  install_reboot_flr_monitor
 
   # 3b. Pin KDE/KWin Wayland to the HOST GPU so binding the (Boot VGA) guest
   #     GPU at VM start does not crash the host compositor. No-op unless the
@@ -9348,6 +9496,8 @@ install_early_binding_from_existing_config() {
   note "  6. Remove the Wayland HOST-GPU render-device pins (early binding binds the"
   note "     guest GPU at boot, before the compositor starts, so the pins are no"
   note "     longer needed)"
+  note "  7. Remove the reboot-FLR monitor (early binding does not use warm-reboot"
+  note "     passthrough; the monitor is dynamic-binding-only)"
   say
 
   # 1. Flip the conf key.
@@ -9382,6 +9532,9 @@ install_early_binding_from_existing_config() {
   #     parks the guest GPU on vfio-pci at boot (before the compositor starts),
   #     so the compositor never renders on it and the pin is no longer needed.
   remove_wayland_render_device_pin
+
+  # 3c. Remove the reboot-FLR monitor (dynamic-binding-only).
+  remove_reboot_flr_monitor
 
   # 4. Re-add early-binding tokens to the kernel cmdline.
   local guest_ids
@@ -13185,6 +13338,8 @@ reset_vfio_all() {
     run systemctl disable --now vfio-disable-usb-bluetooth.service 2>/dev/null || true
     # Graphics protocol adaptation daemon
     run systemctl disable --now vfio-graphics-protocold.service 2>/dev/null || true
+    # Reboot-FLR monitor (dynamic binding only)
+    run systemctl disable --now vfio-reboot-flr.service 2>/dev/null || true
 
     # If we previously masked plymouth units as part of "disable splash",
     # unmask them on reset so the system can return to distro defaults.
@@ -13225,6 +13380,7 @@ reset_vfio_all() {
            "$GRAPHICS_DAEMON_SCRIPT" "$GRAPHICS_DAEMON_UNIT" \
            "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
            "$KWIN_RENDER_PIN_FILE" "$WLR_RENDER_PIN_FILE" \
+           "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook

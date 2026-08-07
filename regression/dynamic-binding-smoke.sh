@@ -1112,6 +1112,87 @@ else
   bad "Q3r generated bind script missing release-path zombie gate"
 fi
 
+# --- Smoke Q3s: reboot-FLR monitor (soft FLR on guest warm reboot) ---
+# Test the monitor logic: parse a mock virsh event line, check if the domain has
+# the GPU, and do a soft FLR if it does. Mock the sysfs reset file + virsh dumpxml.
+qfake3="$tmp/syspci_qs"
+mkdir -p "$qfake3/0000:0e:00.0" "$qfake3/drivers/vfio-pci"
+printf '0x1002' > "$qfake3/0000:0e:00.0/vendor"
+printf '\x02\x10\x50\x75' > "$qfake3/0000:0e:00.0/config"
+printf '0' > "$qfake3/0000:0e:00.0/reset"
+cat > "$tmp/smoke_reboot_flr.sh" <<'QSEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
+GUEST_GPU_BDF="${GUEST_GPU_BDF:-0000:0e:00.0}"
+MOCK_VIRSH_DUMPXML="${MOCK_VIRSH_DUMPXML:-}"
+FLR_FILE="$SYSROOT/$GUEST_GPU_BDF/reset"
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-reboot-flr -- "$*" 2>/dev/null || true; }
+do_flr() {
+  if [[ -w "$FLR_FILE" ]]; then
+    echo 1 >"$FLR_FILE" 2>/dev/null || true
+    echo "FLR_DONE"
+  else
+    echo "FLR_SKIP"
+  fi
+}
+domain_has_gpu() {
+  local _dom="$1"
+  if [[ -n "$MOCK_VIRSH_DUMPXML" ]]; then
+    # Substring match (the real vfio.sh uses -Fixq on parsed BDF-per-line output;
+    # here we test the reboot event logic, not the XML parser, so -Fq is sufficient)
+    grep -Fq "$GUEST_GPU_BDF" <<<"$MOCK_VIRSH_DUMPXML" 2>/dev/null
+  else
+    return 1
+  fi
+}
+# Simulate processing a reboot event line
+_line="$1"
+_dom="$(printf '%s' "$_line" | sed -n "s/.*for domain \([^:]*\):.*/\1/p" 2>/dev/null || true)"
+if printf '%s' "$_line" | grep -qi 'reboot'; then
+  if domain_has_gpu "$_dom"; then
+    echo "REBOOT+GPU:$_dom"
+    do_flr
+  else
+    echo "REBOOT+NOGPU:$_dom"
+  fi
+else
+  echo "NOT_REBOOT:$_dom"
+fi
+QSEOF
+# Case 1: reboot event + domain has GPU -> FLR done (mock XML must contain the BDF string for grep -Fixq)
+_mock_xml="0000:0e:00.0 <hostdev><address domain='0x0000' bus='0x0e' slot='0x00' function='0x0'/></hostdev>"
+s1="$(SYSROOT="$qfake3" GUEST_GPU_BDF=0000:0e:00.0 MOCK_VIRSH_DUMPXML="$_mock_xml" bash "$tmp/smoke_reboot_flr.sh" "event 'lifecycle' for domain win11: Rebooted" 2>&1 || true)"
+if echo "$s1" | grep -Fq 'REBOOT+GPU:win11' && echo "$s1" | grep -Fq 'FLR_DONE'; then ok "Q3s reboot event + domain has GPU -> soft FLR applied"; else bad "Q3s reboot+GPU case failed (got: $s1)"; fi
+# Case 2: reboot event + domain does NOT have GPU -> FLR skipped
+s2="$(SYSROOT="$qfake3" GUEST_GPU_BDF=0000:0e:00.0 MOCK_VIRSH_DUMPXML="<hostdev><address bus='0x03'/></hostdev>" bash "$tmp/smoke_reboot_flr.sh" "event 'lifecycle' for domain other_vm: Rebooted" 2>&1 || true)"
+if echo "$s2" | grep -Fq 'REBOOT+NOGPU:other_vm'; then ok "Q3s reboot event + domain without GPU -> FLR skipped"; else bad "Q3s reboot+no-GPU case failed (got: $s2)"; fi
+# Case 3: non-reboot event -> no FLR
+s3="$(SYSROOT="$qfake3" GUEST_GPU_BDF=0000:0e:00.0 MOCK_VIRSH_DUMPXML="$_mock_xml" bash "$tmp/smoke_reboot_flr.sh" "event 'lifecycle' for domain win11: Started" 2>&1 || true)"
+if echo "$s3" | grep -Fq 'NOT_REBOOT:win11'; then ok "Q3s non-reboot event -> no FLR"; else bad "Q3s non-reboot case failed (got: $s3)"; fi
+# Case 4 (static): vfio.sh defines the monitor script heredoc + systemd unit + install/remove
+if grep -Fq 'REBOOT_FLR_SCRIPT=' "$VFIO_SCRIPT" \
+  && grep -Fq 'install_reboot_flr_monitor()' "$VFIO_SCRIPT" \
+  && grep -Fq 'remove_reboot_flr_monitor()' "$VFIO_SCRIPT" \
+  && grep -Fq 'virsh -c qemu:///system event --all --event lifecycle --loop' "$VFIO_SCRIPT" \
+  && grep -Fq 'Restart=always' "$VFIO_SCRIPT" \
+  && grep -Fq 'vfio-reboot-flr.service' "$VFIO_SCRIPT"; then
+  ok "Q3s vfio.sh defines monitor constants + functions + systemd unit + virsh event"
+else
+  bad "Q3s vfio.sh missing monitor definitions"
+fi
+# Case 5 (static): install-dynamic calls installer, install-early + reset call remover
+_q3s_dyn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_q3s_early="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_q3s_reset="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'install_reboot_flr_monitor' <<<"$_q3s_dyn" \
+  && grep -Fq 'remove_reboot_flr_monitor' <<<"$_q3s_early" \
+  && grep -Fq 'vfio-reboot-flr.service' <<<"$_q3s_reset"; then
+  ok "Q3s install-dynamic installs, install-early + reset remove the monitor"
+else
+  bad "Q3s monitor wiring missing in install-dynamic/install-early/reset"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

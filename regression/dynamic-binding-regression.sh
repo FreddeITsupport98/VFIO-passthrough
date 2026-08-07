@@ -1072,6 +1072,70 @@ assert_contains_text \
   'a healthy card is never reset' \
   "$bind_block"
 
+# --- Functional Q3s: reboot-FLR monitor (soft FLR on guest warm reboot) ---
+# On RX 9070 / RDNA4 with on_reboot=restart (warm reboot), the card survives
+# (qemu never releases the vfio device, link stays up), but the GPU's display
+# engine wedges and OVMF can't re-POST (frozen screen). A systemd service
+# watches libvirt for guest reboot lifecycle events and does a soft FLR to
+# clear the display wedge so OVMF re-POSTs without a host reboot. Libvirt's
+# qemu hook does NOT fire a 'reboot' phase, so this requires an external monitor.
+assert_contains_file \
+  "Q3s REBOOT_FLR_SCRIPT constant defined" \
+  'REBOOT_FLR_SCRIPT=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s REBOOT_FLR_UNIT constant defined" \
+  'REBOOT_FLR_UNIT=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s install_reboot_flr_monitor function defined" \
+  'install_reboot_flr_monitor()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s remove_reboot_flr_monitor function defined" \
+  'remove_reboot_flr_monitor()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s monitor script uses virsh event --all --loop" \
+  'virsh -c qemu:///system event --all --event lifecycle --loop' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s monitor script does soft FLR via sysfs reset" \
+  'echo 1 >"$_sys/reset"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s monitor script checks domain has GPU before FLR" \
+  'domain_has_gpu' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s systemd service unit defined with Restart=always" \
+  'Restart=always' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3s systemd service unit runs the monitor script" \
+  'ExecStart=$REBOOT_FLR_SCRIPT' \
+  "$VFIO_SCRIPT"
+# install-dynamic-binding must call install_reboot_flr_monitor
+assert_contains_text \
+  "Q3s install-dynamic-binding calls install_reboot_flr_monitor" \
+  'install_reboot_flr_monitor' \
+  "$_dyn_fn"
+# install-early-binding must call remove_reboot_flr_monitor
+assert_contains_text \
+  "Q3s install-early-binding calls remove_reboot_flr_monitor" \
+  'remove_reboot_flr_monitor' \
+  "$_early_fn3"
+# reset must disable + remove the reboot-FLR service + script
+_reset_fn2="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3s reset disables vfio-reboot-flr.service" \
+  'vfio-reboot-flr.service' \
+  "$_reset_fn2"
+assert_contains_text \
+  "Q3s reset removes REBOOT_FLR_SCRIPT + REBOOT_FLR_UNIT" \
+  '$REBOOT_FLR_SCRIPT' \
+  "$_reset_fn2"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

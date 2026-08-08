@@ -1193,6 +1193,64 @@ else
   bad "Q3s monitor wiring missing in install-dynamic/install-early/reset"
 fi
 
+# --- Smoke Q3t: RX 9070-gated pre-FLR Gen1 downtrain ---
+# Test the _is_rx9070 gate and the LnkCtl2 Gen1/Gen5 value construction.
+# Mock config space: 02 10 50 75 = vendor 0x1002, device 0x7550 (RX 9070).
+qfake4="$tmp/syspci_qt"
+mkdir -p "$qfake4/0000:0e:00.0"
+printf '\x02\x10\x50\x75' > "$qfake4/0000:0e:00.0/config"
+cat > "$tmp/smoke_q3t_gate.sh" <<'QTEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SYSROOT="${SYSROOT:-/sys/bus/pci/devices}"
+GUEST_GPU_BDF="${GUEST_GPU_BDF:-0000:0e:00.0}"
+_RX9070_DEVICE_ID="7550"
+_is_rx9070() {
+  local _sys="$SYSROOT/$GUEST_GPU_BDF" _vendor _device _cfg
+  [[ -d "$_sys" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_cfg" ]] || return 1
+  _vendor="${_cfg:2:2}${_cfg:0:2}"
+  _device="${_cfg:6:2}${_cfg:4:2}"
+  [[ "${_vendor,,}" == "1002" ]] || return 1
+  [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
+}
+if _is_rx9070; then echo "IS_RX9070=YES"; else echo "IS_RX9070=NO"; fi
+# Test the LnkCtl2 Gen1/Gen5 value construction
+_ctl2="0045"
+_saved_hi="${_ctl2:0:3}"
+_gen1="${_saved_hi}1"
+_gen5="${_saved_hi}5"
+echo "CTL2_ORIG=$_ctl2 GEN1=$_gen1 GEN5=$_gen5"
+QTEOF
+# Case 1: RX 9070 config -> IS_RX9070=YES + Gen1/Gen5 values correct
+r1="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
+if echo "$r1" | grep -Fq 'IS_RX9070=YES' \
+  && echo "$r1" | grep -Fq 'GEN1=0041' \
+  && echo "$r1" | grep -Fq 'GEN5=0045'; then
+  ok "Q3t RX 9070 detected + LnkCtl2 Gen1=0041 Gen5=0045 (preserves upper bits)"
+else
+  bad "Q3t RX 9070 gate or LnkCtl2 values wrong (got: $r1)"
+fi
+# Case 2: non-RX 9070 config (NVIDIA 10de) -> IS_RX9070=NO
+printf '\xde\x10\x00\x00' > "$qfake4/0000:0e:00.0/config"
+r2="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
+if echo "$r2" | grep -Fq 'IS_RX9070=NO'; then ok "Q3t non-RX 9070 (NVIDIA) -> gate skips"; else bad "Q3t non-RX 9070 case failed (got: $r2)"; fi
+# Case 3 (static): vfio.sh defines the gate + downtrain functions + setpci writes
+_reboot_block="$(sed -n '/write_file_atomic "$REBOOT_FLR_SCRIPT" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
+if echo "$_reboot_block" | grep -Fq '_is_rx9070()' \
+  && echo "$_reboot_block" | grep -Fq '_gpu_upstream_port()' \
+  && echo "$_reboot_block" | grep -Fq '_pre_flr_gen1_downtrain()' \
+  && echo "$_reboot_block" | grep -Fq '_post_flr_restore_gen5()' \
+  && echo "$_reboot_block" | grep -Fq '88.w' \
+  && echo "$_reboot_block" | grep -Fq '6A.w' \
+  && echo "$_reboot_block" | grep -Fq '0x2000' \
+  && echo "$_reboot_block" | grep -Fq '7550'; then
+  ok "Q3t vfio.sh defines gate + downtrain + setpci LnkCtl2/LnkSta writes"
+else
+  bad "Q3t vfio.sh missing gate/downtrain/setpci definitions"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

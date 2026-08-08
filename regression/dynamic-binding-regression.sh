@@ -1136,6 +1136,62 @@ assert_contains_text \
   '$REBOOT_FLR_SCRIPT' \
   "$_reset_fn2"
 
+# --- Functional Q3t: RX 9070-gated pre-FLR Gen1 downtrain ---
+# On RX 9070 / RDNA4 the post-FLR Gen5 link retrain fails (the on-card switch
+# can't retrain Gen5 after a function reset). The fix: force the target link
+# speed to Gen1 BEFORE the FLR so the retrain happens at Gen1 (fast + reliable),
+# then restore Gen5 after. Gated to RX 9070 ONLY (vendor 1002, device 7550) so
+# it does not run on other cards. Uses setpci on the auto-detected upstream port.
+_reboot_block="$(sed -n '/write_file_atomic "$REBOOT_FLR_SCRIPT" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3t _RX9070_DEVICE_ID constant defined" \
+  '_RX9070_DEVICE_ID=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _is_rx9070 gate reads vendor+device from config" \
+  '_is_rx9070()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _is_rx9070 checks device 7550" \
+  '7550' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _gpu_upstream_port auto-detects upstream port" \
+  '_gpu_upstream_port()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain writes LnkCtl2 at 0x88" \
+  '88.w' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain sets Gen1 target (low nibble 1)" \
+  '${_saved_hi}1' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain forces retrain via LnkCtl bit 5" \
+  '0x0020' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t polls LnkSta at 0x6A for link active bit 13" \
+  '6A.w' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t polls Data Link Layer Link Active bit (0x2000)" \
+  '0x2000' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore sets Gen5 target (low nibble 5)" \
+  '${_saved_hi}5' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t do_flr gates downtrain on _is_rx9070" \
+  'if _is_rx9070; then' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t do_flr logs non-RX9070 skip" \
+  'not RX 9070, skipping pre-FLR Gen1 downtrain' \
+  "$_reboot_block"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

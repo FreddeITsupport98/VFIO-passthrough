@@ -8301,14 +8301,144 @@ CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-reboot-flr -- "$*" 2>/dev/null || true; }
 
+# RX 9070 / RDNA4 (Navi 48) device ID — the ONLY card this downtrain logic
+# is gated on. Other AMD cards (or non-AMD) skip the Gen1 downtrain entirely.
+_RX9070_DEVICE_ID="7550"
+
+# Find the upstream PCIe switch downstream port for the GPU BDF by walking
+# sysfs. For 0000:0e:00.0 the parent bridge is 0000:0d:00.0 (the AMD Navi 10
+# XL Downstream Port of the on-card PCIe switch). Prints the upstream BDF
+# (e.g. 0000:0d:00.0) and returns 0, or returns 1 if not found.
+_gpu_upstream_port() {
+  local _gpu="$1" _parent_dir _upstream
+  [[ -n "$_gpu" ]] || return 1
+  # sysfs layout: /sys/bus/pci/devices/<upstream>/<gpu>  (the GPU is a child
+  # of the upstream bridge in the device tree).
+  _parent_dir="$(ls -d /sys/bus/pci/devices/*/"$_gpu" 2>/dev/null | head -1)"
+  [[ -n "$_parent_dir" ]] || return 1
+  _upstream="$(basename "$(dirname "$_parent_dir")")"
+  [[ -n "$_upstream" ]] || return 1
+  printf '%s\n' "$_upstream"
+}
+
+# Check if the guest GPU is an RX 9070 / RDNA4 (vendor 1002, device 7550).
+# Used to gate the pre-FLR Gen1 downtrain so it ONLY runs on this specific
+# card family (other cards may not need it, or may be harmed by it).
+_is_rx9070() {
+  local _sys="/sys/bus/pci/devices/$GUEST_GPU_BDF" _vendor _device _cfg
+  [[ -d "$_sys" ]] || return 1
+  # Read vendor + device from config space (first 4 bytes: little-endian
+  # vendor at 0x00, device at 0x02). 02 10 50 75 = vendor 0x1002, device 0x7550.
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_cfg" ]] || return 1
+  # vendor = bytes 2:1 (LE), device = bytes 4:3 (LE)
+  _vendor="${_cfg:2:2}${_cfg:0:2}"
+  _device="${_cfg:6:2}${_cfg:4:2}"
+  [[ "${_vendor,,}" == "1002" ]] || return 1
+  [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
+}
+
+# Pre-FLR Gen1 downtrain + post-FLR link-wait + Gen5 restore.
+# On RX 9070 / RDNA4 the post-FLR Gen5 link retrain fails (the on-card switch
+# can't retrain Gen5 after a function reset). Forcing the target link speed to
+# Gen1 BEFORE the FLR makes the retrain happen at Gen1 (fast + reliable), so the
+# link comes back in milliseconds and OVMF re-POSTs on a live GPU. After the
+# link is back, restore the target to Gen5 so the link negotiates back up.
+# Gated to RX 9070 ONLY. Uses setpci on the upstream switch downstream port.
+# Registers (verified on ASUS TUF X570-PLUS + RX 9070):
+#   LnkCtl2 at 0x88: bits[3:0] = Target Link Speed (1=Gen1, 2=Gen2, 5=Gen5)
+#   LnkCtl  at 0x68: bit 5 (0x20) = Retrain Link
+#   LnkSta  at 0x6A: bit 13 (0x2000) = Data Link Layer Link Active
+_pre_flr_gen1_downtrain() {
+  local _upstream _ctl2 _ctl _sta _i
+  _upstream="$(_gpu_upstream_port "$GUEST_GPU_BDF" 2>/dev/null || true)"
+  if [[ -z "$_upstream" ]]; then
+    jlog "$GUEST_GPU_BDF: pre-FLR downtrain skipped (could not find upstream port)"
+    return 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    jlog "$GUEST_GPU_BDF: pre-FLR downtrain skipped (setpci not installed)"
+    return 1
+  fi
+  jlog "$GUEST_GPU_BDF: pre-FLR Gen1 downtrain on upstream $_upstream"
+  # Read current LnkCtl2 (we will restore it after).
+  _ctl2="$(setpci -s "$_upstream" 88.w 2>/dev/null || true)"
+  if [[ -z "$_ctl2" ]]; then
+    jlog "$GUEST_GPU_BDF: pre-FLR downtrain aborted (could not read LnkCtl2 from $_upstream)"
+    return 1
+  fi
+  # Save the upper 12 bits (preserve de-emphasis etc), set low nibble to 1 (Gen1).
+  # _ctl2 is like '0045' — keep bits 15:4, set bits 3:0 to 0001.
+  local _saved_hi="${_ctl2:0:3}"  # first 3 hex digits = bits 15:4
+  local _gen1_ctl2="${_saved_hi}1"
+  setpci -s "$_upstream" 88.w="$_gen1_ctl2" 2>/dev/null || true
+  jlog "$GUEST_GPU_BDF: LnkCtl2 set to $_gen1_ctl2 (was $_ctl2) — target Gen1"
+  # Force a retrain so the link downtrains to Gen1 NOW (before the FLR).
+  _ctl="$(setpci -s "$_upstream" 68.w 2>/dev/null || true)"
+  setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+  jlog "$GUEST_GPU_BDF: forced link retrain at Gen1 (LnkCtl bit 5 set)"
+  # Wait for the link to come back at Gen1 (poll LnkSta bit 13, up to 2s).
+  for _i in $(seq 1 20); do
+    _sta="$(setpci -s "$_upstream" 6A.w 2>/dev/null || true)"
+    if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
+      jlog "$GUEST_GPU_BDF: link active at Gen1 after $(( _i * 100 ))ms"
+      return 0
+    fi
+    sleep 0.1
+  done
+  jlog "$GUEST_GPU_BDF: WARN link did not come back at Gen1 within 2s (continuing with FLR anyway)"
+  return 0
+}
+
+_post_flr_restore_gen5() {
+  local _upstream _ctl _sta _i
+  _upstream="$(_gpu_upstream_port "$GUEST_GPU_BDF" 2>/dev/null || true)"
+  [[ -n "$_upstream" ]] || return 1
+  command -v setpci >/dev/null 2>&1 || return 1
+  # Wait for the link to come back after the FLR (poll LnkSta bit 13, up to 5s).
+  for _i in $(seq 1 50); do
+    _sta="$(setpci -s "$_upstream" 6A.w 2>/dev/null || true)"
+    if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
+      jlog "$GUEST_GPU_BDF: link active after FLR (waited $(( _i * 100 ))ms)"
+      break
+    fi
+    sleep 0.1
+  done
+  # Restore the target link speed to Gen5 (bits 3:0 = 5) and retrain.
+  local _ctl2
+  _ctl2="$(setpci -s "$_upstream" 88.w 2>/dev/null || true)"
+  if [[ -n "$_ctl2" ]]; then
+    local _saved_hi="${_ctl2:0:3}"
+    setpci -s "$_upstream" 88.w="${_saved_hi}5" 2>/dev/null || true
+    jlog "$GUEST_GPU_BDF: LnkCtl2 restored to ${_saved_hi}5 (Gen5 target)"
+  fi
+  _ctl="$(setpci -s "$_upstream" 68.w 2>/dev/null || true)"
+  setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+  jlog "$GUEST_GPU_BDF: forced link retrain back to Gen5"
+}
+
 # Soft FLR: reset the GPU's display engine without dropping the PCIe link.
+# On RX 9070 / RDNA4, the FLR drops the Gen5 link and the on-card switch fails
+# to retrain it. The pre-FLR Gen1 downtrain makes the retrain reliable (Gen1
+# retrains fast and succeeds), then we restore Gen5 after. Gated to RX 9070 ONLY.
 do_flr() {
   local _sys="/sys/bus/pci/devices/$GUEST_GPU_BDF"
-  if [[ -w "$_sys/reset" ]]; then
-    echo 1 >"$_sys/reset" 2>/dev/null || true
-    jlog "$GUEST_GPU_BDF: soft FLR applied after guest reboot (display wedge clear)"
-  else
+  if [[ ! -w "$_sys/reset" ]]; then
     jlog "$GUEST_GPU_BDF: reset sysfs not writable; cannot FLR after guest reboot"
+    return 1
+  fi
+  # RX 9070 only: pre-FLR Gen1 downtrain to make the post-FLR retrain reliable.
+  if _is_rx9070; then
+    _pre_flr_gen1_downtrain
+  else
+    jlog "$GUEST_GPU_BDF: not RX 9070, skipping pre-FLR Gen1 downtrain"
+  fi
+  # The soft FLR.
+  echo 1 >"$_sys/reset" 2>/dev/null || true
+  jlog "$GUEST_GPU_BDF: soft FLR applied after guest reboot (display wedge clear)"
+  # RX 9070 only: wait for link + restore Gen5.
+  if _is_rx9070; then
+    _post_flr_restore_gen5
   fi
 }
 

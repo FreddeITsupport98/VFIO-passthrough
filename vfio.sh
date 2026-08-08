@@ -8321,7 +8321,10 @@ do_flr() {
 domain_has_gpu() {
   local _dom="$1" _xml _bdfs
   _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-  [[ -n "$_xml" ]] || return 1
+  if [[ -z "$_xml" ]]; then
+    jlog "domain_has_gpu: virsh dumpxml '$_dom' returned EMPTY (domain name may still be quoted or domain not found)"
+    return 1
+  fi
   _bdfs="$(printf '%s' "$_xml" | awk '
     /<hostdev/ { in_hostdev=1; is_pci=0 }
     in_hostdev && /type=.pci./ { is_pci=1 }
@@ -8348,7 +8351,11 @@ domain_has_gpu() {
     }
     /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
   ')"
-  [[ -n "$_bdfs" ]] || return 1
+  if [[ -z "$_bdfs" ]]; then
+    jlog "domain_has_gpu: parsed 0 PCI BDFs from '$_dom' XML (no PCI hostdevs?)"
+    return 1
+  fi
+  jlog "domain_has_gpu: domain='$_dom' parsed BDFs='$_bdfs' looking_for='$GUEST_GPU_BDF'"
   grep -Fixq "$GUEST_GPU_BDF" <<<"$_bdfs" 2>/dev/null
 }
 
@@ -8367,20 +8374,29 @@ while true; do
     continue
   fi
   timeout 86400 virsh -c qemu:///system event --all --loop 2>/dev/null | while IFS= read -r _line; do
-    # virsh event --all output: event '<type>' for domain <name>[: <detail>]
-    # NOTE: 'reboot' is a SEPARATE event type (not a lifecycle sub-event), and
-    # its format has NO colon after the domain name:
-    #   event 'reboot' for domain win11
+    # virsh event --all output: event '<type>' for domain '<name>'[: <detail>]
+    # NOTE: virsh wraps the domain name in SINGLE QUOTES, and 'reboot' is a
+    # SEPARATE event type (not a lifecycle sub-event) with NO colon after the
+    # quoted name:
+    #   event 'reboot' for domain 'win11'
     # vs lifecycle which has a colon + detail:
-    #   event 'lifecycle' for domain win11: Rebooted
-    # The sed must handle BOTH (colon optional) or the reboot event is skipped.
-    _dom="$(printf '%s' "$_line" | sed -n 's/.*for domain \([^:]*\).*/\1/p' 2>/dev/null || true)"
+    #   event 'lifecycle' for domain 'win11': Rebooted
+    # The sed must (a) handle both formats (colon optional), and (b) STRIP the
+    # single quotes from the domain name, or virsh dumpxml ''win11'' fails and
+    # domain_has_gpu silently returns false (the "no guest GPU" false negative).
+    _dom="$(printf '%s' "$_line" | sed -n "s/.*for domain '\([^:']*\).*/\1/p" 2>/dev/null || true)"
+    # Fallback: if the quote-aware sed did not match (unquoted domain name), try
+    # the original colon-optional parser.
+    if [[ -z "$_dom" ]]; then
+      _dom="$(printf '%s' "$_line" | sed -n 's/.*for domain \([^:]*\).*/\1/p' 2>/dev/null || true)"
+    fi
     [[ -n "$_dom" ]] || continue
     # Only act on reboot events (case-insensitive). Matches both the 'reboot'
     # event type AND the 'Rebooted' lifecycle detail.
     if printf '%s' "$_line" | grep -qi 'reboot'; then
+      jlog "reboot event received for domain '$_dom' (raw line: $_line)"
       if domain_has_gpu "$_dom"; then
-        jlog "$GUEST_GPU_BDF: reboot lifecycle event for domain $_dom (has guest GPU); applying soft FLR to clear display wedge"
+        jlog "$GUEST_GPU_BDF: reboot event for domain $_dom (has guest GPU); applying soft FLR to clear display wedge"
         do_flr
       else
         jlog "reboot event for domain $_dom (no guest GPU); skipping FLR"

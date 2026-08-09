@@ -1269,16 +1269,16 @@ cat > "$tmp/mock_vm_no_hv.xml" <<'XEOF'
   </features>
 </domain>
 XEOF
-# Apply the same sed the function uses
+# Apply the same sed the function uses (vendor_id in hyperv + kvm hidden, NOT hidden in hyperv)
 _tmp="$tmp/mock_vm_edited.xml"
 cp "$tmp/mock_vm_no_hv.xml" "$_tmp"
-sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n      <hidden state='on'/>\n    </hyperv>\n    <kvm>\n      <hidden state='on'/>\n    </kvm>|" "$_tmp" 2>/dev/null || true
+sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n    </hyperv>\n    <kvm>\n      <hidden state='on'/>\n    </kvm>|" "$_tmp" 2>/dev/null || true
 # Case 1: edited XML has vendor_id=random
 if grep -Fq "vendor_id state='on' value='random'" "$_tmp"; then ok "Q3u XML edit adds vendor_id=random"; else bad "Q3u XML edit missing vendor_id"; fi
-# Case 2: edited XML has hidden state=on
-if grep -Fq "<hidden state='on'/>" "$_tmp"; then ok "Q3u XML edit adds hidden state=on"; else bad "Q3u XML edit missing hidden"; fi
-# Case 3: edited XML has kvm hidden
-if grep -Fq '<kvm>' "$_tmp" && grep -Fq '<hidden' "$_tmp"; then ok "Q3u XML edit adds kvm hidden"; else bad "Q3u XML edit missing kvm"; fi
+# Case 2: edited XML has kvm hidden (not hidden in hyperv)
+if grep -Fq '<kvm>' "$_tmp" && grep -Fq "<hidden state='on'/>" "$_tmp"; then ok "Q3u XML edit adds kvm hidden"; else bad "Q3u XML edit missing kvm hidden"; fi
+# Case 3: edited XML does NOT have hidden inside hyperv (unsupported by older libvirt)
+if ! grep -Fq "hidden" <<<"$(sed -n '/<hyperv/,/<\/hyperv>/p' "$_tmp")"; then ok "Q3u XML edit does NOT add hidden inside hyperv"; else bad "Q3u XML edit wrongly adds hidden inside hyperv"; fi
 # Case 4: idempotent — already-hidden XML is not double-edited
 cat > "$tmp/mock_vm_has_hv.xml" <<'XEOF'
 <domain type='kvm'>

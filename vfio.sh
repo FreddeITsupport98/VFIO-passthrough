@@ -8566,13 +8566,18 @@ EOF
 # (via CPUID hypervisor leaves + Hyper-V vendor ID) and refuses to install the
 # real display driver — the card shows up as "Microsoft Basic Display Adapter"
 # + unknown "PCI Device" / "PCI Simple Communications Controller" with yellow
-# marks. Hiding the hypervisor (vendor_id=random, hidden state=on, kvm hidden)
-# makes the AMD driver install the real Radeon driver. Only acts on shut-off
-# VMs (running VMs can't be redefined); skipped with a note for running VMs.
+# marks. Hiding the hypervisor (vendor_id=random + kvm hidden state=on) makes
+# the AMD driver install the real Radeon driver. Only acts on shut-off VMs
+# (running VMs can't be redefined); skipped with a note for running VMs.
 # Gated to AMD guest GPUs (vendor 1002) since that's where the anti-passthrough
 # detection matters most.
+# NOTE: <hidden state='on'/> INSIDE <hyperv> is NOT supported by older libvirt
+# (e.g. 12.5.0 rejects it as "unsupported HyperV Enlightenment feature"). Only
+# <vendor_id> inside <hyperv> and <kvm><hidden state='on'/></kvm> are used —
+# the kvm hidden is the main CPUID hypervisor-leaf mask, which is the primary
+# detection vector the AMD driver checks.
 install_hypervisor_hiding() {
-  local _guest_gpu _vendor _dom _xml _tmp _changed
+  local _guest_gpu _vendor _dom _xml _tmp _changed _bdfs
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
   _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
@@ -8588,21 +8593,50 @@ install_hypervisor_hiding() {
   hdr "Hypervisor hiding (AMD driver install fix)"
   note "The AMD Windows driver detects the hypervisor and refuses to install the real"
   note "display driver (card shows as Microsoft Basic Display Adapter + unknown PCI devices)."
-  note "Hiding the hypervisor (vendor_id=random, hidden, kvm hidden) lets the AMD driver install."
+  note "Hiding the hypervisor (vendor_id=random + kvm hidden) lets the AMD driver install."
   note "Only shut-off VMs with the guest GPU can be updated; running VMs are skipped."
   say
   local _updated=0 _skipped_running=0
   while IFS= read -r _dom; do
     [[ -n "$_dom" ]] || continue
-    # Check if this domain has the guest GPU in its XML.
+    # Check if this domain has the guest GPU in its XML. virsh dumpxml stores
+    # PCI addresses as separate attributes (domain/bus/slot/function), NOT as
+    # the combined BDF string — so we must parse them with awk and reconstruct
+    # the BDF before comparing (same parser as the reboot-FLR monitor).
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    if ! grep -Fixq "$_guest_gpu" <<<"$_xml" 2>/dev/null; then
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) {
+          s=substr(line, RSTART, RLENGTH); sub(/^domain=./, "", s); sub(/^0x/, "", s); dom=s
+        }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) {
+          s=substr(line, RSTART, RLENGTH); sub(/^bus=./, "", s); sub(/^0x/, "", s); bus=s
+        }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) {
+          s=substr(line, RSTART, RLENGTH); sub(/^slot=./, "", s); sub(/^0x/, "", s); slot=s
+        }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) {
+          s=substr(line, RSTART, RLENGTH); sub(/^function=./, "", s); sub(/^0x/, "", s); fn=s
+        }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
       continue
     fi
-    # Check if already hidden (idempotent).
+    # Check if already hidden (idempotent) — vendor_id + kvm hidden both present.
     if grep -Fq "vendor_id state='on'" <<<"$_xml" 2>/dev/null \
-      && grep -Fq "<hidden state='on'/>" <<<"$_xml" 2>/dev/null \
-      && grep -Fq '<kvm>' <<<"$_xml" 2>/dev/null; then
+      && grep -Fq '<kvm>' <<<"$_xml" 2>/dev/null \
+      && grep -Fq "hidden state='on'" <<<"$_xml" 2>/dev/null; then
       note "VM '$_dom' already has hypervisor hiding; skipping."
       continue
     fi
@@ -8615,21 +8649,25 @@ install_hypervisor_hiding() {
       continue
     fi
     # Add the hypervisor-hiding features to the XML.
+    # Only vendor_id (inside <hyperv>) + <kvm><hidden state='on'/></kvm> — NOT
+    # <hidden> inside <hyperv> (unsupported by older libvirt like 12.5.0).
     _tmp="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp"
-    # Add vendor_id + hidden to <hyperv> (before </hyperv>).
-    # Add <kvm><hidden state='on'/></kvm> before <vmport> if not present.
     if ! grep -Fq '<kvm>' "$_tmp" 2>/dev/null; then
-      sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n      <hidden state='on'/>\n    </hyperv>\n    <kvm>\n      <hidden state='on'/>\n    </kvm>|" "$_tmp" 2>/dev/null || true
+      sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n    </hyperv>\n    <kvm>\n      <hidden state='on'/>\n    </kvm>|" "$_tmp" 2>/dev/null || true
     else
-      sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n      <hidden state='on'/>\n    </hyperv>|" "$_tmp" 2>/dev/null || true
+      sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n    </hyperv>|" "$_tmp" 2>/dev/null || true
+      # Ensure kvm hidden is set if <kvm> block already exists but lacks hidden.
+      if ! grep -Fq "hidden state='on'" "$_tmp" 2>/dev/null; then
+        sed -i "s|<kvm>|<kvm>\n      <hidden state='on'/>|" "$_tmp" 2>/dev/null || true
+      fi
     fi
     # Validate + define.
     if virt-xml-validate "$_tmp" 2>/dev/null; then
       if (( ! DRY_RUN )); then
         virsh -c qemu:///system define "$_tmp" 2>/dev/null
       fi
-      say "Updated VM '$_dom' with hypervisor hiding (vendor_id=random, hidden, kvm hidden)."
+      say "Updated VM '$_dom' with hypervisor hiding (vendor_id=random, kvm hidden)."
       note "The AMD driver should now install the real display driver on next VM boot."
       _updated=1
     else
@@ -9641,9 +9679,9 @@ install_dynamic_binding_from_existing_config() {
   note "  7. Install the reboot-FLR monitor (a systemd service that watches for guest"
   note "     warm reboot and does a soft FLR to clear the GPU display wedge so OVMF"
   note "     can re-POST without needing a host reboot — set on_reboot=restart in VM XML)"
-  note "  8. Hide the hypervisor on shut-off VMs with the guest GPU (adds vendor_id=random,"
-  note "     hidden state, kvm hidden to the VM XML so the AMD Windows driver installs"
-  note "     the real display driver instead of refusing with unknown PCI devices)"
+  note "  8. Hide the hypervisor on shut-off VMs with the guest GPU (adds vendor_id=random"
+  note "     + kvm hidden to the VM XML so the AMD Windows driver installs the real"
+  note "     display driver instead of refusing with unknown PCI devices)"
   say
   note "What stays unchanged:"
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"

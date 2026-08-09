@@ -1215,13 +1215,29 @@ assert_contains_file \
   "vendor_id state='on' value='random'" \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "Q3u helper adds hidden state=on" \
-  "<hidden state='on'/>" \
-  "$VFIO_SCRIPT"
-assert_contains_file \
   "Q3u helper adds kvm hidden" \
   '<kvm>' \
   "$VFIO_SCRIPT"
+# The sed must add vendor_id before </hyperv> but NOT <hidden> (unsupported by
+# older libvirt). Verify the sed line has vendor_id but NOT hidden before </hyperv>.
+assert_contains_file \
+  "Q3u helper adds vendor_id before close hyperv" \
+  "vendor_id state='on' value='random'/>\\n    </hyperv>" \
+  "$VFIO_SCRIPT"
+# The <hidden> must only appear inside <kvm>, not inside <hyperv>. The first sed
+# (no <kvm> present) inserts the whole <kvm> block with <hidden> inside it — that
+# is correct. The SECOND sed (else branch, <kvm> already exists) should only add
+# vendor_id before </hyperv> and NOT <hidden>. Check that the else-branch sed
+# does not have <hidden> before </hyperv>.
+_hyperv_fn="$(sed -n '/^install_hypervisor_hiding()/,/^}/p' "$VFIO_SCRIPT")"
+# The else-branch sed is the one that does NOT contain <kvm> in its replacement.
+_else_sed="$(printf '%s' "$_hyperv_fn" | grep 's|</hyperv>|' | grep -v '<kvm>' | head -1)"
+if [[ -n "$_else_sed" ]] && ! printf '%s' "$_else_sed" | grep -Fq '<hidden' 2>/dev/null; then
+  printf 'PASS: Q3u else-branch sed does NOT add hidden inside hyperv\n'
+else
+  printf 'FAIL: Q3u else-branch sed wrongly adds hidden inside hyperv (unsupported by older libvirt)\n' >&2
+  record_failure "Q3u else-branch sed does not add hidden inside hyperv"
+fi
 assert_contains_file \
   "Q3u helper checks VM state (shut off only)" \
   'domstate' \

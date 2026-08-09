@@ -1193,9 +1193,11 @@ else
   bad "Q3s monitor wiring missing in install-dynamic/install-early/reset"
 fi
 
-# --- Smoke Q3t: RX 9070-gated pre-FLR Gen1 downtrain ---
-# Test the _is_rx9070 gate and the LnkCtl2 Gen1/Gen5 value construction.
-# Mock config space: 02 10 50 75 = vendor 0x1002, device 0x7550 (RX 9070).
+# --- Smoke Q3t: RX 9070 family-gated pre-FLR Gen1 downtrain + adaptive restore ---
+# Test the _is_rx9070 gate, the sysfs speed-string -> gen parsing, and the
+# adaptive restore target selection (Gen4 slot vs Gen5 card vs degraded link).
+# Mock config space: 02 10 50 75 = vendor 0x1002, device 0x7550 (RX 9070 family:
+# RX 9070 / 9070 XT / 9070 GRE all share 0x7550).
 qfake4="$tmp/syspci_qt"
 mkdir -p "$qfake4/0000:0e:00.0"
 printf '\x02\x10\x50\x75' > "$qfake4/0000:0e:00.0/config"
@@ -1215,40 +1217,83 @@ _is_rx9070() {
   [[ "${_vendor,,}" == "1002" ]] || return 1
   [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
 }
+_speed_to_gen() {
+  local _s="${1:-}" _n
+  [[ -n "$_s" ]] || return 1
+  _n="$(printf '%s' "$_s" | tr -cd '0-9.')"
+  [[ -n "$_n" ]] || return 1
+  case "$_n" in
+    2.5) echo 1 ;; 5|5.0) echo 2 ;; 8|8.0) echo 3 ;;
+    16|16.0) echo 4 ;; 32|32.0) echo 5 ;; 64|64.0) echo 6 ;; *) return 1 ;;
+  esac
+}
+# Adaptive target selection mirroring _post_flr_restore_target priority:
+# cap+cur(cur<cap)->cur ; cap+cur(cur>=cap)->cap ; cap only->cap ; sav->sav ; none->5.
+_pick_target() {
+  local _cap="${1:-}" _cur="${2:-}" _sav="${3:-}"
+  if [[ -n "$_cap" && -n "$_cur" ]]; then
+    if (( _cur < _cap )) 2>/dev/null; then echo "$_cur"; else echo "$_cap"; fi
+  elif [[ -n "$_cap" ]]; then echo "$_cap"
+  elif [[ -n "$_sav" ]]; then echo "$_sav"
+  else echo 5; fi
+}
 if _is_rx9070; then echo "IS_RX9070=YES"; else echo "IS_RX9070=NO"; fi
-# Test the LnkCtl2 Gen1/Gen5 value construction
-_ctl2="0045"
-_saved_hi="${_ctl2:0:3}"
-_gen1="${_saved_hi}1"
-_gen5="${_saved_hi}5"
-echo "CTL2_ORIG=$_ctl2 GEN1=$_gen1 GEN5=$_gen5"
+# LnkCtl2 Gen1 value construction (preserves upper 12 bits, low nibble 1).
+_ctl2="0045"; _saved_hi="${_ctl2:0:3}"; echo "GEN1=${_saved_hi}1"
+# Sysfs speed-string -> PCIe generation parsing.
+echo "G16=$(_speed_to_gen "16 GT/s" || echo X)"
+echo "G32=$(_speed_to_gen "32 GT/s" || echo X)"
+echo "G25=$(_speed_to_gen "2.5 GT/s" || echo X)"
+# Adaptive restore target: Gen5 slot, Gen4 slot, degraded link, sav-only, none.
+echo "T_GEN5=$(_pick_target 5 5)"
+echo "T_GEN4=$(_pick_target 4 4)"
+echo "T_DEGRADED=$(_pick_target 5 4)"
+echo "T_SAVONLY=$(_pick_target "" "" 5)"
+echo "T_NONE=$(_pick_target "" "" "")"
 QTEOF
-# Case 1: RX 9070 config -> IS_RX9070=YES + Gen1/Gen5 values correct
+# Case 1: RX 9070 family config -> IS_RX9070=YES + Gen1 value + speed parse + adaptive targets
 r1="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
 if echo "$r1" | grep -Fq 'IS_RX9070=YES' \
   && echo "$r1" | grep -Fq 'GEN1=0041' \
-  && echo "$r1" | grep -Fq 'GEN5=0045'; then
-  ok "Q3t RX 9070 detected + LnkCtl2 Gen1=0041 Gen5=0045 (preserves upper bits)"
+  && echo "$r1" | grep -Fq 'G16=4' \
+  && echo "$r1" | grep -Fq 'G32=5' \
+  && echo "$r1" | grep -Fq 'G25=1' \
+  && echo "$r1" | grep -Fq 'T_GEN5=5' \
+  && echo "$r1" | grep -Fq 'T_GEN4=4' \
+  && echo "$r1" | grep -Fq 'T_DEGRADED=4' \
+  && echo "$r1" | grep -Fq 'T_SAVONLY=5' \
+  && echo "$r1" | grep -Fq 'T_NONE=5'; then
+  ok "Q3t RX 9070 family detected + Gen1=0041 + speed parse + adaptive Gen4/Gen5/degraded targets"
 else
-  bad "Q3t RX 9070 gate or LnkCtl2 values wrong (got: $r1)"
+  bad "Q3t RX 9070 gate/speed/adaptive targets wrong (got: $r1)"
 fi
 # Case 2: non-RX 9070 config (NVIDIA 10de) -> IS_RX9070=NO
 printf '\xde\x10\x00\x00' > "$qfake4/0000:0e:00.0/config"
 r2="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
 if echo "$r2" | grep -Fq 'IS_RX9070=NO'; then ok "Q3t non-RX 9070 (NVIDIA) -> gate skips"; else bad "Q3t non-RX 9070 case failed (got: $r2)"; fi
-# Case 3 (static): vfio.sh defines the gate + downtrain functions + setpci writes
+# Case 3 (static): vfio.sh defines gate + downtrain + adaptive restore + speed helpers
 _reboot_block="$(sed -n '/write_file_atomic "$REBOOT_FLR_SCRIPT" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
 if echo "$_reboot_block" | grep -Fq '_is_rx9070()' \
   && echo "$_reboot_block" | grep -Fq '_gpu_upstream_port()' \
   && echo "$_reboot_block" | grep -Fq '_pre_flr_gen1_downtrain()' \
-  && echo "$_reboot_block" | grep -Fq '_post_flr_restore_gen5()' \
+  && echo "$_reboot_block" | grep -Fq '_post_flr_restore_target()' \
+  && echo "$_reboot_block" | grep -Fq '_speed_to_gen()' \
+  && echo "$_reboot_block" | grep -Fq '_port_speed_gen()' \
+  && echo "$_reboot_block" | grep -Fq 'max_link_speed' \
+  && echo "$_reboot_block" | grep -Fq 'current_link_speed' \
   && echo "$_reboot_block" | grep -Fq '88.w' \
   && echo "$_reboot_block" | grep -Fq '6A.w' \
   && echo "$_reboot_block" | grep -Fq '0x2000' \
   && echo "$_reboot_block" | grep -Fq '7550'; then
-  ok "Q3t vfio.sh defines gate + downtrain + setpci LnkCtl2/LnkSta writes"
+  ok "Q3t vfio.sh defines gate + downtrain + adaptive restore + speed helpers + setpci writes"
 else
-  bad "Q3t vfio.sh missing gate/downtrain/setpci definitions"
+  bad "Q3t vfio.sh missing gate/downtrain/adaptive-restore/speed definitions"
+fi
+# Case 4 (static): the old hardcoded Gen5-only restore name must be gone.
+if echo "$_reboot_block" | grep -Fq '_post_flr_restore_gen5'; then
+  bad "Q3t old _post_flr_restore_gen5 name still present in vfio.sh"
+else
+  ok "Q3t old Gen5-only restore name removed from vfio.sh"
 fi
 
 # --- Smoke Q3u: install_hypervisor_hiding (AMD driver install fix) ---

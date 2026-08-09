@@ -1136,16 +1136,23 @@ assert_contains_text \
   '$REBOOT_FLR_SCRIPT' \
   "$_reset_fn2"
 
-# --- Functional Q3t: RX 9070-gated pre-FLR Gen1 downtrain ---
-# On RX 9070 / RDNA4 the post-FLR Gen5 link retrain fails (the on-card switch
-# can't retrain Gen5 after a function reset). The fix: force the target link
-# speed to Gen1 BEFORE the FLR so the retrain happens at Gen1 (fast + reliable),
-# then restore Gen5 after. Gated to RX 9070 ONLY (vendor 1002, device 7550) so
-# it does not run on other cards. Uses setpci on the auto-detected upstream port.
+# --- Functional Q3t: RX 9070 family-gated pre-FLR Gen1 downtrain + adaptive restore ---
+# On the RX 9070 family / RDNA4 the post-FLR link retrain at the card's max gen
+# can fail (the on-card switch can't retrain Gen5 after a function reset). The
+# fix: force the target link speed to Gen1 BEFORE the FLR so the retrain happens
+# at Gen1 (fast + reliable), then adaptively restore the link to the hardware's
+# actual max (Gen5 on Gen5 boards, Gen4 on slower slots/mobos) with a degraded-
+# link fallback. Gated to the RX 9070 family (vendor 1002, device 7550 — the RX
+# 9070, 9070 XT, and 9070 GRE all share 0x7550) so it does not run on other
+# cards. Uses setpci on the auto-detected upstream port + sysfs speed detection.
 _reboot_block="$(sed -n '/write_file_atomic "$REBOOT_FLR_SCRIPT" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
 assert_contains_text \
   "Q3t _RX9070_DEVICE_ID constant defined" \
   '_RX9070_DEVICE_ID=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t device-ID comment documents the RX 9070 family (9070/9070XT/9070GRE share 7550)" \
+  'RX 9070 XT, and RX 9070 GRE ALL' \
   "$_reboot_block"
 assert_contains_text \
   "Q3t _is_rx9070 gate reads vendor+device from config" \
@@ -1158,6 +1165,31 @@ assert_contains_text \
 assert_contains_text \
   "Q3t _gpu_upstream_port auto-detects upstream port" \
   '_gpu_upstream_port()' \
+  "$_reboot_block"
+# --- Hardware detection helpers (sysfs link speed -> PCIe gen) ---
+assert_contains_text \
+  "Q3t _speed_to_gen helper maps GT/s string to a generation" \
+  '_speed_to_gen()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _port_speed_gen reads sysfs max_link_speed" \
+  'max_link_speed' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _port_speed_gen reads sysfs current_link_speed" \
+  'current_link_speed' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain detects link capability into _FLR_DETECTED_CAP" \
+  '_FLR_DETECTED_CAP=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain detects current speed into _FLR_DETECTED_CUR" \
+  '_FLR_DETECTED_CUR=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain saves original LnkCtl2 target nibble" \
+  '_FLR_SAVED_TARGET=' \
   "$_reboot_block"
 assert_contains_text \
   "Q3t pre-FLR downtrain writes LnkCtl2 at 0x88" \
@@ -1179,9 +1211,42 @@ assert_contains_text \
   "Q3t polls Data Link Layer Link Active bit (0x2000)" \
   '0x2000' \
   "$_reboot_block"
+# --- Adaptive post-FLR restore (replaces the old hardcoded Gen5 restore) ---
 assert_contains_text \
-  "Q3t post-FLR restore sets Gen5 target (low nibble 5)" \
-  '${_saved_hi}5' \
+  "Q3t _post_flr_restore_target helper defined (replaces Gen5-only restore)" \
+  '_post_flr_restore_target()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore adapts when current < cap (slower slot/hardware)" \
+  'adapting restore to Gen' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore falls back to saved LnkCtl2 target when sysfs unavailable" \
+  'restoring to saved LnkCtl2 target' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore last-resort defaults to Gen5" \
+  'defaulting restore to Gen5' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore clamps target to a sane PCIe gen range" \
+  'out of range; defaulting to Gen5' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore sets adaptive LnkCtl2 target via printf %x" \
+  '${_saved_hi}$(printf' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore verifies negotiated speed after retrain" \
+  'link negotiated at Gen' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore has a one-step degraded-link fallback" \
+  'adapting to Gen' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore logs a hardware-problem diagnostic when link stays degraded" \
+  'possible hardware/signal-integrity issue' \
   "$_reboot_block"
 assert_contains_text \
   "Q3t do_flr gates downtrain on _is_rx9070" \
@@ -1191,6 +1256,19 @@ assert_contains_text \
   "Q3t do_flr logs non-RX9070 skip" \
   'not RX 9070, skipping pre-FLR Gen1 downtrain' \
   "$_reboot_block"
+# The old hardcoded Gen5-only restore name/value must be gone so we do not regress.
+if grep -Fq '_post_flr_restore_gen5' <<<"$_reboot_block"; then
+  printf 'FAIL: Q3t old _post_flr_restore_gen5 name still present\n' >&2
+  record_failure "Q3t old Gen5-only restore name removed"
+else
+  printf 'PASS: Q3t old _post_flr_restore_gen5 name removed\n'
+fi
+if grep -Fq '${_saved_hi}5' <<<"$_reboot_block"; then
+  printf 'FAIL: Q3t old hardcoded Gen5 LnkCtl2 restore still present\n' >&2
+  record_failure "Q3t old hardcoded Gen5 restore value removed"
+else
+  printf 'PASS: Q3t old hardcoded Gen5 LnkCtl2 restore removed\n'
+fi
 
 # --- Functional Q3u: install_hypervisor_hiding (AMD driver install fix) ---
 # The AMD Windows driver detects the hypervisor (CPUID leaves + Hyper-V vendor

@@ -1179,6 +1179,51 @@ assert_contains_text \
   "Q3t _port_speed_gen reads sysfs current_link_speed" \
   'current_link_speed' \
   "$_reboot_block"
+# --- New helpers: SKU resolver, defensive setpci reader, link width, alive-check ---
+assert_contains_text \
+  "Q3t _rx9070_sku_name resolves 9070/XT/GRE by PCI revision" \
+  '_rx9070_sku_name()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _rx9070_sku_name maps rev c0 to 9070 XT" \
+  'RX 9070 XT' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _rx9070_sku_name maps rev c2 to 9070 GRE" \
+  'RX 9070 GRE' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _rx9070_sku_name maps rev c3 to 9070 base" \
+  'printf' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _setpci_word defensive setpci reader defined" \
+  '_setpci_word()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _setpci_word trims whitespace from setpci output" \
+  "tr -d '[:space:]'" \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _setpci_word left-pads to 4 hex digits" \
+  'while (( ${#_v} < 4 ))' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _port_link_width reads sysfs current_link_width" \
+  '_port_link_width()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _port_link_width reads current_link_width sysfs attr" \
+  'current_link_width' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _gpu_alive endpoint alive-check defined" \
+  '_gpu_alive()' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t _gpu_alive rejects vendor 0xffff" \
+  '0xffff' \
+  "$_reboot_block"
 assert_contains_text \
   "Q3t pre-FLR downtrain detects link capability into _FLR_DETECTED_CAP" \
   '_FLR_DETECTED_CAP=' \
@@ -1186,6 +1231,22 @@ assert_contains_text \
 assert_contains_text \
   "Q3t pre-FLR downtrain detects current speed into _FLR_DETECTED_CUR" \
   '_FLR_DETECTED_CUR=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain detects link width into _FLR_DETECTED_WIDTH" \
+  '_FLR_DETECTED_WIDTH=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain stashes SKU name into _FLR_SKU_NAME" \
+  '_FLR_SKU_NAME=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain logs SKU + width in jlog" \
+  'width=x' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t pre-FLR downtrain reads LnkCtl2 via _setpci_word (defensive)" \
+  '_setpci_word "$_upstream" 88.w' \
   "$_reboot_block"
 assert_contains_text \
   "Q3t pre-FLR downtrain saves original LnkCtl2 target nibble" \
@@ -1240,13 +1301,50 @@ assert_contains_text \
   "Q3t post-FLR restore verifies negotiated speed after retrain" \
   'link negotiated at Gen' \
   "$_reboot_block"
+# --- Bounded descent (replaces the old one-step fallback) + MAX_GEN cap + width + alive ---
 assert_contains_text \
-  "Q3t post-FLR restore has a one-step degraded-link fallback" \
-  'adapting to Gen' \
+  "Q3t post-FLR restore uses a bounded descent C-style for loop" \
+  'for (( _g = _target; _g >= 1; _g-- ))' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore descends one gen on a missed target" \
+  'descending to Gen' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore accepts highest stable gen into _best" \
+  '_best=' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore polls current_link_speed per gen attempt" \
+  'for _p in $(seq 1 6)' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore reads VFIO_REBOOT_FLR_MAX_GEN operator cap" \
+  'VFIO_REBOOT_FLR_MAX_GEN' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore logs the MAX_GEN clamp" \
+  'clamps restore target from Gen' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore includes width in negotiated log" \
+  'link negotiated at Gen' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore includes width in restore-OK log" \
+  'restore OK — link back at Gen' \
   "$_reboot_block"
 assert_contains_text \
   "Q3t post-FLR restore logs a hardware-problem diagnostic when link stays degraded" \
   'possible hardware/signal-integrity issue' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore runs a GPU-endpoint alive-check" \
+  'if ! _gpu_alive; then' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t post-FLR restore logs a wedged-GPU warning" \
+  'GPU is still wedged — a host reboot may be needed' \
   "$_reboot_block"
 assert_contains_text \
   "Q3t do_flr gates downtrain on _is_rx9070" \
@@ -1256,7 +1354,15 @@ assert_contains_text \
   "Q3t do_flr logs non-RX9070 skip" \
   'not RX 9070, skipping pre-FLR Gen1 downtrain' \
   "$_reboot_block"
-# The old hardcoded Gen5-only restore name/value must be gone so we do not regress.
+assert_contains_text \
+  "Q3t do_flr resets _FLR_DETECTED_WIDTH stash" \
+  '_FLR_DETECTED_WIDTH=""' \
+  "$_reboot_block"
+assert_contains_text \
+  "Q3t do_flr resets _FLR_SKU_NAME stash" \
+  '_FLR_SKU_NAME=""' \
+  "$_reboot_block"
+# The old hardcoded Gen5-only restore name/value AND one-step fallback must be gone.
 if grep -Fq '_post_flr_restore_gen5' <<<"$_reboot_block"; then
   printf 'FAIL: Q3t old _post_flr_restore_gen5 name still present\n' >&2
   record_failure "Q3t old Gen5-only restore name removed"
@@ -1269,6 +1375,37 @@ if grep -Fq '${_saved_hi}5' <<<"$_reboot_block"; then
 else
   printf 'PASS: Q3t old hardcoded Gen5 LnkCtl2 restore removed\n'
 fi
+if grep -Fq 'adapting to Gen' <<<"$_reboot_block"; then
+  printf 'FAIL: Q3t old one-step fallback log (adapting to Gen) still present\n' >&2
+  record_failure "Q3t old one-step fallback log removed"
+else
+  printf 'PASS: Q3t old one-step fallback log removed\n'
+fi
+if grep -Fq 'for _try in 1 2' <<<"$_reboot_block"; then
+  printf 'FAIL: Q3t old one-step retry loop (for _try in 1 2) still present\n' >&2
+  record_failure "Q3t old one-step retry loop removed"
+else
+  printf 'PASS: Q3t old one-step retry loop removed\n'
+fi
+# --- write_conf persists the new VFIO_REBOOT_FLR_MAX_GEN default ---
+assert_contains_file \
+  "Q3t write_conf persists VFIO_REBOOT_FLR_MAX_GEN default (empty)" \
+  'VFIO_REBOOT_FLR_MAX_GEN=""' \
+  "$VFIO_SCRIPT"
+# --- installer warns when setpci (pciutils) is missing, with distro commands ---
+_inst_flr_fn="$(sed -n '/^install_reboot_flr_monitor()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3t installer checks for setpci" \
+  'have_cmd setpci' \
+  "$_inst_flr_fn"
+assert_contains_text \
+  "Q3t installer warns the downtrain/restore will be skipped" \
+  'adaptive PCIe link restore will be SKIPPED' \
+  "$_inst_flr_fn"
+assert_contains_text \
+  "Q3t installer names the openSUSE pciutils install command" \
+  'zypper in pciutils' \
+  "$_inst_flr_fn"
 
 # --- Functional Q3u: install_hypervisor_hiding (AMD driver install fix) ---
 # The AMD Windows driver detects the hypervisor (CPUID leaves + Hyper-V vendor

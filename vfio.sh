@@ -4204,6 +4204,19 @@ VFIO_RESTORE_D3COLD_ON_RELEASE="0"
 # hung bind is aborted. Lower it only if your hook deadline is shorter; raise it
 # only if a legitimately slow bind keeps getting aborted (rare).
 VFIO_HOOK_BIND_TIMEOUT="20"
+# Reboot-FLR monitor: optional max PCIe generation cap for the post-FLR link
+# restore (read by vfio-reboot-flr-monitor.sh). The RX 9070 family Gen1
+# downtrain + adaptive restore normally targets the hardware's detected link
+# capability (Gen5 on Gen5 boards, Gen4 on slower slots). On boards that
+# reliably retrain at a lower gen but NOT the card's full capability after an
+# FLR, set this to clamp the restore target so it does not keep failing up to
+# the higher gen and falling back every warm reboot.
+# - empty (default): no cap; restore targets the detected capability.
+# - 1..6: clamp the restore target to at most this generation.
+# WHY this value: empty lets the adaptive logic pick the best gen per hardware.
+# Set 4 (for example) only if your board reliably retrains Gen4 but not Gen5
+# after an FLR and you want to skip the Gen5 retrain attempt.
+VFIO_REBOOT_FLR_MAX_GEN=""
 EOF
 }
 
@@ -8269,6 +8282,26 @@ install_reboot_flr_monitor() {
     note "virsh not available; skipping reboot-FLR monitor installation (needs virsh event)."
     return 0
   fi
+  # The RX 9070 family pre-FLR Gen1 downtrain + adaptive restore need setpci
+  # (pciutils) to read/write LnkCtl2/LnkCtl/LnkSta on the upstream switch port.
+  # Without it the warm-reboot display-wedge fix is silently inactive, so make
+  # the dependency obvious (with the distro install command) instead of only
+  # logging it at FLR time.
+  if ! have_cmd setpci; then
+    note "setpci (pciutils) is NOT installed: the reboot-FLR monitor's RX 9070 family"
+    note "pre-FLR Gen1 downtrain + adaptive PCIe link restore will be SKIPPED."
+    if have_cmd zypper; then
+      note "Install it with: sudo zypper in pciutils"
+    elif have_cmd dnf; then
+      note "Install it with: sudo dnf install pciutils"
+    elif have_cmd apt-get; then
+      note "Install it with: sudo apt-get install pciutils"
+    elif have_cmd pacman; then
+      note "Install it with: sudo pacman -S pciutils"
+    else
+      note "Install the pciutils package via your package manager."
+    fi
+  fi
 
   if (( ! DRY_RUN )); then
     mkdir -p "$(dirname "$REBOOT_FLR_SCRIPT")" "$(dirname "$REBOOT_FLR_UNIT")"
@@ -8311,6 +8344,30 @@ jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-reboot-flr -- "$*" 
 #  the adaptive speed restore below would handle it identically if added.)
 _RX9070_DEVICE_ID="7550"
 
+# Best-effort SKU resolver for the RX 9070 family. The RX 9070, 9070 XT, and
+# 9070 GRE all share PCI device 0x7550; they are differentiated by PCI revision
+# (observed in public probes: rev 0xc0 -> 9070 XT, 0xc2 -> 9070 GRE,
+# 0xc3 -> 9070 base) and/or subsystem vendor/device (board-model specific).
+# This reads the PCI revision from sysfs and maps known revisions to SKU
+# names for diagnostic logging. The mapping is HEURISTIC (sampled from public
+# probes) and may not cover every board; unknown revisions fall back to a
+# labeled "unknown SKU" string. Returns 0 and echoes the SKU name (always);
+# returns 1 only if the revision sysfs file is unreadable.
+_rx9070_sku_name() {
+  local _sys="/sys/bus/pci/devices/$GUEST_GPU_BDF" _rev _r
+  [[ -r "$_sys/revision" ]] || return 1
+  _rev="$(cat "$_sys/revision" 2>/dev/null || true)"
+  [[ -n "$_rev" ]] || return 1
+  _r="$(printf '%s' "$_rev" | tr -d '[:space:]' | sed 's/^0x//' | tr 'A-F' 'a-f')"
+  case "$_r" in
+    c0) printf '%s\n' "RX 9070 XT" ;;
+    c2) printf '%s\n' "RX 9070 GRE" ;;
+    c3) printf '%s\n' "RX 9070" ;;
+    *) printf '%s\n' "RX 9070 family (unknown SKU, rev 0x${_r:-?})" ;;
+  esac
+  return 0
+}
+
 # Find the upstream PCIe switch downstream port for the GPU BDF by walking
 # sysfs. For 0000:0e:00.0 the parent bridge is 0000:0d:00.0 (the AMD Navi 10
 # XL Downstream Port of the on-card PCIe switch). Prints the upstream BDF
@@ -8342,6 +8399,23 @@ _is_rx9070() {
   _device="${_cfg:6:2}${_cfg:4:2}"
   [[ "${_vendor,,}" == "1002" ]] || return 1
   [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
+}
+
+# Read a 16-bit PCI config word via setpci and return it as a clean 4-hex-digit
+# lowercase string, trimmed of whitespace and left-padded to 4 digits. Returns
+# 1 if setpci fails or the value is not hex. Defensive against setpci output
+# formatting variations (leading/trailing whitespace, short values) so the
+# LnkCtl2 nibble slicing below is robust regardless of setpci's exact format
+# (the raw `${_ctl2:3:1}` slice assumes exactly 4 clean hex chars).
+_setpci_word() {
+  local _bdf="$1" _off="$2" _v
+  _v="$(setpci -s "$_bdf" "$_off" 2>/dev/null || true)"
+  [[ -n "$_v" ]] || return 1
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  [[ "$_v" =~ ^[0-9a-fA-F]+$ ]] || return 1
+  while (( ${#_v} < 4 )); do _v="0$_v"; done
+  printf '%s\n' "${_v,,}"
 }
 
 # Map a PCIe link-speed string (as printed by sysfs max_link_speed /
@@ -8379,6 +8453,37 @@ _port_speed_gen() {
   _speed_to_gen "$_v"
 }
 
+# Read the current PCIe link width from sysfs (e.g. "16", "8", "1") for a PCI
+# BDF. Returns 1 if sysfs is absent/unreadable. Used in the restore diagnostics
+# so a width degradation (x16->x8 from a bad slot/cable) is visible alongside
+# the speed — the speed check alone cannot see a width problem.
+_port_link_width() {
+  local _bdf="$1" _f _v
+  _f="/sys/bus/pci/devices/$_bdf/current_link_width"
+  [[ -r "$_f" ]] || return 1
+  _v="$(cat "$_f" 2>/dev/null || true)"
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  printf '%s\n' "$_v"
+}
+
+# Check that the GPU endpoint itself is alive (vendor sysfs not 0xffff and
+# config space not all-ff). Used after the post-FLR link restore to catch the
+# case where the LINK is back up at a good gen but the GPU's display engine is
+# still wedged (the speed check alone cannot see that). Non-fatal: logs a WARN
+# but does not fail the FLR (the display-wedge clear already happened).
+_gpu_alive() {
+  local _sys="/sys/bus/pci/devices/$GUEST_GPU_BDF" _vendor _cfg
+  [[ -d "$_sys" ]] || return 1
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || true)"
+  _vendor="$(printf '%s' "$_vendor" | tr -d '[:space:]')"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]]
+}
+
 # Pre-FLR Gen1 downtrain + post-FLR link-wait + adaptive target restore.
 # On the RX 9070 family / RDNA4 the post-FLR link retrain at the card's max gen
 # can fail (the on-card switch can't retrain Gen5 after a function reset).
@@ -8393,7 +8498,7 @@ _port_speed_gen() {
 #   LnkCtl  at 0x68: bit 5 (0x20) = Retrain Link
 #   LnkSta  at 0x6A: bit 13 (0x2000) = Data Link Layer Link Active
 _pre_flr_gen1_downtrain() {
-  local _upstream _ctl2 _ctl _sta _i
+  local _upstream _ctl2 _ctl _sta _i _sku
   _upstream="$(_gpu_upstream_port "$GUEST_GPU_BDF" 2>/dev/null || true)"
   if [[ -z "$_upstream" ]]; then
     jlog "$GUEST_GPU_BDF: pre-FLR downtrain skipped (could not find upstream port)"
@@ -8404,19 +8509,26 @@ _pre_flr_gen1_downtrain() {
     return 1
   fi
 
+  # Resolve the SKU name for diagnostic logging (best-effort; the 9070 / 9070
+  # XT / 9070 GRE share device 0x7550 and are told apart by PCI revision).
+  _sku="$(_rx9070_sku_name 2>/dev/null || echo "RX 9070 family")"
+  _FLR_SKU_NAME="$_sku"
+
   # --- Hardware detection: read the upstream switch port's link capability
-  # and current negotiated speed so the post-FLR restore can ADAPT to the
-  # actual hardware (Gen4 slot/mobo vs Gen5 card) instead of blindly forcing
-  # Gen5. If the link is already running below its max (slower slot, signal
-  # integrity, or a Gen4 board), the restore keeps that proven gen rather than
-  # forcing a higher one that may fail to retrain after the FLR. Stashed in
-  # globals for _post_flr_restore_target (same do_flr() call).
+  # and current negotiated speed/width so the post-FLR restore can ADAPT to
+  # the actual hardware (Gen4 slot/mobo vs Gen5 card) instead of blindly
+  # forcing Gen5. If the link is already running below its max (slower slot,
+  # signal integrity, or a Gen4 board), the restore keeps that proven gen
+  # rather than forcing a higher one that may fail to retrain after the FLR.
+  # Stashed in globals for _post_flr_restore_target (same do_flr() call).
   _FLR_DETECTED_CAP="$(_port_speed_gen "$_upstream" max_link_speed 2>/dev/null || true)"
   _FLR_DETECTED_CUR="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
-  jlog "$GUEST_GPU_BDF: pre-FLR Gen1 downtrain on upstream $_upstream (cap=Gen${_FLR_DETECTED_CAP:-?} cur=Gen${_FLR_DETECTED_CUR:-?})"
+  _FLR_DETECTED_WIDTH="$(_port_link_width "$_upstream" 2>/dev/null || true)"
+  jlog "$GUEST_GPU_BDF: pre-FLR Gen1 downtrain on upstream $_upstream ($_sku; cap=Gen${_FLR_DETECTED_CAP:-?} cur=Gen${_FLR_DETECTED_CUR:-?} width=x${_FLR_DETECTED_WIDTH:-?})"
 
-  # Read current LnkCtl2 (we will restore it after).
-  _ctl2="$(setpci -s "$_upstream" 88.w 2>/dev/null || true)"
+  # Read current LnkCtl2 (we will restore it after) via the defensive helper
+  # so whitespace/short-value formatting from setpci can't corrupt the slice.
+  _ctl2="$(_setpci_word "$_upstream" 88.w 2>/dev/null || true)"
   if [[ -z "$_ctl2" ]]; then
     jlog "$GUEST_GPU_BDF: pre-FLR downtrain aborted (could not read LnkCtl2 from $_upstream)"
     return 1
@@ -8427,18 +8539,21 @@ _pre_flr_gen1_downtrain() {
   _FLR_SAVED_TARGET="$(printf '%d' "0x${_ctl2:3:1}" 2>/dev/null)" || true
 
   # Save the upper 12 bits (preserve de-emphasis etc), set low nibble to 1 (Gen1).
-  # _ctl2 is like '0045' — keep bits 15:4, set bits 3:0 to 0001.
+  # _ctl2 is now a clean 4-hex-digit string like '0045' — keep bits 15:4, set
+  # bits 3:0 to 0001.
   local _saved_hi="${_ctl2:0:3}"  # first 3 hex digits = bits 15:4
   local _gen1_ctl2="${_saved_hi}1"
   setpci -s "$_upstream" 88.w="$_gen1_ctl2" 2>/dev/null || true
   jlog "$GUEST_GPU_BDF: LnkCtl2 set to $_gen1_ctl2 (was $_ctl2) — target Gen1"
   # Force a retrain so the link downtrains to Gen1 NOW (before the FLR).
-  _ctl="$(setpci -s "$_upstream" 68.w 2>/dev/null || true)"
-  setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+  _ctl="$(_setpci_word "$_upstream" 68.w 2>/dev/null || true)"
+  if [[ -n "$_ctl" ]]; then
+    setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+  fi
   jlog "$GUEST_GPU_BDF: forced link retrain at Gen1 (LnkCtl bit 5 set)"
   # Wait for the link to come back at Gen1 (poll LnkSta bit 13, up to 2s).
   for _i in $(seq 1 20); do
-    _sta="$(setpci -s "$_upstream" 6A.w 2>/dev/null || true)"
+    _sta="$(_setpci_word "$_upstream" 6A.w 2>/dev/null || true)"
     if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
       jlog "$GUEST_GPU_BDF: link active at Gen1 after $(( _i * 100 ))ms"
       return 0
@@ -8457,18 +8572,25 @@ _pre_flr_gen1_downtrain() {
 #   2. the port's detected capability (max_link_speed),
 #   3. the saved original LnkCtl2 low nibble (BIOS-configured target),
 #   4. Gen5 (last-resort default for the RX 9070 family on Gen5 boards).
-# After retraining, the negotiated speed is verified; if the link did NOT
-# reach the target (a hardware/signal-integrity problem), the target is
-# dropped one generation and retried once so the policy ADAPTS instead of
-# leaving the link degraded or failing the FLR. Gated to the RX 9070 family.
+# An optional operator cap (VFIO_REBOOT_FLR_MAX_GEN, 1..6) clamps the target
+# for boards that reliably retrain at a lower gen but not the card's full cap.
+# The restore then does a BOUNDED DESCENT: set LnkCtl2[3:0] = gen and retrain
+# from the target down to 1, accepting the highest gen the link actually
+# negotiates at. This generalizes the old one-step fallback: a Gen5 target
+# that only retrains at Gen4 will also try Gen3 if Gen4 also fails, etc.
+# Bounded (<= 6 iterations) so it can never loop forever, and Gen1 is
+# guaranteed (the pre-FLR downtrain proved the link works at Gen1). Link WIDTH
+# is logged too (x16->x8 degradation from a bad slot/cable is otherwise
+# invisible), and a GPU-endpoint alive-check catches a wedged GPU behind a live
+# link. Gated to the RX 9070 family.
 _post_flr_restore_target() {
-  local _upstream _ctl _sta _i _target _neg_gen _try _ctl2
+  local _upstream _ctl _sta _i _target _neg_gen _g _ctl2 _width _p _best _saved_hi
   _upstream="$(_gpu_upstream_port "$GUEST_GPU_BDF" 2>/dev/null || true)"
   [[ -n "$_upstream" ]] || return 1
   command -v setpci >/dev/null 2>&1 || return 1
   # Wait for the link to come back after the FLR (poll LnkSta bit 13, up to 5s).
   for _i in $(seq 1 50); do
-    _sta="$(setpci -s "$_upstream" 6A.w 2>/dev/null || true)"
+    _sta="$(_setpci_word "$_upstream" 6A.w 2>/dev/null || true)"
     if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
       jlog "$GUEST_GPU_BDF: link active after FLR (waited $(( _i * 100 ))ms)"
       break
@@ -8497,46 +8619,75 @@ _post_flr_restore_target() {
     _target=5
     jlog "$GUEST_GPU_BDF: no speed detection available; defaulting restore to Gen5"
   fi
+  # --- Optional operator cap: VFIO_REBOOT_FLR_MAX_GEN clamps the restore
+  # target for boards that reliably retrain at a lower gen but not the card's
+  # full capability (e.g. a Gen5 card in a board that only retrains Gen4 after
+  # an FLR). Empty/invalid = no cap.
+  local _max="${VFIO_REBOOT_FLR_MAX_GEN:-}"
+  if [[ -n "$_max" ]] && (( _max >= 1 && _max <= 6 )) 2>/dev/null; then
+    if (( _target > _max )) 2>/dev/null; then
+      jlog "$GUEST_GPU_BDF: VFIO_REBOOT_FLR_MAX_GEN=$_max clamps restore target from Gen$_target to Gen$_max"
+      _target="$_max"
+    fi
+  fi
   # Clamp to a sane PCIe generation range (defensive).
   if ! (( _target >= 1 && _target <= 6 )) 2>/dev/null; then
     jlog "$GUEST_GPU_BDF: detected target '$_target' out of range; defaulting to Gen5"
     _target=5
   fi
-  # Set LnkCtl2[3:0] = target and retrain, with one adaptive fallback step.
-  for _try in 1 2; do
-    _ctl2="$(setpci -s "$_upstream" 88.w 2>/dev/null || true)"
+  # --- Bounded descent: set LnkCtl2[3:0] = gen and retrain from _target down
+  # to 1, accepting the highest gen the link actually negotiates at. This
+  # generalizes the old one-step fallback: a Gen5 target that only retrains at
+  # Gen4 will also try Gen3 if Gen4 also fails, etc. Bounded by the gen range
+  # (<= 6 iterations) so it can never loop forever, and Gen1 is guaranteed
+  # (the pre-FLR downtrain proved the link works at Gen1).
+  _best=0
+  for (( _g = _target; _g >= 1; _g-- )); do
+    _ctl2="$(_setpci_word "$_upstream" 88.w 2>/dev/null || true)"
     if [[ -n "$_ctl2" ]]; then
-      local _saved_hi="${_ctl2:0:3}"
-      setpci -s "$_upstream" 88.w="${_saved_hi}$(printf '%x' "$_target")" 2>/dev/null || true
-      jlog "$GUEST_GPU_BDF: LnkCtl2 target set to Gen$_target (${_saved_hi}$(printf '%x' "$_target"))"
+      _saved_hi="${_ctl2:0:3}"
+      setpci -s "$_upstream" 88.w="${_saved_hi}$(printf '%x' "$_g")" 2>/dev/null || true
+      jlog "$GUEST_GPU_BDF: LnkCtl2 target set to Gen$_g (${_saved_hi}$(printf '%x' "$_g"))"
     fi
-    _ctl="$(setpci -s "$_upstream" 68.w 2>/dev/null || true)"
-    setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
-    jlog "$GUEST_GPU_BDF: forced link retrain to Gen$_target (attempt $_try/2)"
-    # Give the link a moment to re-negotiate up from Gen1.
-    sleep 0.2
-    _neg_gen="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
+    _ctl="$(_setpci_word "$_upstream" 68.w 2>/dev/null || true)"
+    if [[ -n "$_ctl" ]]; then
+      setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+    fi
+    jlog "$GUEST_GPU_BDF: forced link retrain to Gen$_g"
+    # Poll for the link to re-negotiate at this gen (up to ~0.6s).
+    _neg_gen=""
+    for _p in $(seq 1 6); do
+      sleep 0.1
+      _neg_gen="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
+      if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _g )) 2>/dev/null; then
+        break
+      fi
+    done
+    _width="$(_port_link_width "$_upstream" 2>/dev/null || true)"
     if [[ -n "$_neg_gen" ]]; then
-      jlog "$GUEST_GPU_BDF: link negotiated at Gen$_neg_gen (target Gen$_target)"
+      jlog "$GUEST_GPU_BDF: link negotiated at Gen$_neg_gen x${_width:-?} (target Gen$_g)"
     fi
-    if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _target )) 2>/dev/null; then
-      jlog "$GUEST_GPU_BDF: restore OK — link back at Gen$_neg_gen"
-      return 0
+    if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _g )) 2>/dev/null; then
+      _best="$_neg_gen"
+      jlog "$GUEST_GPU_BDF: restore OK — link back at Gen$_neg_gen x${_width:-?}"
+      break
     fi
-    # Hardware problem: link did not reach the target. Adapt: drop one gen and
-    # retry once (e.g. Gen5 target but the link only comes back at Gen4 -> accept
-    # Gen4). Bounded so we never loop forever.
-    if (( _try == 1 && _target > 1 )) 2>/dev/null; then
-      _target=$((_target - 1))
-      jlog "$GUEST_GPU_BDF: WARN link below target (got Gen${_neg_gen:-?}); adapting to Gen$_target and retrying"
-      continue
+    if (( _g > 1 )); then
+      jlog "$GUEST_GPU_BDF: WARN link below Gen$_g (got Gen${_neg_gen:-?}); descending to Gen$((_g - 1))"
     fi
   done
-  # Could not reach the original target even after the fallback. The link IS up
-  # (the Gen1 downtrain guaranteed that) but running degraded — log a
-  # hardware-problem diagnostic so the operator can investigate (slot/signal/
-  # cabling), but do NOT fail the FLR (the display-wedge clear already succeeded).
-  jlog "$GUEST_GPU_BDF: WARN link restore settled at Gen${_neg_gen:-?} (wanted >= Gen${_FLR_DETECTED_CAP:-$_target}); possible hardware/signal-integrity issue — link up but degraded"
+  # Final diagnostics (with width) so a degraded link is easy to spot.
+  if (( _best == 0 )) 2>/dev/null; then
+    jlog "$GUEST_GPU_BDF: WARN link restore did not settle at any gen >= 1 (cap=Gen${_FLR_DETECTED_CAP:-?}, pre=Gen${_FLR_DETECTED_CUR:-?} x${_FLR_DETECTED_WIDTH:-?}); possible hardware/signal-integrity issue"
+  elif (( _best < _target )) 2>/dev/null; then
+    jlog "$GUEST_GPU_BDF: WARN link restore settled at Gen$_best x${_width:-?} (wanted Gen$_target, cap=Gen${_FLR_DETECTED_CAP:-?}); possible hardware/signal-integrity issue — link up but degraded"
+  fi
+  # GPU-endpoint alive-check: the LINK may be back at a good gen while the GPU
+  # itself is still wedged. Catch that (non-fatal; the display-wedge clear
+  # already happened, but a host reboot may be needed).
+  if ! _gpu_alive; then
+    jlog "$GUEST_GPU_BDF: WARN GPU endpoint not alive after FLR restore (vendor=0xffff or config all-ff); link may be up but the GPU is still wedged — a host reboot may be needed"
+  fi
   return 0
 }
 
@@ -8555,8 +8706,10 @@ do_flr() {
   # Reset the hardware-detection stash so a previous run can't leak in.
   _FLR_DETECTED_CAP=""
   _FLR_DETECTED_CUR=""
+  _FLR_DETECTED_WIDTH=""
   _FLR_SAVED_CTL2=""
   _FLR_SAVED_TARGET=""
+  _FLR_SKU_NAME=""
   # RX 9070 family only: pre-FLR Gen1 downtrain for a reliable post-FLR retrain.
   if _is_rx9070; then
     _pre_flr_gen1_downtrain

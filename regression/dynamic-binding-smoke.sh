@@ -1227,6 +1227,40 @@ _speed_to_gen() {
     16|16.0) echo 4 ;; 32|32.0) echo 5 ;; 64|64.0) echo 6 ;; *) return 1 ;;
   esac
 }
+# Defensive setpci-word cleanup (mirrors _setpci_word trim+validate+pad+lower).
+_clean_hex() {
+  local _v="${1:-}"
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  [[ "$_v" =~ ^[0-9a-fA-F]+$ ]] || return 1
+  while (( ${#_v} < 4 )); do _v="0$_v"; done
+  printf '%s' "${_v,,}"
+}
+# SKU resolver mirroring _rx9070_sku_name (reads $SYSROOT/$GUEST_GPU_BDF/revision).
+_rx9070_sku_name() {
+  local _sys="$SYSROOT/$GUEST_GPU_BDF" _rev _r
+  [[ -r "$_sys/revision" ]] || return 1
+  _rev="$(cat "$_sys/revision" 2>/dev/null || true)"
+  [[ -n "$_rev" ]] || return 1
+  _r="$(printf '%s' "$_rev" | tr -d '[:space:]' | sed 's/^0x//' | tr 'A-F' 'a-f')"
+  case "$_r" in
+    c0) echo "RX 9070 XT" ;;
+    c2) echo "RX 9070 GRE" ;;
+    c3) echo "RX 9070" ;;
+    *) echo "RX 9070 family (unknown SKU, rev 0x${_r:-?})" ;;
+  esac
+  return 0
+}
+# Link width mirroring _port_link_width.
+_port_link_width() {
+  local _bdf="$1" _f _v
+  _f="$SYSROOT/$_bdf/current_link_width"
+  [[ -r "$_f" ]] || return 1
+  _v="$(cat "$_f" 2>/dev/null || true)"
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  echo "$_v"
+}
 # Adaptive target selection mirroring _post_flr_restore_target priority:
 # cap+cur(cur<cap)->cur ; cap+cur(cur>=cap)->cap ; cap only->cap ; sav->sav ; none->5.
 _pick_target() {
@@ -1236,6 +1270,22 @@ _pick_target() {
   elif [[ -n "$_cap" ]]; then echo "$_cap"
   elif [[ -n "$_sav" ]]; then echo "$_sav"
   else echo 5; fi
+}
+# MAX_GEN clamp mirroring _post_flr_restore_target's operator-cap step.
+_clamp_target() {
+  local _t="$1" _m="${2:-}"
+  if [[ -n "$_m" ]] && (( _m >= 1 && _m <= 6 )) 2>/dev/null; then
+    if (( _t > _m )) 2>/dev/null; then echo "$_m"; else echo "$_t"; fi
+  else echo "$_t"; fi
+}
+# Bounded descent: highest gen the link reaches, trying target..1. $1=target, $2=hw max.
+# Mirrors the for((g=target..1)) loop; demonstrates multi-step drop (Gen5->Gen3).
+_descent_best() {
+  local _t="$1" _hw="$2" _g
+  for (( _g = _t; _g >= 1; _g-- )); do
+    if (( _hw >= _g )) 2>/dev/null; then echo "$_g"; return 0; fi
+  done
+  echo 0
 }
 if _is_rx9070; then echo "IS_RX9070=YES"; else echo "IS_RX9070=NO"; fi
 # LnkCtl2 Gen1 value construction (preserves upper 12 bits, low nibble 1).
@@ -1250,8 +1300,24 @@ echo "T_GEN4=$(_pick_target 4 4)"
 echo "T_DEGRADED=$(_pick_target 5 4)"
 echo "T_SAVONLY=$(_pick_target "" "" 5)"
 echo "T_NONE=$(_pick_target "" "" "")"
+# MAX_GEN clamp + bounded descent (incl. multi-step Gen5->Gen3 drop).
+echo "CLAMP_5_4=$(_clamp_target 5 4)"
+echo "CLAMP_5_NONE=$(_clamp_target 5)"
+echo "DESC_5_5=$(_descent_best 5 5)"
+echo "DESC_5_4=$(_descent_best 5 4)"
+echo "DESC_5_3=$(_descent_best 5 3)"
+echo "DESC_4_4=$(_descent_best 4 4)"
+# Defensive setpci-word cleanup (trim whitespace + left-pad to 4 hex digits).
+echo "CLEAN45=$(_clean_hex "  45 " || echo BAD)"
+echo "CLEAN5=$(_clean_hex "5" || echo BAD)"
+# Link width + SKU (read from mock sysfs: revision + current_link_width files).
+echo "W16=$(_port_link_width "$GUEST_GPU_BDF" 2>/dev/null || echo NONE)"
+echo "SKU=$(_rx9070_sku_name 2>/dev/null || echo NONE)"
 QTEOF
-# Case 1: RX 9070 family config -> IS_RX9070=YES + Gen1 value + speed parse + adaptive targets
+# Case 1: RX 9070 base (rev c3) -> gate + Gen1 + speed + adaptive targets + bounded
+# descent + MAX_GEN clamp + defensive clean + width + SKU. Mock sysfs revision + width.
+printf '0xc3' > "$qfake4/0000:0e:00.0/revision"
+printf '16' > "$qfake4/0000:0e:00.0/current_link_width"
 r1="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
 if echo "$r1" | grep -Fq 'IS_RX9070=YES' \
   && echo "$r1" | grep -Fq 'GEN1=0041' \
@@ -1262,16 +1328,38 @@ if echo "$r1" | grep -Fq 'IS_RX9070=YES' \
   && echo "$r1" | grep -Fq 'T_GEN4=4' \
   && echo "$r1" | grep -Fq 'T_DEGRADED=4' \
   && echo "$r1" | grep -Fq 'T_SAVONLY=5' \
-  && echo "$r1" | grep -Fq 'T_NONE=5'; then
-  ok "Q3t RX 9070 family detected + Gen1=0041 + speed parse + adaptive Gen4/Gen5/degraded targets"
+  && echo "$r1" | grep -Fq 'T_NONE=5' \
+  && echo "$r1" | grep -Fq 'CLAMP_5_4=4' \
+  && echo "$r1" | grep -Fq 'CLAMP_5_NONE=5' \
+  && echo "$r1" | grep -Fq 'DESC_5_5=5' \
+  && echo "$r1" | grep -Fq 'DESC_5_4=4' \
+  && echo "$r1" | grep -Fq 'DESC_5_3=3' \
+  && echo "$r1" | grep -Fq 'DESC_4_4=4' \
+  && echo "$r1" | grep -Fq 'CLEAN45=0045' \
+  && echo "$r1" | grep -Fq 'CLEAN5=0005' \
+  && echo "$r1" | grep -Fq 'W16=16' \
+  && echo "$r1" | grep -xFq 'SKU=RX 9070'; then
+  ok "Q3t 9070 base (rev c3): gate + speed + adaptive targets + bounded descent + MAX_GEN clamp + clean + width + SKU"
 else
-  bad "Q3t RX 9070 gate/speed/adaptive targets wrong (got: $r1)"
+  bad "Q3t case 1 wrong (got: $r1)"
 fi
+# Case 1b: rev c0 -> RX 9070 XT (exact-line match so 'RX 9070' base doesn't false-match).
+printf '0xc0' > "$qfake4/0000:0e:00.0/revision"
+rb="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
+if echo "$rb" | grep -xFq 'SKU=RX 9070 XT'; then ok "Q3t rev c0 -> RX 9070 XT"; else bad "Q3t rev c0 SKU wrong (got: $rb)"; fi
+# Case 1c: rev c2 -> RX 9070 GRE
+printf '0xc2' > "$qfake4/0000:0e:00.0/revision"
+rc="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
+if echo "$rc" | grep -xFq 'SKU=RX 9070 GRE'; then ok "Q3t rev c2 -> RX 9070 GRE"; else bad "Q3t rev c2 SKU wrong (got: $rc)"; fi
+# Case 1d: rev c9 -> unknown SKU (heuristic fallback)
+printf '0xc9' > "$qfake4/0000:0e:00.0/revision"
+rd="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
+if echo "$rd" | grep -Fq 'SKU=RX 9070 family (unknown SKU, rev 0xc9)'; then ok "Q3t rev c9 -> unknown SKU fallback"; else bad "Q3t rev c9 SKU wrong (got: $rd)"; fi
 # Case 2: non-RX 9070 config (NVIDIA 10de) -> IS_RX9070=NO
 printf '\xde\x10\x00\x00' > "$qfake4/0000:0e:00.0/config"
 r2="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
 if echo "$r2" | grep -Fq 'IS_RX9070=NO'; then ok "Q3t non-RX 9070 (NVIDIA) -> gate skips"; else bad "Q3t non-RX 9070 case failed (got: $r2)"; fi
-# Case 3 (static): vfio.sh defines gate + downtrain + adaptive restore + speed helpers
+# Case 3 (static): vfio.sh defines gate + downtrain + adaptive restore + all new helpers.
 _reboot_block="$(sed -n '/write_file_atomic "$REBOOT_FLR_SCRIPT" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
 if echo "$_reboot_block" | grep -Fq '_is_rx9070()' \
   && echo "$_reboot_block" | grep -Fq '_gpu_upstream_port()' \
@@ -1279,21 +1367,49 @@ if echo "$_reboot_block" | grep -Fq '_is_rx9070()' \
   && echo "$_reboot_block" | grep -Fq '_post_flr_restore_target()' \
   && echo "$_reboot_block" | grep -Fq '_speed_to_gen()' \
   && echo "$_reboot_block" | grep -Fq '_port_speed_gen()' \
+  && echo "$_reboot_block" | grep -Fq '_setpci_word()' \
+  && echo "$_reboot_block" | grep -Fq '_port_link_width()' \
+  && echo "$_reboot_block" | grep -Fq '_gpu_alive()' \
+  && echo "$_reboot_block" | grep -Fq '_rx9070_sku_name()' \
   && echo "$_reboot_block" | grep -Fq 'max_link_speed' \
   && echo "$_reboot_block" | grep -Fq 'current_link_speed' \
+  && echo "$_reboot_block" | grep -Fq 'current_link_width' \
+  && echo "$_reboot_block" | grep -Fq 'VFIO_REBOOT_FLR_MAX_GEN' \
+  && echo "$_reboot_block" | grep -Fq 'for (( _g = _target; _g >= 1; _g-- ))' \
+  && echo "$_reboot_block" | grep -Fq 'descending to Gen' \
   && echo "$_reboot_block" | grep -Fq '88.w' \
   && echo "$_reboot_block" | grep -Fq '6A.w' \
   && echo "$_reboot_block" | grep -Fq '0x2000' \
   && echo "$_reboot_block" | grep -Fq '7550'; then
-  ok "Q3t vfio.sh defines gate + downtrain + adaptive restore + speed helpers + setpci writes"
+  ok "Q3t vfio.sh defines gate + downtrain + adaptive restore + helpers (sku/setpci_word/width/alive) + MAX_GEN + bounded descent"
 else
-  bad "Q3t vfio.sh missing gate/downtrain/adaptive-restore/speed definitions"
+  bad "Q3t vfio.sh missing gate/downtrain/adaptive-restore/helper definitions"
 fi
-# Case 4 (static): the old hardcoded Gen5-only restore name must be gone.
+# Case 4 (static): old Gen5-only restore name AND one-step retry loop must be gone.
 if echo "$_reboot_block" | grep -Fq '_post_flr_restore_gen5'; then
   bad "Q3t old _post_flr_restore_gen5 name still present in vfio.sh"
 else
   ok "Q3t old Gen5-only restore name removed from vfio.sh"
+fi
+if echo "$_reboot_block" | grep -Fq 'for _try in 1 2'; then
+  bad "Q3t old one-step retry loop still present in vfio.sh"
+else
+  ok "Q3t old one-step retry loop removed from vfio.sh"
+fi
+# Case 5 (static): write_conf persists the VFIO_REBOOT_FLR_MAX_GEN default (empty).
+if grep -Fq 'VFIO_REBOOT_FLR_MAX_GEN=""' "$VFIO_SCRIPT"; then
+  ok "Q3t write_conf persists VFIO_REBOOT_FLR_MAX_GEN default"
+else
+  bad "Q3t write_conf missing VFIO_REBOOT_FLR_MAX_GEN default"
+fi
+# Case 6 (static): installer warns when setpci is missing + names the pciutils command.
+_inst_flr_fn="$(sed -n '/^install_reboot_flr_monitor()/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_inst_flr_fn" | grep -Fq 'have_cmd setpci' \
+  && echo "$_inst_flr_fn" | grep -Fq 'zypper in pciutils' \
+  && echo "$_inst_flr_fn" | grep -Fq 'adaptive PCIe link restore will be SKIPPED'; then
+  ok "Q3t installer warns on missing setpci + names openSUSE pciutils command"
+else
+  bad "Q3t installer missing setpci/pciutils notice"
 fi
 
 # --- Smoke Q3u: install_hypervisor_hiding (AMD driver install fix) ---

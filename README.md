@@ -17,6 +17,7 @@
 ## Quick links
 
 - [What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning](#whats-new--rx-9070--rdna4-dynamic-binding--wayland-render-device-pinning)
+- [Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card)
 - [Why this matters for newer AMD cards](#why-this-matters-for-newer-amd-cards)
 - [The two-mode choice (early vs dynamic)](#the-two-mode-choice-early-vs-dynamic)
 - [How the host desktop stays alive (3 defenses)](#how-the-host-desktop-stays-alive-3-defenses)
@@ -43,7 +44,95 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 
 ## What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning
 
-vfio 6.0 adds reliable passthrough for **RDNA4 / RX 9070** and other cards that hit the `Unknown PCI header type 127` reset bug, plus automatic Wayland render-device pinning so your host desktop no longer crashes when the VM starts. No BIOS visit required on a dual-GPU setup.
+vfio 6.0 adds reliable passthrough for **RDNA4 / RX 9070** and other cards that hit the `Unknown PCI header type 127` reset bug, plus automatic Wayland render-device pinning so your host desktop no longer crashes when the VM starts. No BIOS visit required on a dual-GPU setup. It also keeps the RX 9070 alive through a guest **soft reboot** and a rapid **stop/start** — two of the hardest remaining RDNA4 passthrough problems — via a reboot-FLR monitor, a Gen1-downtrain + adaptive PCIe link restore, and a three-layer zombie-card recovery; see [Keeping the RX 9070 alive](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card) below.
+
+### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
+
+The hardest remaining RX 9070 / RDNA4 passthrough problems are **not** the first bind — they are what happens *after* the VM is running: the guest warm-reboot display wedge, the post-FLR Gen5 link that won't come back, and the card that dies into "zombie mode" on a rapid stop/start. vfio 6.0 has a concrete, working mitigation for each. This is the part that makes the script more than a general VFIO helper.
+
+**1. Soft reboot keeps the card alive (reboot-FLR monitor).** With `on_reboot=restart` (warm reboot), qemu never releases the vfio device, so the PCIe link stays up and the card survives — but the GPU's display engine wedges in the old guest's framebuffer and OVMF cannot re-POST (frozen screen). A systemd service (`vfio-reboot-flr.service`, installed by `--install-dynamic-binding`) watches libvirt for guest reboot lifecycle events and does a soft function-level reset (`echo 1 > /sys/.../reset`) on the guest GPU to clear the display wedge **without dropping the PCIe link**, so OVMF re-POSTs and the guest reboots cleanly — no host reboot needed. Gated to the RX 9070 family (vendor `1002`, device `7550` — the RX 9070, 9070 XT, and 9070 GRE all share that ID).
+
+**2. Gen1-downtrain + adaptive link restore (the technique that makes the FLR reliable).** A bare FLR on the RX 9070 family drops the link and the on-card PCIe switch fails to retrain it at Gen5. The fix, verified on ASUS TUF X570-PLUS + RX 9070:
+  - **before** the FLR: force the upstream switch port's target link speed to **Gen1** (`LnkCtl2` low nibble = 1) and retrain, so the link downtrains to Gen1 immediately — Gen1 retrains fast and always succeeds;
+  - **after** the FLR: adaptively restore the link to the hardware's **actual** max — Gen5 on Gen5 boards, Gen4 on slower slots — instead of blindly forcing Gen5.
+  The restore reads the upstream port's sysfs `max_link_speed` / `current_link_speed`, keeps a proven slower gen when the link was already running below cap (slower slot / signal integrity / Gen4 board), and does a **bounded descent** (Gen5 → Gen4 → … → Gen1) accepting the highest gen the link actually negotiates at — so a board that only retrains Gen4 after an FLR settles at Gen4 instead of failing. Link **width** is logged too (an x16→x8 degradation from a bad slot/cable is otherwise invisible), a GPU-endpoint alive-check catches a wedged GPU behind a live link, the SKU (9070 / 9070 XT / 9070 GRE, told apart by PCI revision) is named in the log, and an optional `VFIO_REBOOT_FLR_MAX_GEN` cap (1–6) lets you pin the restore to a lower gen on boards that never retrain the card's full cap.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as Guest OS
+    participant Q as qemu + vfio-pci
+    participant M as vfio-reboot-flr monitor
+    participant U as upstream PCIe switch port
+    participant C as RX 9070 (Navi 48)
+
+    Note over G,C: VM running, GPU passed through, PCIe link up at Gen5.
+    G->>Q: guest warm reboot (on_reboot=restart)
+    Note over Q: qemu never releases the vfio device — link stays up, card survives.
+    Q->>M: libvirt lifecycle Rebooted event
+    M->>M: domain_has_gpu? yes → apply soft FLR
+    Note over M,U: Pre-FLR Gen1 downtrain (RX 9070 family only)
+    M->>U: read max/current link speed + width (sysfs)
+    M->>U: set LnkCtl2 target = Gen1, retrain
+    U->>C: link downtrains to Gen1 (fast, reliable)
+    M->>C: echo 1 > /sys/.../reset (soft FLR, clears display wedge)
+    Note over M,U: Post-FLR adaptive link restore
+    M->>U: pick target = cap, or current if below cap (slower slot)
+    M->>M: optional VFIO_REBOOT_FLR_MAX_GEN cap
+    loop bounded descent Gen5 → Gen1
+        M->>U: set LnkCtl2 target = GenN, retrain
+        U->>C: link retrains
+        M->>U: read current_link_speed + width
+        alt negotiated >= GenN
+            M->>M: accept highest stable gen, break
+        else below target
+            M->>M: drop one gen, retry
+        end
+    end
+    M->>C: _gpu_alive? vendor + config not all-ff
+    Note over G: OVMF re-POSTs on a live GPU — guest reboots, no host reboot.
+```
+
+**3. Zombie mode after stop/reboot, solved in practice.** A rapid VM stop/start (or a stop → reboot) can drop the RX 9070 off the PCI bus on the D3cold exit — the card looks "alive" per the cached vfio-pci driver symlink but its config space reads all `0xff`, and qemu crashes with `Unknown PCI header type 127`. vfio 6.0 handles this at three layers instead of letting qemu crash:
+  - **release-time zombie recovery**: on VM stop (`--release`), if the card is already dead, attempt a `remove` + PCI `rescan` immediately while it is in a fresher state (a healthy card is never touched, so the parked-on-vfio-pci invariant is preserved);
+  - **cooldown readiness probe**: on the next VM start within `VFIO_DYNAMIC_COOLDOWN_SECONDS` (default 10s), actively poll the card's liveness (`vendor` sysfs + live config space) until it recovers or the window expires — a card that recovers early proceeds immediately, a card still dead after the window fails with an actionable "card needs a host reboot" message;
+  - **alive-check + clean abort**: before reporting bind success, read `vendor` sysfs + live config space (rejecting `0xffff` / all-`0xff`); a dead card gets one PCI reset + remove/rescan attempt, and if still dead the VM start is aborted cleanly so libvirt never hands qemu a dead card (the success log says `bound to vfio-pci (verified, alive)`).
+
+```mermaid
+flowchart TD
+    Stop([VM stop --release]) --> Dead{card alive?<br/>vendor + config space}
+    Dead -- yes --> Park([leave on vfio-pci<br/>record stop timestamp])
+    Dead -- no --> RR[remove + PCI rescan<br/>release-time zombie recovery]
+    RR --> Back{reappeared + alive?}
+    Back -- yes --> Park
+    Back -- no --> WaitDead([next bind-now reports<br/>host reboot needed])
+    Start([VM start --bind-now]) --> Cool{within cooldown<br/>VFIO_DYNAMIC_COOLDOWN_SECONDS?}
+    Cool -- no --> Bind([proceed to bind])
+    Cool -- yes --> Probe[actively poll liveness<br/>until alive or window expires]
+    Probe --> AliveNow{alive?}
+    AliveNow -- yes --> Bind
+    AliveNow -- no --> Abort1([abort VM start cleanly<br/>card needs a host reboot])
+    Bind --> Already{already on vfio-pci?}
+    Already -- no --> DoBind[unbind amdgpu, bind vfio-pci]
+    Already -- yes --> Alive2{alive?<br/>alive-check}
+    Alive2 -- yes --> OK([bound, verified alive])
+    Alive2 -- no --> Reset[PCI FLR + remove/rescan]
+    Reset --> Alive3{alive?}
+    Alive3 -- yes --> OK
+    Alive3 -- no --> Abort2([abort VM start cleanly<br/>Unknown PCI header type 127])
+    DoBind --> OK
+
+    classDef ok fill:#2d6a4f,stroke:#1b4332,color:#fff
+    classDef bad fill:#9d0208,stroke:#6a040f,color:#fff
+    classDef check fill:#003566,stroke:#001233,color:#fff
+    classDef neutral fill:#3a3a3a,stroke:#111,color:#fff
+    class Park,OK,Bind,DoBind ok
+    class WaitDead,Abort1,Abort2 bad
+    class Dead,Back,Cool,AliveNow,Alive2,Alive3,Probe,Reset,RR check
+    class Stop,Start,Already neutral
+```
+
+These three mitigations run automatically once `--install-dynamic-binding` is in place — no per-reboot manual steps. Follow them live with `journalctl -t vfio-reboot-flr -f` (reboot-FLR monitor) and `journalctl -t vfio-dynamic -f` (bind/release + zombie recovery).
 
 ### Why this matters for newer AMD cards
 

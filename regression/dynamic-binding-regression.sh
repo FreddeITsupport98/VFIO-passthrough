@@ -1192,6 +1192,59 @@ assert_contains_text \
   'not RX 9070, skipping pre-FLR Gen1 downtrain' \
   "$_reboot_block"
 
+# --- Functional Q3u: install_hypervisor_hiding (AMD driver install fix) ---
+# The AMD Windows driver detects the hypervisor (CPUID leaves + Hyper-V vendor
+# ID) and refuses to install the real display driver — card shows as Microsoft
+# Basic Display Adapter + unknown PCI devices. install_hypervisor_hiding()
+# automatically adds vendor_id=random, hidden state=on, kvm hidden to the XML
+# of shut-off VMs that have the guest GPU. Gated to AMD guest GPUs.
+assert_contains_file \
+  "Q3u install_hypervisor_hiding function defined" \
+  'install_hypervisor_hiding()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper gates on AMD vendor 1002" \
+  '"${_vendor,,}" != "1002"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper uses virsh dumpxml + define" \
+  'virsh -c qemu:///system define' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper adds vendor_id=random" \
+  "vendor_id state='on' value='random'" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper adds hidden state=on" \
+  "<hidden state='on'/>" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper adds kvm hidden" \
+  '<kvm>' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper checks VM state (shut off only)" \
+  'domstate' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper is idempotent (skips already-hidden)" \
+  'already has hypervisor hiding' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3u helper validates XML before define" \
+  'virt-xml-validate' \
+  "$VFIO_SCRIPT"
+# install-dynamic-binding must call install_hypervisor_hiding
+assert_contains_text \
+  "Q3u install-dynamic-binding calls install_hypervisor_hiding" \
+  'install_hypervisor_hiding' \
+  "$_dyn_fn"
+# The 'What this will do' note must document step 8
+assert_contains_text \
+  "Q3u dynamic note documents step 8 hypervisor hiding" \
+  'Hide the hypervisor on shut-off VMs' \
+  "$_dyn_fn"
+
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \
   "Q3j hook has dedicated log file" \

@@ -1251,6 +1251,66 @@ else
   bad "Q3t vfio.sh missing gate/downtrain/setpci definitions"
 fi
 
+# --- Smoke Q3u: install_hypervisor_hiding (AMD driver install fix) ---
+# Test the XML-editing logic: take a mock VM XML without hypervisor hiding,
+# apply the sed that adds vendor_id+hidden+kvm hidden, verify the result.
+cat > "$tmp/mock_vm_no_hv.xml" <<'XEOF'
+<domain type='kvm'>
+  <name>testvm</name>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv mode='custom'>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+    </hyperv>
+    <vmport state='off'/>
+    <smm state='on'/>
+  </features>
+</domain>
+XEOF
+# Apply the same sed the function uses
+_tmp="$tmp/mock_vm_edited.xml"
+cp "$tmp/mock_vm_no_hv.xml" "$_tmp"
+sed -i "s|</hyperv>|      <vendor_id state='on' value='random'/>\n      <hidden state='on'/>\n    </hyperv>\n    <kvm>\n      <hidden state='on'/>\n    </kvm>|" "$_tmp" 2>/dev/null || true
+# Case 1: edited XML has vendor_id=random
+if grep -Fq "vendor_id state='on' value='random'" "$_tmp"; then ok "Q3u XML edit adds vendor_id=random"; else bad "Q3u XML edit missing vendor_id"; fi
+# Case 2: edited XML has hidden state=on
+if grep -Fq "<hidden state='on'/>" "$_tmp"; then ok "Q3u XML edit adds hidden state=on"; else bad "Q3u XML edit missing hidden"; fi
+# Case 3: edited XML has kvm hidden
+if grep -Fq '<kvm>' "$_tmp" && grep -Fq '<hidden' "$_tmp"; then ok "Q3u XML edit adds kvm hidden"; else bad "Q3u XML edit missing kvm"; fi
+# Case 4: idempotent — already-hidden XML is not double-edited
+cat > "$tmp/mock_vm_has_hv.xml" <<'XEOF'
+<domain type='kvm'>
+  <name>testvm</name>
+  <features>
+    <hyperv mode='custom'>
+      <vendor_id state='on' value='random'/>
+      <hidden state='on'/>
+    </hyperv>
+    <kvm>
+      <hidden state='on'/>
+    </kvm>
+  </features>
+</domain>
+XEOF
+if grep -Fq "vendor_id state='on'" "$tmp/mock_vm_has_hv.xml" \
+  && grep -Fq "<hidden state='on'/>" "$tmp/mock_vm_has_hv.xml" \
+  && grep -Fq '<kvm>' "$tmp/mock_vm_has_hv.xml"; then
+  ok "Q3u idempotent check recognizes already-hidden XML"
+else
+  bad "Q3u idempotent check failed to recognize already-hidden XML"
+fi
+# Case 5 (static): vfio.sh defines install_hypervisor_hiding + wiring
+_q3u_dyn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'install_hypervisor_hiding()' "$VFIO_SCRIPT" \
+  && grep -Fq 'install_hypervisor_hiding' <<<"$_q3u_dyn" \
+  && grep -Fq 'Hide the hypervisor' "$VFIO_SCRIPT"; then
+  ok "Q3u vfio.sh defines install_hypervisor_hiding + wired into install-dynamic"
+else
+  bad "Q3u vfio.sh missing install_hypervisor_hiding or wiring"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

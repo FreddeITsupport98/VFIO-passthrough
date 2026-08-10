@@ -9184,6 +9184,9 @@ install_stealth_vm_tuning() {
 import sys, xml.etree.ElementTree as ET, os, uuid, secrets, string
 QEMU_NS = 'http://libvirt.org/schemas/domain/qemu/1.0'
 ET.register_namespace('qemu', QEMU_NS)
+# Register the libosinfo namespace so ElementTree preserves the 'libosinfo:'
+# prefix instead of rewriting it to 'ns0:' — libvirt rejects 'ns0:' on define.
+ET.register_namespace('libosinfo', 'http://libosinfo.org/xmlns/libvirt/domain/1.0')
 path = sys.argv[1]
 tree = ET.parse(path); root = tree.getroot()
 # NOTE: do NOT root.set('xmlns:qemu', QEMU_NS) — ET.register_namespace above
@@ -9297,6 +9300,17 @@ for t in clock.findall('timer'):
     if t.get('name') == 'hypervclock': ht = t; break
 if ht is None: ht = ET.SubElement(clock, 'timer', {'name': 'hypervclock'})
 if ht.get('present') != 'no': ht.set('present', 'no'); changed = True
+# Disable hyperv enlightenment features that REQUIRE hypervclock — libvirt
+# rejects the XML if these are 'on' while hypervclock is 'no' (e.g. "'stimer'
+# hyperv feature requires 'hypervclock' timer"). These are deep hyperv
+# features (synthetic interrupts / virtual processor index) that a real
+# desktop PC wouldn't have anyway, so disabling them is consistent with stealth.
+for _hv_feat in ('synic', 'stimer', 'vpindex', 'runtime', 'tlbflush', 'ipi', 'avic'):
+    _fv = None
+    for ch in hyperv:
+        if ch.tag == _hv_feat: _fv = ch; break
+    if _fv is not None and _fv.get('state') != 'off':
+        _fv.set('state', 'off'); changed = True
 tsc = None
 for t in clock.findall('timer'):
     if t.get('name') == 'tsc': tsc = t; break
@@ -9394,8 +9408,17 @@ PYEOF
       rm -f "$_tmp"
       continue
     fi
+    local _define_rc=0
     if (( ! DRY_RUN )); then
-      virsh -c qemu:///system define "$_tmp" 2>/dev/null
+      local _define_err
+      _define_err="$(virsh -c qemu:///system define "$_tmp" 2>&1 >/dev/null)" || _define_rc=$?
+    fi
+    if (( _define_rc != 0 )); then
+      note "ERROR: virsh define failed for '$_dom' (exit $_define_rc): $_define_err"
+      note "The tuned XML is in $_tmp; backup at $_backup_xml. You can define it manually:"
+      note "  virsh -c qemu:///system define $_tmp"
+      rm -f "$_tmp"
+      continue
     fi
     say
     if (( ENABLE_COLOR )); then

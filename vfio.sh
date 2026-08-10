@@ -9305,7 +9305,7 @@ if ht.get('present') != 'no': ht.set('present', 'no'); changed = True
 # hyperv feature requires 'hypervclock' timer"). These are deep hyperv
 # features (synthetic interrupts / virtual processor index) that a real
 # desktop PC wouldn't have anyway, so disabling them is consistent with stealth.
-for _hv_feat in ('synic', 'stimer', 'vpindex', 'runtime', 'tlbflush', 'ipi', 'avic'):
+for _hv_feat in ('synic', 'stimer', 'vpindex', 'runtime', 'frequencies', 'tlbflush', 'ipi', 'avic'):
     _fv = None
     for ch in hyperv:
         if ch.tag == _hv_feat: _fv = ch; break

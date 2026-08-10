@@ -9174,10 +9174,10 @@ install_stealth_vm_tuning() {
     _tmp="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp"
     _backup_xml="$_backup_dir/${_dom}_stealth_$(date +%Y%m%d-%H%M%S).xml"
-    if (( ! DRY_RUN )); then
-      mkdir -p "$_backup_dir" 2>/dev/null || true
-      cp "$_tmp" "$_backup_xml" 2>/dev/null || true
-    fi
+    # Write the backup XML even in dry-run so the dry-run diff (below) has a
+    # baseline to diff against. The tuned temp copy is the "after".
+    mkdir -p "$_backup_dir" 2>/dev/null || true
+    cp "$_tmp" "$_backup_xml" 2>/dev/null || true
     # Run the python tuning (profile=all) on the temp XML.
     # Exit codes: 0 = changed, 3 = no changes needed (idempotent), 4 = unsupported domain.
     python3 - "$_tmp" <<'PYEOF'
@@ -9226,8 +9226,18 @@ def remove_qemu_arg_pair(qcmd, flag_value):
 # --- stealth ---
 features = get_or_create(root, 'features')
 hyperv = get_or_create(features, 'hyperv', {'mode': 'custom'})
-if not any(ch.tag == 'vendor_id' for ch in hyperv):
+# Set vendor_id to GENUINE00000 — ADD if missing, or REPLACE the existing
+# value (e.g. 'random' from a prior install_hypervisor_hiding() run) so the
+# stealth-tuned VM uses a realistic OEM string, not the old 'random'.
+_vendor_id_el = None
+for ch in hyperv:
+    if ch.tag == 'vendor_id': _vendor_id_el = ch; break
+if _vendor_id_el is None:
     ET.SubElement(hyperv, 'vendor_id', {'state': 'on', 'value': 'GENUINE00000'}); changed = True
+elif _vendor_id_el.get('value') != 'GENUINE00000':
+    _vendor_id_el.set('value', 'GENUINE00000'); changed = True
+if _vendor_id_el is not None and _vendor_id_el.get('state') != 'on':
+    _vendor_id_el.set('state', 'on'); changed = True
 kvm = get_or_create(features, 'kvm')
 hidden = None
 for ch in kvm:

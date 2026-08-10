@@ -90,7 +90,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "bash completion opts include --binding-mode" \
-  "--binding-mode --verify" \
+  "--binding-mode --stealth-vm-tuning" \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "zsh completion includes --binding-mode" \
@@ -1465,16 +1465,144 @@ assert_contains_file \
   "Q3u helper validates XML before define" \
   'virt-xml-validate' \
   "$VFIO_SCRIPT"
-# install-dynamic-binding must call install_hypervisor_hiding
+# install-dynamic-binding must call install_stealth_vm_tuning (opt-in) — the old
+# install_hypervisor_hiding() call was replaced by the fuller stealth/perf tuning
+# (which includes the hypervisor hide as a subset with vendor_id=GENUINE00000).
 assert_contains_text \
-  "Q3u install-dynamic-binding calls install_hypervisor_hiding" \
-  'install_hypervisor_hiding' \
+  "Q3v install-dynamic-binding calls install_stealth_vm_tuning" \
+  'install_stealth_vm_tuning' \
   "$_dyn_fn"
-# The 'What this will do' note must document step 8
+# The old install_hypervisor_hiding() must NOT be called from the dynamic path
+# (avoids a duplicate vendor_id conflict with the stealth tuning).
+if grep -Fq 'install_hypervisor_hiding' <<<"$_dyn_fn"; then
+  printf 'FAIL: Q3v old install_hypervisor_hiding call still present in dynamic path\n' >&2
+  record_failure "Q3v old install_hypervisor_hiding call removed from dynamic path"
+else
+  printf 'PASS: Q3v old install_hypervisor_hiding call removed from dynamic path\n'
+fi
+# The 'What this will do' note must document step 8 (stealth/perf VM tuning)
 assert_contains_text \
-  "Q3u dynamic note documents step 8 hypervisor hiding" \
-  'Hide the hypervisor on shut-off VMs' \
+  "Q3v dynamic note documents step 8 stealth/perf VM tuning" \
+  'Stealth/perf VM tuning' \
   "$_dyn_fn"
+assert_contains_text \
+  "Q3v dynamic note mentions SMBIOS spoofing" \
+  'SMBIOS spoofing' \
+  "$_dyn_fn"
+assert_contains_text \
+  "Q3v dynamic note mentions virt-xml-validate verification" \
+  'virt-xml-validate' \
+  "$_dyn_fn"
+# --- Q3v: install_stealth_vm_tuning function + CLI flags + standalone mode ---
+assert_contains_file \
+  "Q3v install_stealth_vm_tuning function defined" \
+  'install_stealth_vm_tuning()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v STEALTH_VM_TUNING_OVERRIDE var declared" \
+  'STEALTH_VM_TUNING_OVERRIDE=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v parse_args handles --stealth-vm-tuning" \
+  '--stealth-vm-tuning)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v parse_args handles --no-stealth-vm-tuning" \
+  '--no-stealth-vm-tuning)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v parse_args handles --install-stealth-vm-tuning" \
+  '--install-stealth-vm-tuning)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v usage documents --stealth-vm-tuning" \
+  '--stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v usage documents --install-stealth-vm-tuning" \
+  '--install-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v fish completion includes --stealth-vm-tuning" \
+  'complete -c $cmd -l stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v fish completion includes --install-stealth-vm-tuning" \
+  'complete -c $cmd -l install-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v bash completion includes --stealth-vm-tuning" \
+  '--stealth-vm-tuning --no-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v bash completion includes --install-stealth-vm-tuning" \
+  '--install-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v zsh completion includes --stealth-vm-tuning" \
+  "'--stealth-vm-tuning" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v zsh completion includes --install-stealth-vm-tuning" \
+  "'--install-stealth-vm-tuning" \
+  "$VFIO_SCRIPT"
+# --- Q3v: the function uses the Stealthy-VM tuning (vendor_id=GENUINE00000, python3) ---
+assert_contains_file \
+  "Q3v stealth tuning uses GENUINE00000 vendor_id" \
+  'GENUINE00000' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning uses python3" \
+  'python3 - "$_tmp"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning adds -cpu arg with kvm=off" \
+  'kvm=off,hypervisor=off' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning adds -smbios arg" \
+  'manufacturer=ASUS,product=ROG STRIX B550-F' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning changes e1000e NIC" \
+  "e1000e" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning randomizes disk serials" \
+  'Samsung_' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning sets memballoon=none" \
+  "mb.set('model', 'none')" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning handles python exit 3 (no changes)" \
+  '_py_status == 3' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning validates XML before define" \
+  'virt-xml-validate "$_tmp"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning prompts before redefine" \
+  'Redefine VM' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning skips running VMs" \
+  'not shut off' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning checks for python3" \
+  'have_cmd python3' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v standalone install-stealth-vm-tuning MODE dispatch" \
+  'MODE" == "install-stealth-vm-tuning"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v stealth tuning notes MIT license attribution" \
+  'MIT-licensed' \
+  "$VFIO_SCRIPT"
 
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \

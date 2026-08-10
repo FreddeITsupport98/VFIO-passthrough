@@ -75,13 +75,14 @@ DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_NORETRY_OVERRIDE=""       # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_D3_OVERRIDE=""            # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install mode only)
+STEALTH_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: stealth/perf VM XML tuning)
 BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
 GRAPHICS_DAEMON_INTERVAL_DEFAULT=1
@@ -645,8 +646,11 @@ complete -c $cmd -l no-amd-disable-idle-d3 -d 'Skip vfio-pci.disable_idle_d3=1 f
 complete -c $cmd -l amd-pcie-port-pm-off -d 'Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)'
 complete -c $cmd -l no-amd-pcie-port-pm-off -d 'Skip pcie_port_pm=off for AMD guest GPU (skip prompt)'
 complete -c $cmd -l binding-mode -r -a 'early dynamic' -d 'Install-mode GPU binding strategy (early|dynamic)'
+complete -c $cmd -l stealth-vm-tuning -d 'Dynamic-install: apply stealth/perf VM XML tuning (skip prompt)'
+complete -c $cmd -l no-stealth-vm-tuning -d 'Dynamic-install: skip stealth/perf VM XML tuning'
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
+complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -686,7 +690,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -736,8 +740,11 @@ _vfio_sh_complete() {
     '--amd-pcie-port-pm-off[Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
     '--no-amd-pcie-port-pm-off[Skip pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
     '--binding-mode=[Install-mode GPU binding strategy]:mode:(early dynamic)' \\
+    '--stealth-vm-tuning[Dynamic-install: apply stealth/perf VM XML tuning (skip prompt)]' \\
+    '--no-stealth-vm-tuning[Dynamic-install: skip stealth/perf VM XML tuning]' \\
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
+    '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1359,7 +1366,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1443,6 +1450,16 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Switch a dynamic-binding setup back to early binding. Sets VFIO_BINDING_MODE=early,
                    removes the libvirt qemu hook (restoring any pre-existing hook), and re-adds
                    vfio-pci.ids / rd.driver.pre=vfio-pci to the kernel cmdline (BLS sync).
+  --stealth-vm-tuning
+                   Dynamic-install override: apply stealth/perf VM XML tuning (SMBIOS spoofing,
+                   hypervisor CPUID disable, e1000e NIC, randomized disk serials, memballoon=none,
+                   iothreads/cputune) to detected guest-GPU VMs without prompting.
+  --no-stealth-vm-tuning
+                   Dynamic-install override: skip stealth/perf VM XML tuning.
+  --install-stealth-vm-tuning
+                   Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
+                   re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
+                   Verifies the tuned XML (virt-xml-validate) and prompts before redefining each VM.
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev).
                    Default behavior detaches USB Bluetooth adapters from host drivers while keeping devices VM-pass-through eligible.
@@ -1663,6 +1680,15 @@ parse_args() {
         ;;
       --install-early-binding)
         MODE="install-early-binding"
+        ;;
+      --install-stealth-vm-tuning)
+        MODE="install-stealth-vm-tuning"
+        ;;
+      --stealth-vm-tuning)
+        STEALTH_VM_TUNING_OVERRIDE=1
+        ;;
+      --no-stealth-vm-tuning)
+        STEALTH_VM_TUNING_OVERRIDE=0
         ;;
       --install-usb-bt-mitigation)
         MODE="install-usb-bt-mitigation"
@@ -9004,6 +9030,282 @@ install_hypervisor_hiding() {
   fi
 }
 
+# Stealth/perf VM XML tuning — ports the Stealthy-VM setup_vm_stealth.sh tuning
+# (profile=all: stealth + perf) into vfio.sh so a dynamic install can apply it
+# directly to the detected guest-GPU VMs. Stealthy-VM is MIT-licensed (Copyright
+# (c) 2026 Fredrik Bäckström); the tuning algorithm is ported faithfully below.
+# This SUPERSEDES install_hypervisor_hiding() for the dynamic path: it includes
+# the hypervisor hide (vendor_id + kvm hidden) as a subset using a realistic
+# OEM vendor_id (GENUINE00000) instead of 'random', PLUS SMBIOS spoofing, CPU
+# hypervisor-CPUID-bit disable, e1000e NIC, randomized disk serials,
+# memballoon=none, hypervclock off, TSC native, QEMU -cpu/-smbios args, and perf
+# (iothreads/cputune/disk iothread). Idempotent (rebuilds <qemu:commandline>);
+# python exit 3 = no changes needed. AMD-gated (consistent with hypervisor
+# hiding). Only acts on shut-off VMs (running VMs are skipped with a note).
+# Verifies the tuned XML with virt-xml-validate and prompts before redefining.
+install_stealth_vm_tuning() {
+  if ! readable_file "$CONF_FILE"; then
+    note "Missing $CONF_FILE; skipping stealth/perf VM tuning."
+    return 0
+  fi
+  # shellcheck disable=SC1090
+  local _guest_gpu _vendor
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -z "$_guest_gpu" ]]; then
+    note "No GUEST_GPU_BDF in $CONF_FILE; skipping stealth/perf VM tuning."
+    return 0
+  fi
+  if [[ "${_vendor,,}" != "1002" ]]; then
+    note "Guest GPU is not AMD; skipping stealth/perf VM tuning (AMD-driver anti-passthrough detection is AMD-specific)."
+    return 0
+  fi
+  if ! have_cmd virsh; then
+    note "virsh not available; skipping stealth/perf VM tuning."
+    return 0
+  fi
+  if ! have_cmd python3; then
+    note "python3 not available; skipping stealth/perf VM tuning (the XML patcher needs python3)."
+    return 0
+  fi
+
+  say
+  hdr "Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)"
+  note "This applies the Stealthy-VM tuning to each shut-off VM that has the guest GPU:"
+  note "  - hyperv vendor_id=GENUINE00000 + kvm hidden (hypervisor hide for the AMD driver)"
+  note "  - cpu host-passthrough + hypervisor CPUID bit disabled"
+  note "  - SMBIOS type 0 (BIOS) + type 1 (system) spoofing with randomized serial/UUID"
+  note "  - virtio NIC -> e1000e; randomized disk serials; memballoon=none"
+  note "  - hypervclock off; TSC native; QEMU -cpu/-smbios commandline args"
+  note "  - perf: iothreads=1, host-aware cputune, disk iothread assignment"
+  note "Only shut-off VMs are touched; running VMs are skipped. The tuned XML is"
+  note "validated (virt-xml-validate) and you are prompted before each redefine."
+  note "This is cosmetic realism + perf tuning, NOT an anti-cheat bypass."
+  say
+
+  local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp _backup_dir _backup_xml
+  _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    # Parse PCI hostdev BDFs (same awk parser as install_hypervisor_hiding).
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+      continue
+    fi
+    # Only define shut-off VMs.
+    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping stealth/perf tuning. Shut it off and re-run."
+      _skipped_running=1
+      continue
+    fi
+    _tmp="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp"
+    _backup_xml="$_backup_dir/${_dom}_stealth_$(date +%Y%m%d-%H%M%S).xml"
+    if (( ! DRY_RUN )); then
+      mkdir -p "$_backup_dir" 2>/dev/null || true
+      cp "$_tmp" "$_backup_xml" 2>/dev/null || true
+    fi
+    # Run the python tuning (profile=all) on the temp XML.
+    # Exit codes: 0 = changed, 3 = no changes needed (idempotent), 4 = unsupported domain.
+    python3 - "$_tmp" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET, os, uuid, secrets, string
+QEMU_NS = 'http://libvirt.org/schemas/domain/qemu/1.0'
+ET.register_namespace('qemu', QEMU_NS)
+path = sys.argv[1]
+tree = ET.parse(path); root = tree.getroot()
+# NOTE: do NOT root.set('xmlns:qemu', QEMU_NS) — ET.register_namespace above
+# already maps the qemu: prefix and the serializer emits xmlns:qemu automatically.
+# Setting it explicitly causes a duplicate-attribute ParseError on re-parse
+# (idempotent re-run). register_namespace alone is sufficient.
+vcpu_el = root.find('vcpu')
+if vcpu_el is not None and vcpu_el.text:
+    try:
+        vc = int(vcpu_el.text.strip())
+        if vc > 1 and (vc % 2) == 1:
+            sys.stderr.write(f"Warning: vCPU count {vc} is odd (>1); may look unrealistic.\n")
+    except ValueError: pass
+domain_type = root.get('type')
+if domain_type not in (None, 'kvm', 'qemu'):
+    sys.stderr.write(f"Unsupported domain type: {domain_type}\n"); sys.exit(4)
+changed = False
+def get_or_create(parent, tag, attrs=None):
+    for c in parent:
+        if c.tag == tag: return c
+    return ET.SubElement(parent, tag, attrs or {})
+def reset_qemu_commandline(root_el):
+    for c in list(root_el):
+        if c.tag == f"{{{QEMU_NS}}}commandline": root_el.remove(c)
+    return ET.SubElement(root_el, f"{{{QEMU_NS}}}commandline")
+# --- stealth ---
+features = get_or_create(root, 'features')
+hyperv = get_or_create(features, 'hyperv', {'mode': 'custom'})
+if not any(ch.tag == 'vendor_id' for ch in hyperv):
+    ET.SubElement(hyperv, 'vendor_id', {'state': 'on', 'value': 'GENUINE00000'}); changed = True
+kvm = get_or_create(features, 'kvm')
+hidden = None
+for ch in kvm:
+    if ch.tag == 'hidden': hidden = ch; break
+if hidden is None: hidden = ET.SubElement(kvm, 'hidden')
+if hidden.get('state') != 'on': hidden.set('state', 'on'); changed = True
+cpu = root.find('cpu')
+if cpu is None: cpu = ET.SubElement(root, 'cpu', {'mode': 'host-passthrough', 'check': 'none', 'migratable': 'on'}); changed = True
+has_hv = False
+for ch in cpu:
+    if ch.tag == 'feature' and ch.get('name') == 'hypervisor':
+        has_hv = True
+        if ch.get('policy') != 'disable': ch.set('policy', 'disable'); changed = True
+        break
+if not has_hv: ET.SubElement(cpu, 'feature', {'policy': 'disable', 'name': 'hypervisor'}); changed = True
+os_el = root.find('os')
+if os_el is not None:
+    for smb in list(os_el.findall('smbios')): os_el.remove(smb); changed = True
+for sysinfo in list(root.findall('sysinfo')): root.remove(sysinfo); changed = True
+devices = root.find('devices')
+if devices is not None:
+    for tag in ('serial', 'console'):
+        for el in list(devices):
+            if el.tag == tag: devices.remove(el); changed = True
+    has_usb_mouse = False
+    for el in list(devices):
+        if el.tag == 'input':
+            itype = el.get('type'); bus = el.get('bus')
+            if itype == 'tablet': devices.remove(el); changed = True
+            elif itype == 'mouse' and bus == 'usb': has_usb_mouse = True
+    if not has_usb_mouse: ET.SubElement(devices, 'input', {'type': 'mouse', 'bus': 'usb'}); changed = True
+    for el in list(devices):
+        if el.tag == 'controller' and el.get('type') == 'virtio-serial': devices.remove(el); changed = True
+    for iface in devices.findall('interface'):
+        model = iface.find('model')
+        if model is not None and model.get('type') == 'virtio': model.set('type', 'e1000e'); changed = True
+        driver = iface.find('driver')
+        if driver is not None and driver.get('name') == 'vhost': iface.remove(driver); changed = True
+    for disk in devices.findall('disk'):
+        if disk.find('serial') is None:
+            ds = "Samsung_" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+            ET.SubElement(disk, 'serial').text = ds; changed = True
+for mb in root.findall('.//memballoon'):
+    if mb.get('model') != 'none': mb.set('model', 'none'); changed = True
+clock = root.find('clock')
+if clock is None: clock = ET.SubElement(root, 'clock', {'offset': 'localtime'}); changed = True
+ht = None
+for t in clock.findall('timer'):
+    if t.get('name') == 'hypervclock': ht = t; break
+if ht is None: ht = ET.SubElement(clock, 'timer', {'name': 'hypervclock'})
+if ht.get('present') != 'no': ht.set('present', 'no'); changed = True
+tsc = None
+for t in clock.findall('timer'):
+    if t.get('name') == 'tsc': tsc = t; break
+if tsc is None: tsc = ET.SubElement(clock, 'timer', {'name': 'tsc'})
+if tsc.get('mode') != 'native': tsc.set('mode', 'native'); changed = True
+if tsc.get('present') not in (None, 'yes'): tsc.set('present', 'yes'); changed = True
+qemu_cmd = reset_qemu_commandline(root)
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-cpu"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "type=0,vendor=American Megatrends Inc.,version=1802,date=12/12/2023"})
+smbios_serial = secrets.token_hex(5).upper(); smbios_uuid = uuid.uuid4()
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=1,manufacturer=ASUS,product=ROG STRIX B550-F,serial={smbios_serial},uuid={smbios_uuid}"})
+changed = True
+# --- perf ---
+if root.find('iothreads') is None:
+    children = list(root); vcpu_el = root.find('vcpu')
+    idx = children.index(vcpu_el) + 1 if vcpu_el is not None else len(children)
+    it = ET.Element('iothreads'); it.text = '1'; root.insert(idx, it); changed = True
+if root.find('cputune') is None:
+    vcpu_el = root.find('vcpu'); vcpu_count = 0
+    if vcpu_el is not None and vcpu_el.text:
+        try: vcpu_count = int(vcpu_el.text.strip())
+        except ValueError: vcpu_count = 0
+    host_cpus = os.cpu_count() or 1
+    if 0 < vcpu_count <= host_cpus:
+        cputune = ET.SubElement(root, 'cputune')
+        if host_cpus >= vcpu_count + 4:
+            for v in range(vcpu_count): ET.SubElement(cputune, 'vcpupin', {'vcpu': str(v), 'cpuset': str(4 + v)})
+            ET.SubElement(cputune, 'emulatorpin', {'cpuset': '0-1'})
+            ET.SubElement(cputune, 'iothreadpin', {'iothread': '1', 'cpuset': '2-3'})
+        elif host_cpus >= vcpu_count + 2:
+            for v in range(vcpu_count): ET.SubElement(cputune, 'vcpupin', {'vcpu': str(v), 'cpuset': str(2 + v)})
+            ET.SubElement(cputune, 'emulatorpin', {'cpuset': '0'})
+            ET.SubElement(cputune, 'iothreadpin', {'iothread': '1', 'cpuset': '1'})
+        elif host_cpus >= vcpu_count:
+            for v in range(vcpu_count): ET.SubElement(cputune, 'vcpupin', {'vcpu': str(v), 'cpuset': str(v)})
+        changed = True
+devices = root.find('devices')
+if devices is not None:
+    for disk in devices.findall('disk'):
+        driver = disk.find('driver')
+        if driver is None: continue
+        target = disk.find('target'); bus = target.get('bus') if target is not None else None
+        if (driver.get('name') == 'qemu' and driver.get('type') == 'qcow2' and driver.get('iothread') is None and bus in ('virtio', 'scsi')):
+            driver.set('iothread', '1'); changed = True
+if not changed: sys.exit(3)
+tree.write(path)
+PYEOF
+    local _py_status=$?
+    if (( _py_status == 3 )); then
+      say "VM '$_dom' is already tuned (no changes needed)."
+      _updated=1
+      rm -f "$_tmp"
+      continue
+    elif (( _py_status == 4 )); then
+      note "WARN: VM '$_dom' has an unsupported domain type; skipping stealth/perf tuning."
+      rm -f "$_tmp"
+      continue
+    elif (( _py_status != 0 )); then
+      note "WARN: stealth/perf XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      rm -f "$_tmp"
+      continue
+    fi
+    # Verify the tuned XML before redefining.
+    if ! virt-xml-validate "$_tmp" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for tuned '$_dom'; skipping redefine (backup at $_backup_xml)."
+      rm -f "$_tmp"
+      continue
+    fi
+    say "Tuned XML for '$_dom' validates. Backup of original: $_backup_xml"
+    if ! prompt_yn "Redefine VM '$_dom' with the stealth/perf tuning now?" N "Stealth/perf VM tuning"; then
+      note "Skipped '$_dom' by user choice (tuned XML left in $_tmp; backup at $_backup_xml)."
+      rm -f "$_tmp"
+      continue
+    fi
+    if (( ! DRY_RUN )); then
+      virsh -c qemu:///system define "$_tmp" 2>/dev/null
+    fi
+    say "Applied stealth/perf tuning to VM '$_dom' (backup: $_backup_xml)."
+    note "Restore with: virsh -c qemu:///system define $_backup_xml"
+    _updated=1
+    rm -f "$_tmp"
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  if (( ! _updated )); then
+    if (( _skipped_running )); then
+      note "No VMs were tuned (running VMs must be shut off first). Shut off the VM and re-run."
+    else
+      note "No shut-off VMs with the guest GPU found; nothing to tune."
+    fi
+  fi
+}
+
 # Remove the reboot-FLR monitor service + script.
 remove_reboot_flr_monitor() {
   if command -v systemctl >/dev/null 2>&1; then
@@ -9999,9 +10301,11 @@ install_dynamic_binding_from_existing_config() {
   note "  7. Install the reboot-FLR monitor (a systemd service that watches for guest"
   note "     warm reboot and does a soft FLR to clear the GPU display wedge so OVMF"
   note "     can re-POST without needing a host reboot — set on_reboot=restart in VM XML)"
-  note "  8. Hide the hypervisor on shut-off VMs with the guest GPU (adds vendor_id=random"
-  note "     + kvm hidden to the VM XML so the AMD Windows driver installs the real"
-  note "     display driver instead of refusing with unknown PCI devices)"
+  note "  8. Stealth/perf VM tuning (optional, opt-in): on shut-off VMs with the guest GPU,"
+  note "     apply SMBIOS spoofing + CPU hypervisor-bit disable + e1000e NIC + randomized"
+  note "     disk serials + memballoon=none + iothreads/cputune + hypervisor hide"
+  note "     (vendor_id=GENUINE00000 + kvm hidden). Verified (virt-xml-validate) + prompted."
+  note "     Skipped unless --stealth-vm-tuning or you accept the prompt."
   say
   note "What stays unchanged:"
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"
@@ -10064,9 +10368,20 @@ install_dynamic_binding_from_existing_config() {
   #     soft FLR to clear the display wedge so OVMF re-POSTs without a host reboot).
   install_reboot_flr_monitor
 
-  # 3d. Hide the hypervisor on shut-off VMs with the guest GPU so the AMD Windows
-  #     driver installs the real display driver instead of refusing.
-  install_hypervisor_hiding
+  # 3d. Stealth/perf VM tuning (opt-in) — supersedes the minimal hypervisor-hide
+  #     helper for the dynamic path. Applies the full Stealthy-VM tuning (which
+  #     includes the hypervisor hide as a subset with a realistic OEM vendor_id)
+  #     to each shut-off guest-GPU VM, verified + prompted. The old minimal
+  #     hypervisor-hide call is no longer used here to avoid a duplicate vendor_id.
+  if [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "1" ]]; then
+    install_stealth_vm_tuning
+  elif [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
+    note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning). The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard if needed."
+  elif prompt_yn "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials/iothreads + hypervisor hide) to detected guest-GPU VMs now?" N "Stealth/perf VM tuning"; then
+    install_stealth_vm_tuning
+  else
+    note "Skipping stealth/perf VM tuning. The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard."
+  fi
 
   # 3b. Pin KDE/KWin Wayland to the HOST GPU so binding the (Boot VGA) guest
   #     GPU at VM start does not crash the host compositor. No-op unless the
@@ -15407,6 +15722,22 @@ main() {
     require_systemd
     require_writable_root_or_die
     install_early_binding_from_existing_config
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-stealth-vm-tuning" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run the full installer first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; stealth/perf VM tuning needs libvirt to dump/define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Stealth/perf VM tuning"; then
+        die "Aborted by user"
+      fi
+    fi
+    install_stealth_vm_tuning
     exit 0
   fi
 

@@ -9397,8 +9397,22 @@ PYEOF
     if (( ! DRY_RUN )); then
       virsh -c qemu:///system define "$_tmp" 2>/dev/null
     fi
-    say "Applied stealth/perf tuning to VM '$_dom' (backup: $_backup_xml)."
-    note "Restore with: virsh -c qemu:///system define $_backup_xml"
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}${C_BOLD}✔ Stealth/perf tuning applied to VM '$_dom'${C_RESET}"
+    else
+      say "✔ Stealth/perf tuning applied to VM '$_dom'"
+    fi
+    say "  ✔ hyperv vendor_id=GENUINE00000 + kvm hidden (hypervisor hide)"
+    say "  ✔ vmport state=off (VMware backdoor port disabled — stops \"Is Virtual Machine: yes\")"
+    say "  ✔ CPU host-passthrough + hypervisor CPUID bit disabled"
+    say "  ✔ SMBIOS spoofed from host DMI: ${_dmi_sys_vendor:-<default>} ${_dmi_product:-<default>} (BIOS ${_dmi_bios_version:-<default>})"
+    say "  ✔ QEMU -cpu host,kvm=off,hypervisor=off + -smbios type=0/type=1 args"
+    say "  ✔ NIC -> e1000e; disk serials randomized; memballoon=none"
+    say "  ✔ hypervclock off; TSC native; serial/console + tablet removed"
+    say "  ✔ perf: iothreads=1, host-aware cputune, disk iothread assignment"
+    say "  Backup of original XML: $_backup_xml"
+    note "Restore with: sudo $SCRIPT_NAME --reset-stealth-vm-tuning  (or: virsh -c qemu:///system define $_backup_xml)"
     _updated=1
     rm -f "$_tmp"
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)

@@ -6595,6 +6595,27 @@ systemd_boot_add_kernel_params() {
     if [[ -n "$boot_metadata_opts" ]]; then
       new_cmdline="$(cmdline_add_boot_metadata_tokens_from_options "$new_cmdline" "$boot_metadata_opts")"
     fi
+    # --- Dynamic binding: distro-aware streamlined path ---
+    # When the user chose dynamic binding, auto-add the RX 9070 / RDNA4 reset-
+    # bug stability params (vfio-pci.disable_idle_d3=1, pcie_port_pm=off) plus
+    # pcie_aspm=off (kept on the cmdline for both modes per the release note)
+    # NON-interactively when the guest GPU is AMD, and SKIP the optional prompts
+    # below (USB/xHCI, framebuffer, SELinux/AppArmor, rd.driver.pre, verbosity,
+    # boot target, ACS, custom kernel params) so the dynamic install is one
+    # streamlined pass. The persistence mechanism is distro-aware: this openSUSE
+    # branch writes /etc/kernel/cmdline + syncs BLS via sdbootutil; classic GRUB
+    # and generic systemd-boot have their own branches below. Early binding still
+    # gets the full interactive optional-prompt set (the else branch). Honors
+    # --no-amd-disable-idle-d3 / --no-amd-pcie-port-pm-off opt-outs.
+    if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+      if [[ -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
+        note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to /etc/kernel/cmdline (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
+        [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] && new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
+        [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
+        new_cmdline="$(add_param_once "$new_cmdline" "pcie_aspm=off")"
+      fi
+      note "Dynamic binding mode: skipping the optional USB/xHCI, framebuffer, SELinux/AppArmor, rd.driver.pre, verbosity, boot-target, ACS, and custom-kernel-param prompts (use the full early-binding flow to access them)."
+    else
     # Optional: USB/xHCI stability workaround for hosts that can freeze or
     # spam disconnects due to USB runtime PM / PCIe ASPM interactions.
     say
@@ -6771,7 +6792,7 @@ systemd_boot_add_kernel_params() {
       new_cmdline="$(add_param_once "$new_cmdline" "pcie_acs_override=downstream,multifunction")"
     fi
     new_cmdline="$(add_custom_kernel_params_interactive "$new_cmdline" "/etc/kernel/cmdline (persistence)")"
-
+    fi
     # Preserve current persisted boot metadata unless explicitly unavailable.
     # This keeps root/rootflags stable across additive parameter updates.
     if [[ -n "$cmdline_root_tok" || -n "$cmdline_rootflags_tok" || -n "$cmdline_rootfstype_tok" || -n "$cmdline_resume_tok" || -n "$cmdline_machine_id_tok" ]]; then
@@ -6952,6 +6973,24 @@ systemd_boot_add_kernel_params() {
     note "Dynamic binding mode: skipping vfio-pci.ids for this entry (libvirt hook will bind at VM start)."
   fi
 
+  # --- Dynamic binding: distro-aware streamlined path (generic systemd-boot) ---
+  # When the user chose dynamic binding, auto-add the RX 9070 / RDNA4 reset-bug
+  # stability params (vfio-pci.disable_idle_d3=1, pcie_port_pm=off) plus
+  # pcie_aspm=off NON-interactively when the guest GPU is AMD, and SKIP the
+  # optional prompts below (USB/xHCI, AMD-4-param, ACS, custom kernel params)
+  # so the dynamic install is one streamlined pass. Persistence here edits the
+  # selected systemd-boot entry in-place; the openSUSE /etc/kernel/cmdline and
+  # classic GRUB branches have their own streamlined blocks. Early binding still
+  # gets the full optional-prompt set (the else branch). Honors --no-amd-*.
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    if [[ -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
+      note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to this boot entry (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
+      [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] && new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
+      [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
+      new_opts="$(add_param_once "$new_opts" "pcie_aspm=off")"
+    fi
+    note "Dynamic binding mode: skipping the optional USB/xHCI, AMD-stability, ACS, and custom-kernel-param prompts for this entry."
+  else
   # Optional: USB/xHCI stability workaround for the selected live entry.
   say
   hdr "USB/xHCI power-management stability (optional)"
@@ -7026,6 +7065,7 @@ systemd_boot_add_kernel_params() {
     new_opts="$(add_param_once "$new_opts" "pcie_acs_override=downstream,multifunction")"
   fi
   new_opts="$(add_custom_kernel_params_interactive "$new_opts" "systemd-boot entry")"
+  fi
 
   if [[ "$(trim "$new_opts")" == "$(trim "$current_opts")" ]]; then
     say "systemd-boot entry options unchanged (params already present)."
@@ -7103,6 +7143,25 @@ grub_add_kernel_params() {
     note "Dynamic binding mode: skipping vfio-pci.ids (libvirt hook will bind at VM start)."
   fi
 
+  # --- Dynamic binding: distro-aware streamlined path (classic GRUB) ---
+  # When the user chose dynamic binding, auto-add the RX 9070 / RDNA4 reset-bug
+  # stability params (vfio-pci.disable_idle_d3=1, pcie_port_pm=off) plus
+  # pcie_aspm=off NON-interactively when the guest GPU is AMD, and SKIP the
+  # optional prompts below (USB/xHCI, framebuffer, AMD-4-param, SELinux, ACS,
+  # verbosity, boot target) so the dynamic install is one streamlined pass.
+  # Persistence here is classic GRUB (/etc/default/grub + grub-mkconfig); the
+  # openSUSE /etc/kernel/cmdline and generic systemd-boot branches have their
+  # own streamlined blocks. Early binding still gets the full optional-prompt
+  # set (the else branch). Honors --no-amd-disable-idle-d3 / --no-amd-pcie-port-pm-off.
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+    if [[ -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
+      note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to GRUB kernel cmdline (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
+      [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] && new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
+      [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new="$(add_param_once "$new" "pcie_port_pm=off")"
+      new="$(add_param_once "$new" "pcie_aspm=off")"
+    fi
+    note "Dynamic binding mode: skipping the optional USB/xHCI, framebuffer, SELinux/AppArmor, ACS, verbosity, and boot-target prompts (use the full early-binding flow to access them)."
+  else
   # Optional USB/xHCI power-management workaround.
   say
   hdr "USB/xHCI power-management stability (optional)"
@@ -7246,6 +7305,7 @@ grub_add_kernel_params() {
   note "In text mode, you'll land at a console login first and can start the desktop manually after checking logs (for example with journalctl -b)."
   if prompt_yn "Change the DEFAULT boot to multi-user.target (text mode) until you switch it back?" N "Boot target"; then
     new="$(add_param_once "$new" "systemd.unit=multi-user.target")"
+  fi
   fi
 
   # Dracut-specific early driver ordering (advanced)
@@ -15020,7 +15080,14 @@ apply_configuration() {
     q="Show recommended IOMMU kernel parameters and MANUAL instructions now? (recommended)"
   fi
 
-  if prompt_yn "$q" Y "Boot options"; then
+  # Dynamic binding: auto-proceed the IOMMU gateway (IOMMU is mandatory for
+  # passthrough in both modes) and let the bootloader function's streamlined
+  # dynamic path auto-add the AMD reset-bug stability params + skip the optional
+  # prompts. Early binding still asks the gateway prompt (default Y).
+  if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]] || prompt_yn "$q" Y "Boot options"; then
+    if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" ]]; then
+      note "Dynamic binding mode: auto-proceeding to kernel-cmdline update (IOMMU + AMD reset-bug stability params); optional prompts are skipped."
+    fi
     if [[ "$bl2" == "grub" ]]; then
       grub_add_kernel_params
     elif [[ "$bl2" == "systemd-boot" || "$bl2" == "grub2-bls" ]]; then

@@ -1560,8 +1560,8 @@ assert_contains_file \
   'kvm=off,hypervisor=off' \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "Q3v stealth tuning adds -smbios arg" \
-  'manufacturer=ASUS,product=ROG STRIX B550-F' \
+  "Q3v stealth tuning adds -smbios arg (DMI-driven manufacturer/product)" \
+  'type=1,manufacturer=' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "Q3v stealth tuning changes e1000e NIC" \
@@ -1603,6 +1603,133 @@ assert_contains_file \
   "Q3v stealth tuning notes MIT license attribution" \
   'MIT-licensed' \
   "$VFIO_SCRIPT"
+
+# --- Q3v+: the 7 stealth improvements (DMI / preserve commandline / reset mode / status / dry-run diff / backup dir / README) ---
+# #1: host DMI sysfs reads for SMBIOS spoofing
+assert_contains_file \
+  "Q3v+ reads host DMI sys_vendor for SMBIOS" \
+  '/sys/class/dmi/id/sys_vendor' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ reads host DMI product_name for SMBIOS" \
+  '/sys/class/dmi/id/product_name' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ exports VFIO_STEALTH_DMI_SYS_VENDOR for python" \
+  'VFIO_STEALTH_DMI_SYS_VENDOR' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ python reads DMI env var for SMBIOS manufacturer" \
+  "os.environ.get('VFIO_STEALTH_DMI_SYS_VENDOR'" \
+  "$VFIO_SCRIPT"
+# #2: preserve existing qemu:commandline (dedupe instead of wipe)
+assert_contains_file \
+  "Q3v+ uses get_or_create_qemu_commandline (preserve, not wipe)" \
+  'get_or_create_qemu_commandline' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ uses remove_qemu_arg_pair for idempotent dedupe" \
+  'remove_qemu_arg_pair' \
+  "$VFIO_SCRIPT"
+if grep -Fq 'reset_qemu_commandline' "$VFIO_SCRIPT"; then
+  printf 'FAIL: Q3v+ old reset_qemu_commandline (wipe) still present\n' >&2
+  record_failure "Q3v+ old reset_qemu_commandline removed"
+else
+  printf 'PASS: Q3v+ old reset_qemu_commandline (wipe) removed\n'
+fi
+# #3: --reset-stealth-vm-tuning standalone revert mode
+assert_contains_file \
+  "Q3v+ reset_stealth_vm_tuning function defined" \
+  'reset_stealth_vm_tuning()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ parse_args handles --reset-stealth-vm-tuning" \
+  '--reset-stealth-vm-tuning)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ usage documents --reset-stealth-vm-tuning" \
+  '--reset-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ fish completion includes --reset-stealth-vm-tuning" \
+  'complete -c $cmd -l reset-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ bash completion includes --reset-stealth-vm-tuning" \
+  '--reset-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ zsh completion includes --reset-stealth-vm-tuning" \
+  "'--reset-stealth-vm-tuning" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ standalone reset-stealth-vm-tuning MODE dispatch" \
+  'MODE" == "reset-stealth-vm-tuning"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ reset_vfio_all notes stealth VM XMLs not reverted by --reset" \
+  'stealth/perf-tuned VM XMLs are NOT reverted by --reset' \
+  "$VFIO_SCRIPT"
+# #4: stealth_vm_tuning_status in detect + verify
+assert_contains_file \
+  "Q3v+ stealth_vm_tuning_status function defined" \
+  'stealth_vm_tuning_status()' \
+  "$VFIO_SCRIPT"
+_detect_fn="$(sed -n '/^detect_existing_vfio_report()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3v+ detect report calls stealth_vm_tuning_status" \
+  'stealth_vm_tuning_status' \
+  "$_detect_fn"
+_verify_fn="$(sed -n '/^verify_vfio_setup()/,/^}/p' "$VFIO_SCRIPT" 2>/dev/null || true)"
+if [[ -z "$_verify_fn" ]]; then
+  # verify function may have a different name; check the whole script for the status call near RESULT
+  if grep -Fq 'stealth_vm_tuning_status || true' "$VFIO_SCRIPT"; then
+    printf 'PASS: Q3v+ verify calls stealth_vm_tuning_status\n'
+  else
+    printf 'FAIL: Q3v+ verify does not call stealth_vm_tuning_status\n' >&2
+    record_failure "Q3v+ verify calls stealth_vm_tuning_status"
+  fi
+else
+  assert_contains_text \
+    "Q3v+ verify calls stealth_vm_tuning_status" \
+    'stealth_vm_tuning_status' \
+    "$_verify_fn"
+fi
+# #5: dry-run diff in the tuning function
+assert_contains_file \
+  "Q3v+ dry-run shows diff -u of current vs tuned XML" \
+  'diff -u "$_backup_xml" "$_tmp"' \
+  "$VFIO_SCRIPT"
+# #6: STEALTH_VM_BACKUP_DIR conf key + fallback
+assert_contains_file \
+  "Q3v+ write_conf persists STEALTH_VM_BACKUP_DIR default" \
+  'STEALTH_VM_BACKUP_DIR=""' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ backup dir falls back to /var/lib/vfio-stealth-vm/backups" \
+  '/var/lib/vfio-stealth-vm/backups' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3v+ reads STEALTH_VM_BACKUP_DIR from conf" \
+  'STEALTH_VM_BACKUP_DIR=' \
+  "$VFIO_SCRIPT"
+# #7: README subsection
+assert_contains_file \
+  "Q3v+ README has stealth/perf VM tuning subsection" \
+  'Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)' \
+  "${PROJECT_ROOT}/README.md"
+assert_contains_file \
+  "Q3v+ README documents --reset-stealth-vm-tuning" \
+  '--reset-stealth-vm-tuning' \
+  "${PROJECT_ROOT}/README.md"
+assert_contains_file \
+  "Q3v+ README documents --install-stealth-vm-tuning" \
+  '--install-stealth-vm-tuning' \
+  "${PROJECT_ROOT}/README.md"
+assert_contains_file \
+  "Q3v+ README notes MIT license attribution" \
+  'MIT-licensed, by Fredrik Bäckström' \
+  "${PROJECT_ROOT}/README.md"
 
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \

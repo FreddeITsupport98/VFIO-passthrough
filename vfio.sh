@@ -651,6 +651,7 @@ complete -c $cmd -l no-stealth-vm-tuning -d 'Dynamic-install: skip stealth/perf 
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
+complete -c $cmd -l reset-stealth-vm-tuning -d 'Revert stealth/perf VM tuning from backup XML'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -690,7 +691,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -745,6 +746,7 @@ _vfio_sh_complete() {
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
+    '--reset-stealth-vm-tuning[Revert stealth/perf VM tuning from backup XML]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1460,6 +1462,10 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
                    Verifies the tuned XML (virt-xml-validate) and prompts before redefining each VM.
+  --reset-stealth-vm-tuning
+                   Revert stealth/perf VM XML tuning by redefining each shut-off guest-GPU VM
+                   from its most recent *_stealth_*.xml backup. Verifies the backup XML and
+                   prompts before redefining. Requires an existing $CONF_FILE and libvirt.
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev).
                    Default behavior detaches USB Bluetooth adapters from host drivers while keeping devices VM-pass-through eligible.
@@ -1683,6 +1689,9 @@ parse_args() {
         ;;
       --install-stealth-vm-tuning)
         MODE="install-stealth-vm-tuning"
+        ;;
+      --reset-stealth-vm-tuning)
+        MODE="reset-stealth-vm-tuning"
         ;;
       --stealth-vm-tuning)
         STEALTH_VM_TUNING_OVERRIDE=1
@@ -3618,6 +3627,15 @@ detect_existing_vfio_report() {
   maybe_offer_detect_dynamic_binding
   report_vm_network_precheck || true
 
+  # #4: stealth/perf VM tuning status for guest-GPU VMs (informational).
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}-- Stealth/perf VM tuning status --${C_RESET}"
+  else
+    say "-- Stealth/perf VM tuning status --"
+  fi
+  stealth_vm_tuning_status || true
+
   say "==== End report ===="
 }
 
@@ -4243,6 +4261,10 @@ VFIO_HOOK_BIND_TIMEOUT="20"
 # Set 4 (for example) only if your board reliably retrains Gen4 but not Gen5
 # after an FLR and you want to skip the Gen5 retrain attempt.
 VFIO_REBOOT_FLR_MAX_GEN=""
+# Stealth/perf VM tuning backup directory for *_stealth_*.xml VM XML backups
+# (read by install_stealth_vm_tuning / reset_stealth_vm_tuning). Default empty
+# = $HOME/Desktop; falls back to /var/lib/vfio-stealth-vm/backups if not writable.
+STEALTH_VM_BACKUP_DIR=""
 EOF
 }
 
@@ -9084,7 +9106,38 @@ install_stealth_vm_tuning() {
   say
 
   local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp _backup_dir _backup_xml
-  _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  # #6: configurable backup directory. Prefer STEALTH_VM_BACKUP_DIR from conf,
+  # then $HOME/Desktop, then a root-writable /var/lib fallback.
+  _backup_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _backup_dir="$(trim "${_backup_dir:-}")"
+  if [[ -z "$_backup_dir" ]]; then
+    _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  fi
+  if ! mkdir -p "$_backup_dir" 2>/dev/null || ! [[ -w "$_backup_dir" ]]; then
+    _backup_dir="/var/lib/vfio-stealth-vm/backups"
+    mkdir -p "$_backup_dir" 2>/dev/null || true
+    note "STEALTH_VM_BACKUP_DIR not writable; using $_backup_dir for VM XML backups."
+  fi
+  note "Stealth VM XML backups: $_backup_dir"
+  # #1: read the host's real DMI identity so the VM's spoofed SMBIOS matches the
+  # host hardware (realistic stealth) instead of a generic ASUS B550. Falls back
+  # to the hardcoded defaults if DMI is unreadable. Exported for the python tuning.
+  local _dmi_sys_vendor _dmi_product _dmi_bios_vendor _dmi_bios_version _dmi_bios_date
+  _dmi_sys_vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
+  _dmi_product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+  _dmi_bios_vendor="$(cat /sys/class/dmi/id/bios_vendor 2>/dev/null || true)"
+  _dmi_bios_version="$(cat /sys/class/dmi/id/bios_version 2>/dev/null || true)"
+  _dmi_bios_date="$(cat /sys/class/dmi/id/bios_date 2>/dev/null || true)"
+  export VFIO_STEALTH_DMI_SYS_VENDOR="${_dmi_sys_vendor:-American Megatrends Inc.}"
+  export VFIO_STEALTH_DMI_PRODUCT="${_dmi_product:-ROG STRIX B550-F}"
+  export VFIO_STEALTH_DMI_BIOS_VENDOR="${_dmi_bios_vendor:-American Megatrends Inc.}"
+  export VFIO_STEALTH_DMI_BIOS_VERSION="${_dmi_bios_version:-1802}"
+  export VFIO_STEALTH_DMI_BIOS_DATE="${_dmi_bios_date:-12/12/2023}"
+  if [[ -n "$_dmi_sys_vendor" || -n "$_dmi_product" ]]; then
+    note "Spoofing SMBIOS from host DMI: $_dmi_sys_vendor $_dmi_product (BIOS $_dmi_bios_vendor $_dmi_bios_version)"
+  else
+    note "DMI unreadable; using hardcoded SMBIOS defaults (ASUS ROG STRIX B550-F / AMI 1802)."
+  fi
   while IFS= read -r _dom; do
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
@@ -9152,10 +9205,24 @@ def get_or_create(parent, tag, attrs=None):
     for c in parent:
         if c.tag == tag: return c
     return ET.SubElement(parent, tag, attrs or {})
-def reset_qemu_commandline(root_el):
-    for c in list(root_el):
-        if c.tag == f"{{{QEMU_NS}}}commandline": root_el.remove(c)
+def get_or_create_qemu_commandline(root_el):
+    # #2: preserve existing <qemu:commandline> args (e.g. Looking Glass kvmfr)
+    # instead of wiping them. We only dedupe the stealth -cpu/-smbios pairs
+    # below so re-running is idempotent without losing user args.
+    for c in root_el:
+        if c.tag == f"{{{QEMU_NS}}}commandline": return c
     return ET.SubElement(root_el, f"{{{QEMU_NS}}}commandline")
+def remove_qemu_arg_pair(qcmd, flag_value):
+    # Remove an <arg value='FLAG'/> and the <arg/> immediately following it
+    # (the payload). Idempotent: no-op if the flag is not present.
+    kids = list(qcmd)
+    i = 0
+    while i < len(kids):
+        if kids[i].get('value') == flag_value and i + 1 < len(kids):
+            qcmd.remove(kids[i+1]); qcmd.remove(kids[i])
+            kids = list(qcmd); i = 0
+        else:
+            i += 1
 # --- stealth ---
 features = get_or_create(root, 'features')
 hyperv = get_or_create(features, 'hyperv', {'mode': 'custom'})
@@ -9218,14 +9285,25 @@ for t in clock.findall('timer'):
 if tsc is None: tsc = ET.SubElement(clock, 'timer', {'name': 'tsc'})
 if tsc.get('mode') != 'native': tsc.set('mode', 'native'); changed = True
 if tsc.get('present') not in (None, 'yes'): tsc.set('present', 'yes'); changed = True
-qemu_cmd = reset_qemu_commandline(root)
+# #1: read the host DMI identity (exported by the bash wrapper) so the spoofed
+# SMBIOS matches the host hardware. Falls back to hardcoded defaults.
+dmi_sv = os.environ.get('VFIO_STEALTH_DMI_SYS_VENDOR', 'ASUS')
+dmi_prod = os.environ.get('VFIO_STEALTH_DMI_PRODUCT', 'ROG STRIX B550-F')
+dmi_bv = os.environ.get('VFIO_STEALTH_DMI_BIOS_VENDOR', 'American Megatrends Inc.')
+dmi_bver = os.environ.get('VFIO_STEALTH_DMI_BIOS_VERSION', '1802')
+dmi_bdate = os.environ.get('VFIO_STEALTH_DMI_BIOS_DATE', '12/12/2023')
+qemu_cmd = get_or_create_qemu_commandline(root)
+# #2: dedupe the stealth -cpu + -smbios pairs (idempotent re-run) WITHOUT
+# wiping other user args (Looking Glass kvmfr, vendor-specific, etc.).
+remove_qemu_arg_pair(qemu_cmd, "-cpu")
+remove_qemu_arg_pair(qemu_cmd, "-smbios")
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-cpu"})
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on"})
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
-ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "type=0,vendor=American Megatrends Inc.,version=1802,date=12/12/2023"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=0,vendor={dmi_bv},version={dmi_bver},date={dmi_bdate}"})
 smbios_serial = secrets.token_hex(5).upper(); smbios_uuid = uuid.uuid4()
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
-ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=1,manufacturer=ASUS,product=ROG STRIX B550-F,serial={smbios_serial},uuid={smbios_uuid}"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=1,manufacturer={dmi_sv},product={dmi_prod},serial={smbios_serial},uuid={smbios_uuid}"})
 changed = True
 # --- perf ---
 if root.find('iothreads') is None:
@@ -9284,6 +9362,15 @@ PYEOF
       continue
     fi
     say "Tuned XML for '$_dom' validates. Backup of original: $_backup_xml"
+    # #5: in dry-run, show a unified diff of current vs tuned XML before prompting.
+    if (( DRY_RUN )); then
+      say "Dry run: showing diff (current -> tuned) for '$_dom' (no redefine will happen):"
+      if command -v diff >/dev/null 2>&1; then
+        diff -u "$_backup_xml" "$_tmp" || true
+      else
+        say "diff(1) not available; tuned XML is in $_tmp"
+      fi
+    fi
     if ! prompt_yn "Redefine VM '$_dom' with the stealth/perf tuning now?" N "Stealth/perf VM tuning"; then
       note "Skipped '$_dom' by user choice (tuned XML left in $_tmp; backup at $_backup_xml)."
       rm -f "$_tmp"
@@ -9304,6 +9391,160 @@ PYEOF
       note "No shut-off VMs with the guest GPU found; nothing to tune."
     fi
   fi
+}
+
+# #3: Revert stealth/perf VM tuning by redefining each guest-GPU VM from its
+# most recent *_stealth_*.xml backup. Standalone mode (--reset-stealth-vm-tuning).
+# Only acts on shut-off VMs (running VMs are skipped with a note). Verifies the
+# backup XML with virt-xml-validate and prompts before redefining.
+reset_stealth_vm_tuning() {
+  if ! readable_file "$CONF_FILE"; then
+    note "Missing $CONF_FILE; nothing to revert."
+    return 0
+  fi
+  local _guest_gpu _vendor
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -z "$_guest_gpu" ]]; then
+    note "No GUEST_GPU_BDF in $CONF_FILE; nothing to revert."
+    return 0
+  fi
+  if ! have_cmd virsh; then
+    note "virsh not available; cannot revert stealth/perf VM tuning."
+    return 0
+  fi
+  # Resolve the backup dir (same logic as install_stealth_vm_tuning).
+  local _backup_dir
+  _backup_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _backup_dir="$(trim "${_backup_dir:-}")"
+  if [[ -z "$_backup_dir" ]]; then _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"; fi
+  if ! [[ -d "$_backup_dir" ]]; then
+    _backup_dir="/var/lib/vfio-stealth-vm/backups"
+  fi
+  say
+  hdr "Revert stealth/perf VM tuning (restore from backup XML)"
+  note "This redefines each shut-off guest-GPU VM from its most recent"
+  note "${_dom:-<vm>}_stealth_*.xml backup in $_backup_dir."
+  note "Only shut-off VMs are touched; running VMs are skipped."
+  say
+  local _reverted=0 _skipped_running=0 _dom _xml _bdfs _state _backup _newest
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+      continue
+    fi
+    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping revert. Shut it off and re-run."
+      _skipped_running=1
+      continue
+    fi
+    # Find the most recent *_stealth_*.xml backup for this VM.
+    _newest=""
+    for _backup in "$_backup_dir/${_dom}_stealth_"*.xml; do
+      [[ -f "$_backup" ]] || continue
+      if [[ -z "$_newest" || "$_backup" -nt "$_newest" ]]; then
+        _newest="$_backup"
+      fi
+    done
+    if [[ -z "$_newest" ]]; then
+      note "No stealth backup XML found for '$_dom' in $_backup_dir; skipping."
+      continue
+    fi
+    if ! virt-xml-validate "$_newest" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for backup '$_newest'; skipping revert of '$_dom'."
+      continue
+    fi
+    say "Found backup for '$_dom': $_newest (validates)."
+    if ! prompt_yn "Redefine VM '$_dom' from the pre-tuning backup now?" N "Revert stealth/perf VM tuning"; then
+      note "Skipped '$_dom' by user choice."
+      continue
+    fi
+    if (( ! DRY_RUN )); then
+      virsh -c qemu:///system define "$_newest" 2>/dev/null
+    fi
+    say "Reverted VM '$_dom' from backup: $_newest"
+    _reverted=1
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  if (( ! _reverted )); then
+    if (( _skipped_running )); then
+      note "No VMs were reverted (running VMs must be shut off first)."
+    else
+      note "No stealth backups found for guest-GPU VMs; nothing to revert."
+    fi
+  fi
+}
+
+# #4: Report stealth/perf VM tuning status for each guest-GPU VM (used by
+# --detect and --verify). Checks for vendor_id=GENUINE00000 + QEMU -cpu/-smbios
+# args in the VM XML. Prints one status line per guest-GPU VM.
+stealth_vm_tuning_status() {
+  if ! readable_file "$CONF_FILE"; then return 0; fi
+  local _guest_gpu _dom _xml _bdfs _has_vendor _has_cpu _has_smbios
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_guest_gpu" ]] || return 0
+  have_cmd virsh || return 0
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null || continue
+    _has_vendor=0; _has_cpu=0; _has_smbios=0
+    grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && _has_vendor=1
+    grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && _has_cpu=1
+    grep -Fq 'type=1,manufacturer=' <<<"$_xml" 2>/dev/null && _has_smbios=1
+    if (( _has_vendor && _has_cpu && _has_smbios )); then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: VM '$_dom' is stealth-tuned (vendor_id=GENUINE00000, -cpu/-smbios present)"
+      else
+        say "OK: VM '$_dom' is stealth-tuned (vendor_id=GENUINE00000, -cpu/-smbios present)"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_YELLOW}INFO${C_RESET}: VM '$_dom' is NOT stealth-tuned (use 'sudo $SCRIPT_NAME --install-stealth-vm-tuning')"
+      else
+        say "INFO: VM '$_dom' is NOT stealth-tuned (use 'sudo $SCRIPT_NAME --install-stealth-vm-tuning')"
+      fi
+    fi
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
 }
 
 # Remove the reboot-FLR monitor service + script.
@@ -13666,6 +13907,14 @@ verify_setup() {
   # Host-side VM internet sanity for libvirt/virt-manager NAT networking.
   # Informational only; does not affect VFIO PASS/FAIL grading.
   report_vm_network_precheck || true
+  # #4: stealth/perf VM tuning status for guest-GPU VMs (informational).
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}Stealth/perf VM tuning status:${C_RESET}"
+  else
+    say "Stealth/perf VM tuning status:"
+  fi
+  stealth_vm_tuning_status || true
   say
   if (( ok )); then
     if (( ENABLE_COLOR )); then
@@ -14278,6 +14527,9 @@ reset_vfio_all() {
   hdr "RESET / CLEANUP"
   note "This will remove VFIO passthrough settings installed by this script."
   note "It will NOT uninstall libvirt/QEMU, and it will NOT change your VM XMLs."
+  note "NOTE: stealth/perf-tuned VM XMLs are NOT reverted by --reset. Use"
+  note "      'sudo $SCRIPT_NAME --reset-stealth-vm-tuning' to restore them"
+  note "      from their *_stealth_*.xml backups before or after this reset."
 
   if ! confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
     die "Reset cancelled"
@@ -15738,6 +15990,22 @@ main() {
       fi
     fi
     install_stealth_vm_tuning
+    exit 0
+  fi
+
+  if [[ "$MODE" == "reset-stealth-vm-tuning" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run the full installer first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; stealth/perf VM revert needs libvirt to dump/define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Revert stealth/perf VM tuning"; then
+        die "Aborted by user"
+      fi
+    fi
+    reset_stealth_vm_tuning
     exit 0
   fi
 

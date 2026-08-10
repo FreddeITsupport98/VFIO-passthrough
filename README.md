@@ -18,6 +18,7 @@
 
 - [What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning](#whats-new--rx-9070--rdna4-dynamic-binding--wayland-render-device-pinning)
 - [Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card)
+- [Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)](#stealthperf-vm-tuning-smbios--cpu--nic--disk-serials--iothreads)
 - [Why this matters for newer AMD cards](#why-this-matters-for-newer-amd-cards)
 - [The two-mode choice (early vs dynamic)](#the-two-mode-choice-early-vs-dynamic)
 - [How the host desktop stays alive (3 defenses)](#how-the-host-desktop-stays-alive-3-defenses)
@@ -143,6 +144,39 @@ flowchart TD
 ```
 
 These three mitigations run automatically once `--install-dynamic-binding` is in place — no per-reboot manual steps. Follow them live with `journalctl -t vfio-reboot-flr -f` (reboot-FLR monitor) and `journalctl -t vfio-dynamic -f` (bind/release + zombie recovery).
+
+### Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)
+
+vfio 6.0 also absorbs the Stealthy-VM tuning (MIT-licensed, by Fredrik Bäckström) so a Windows guest looks more like a real desktop PC and gets perf tuning — applied directly to the detected guest-GPU VMs at install time, with verification before anything is redefined.
+
+**What it does** (to each shut-off VM that has the guest GPU attached):
+- **Hypervisor hide**: `hyperv vendor_id=GENUINE00000` + `kvm hidden` (so the AMD Windows driver installs the real display driver).
+- **CPU**: `host-passthrough` + the `hypervisor` CPUID bit disabled; QEMU `-cpu host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on`.
+- **SMBIOS spoofing** from the **host's real DMI** (`/sys/class/dmi/id/*`) — BIOS vendor/version/date + system manufacturer/product with a randomized serial/UUID — so the VM's SMBIOS matches your actual hardware, not a generic ASUS B550 (falls back to defaults if DMI is unreadable).
+- **Devices**: virtio NIC → `e1000e`; randomized disk serials; `memballoon=none`; tablet input removed (USB mouse kept); `hypervclock` off; TSC native.
+- **Perf**: `iothreads=1`, host-aware `cputune` (vCPU/emulator/iothread pinning based on host core count), disk iothread assignment.
+- **Preserves your existing `<qemu:commandline>` args** (e.g. Looking Glass `kvmfr`) — it dedupes its own `-cpu`/`-smbios` pairs instead of wiping the commandline, so re-running is idempotent.
+
+**Safety / verify-before-define**: for each VM it dumps + backs up the XML, runs the tuning on a temp copy, validates with `virt-xml-validate`, and prompts before `virsh define`. Running VMs are skipped. `--dry-run` shows a `diff -u` of the changes.
+
+```fish path=null start=null
+# During a dynamic install (opt-in prompt, default N):
+sudo ./vfio.sh --install-dynamic-binding --stealth-vm-tuning
+
+# Re-apply/refresh tuning on existing VMs without the full wizard:
+sudo ./vfio.sh --install-stealth-vm-tuning
+
+# Preview the changes without redefining (dry-run diff per VM):
+sudo ./vfio.sh --install-stealth-vm-tuning --dry-run
+
+# Revert a VM from its most recent *_stealth_*.xml backup:
+sudo ./vfio.sh --reset-stealth-vm-tuning
+
+# Check tuning status (in --detect / --verify):
+sudo ./vfio.sh --verify
+```
+
+Backups go to `STEALTH_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-stealth-vm/backups`). `--reset` does NOT revert VM XMLs — use `--reset-stealth-vm-tuning` for that. This is cosmetic realism + perf tuning, **not** an anti-cheat bypass.
 
 ### Why this matters for newer AMD cards
 

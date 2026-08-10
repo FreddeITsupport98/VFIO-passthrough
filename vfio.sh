@@ -9234,6 +9234,14 @@ for ch in kvm:
     if ch.tag == 'hidden': hidden = ch; break
 if hidden is None: hidden = ET.SubElement(kvm, 'hidden')
 if hidden.get('state') != 'on': hidden.set('state', 'on'); changed = True
+# Disable the VMware backdoor port (vmport) so Windows detection tools that
+# probe port 0x5658 ('VMX') don't report "Is Virtual Machine: yes". This is a
+# key hypervisor detection vector alongside the CPUID hypervisor bit.
+vmport = None
+for ch in features:
+    if ch.tag == 'vmport': vmport = ch; break
+if vmport is None: vmport = ET.SubElement(features, 'vmport')
+if vmport.get('state') != 'off': vmport.set('state', 'off'); changed = True
 cpu = root.find('cpu')
 if cpu is None: cpu = ET.SubElement(root, 'cpu', {'mode': 'host-passthrough', 'check': 'none', 'migratable': 'on'}); changed = True
 has_hv = False
@@ -15537,6 +15545,22 @@ apply_configuration() {
     # GPU is Boot VGA. (Early binding binds at boot, before the compositor
     # starts, so the pin is only needed for dynamic binding.)
     install_wayland_render_device_pin "$host_gpu" "$guest_gpu"
+    # Install the reboot-FLR monitor (watches for guest warm reboot and does a
+    # soft FLR to clear the display wedge so OVMF re-POSTs without a host reboot).
+    install_reboot_flr_monitor
+    # Stealth/perf VM tuning (opt-in) — asks the user if they want the VM to
+    # look like a real desktop PC (SMBIOS spoofing, CPU hypervisor-bit disable,
+    # e1000e NIC, randomized disk serials, vmport off, iothreads/cputune).
+    # Honors --stealth-vm-tuning / --no-stealth-vm-tuning overrides.
+    if [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "1" ]]; then
+      install_stealth_vm_tuning
+    elif [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
+      note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning). The minimal hypervisor hide is still available via the full wizard if needed."
+    elif prompt_yn "Apply stealth/perf VM tuning to detected guest-GPU VMs? (SMBIOS spoofing, CPU/NIC/disk serials, vmport off, iothreads — makes the VM look like a real desktop PC)" N "Stealth/perf VM tuning"; then
+      install_stealth_vm_tuning
+    else
+      note "Skipping stealth/perf VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-stealth-vm-tuning"
+    fi
   fi
   if (( INSTALL_GRAPHICS_DAEMON )); then
     install_graphics_protocol_daemon "$graphics_daemon_interval"

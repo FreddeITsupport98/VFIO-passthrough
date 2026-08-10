@@ -1730,6 +1730,29 @@ assert_contains_file \
   "Q3v+ README notes MIT license attribution" \
   'MIT-licensed, by Fredrik Bäckström' \
   "${PROJECT_ROOT}/README.md"
+# vmport state=off (VMware backdoor port — stops Windows "Is Virtual Machine: yes")
+assert_contains_file \
+  "Q3v+ stealth tuning sets vmport state=off" \
+  "vmport.set('state', 'off')" \
+  "$VFIO_SCRIPT"
+# Full wizard (apply_configuration) dynamic block: reboot-FLR monitor + stealth prompt
+_apply_fn="$(sed -n '/^apply_configuration()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3v+ full wizard calls install_reboot_flr_monitor in dynamic block" \
+  'install_reboot_flr_monitor' \
+  "$_apply_fn"
+assert_contains_text \
+  "Q3v+ full wizard calls install_stealth_vm_tuning in dynamic block" \
+  'install_stealth_vm_tuning' \
+  "$_apply_fn"
+assert_contains_text \
+  "Q3v+ full wizard prompts for stealth/perf VM tuning" \
+  'Apply stealth/perf VM tuning to detected guest-GPU VMs' \
+  "$_apply_fn"
+assert_contains_text \
+  "Q3v+ full wizard stealth prompt mentions vmport off" \
+  'vmport off' \
+  "$_apply_fn"
 
 # --- Functional Q3j: dedicated hook log ---
 assert_contains_text \

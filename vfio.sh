@@ -69,6 +69,18 @@ WLR_RENDER_PIN_FILE="/etc/profile.d/vfio-wayland-render-device.sh"
 # keep the VM running through a reboot the same way).
 REBOOT_FLR_SCRIPT="/usr/local/sbin/vfio-reboot-flr-monitor.sh"
 REBOOT_FLR_UNIT="/etc/systemd/system/vfio-reboot-flr.service"
+# Park-keepalive monitor: a systemd service (dynamic binding only) that
+# periodically checks whether the guest GPU parked on vfio-pci between VM
+# sessions (VFIO_DYNAMIC_REBIND_HOST=0, the default) is still alive, and
+# proactively runs the same remove+rescan bus recovery used at --release time
+# if it has died (RX 9070 / RDNA4 reset bug). This is the PROACTIVE complement
+# to the reactive release-time zombie recovery in the bind script: it catches
+# a card that dies while parked BETWEEN VM stop/start events, not just at the
+# moment of VM stop. Installed and enabled automatically (instant on) whenever
+# dynamic binding is installed; disable via VFIO_DYNAMIC_PARK_KEEPALIVE=0 in
+# $CONF_FILE. Removed by --install-early-binding and by --reset.
+PARK_KEEPALIVE_SCRIPT="/usr/local/sbin/vfio-gpu-park-keepalive.sh"
+PARK_KEEPALIVE_UNIT="/etc/systemd/system/vfio-gpu-park-keepalive.service"
 
 DEBUG=0
 DRY_RUN=0
@@ -4265,6 +4277,21 @@ VFIO_REBOOT_FLR_MAX_GEN=""
 # (read by install_stealth_vm_tuning / reset_stealth_vm_tuning). Default empty
 # = $HOME/Desktop; falls back to /var/lib/vfio-stealth-vm/backups if not writable.
 STEALTH_VM_BACKUP_DIR=""
+# Dynamic-mode park-keepalive monitor (read by vfio-gpu-park-keepalive.sh):
+# - 1 (default, instant on): while the guest GPU is parked on vfio-pci between
+#   VM sessions (VFIO_DYNAMIC_REBIND_HOST=0), periodically probe whether it is
+#   still alive and proactively run the remove+rescan bus recovery if it has
+#   died (RX 9070 / RDNA4 reset bug). This is the PROACTIVE complement to the
+#   reactive recovery already run at --release time: it catches a card that
+#   dies while sitting parked, before the next VM start.
+# - 0: disable the periodic keepalive probe (rely only on the release-time and
+#   bind-time recovery attempts).
+VFIO_DYNAMIC_PARK_KEEPALIVE="1"
+# Park-keepalive probe interval in seconds (read by vfio-gpu-park-keepalive.sh).
+# WHY this value: 30s is frequent enough to catch a dead card well before the
+# next VM start on a typical workflow, yet infrequent enough to keep the sysfs
+# config-space polling overhead negligible.
+VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="30"
 EOF
 }
 
@@ -8929,6 +8956,234 @@ EOF
   note "to clear the display wedge so OVMF can re-POST without a host reboot."
 }
 
+# Install the park-keepalive monitor: a systemd service (dynamic binding only)
+# that periodically checks whether the guest GPU, PARKED on vfio-pci between
+# VM sessions (VFIO_DYNAMIC_REBIND_HOST=0, the default), is still alive. If it
+# has died (RX 9070 / RDNA4 reset bug — config space reads all 0xff / vendor
+# 0xffff) it proactively runs the same remove+rescan bus recovery used at
+# --release time, so a card that dies while sitting parked (not right at VM
+# stop) is recovered BEFORE the next VM start instead of failing that VM
+# start. This is the PROACTIVE complement to the reactive release-time zombie
+# recovery already in the bind script.
+#
+# INSTANT ON: unlike stealth/perf VM tuning, this is installed and enabled
+# automatically whenever dynamic binding is installed — there is no prompt.
+# Disable it by setting VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE (the
+# running service re-reads that key every poll interval, so no restart is
+# required for the change to take effect). Removed by --install-early-binding
+# and by --reset.
+install_park_keepalive_monitor() {
+  if ! have_cmd systemctl; then
+    note "systemctl not available; skipping park-keepalive monitor installation."
+    return 0
+  fi
+
+  if (( ! DRY_RUN )); then
+    mkdir -p "$(dirname "$PARK_KEEPALIVE_SCRIPT")" "$(dirname "$PARK_KEEPALIVE_UNIT")"
+  fi
+
+  backup_file "$PARK_KEEPALIVE_SCRIPT"
+  backup_file "$PARK_KEEPALIVE_UNIT"
+
+  write_file_atomic "$PARK_KEEPALIVE_SCRIPT" 0755 "root:root" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Managed by vfio.sh — park-keepalive monitor for dynamic GPU binding.
+# Periodically checks whether the guest GPU, parked on vfio-pci between VM
+# sessions, is still alive; proactively recovers it (remove+rescan) if it has
+# died (RX 9070 / RDNA4 reset bug) so the NEXT VM start does not hit a dead
+# card. PROACTIVE complement to the reactive --release-time zombie recovery.
+# Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --install-early-binding)
+
+CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-park-keepalive -- "$*" 2>/dev/null || true; }
+
+[[ -f "$CONF_FILE" ]] || { jlog "missing $CONF_FILE; exiting"; exit 0; }
+
+# Read a single key out of $CONF_FILE without sourcing the whole file (the
+# conf is re-read every poll iteration so VFIO_DYNAMIC_PARK_KEEPALIVE / the
+# interval / GUEST_GPU_BDF can be changed live without restarting the unit).
+_conf_get() {
+  local _key="$1"
+  awk -F= -v k="$_key" '$1==k{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true
+}
+
+# Same liveness test as the bind script's _pci_dev_alive: config space
+# readable and not all 0xff, vendor sysfs not 0xffff. Duplicated here (not
+# sourced) because each generated helper script is standalone.
+_pci_dev_alive() {
+  local _bdf="$1" _sys _vendor _cfg
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _vendor="$(cat "$_sys/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_vendor" ]] || return 1
+  [[ "$_vendor" != "0xffff" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d " \n")"
+  [[ -n "$_cfg" ]] || return 1
+  [[ "$_cfg" != "ffffffff" ]] || return 1
+  return 0
+}
+
+# Same last-resort recovery as the bind script's _pci_dev_remove_rescan.
+_pci_dev_remove_rescan() {
+  local _bdf="$1" _sys
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  jlog "$_bdf: park-keepalive attempting remove+rescan recovery"
+  if [[ -w "$_sys/remove" ]]; then
+    echo 1 >"$_sys/remove" 2>/dev/null || true
+    sleep 1
+  fi
+  echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+  sleep 1
+  [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after rescan"; return 1; }
+  echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+  echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+  sleep 0.3
+  if _pci_dev_alive "$_bdf"; then
+    jlog "$_bdf: park-keepalive recovered device after remove+rescan (alive)"
+    return 0
+  fi
+  jlog "$_bdf: park-keepalive remove+rescan did not recover device"
+  return 1
+}
+
+# Returns 0 if the guest GPU BDF is currently attached to a RUNNING libvirt
+# domain. Never attempt bus recovery on a card a running VM legitimately owns
+# — only act on a card that is idle/parked. If virsh is unavailable we cannot
+# verify this, so callers must treat that as "unknown, do not act" (fail-safe).
+_gpu_owned_by_running_domain() {
+  local _bdf="$1" _dom _xml _bdfs
+  command -v virsh >/dev/null 2>&1 || return 2
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if grep -Fixq "$_bdf" <<<"$_bdfs" 2>/dev/null; then
+      return 0
+    fi
+  done < <(virsh -c qemu:///system list --name 2>/dev/null)
+  return 1
+}
+
+_warned_no_virsh=0
+jlog "vfio-gpu-park-keepalive monitor started"
+
+while true; do
+  _enabled="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE)"
+  _enabled="${_enabled:-1}"
+  _interval="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL)"
+  if [[ ! "$_interval" =~ ^[0-9]+$ ]] || (( _interval < 5 )); then
+    _interval=30
+  fi
+  _binding_mode="$(_conf_get VFIO_BINDING_MODE)"
+  _rebind_host="$(_conf_get VFIO_DYNAMIC_REBIND_HOST)"
+  _guest_gpu="$(_conf_get GUEST_GPU_BDF)"
+
+  if [[ "$_enabled" != "1" ]]; then
+    sleep "$_interval"
+    continue
+  fi
+  if [[ "${_binding_mode,,}" != "dynamic" ]]; then
+    sleep "$_interval"
+    continue
+  fi
+  if [[ "${_rebind_host:-0}" == "1" ]]; then
+    # Card is meant to go back to the host driver on VM stop, not stay parked
+    # on vfio-pci — nothing for the park-keepalive to watch.
+    sleep "$_interval"
+    continue
+  fi
+  if [[ -z "$_guest_gpu" || ! -d "/sys/bus/pci/devices/$_guest_gpu" ]]; then
+    sleep "$_interval"
+    continue
+  fi
+  _drv=""
+  if [[ -L "/sys/bus/pci/devices/$_guest_gpu/driver" ]]; then
+    _drv="$(basename "$(readlink "/sys/bus/pci/devices/$_guest_gpu/driver")" 2>/dev/null || echo "")"
+  fi
+  if [[ "$_drv" != "vfio-pci" ]]; then
+    # Not currently parked on vfio-pci (e.g. still on amdgpu pre-first-bind).
+    sleep "$_interval"
+    continue
+  fi
+  _owned_rc=0
+  _gpu_owned_by_running_domain "$_guest_gpu" || _owned_rc=$?
+  if (( _owned_rc == 0 )); then
+    # A running VM legitimately owns this device right now; never touch it.
+    sleep "$_interval"
+    continue
+  elif (( _owned_rc == 2 )); then
+    # virsh unavailable: cannot verify the device is idle, so fail safe and
+    # skip any recovery action (log once to avoid spamming the journal).
+    if (( ! _warned_no_virsh )); then
+      jlog "virsh not available; park-keepalive cannot verify device is idle, skipping recovery checks"
+      _warned_no_virsh=1
+    fi
+    sleep "$_interval"
+    continue
+  fi
+  if _pci_dev_alive "$_guest_gpu"; then
+    sleep "$_interval"
+    continue
+  fi
+  jlog "$_guest_gpu: zombie detected while parked (config space unreadable); attempting proactive remove+rescan recovery"
+  if _pci_dev_remove_rescan "$_guest_gpu"; then
+    jlog "$_guest_gpu: park-keepalive recovered parked device (alive again)"
+  else
+    jlog "$_guest_gpu: park-keepalive could not recover parked device; will retry next interval; may need a host reboot"
+  fi
+  sleep "$_interval"
+done
+EOF
+
+  write_file_atomic "$PARK_KEEPALIVE_UNIT" 0644 "root:root" <<EOF
+[Unit]
+Description=vfio GPU park-keepalive monitor (proactively recovers a parked guest GPU that dies between VM sessions)
+After=libvirtd.service virtqemud.service libvirtd.socket virtqemud.socket
+
+[Service]
+Type=simple
+ExecStart=$PARK_KEEPALIVE_SCRIPT
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  run systemctl daemon-reload 2>/dev/null || true
+  run systemctl enable vfio-gpu-park-keepalive.service 2>/dev/null || true
+  run systemctl start vfio-gpu-park-keepalive.service 2>/dev/null || true
+  say "Installed park-keepalive monitor: $PARK_KEEPALIVE_SCRIPT (service: $PARK_KEEPALIVE_UNIT)"
+  note "Instant on: while the guest GPU is parked on vfio-pci between VM sessions, this"
+  note "periodically checks it is alive and proactively recovers it if it died (RX 9070 /"
+  note "RDNA4 reset bug), so the NEXT VM start does not hit a dead card. Disable via"
+  note "VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
+}
+
 # Automatically hide the hypervisor on libvirt VMs that have the guest GPU
 # attached. The AMD Windows driver detects it is running under a hypervisor
 # (via CPUID hypervisor leaves + Hyper-V vendor ID) and refuses to install the
@@ -9608,6 +9863,17 @@ remove_reboot_flr_monitor() {
     run systemctl disable --now vfio-reboot-flr.service 2>/dev/null || true
   fi
   run rm -f "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" 2>/dev/null || true
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl daemon-reload 2>/dev/null || true
+  fi
+}
+
+# Remove the park-keepalive monitor service + script (dynamic-binding only).
+remove_park_keepalive_monitor() {
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl disable --now vfio-gpu-park-keepalive.service 2>/dev/null || true
+  fi
+  run rm -f "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" 2>/dev/null || true
   if command -v systemctl >/dev/null 2>&1; then
     run systemctl daemon-reload 2>/dev/null || true
   fi
@@ -10597,6 +10863,10 @@ install_dynamic_binding_from_existing_config() {
   note "  7. Install the reboot-FLR monitor (a systemd service that watches for guest"
   note "     warm reboot and does a soft FLR to clear the GPU display wedge so OVMF"
   note "     can re-POST without needing a host reboot — set on_reboot=restart in VM XML)"
+  note "  7b. Install the park-keepalive monitor (instant on, no prompt): a systemd"
+  note "      service that periodically checks the guest GPU while parked on vfio-pci"
+  note "      between VM sessions and proactively recovers it if it died. Disable via"
+  note "      VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
   note "  8. Stealth/perf VM tuning (optional, opt-in): on shut-off VMs with the guest GPU,"
   note "     apply SMBIOS spoofing + CPU hypervisor-bit disable + e1000e NIC + randomized"
   note "     disk serials + memballoon=none + iothreads/cputune + hypervisor hide"
@@ -10663,6 +10933,10 @@ install_dynamic_binding_from_existing_config() {
   # 3c. Install the reboot-FLR monitor (watches for guest warm reboot and does a
   #     soft FLR to clear the display wedge so OVMF re-POSTs without a host reboot).
   install_reboot_flr_monitor
+
+  # 3c2. Install the park-keepalive monitor (instant on, no prompt): proactively
+  #      recovers the guest GPU while it is parked on vfio-pci between VM sessions.
+  install_park_keepalive_monitor
 
   # 3d. Stealth/perf VM tuning (opt-in) — supersedes the minimal hypervisor-hide
   #     helper for the dynamic path. Applies the full Stealthy-VM tuning (which
@@ -10749,6 +11023,7 @@ install_early_binding_from_existing_config() {
   note "     longer needed)"
   note "  7. Remove the reboot-FLR monitor (early binding does not use warm-reboot"
   note "     passthrough; the monitor is dynamic-binding-only)"
+  note "  7b. Remove the park-keepalive monitor (dynamic-binding-only)"
   say
 
   # 1. Flip the conf key.
@@ -10786,6 +11061,9 @@ install_early_binding_from_existing_config() {
 
   # 3c. Remove the reboot-FLR monitor (dynamic-binding-only).
   remove_reboot_flr_monitor
+
+  # 3c2. Remove the park-keepalive monitor (dynamic-binding-only).
+  remove_park_keepalive_monitor
 
   # 4. Re-add early-binding tokens to the kernel cmdline.
   local guest_ids
@@ -14602,6 +14880,8 @@ reset_vfio_all() {
     run systemctl disable --now vfio-graphics-protocold.service 2>/dev/null || true
     # Reboot-FLR monitor (dynamic binding only)
     run systemctl disable --now vfio-reboot-flr.service 2>/dev/null || true
+    # Park-keepalive monitor (dynamic binding only)
+    run systemctl disable --now vfio-gpu-park-keepalive.service 2>/dev/null || true
 
     # If we previously masked plymouth units as part of "disable splash",
     # unmask them on reset so the system can return to distro defaults.
@@ -14643,6 +14923,7 @@ reset_vfio_all() {
            "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
            "$KWIN_RENDER_PIN_FILE" "$WLR_RENDER_PIN_FILE" \
            "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" \
+           "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook
@@ -15595,6 +15876,9 @@ apply_configuration() {
     # Install the reboot-FLR monitor (watches for guest warm reboot and does a
     # soft FLR to clear the display wedge so OVMF re-POSTs without a host reboot).
     install_reboot_flr_monitor
+    # Install the park-keepalive monitor (instant on, no prompt): proactively
+    # recovers the guest GPU while it is parked on vfio-pci between VM sessions.
+    install_park_keepalive_monitor
     # Stealth/perf VM tuning (opt-in) — asks the user if they want the VM to
     # look like a real desktop PC (SMBIOS spoofing, CPU hypervisor-bit disable,
     # e1000e NIC, randomized disk serials, vmport off, iothreads/cputune).

@@ -23,6 +23,7 @@ bad() { printf 'SMOKE FAIL: %s\n' "$1" >&2; fail=1; }
 # --- Extract generated bind + hook scripts from the heredocs ---
 sed -n '/write_file_atomic "$BIND_SCRIPT" 0755 "root:root" <<.EOF./,/^EOF$/p' "$VFIO_SCRIPT" | sed '1d;$d' > "$tmp/gen_bind.sh"
 sed -n '/write_file_atomic "$LIBVIRT_HOOK_SCRIPT" 0755 "root:root" <<.EOF./,/^EOF$/p' "$VFIO_SCRIPT" | sed '1d;$d' > "$tmp/gen_hook.sh"
+sed -n '/write_file_atomic "$PARK_KEEPALIVE_SCRIPT" 0755 "root:root" <<.EOF./,/^EOF$/p' "$VFIO_SCRIPT" | sed '1d;$d' > "$tmp/gen_park_keepalive.sh"
 
 if bash -n "$tmp/gen_bind.sh"; then
   ok "generated bind script syntax"
@@ -33,6 +34,11 @@ if bash -n "$tmp/gen_hook.sh"; then
   ok "generated hook script syntax"
 else
   bad "generated hook script syntax"
+fi
+if bash -n "$tmp/gen_park_keepalive.sh"; then
+  ok "generated park-keepalive script syntax"
+else
+  bad "generated park-keepalive script syntax"
 fi
 
 # --- Smoke fix #1: csv_to_array is defined before set_d3cold_for_guest_bdfs uses it ---
@@ -1470,6 +1476,144 @@ if grep -Fq 'install_hypervisor_hiding()' "$VFIO_SCRIPT" \
   ok "Q3u vfio.sh defines install_hypervisor_hiding + wired into install-dynamic"
 else
   bad "Q3u vfio.sh missing install_hypervisor_hiding or wiring"
+fi
+
+# --- Smoke Q3v: park-keepalive monitor (proactive zombie recovery while parked) ---
+# The park-keepalive monitor is a NEW, standalone generated script (extracted
+# above to gen_park_keepalive.sh). It duplicates _pci_dev_alive /
+# _pci_dev_remove_rescan from the bind script (each generated helper script is
+# standalone, same pattern as the reboot-FLR monitor), and adds a
+# _gpu_owned_by_running_domain fail-safe gate + a main loop that re-reads conf
+# every interval so VFIO_DYNAMIC_PARK_KEEPALIVE can be toggled live.
+
+# Case 1: duplicated _pci_dev_alive / _pci_dev_remove_rescan bodies stay in
+# sync with the bind script's copies (same liveness + recovery logic). Comment
+# lines are stripped before comparing since the two copies carry different
+# amounts of prose commentary but must execute identical code.
+_strip_comments() { grep -v '^[[:space:]]*#' | sed '/^[[:space:]]*$/d'; }
+_pka_alive="$(sed -n '/^_pci_dev_alive()/,/^}/p' "$tmp/gen_park_keepalive.sh" | _strip_comments)"
+_bind_alive="$(sed -n '/^_pci_dev_alive()/,/^}/p' "$tmp/gen_bind.sh" | _strip_comments)"
+if [[ -n "$_pka_alive" ]] && [[ "$_pka_alive" == "$_bind_alive" ]]; then
+  ok "Q3v park-keepalive _pci_dev_alive matches bind script's copy (code, ignoring comments)"
+else
+  bad "Q3v park-keepalive _pci_dev_alive drifted from bind script's copy"
+fi
+
+# Case 2: _conf_get parses a key out of a mock conf file (used to re-read
+# VFIO_DYNAMIC_PARK_KEEPALIVE / interval / mode / GUEST_GPU_BDF every poll).
+pkconf="$tmp/pk_conf"
+printf 'VFIO_DYNAMIC_PARK_KEEPALIVE="0"\nGUEST_GPU_BDF="0000:0e:00.0"\n' > "$pkconf"
+cat > "$tmp/smoke_pk_confget.sh" <<'PKCEOF'
+#!/usr/bin/env bash
+set -euo pipefail
+CONF_FILE="$1"
+_conf_get() {
+  local _key="$1"
+  awk -F= -v k="$_key" '$1==k{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true
+}
+echo "EN=$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE)"
+echo "GPU=$(_conf_get GUEST_GPU_BDF)"
+echo "MISSING=$(_conf_get NO_SUCH_KEY)"
+PKCEOF
+pkc="$(bash "$tmp/smoke_pk_confget.sh" "$pkconf")"
+if echo "$pkc" | grep -Fq 'EN=0' && echo "$pkc" | grep -Fq 'GPU=0000:0e:00.0' && echo "$pkc" | grep -Fq 'MISSING='; then
+  ok "Q3v _conf_get reads keys from conf file (present + missing)"
+else
+  bad "Q3v _conf_get case failed (got: $pkc)"
+fi
+
+# Case 3: _gpu_owned_by_running_domain — extract the real function and drive it
+# with a fake virsh so the BDF-ownership + fail-safe (virsh missing -> rc=2)
+# behavior is tested against the ACTUAL generated code, not a re-typed mock.
+_pka_owned_fn="$(sed -n '/^_gpu_owned_by_running_domain()/,/^}/p' "$tmp/gen_park_keepalive.sh")"
+lvfake2="$tmp/fakelvbin_pk"
+mkdir -p "$lvfake2"
+cat > "$lvfake2/virsh" <<'VEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *'list --name'*)
+    printf '%s\n' "${MOCK_DOMAINS:-}"
+    ;;
+  *'dumpxml'*)
+    printf '%s' "${MOCK_XML:-}"
+    ;;
+esac
+VEOF
+chmod +x "$lvfake2/virsh"
+cat > "$tmp/smoke_pk_owned.sh" <<PKOEOF
+#!/usr/bin/env bash
+set -uo pipefail
+$_pka_owned_fn
+_rc=0
+_gpu_owned_by_running_domain "\$1" || _rc=\$?
+echo "rc=\$_rc"
+PKOEOF
+_owned_xml="<hostdev type='pci'><address domain='0x0000' bus='0x0e' slot='0x00' function='0x0'/></hostdev>"
+bash_bin="$(command -v bash)"
+# 3a: running domain owns the BDF -> rc=0
+o1="$(PATH="$lvfake2:$PATH" MOCK_DOMAINS="win11" MOCK_XML="$_owned_xml" "$bash_bin" "$tmp/smoke_pk_owned.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$o1" | grep -Fq 'rc=0'; then ok "Q3v _gpu_owned_by_running_domain rc=0 when a running domain owns the BDF"; else bad "Q3v owned case failed (got: $o1)"; fi
+# 3b: running domain does NOT own the BDF -> rc=1
+o2="$(PATH="$lvfake2:$PATH" MOCK_DOMAINS="win11" MOCK_XML="<hostdev type='pci'><address domain='0x0000' bus='0x03' slot='0x00' function='0x0'/></hostdev>" "$bash_bin" "$tmp/smoke_pk_owned.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$o2" | grep -Fq 'rc=1'; then ok "Q3v _gpu_owned_by_running_domain rc=1 when no running domain owns the BDF"; else bad "Q3v not-owned case failed (got: $o2)"; fi
+# 3c: virsh unavailable -> rc=2 (fail-safe: caller must NOT act). Use an empty
+# directory on PATH (not a full PATH wipe) so the bash interpreter invoked
+# below (by absolute path) still runs, but `command -v virsh` still fails.
+mkdir -p "$tmp/emptybin"
+o3="$(PATH="$tmp/emptybin" "$bash_bin" "$tmp/smoke_pk_owned.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$o3" | grep -Fq 'rc=2'; then ok "Q3v _gpu_owned_by_running_domain rc=2 (fail-safe) when virsh is unavailable"; else bad "Q3v virsh-missing fail-safe failed (got: $o3)"; fi
+
+# Case 4 (static): main loop enforces the full safety-gate order before ever
+# calling remove+rescan: enabled -> dynamic mode -> not rebind-host -> on
+# vfio-pci -> not owned by a running domain -> virsh-present fail-safe.
+if grep -Fq '_enabled" != "1"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_binding_mode,,}" != "dynamic"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_rebind_host:-0}" == "1"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_drv" != "vfio-pci"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_owned_rc == 0' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_owned_rc == 2' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'zombie detected while parked' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_pci_dev_remove_rescan "$_guest_gpu"' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3v main loop enforces full safety-gate order before remove+rescan"
+else
+  bad "Q3v main loop missing one or more safety gates"
+fi
+
+# Case 5 (static): conf keys default to instant-on (1) with a sane interval,
+# and the systemd unit is a Restart=always simple service like reboot-FLR.
+if grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE="1"' "$VFIO_SCRIPT" \
+  && grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="30"' "$VFIO_SCRIPT" \
+  && grep -Fq 'ExecStart=$PARK_KEEPALIVE_SCRIPT' "$VFIO_SCRIPT" \
+  && grep -Fq 'vfio-gpu-park-keepalive.service' "$VFIO_SCRIPT"; then
+  ok "Q3v conf defaults to instant-on (1) + 30s interval; systemd unit defined"
+else
+  bad "Q3v missing instant-on conf defaults or systemd unit definition"
+fi
+
+# Case 6 (static): install_park_keepalive_monitor is called UNCONDITIONALLY
+# (no prompt) right after install_reboot_flr_monitor in both the full wizard's
+# DYNAMIC branch and the --install-dynamic-binding switcher; removal is wired
+# into --install-early-binding and --reset (per the "always update the
+# uninstaller" rule).
+_pkv_dyn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_pkv_early="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_pkv_reset="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'install_park_keepalive_monitor()' "$VFIO_SCRIPT" \
+  && grep -Fq 'remove_park_keepalive_monitor()' "$VFIO_SCRIPT" \
+  && grep -Fq 'install_park_keepalive_monitor' <<<"$_pkv_dyn" \
+  && grep -Fq 'remove_park_keepalive_monitor' <<<"$_pkv_early" \
+  && grep -Fq 'vfio-gpu-park-keepalive.service' <<<"$_pkv_reset" \
+  && grep -Fq 'PARK_KEEPALIVE_SCRIPT' <<<"$_pkv_reset"; then
+  ok "Q3v install/remove wired into dynamic switcher, early switcher, and reset"
+else
+  bad "Q3v install/remove wiring missing in switcher(s) or reset"
+fi
+# Case 7 (static): the full wizard's DYNAMIC branch also installs it unconditionally.
+_pkv_wizard="$(sed -n '/^apply_configuration()/,/^# Automatically hide the hypervisor/p' "$VFIO_SCRIPT")"
+if grep -Fq 'install_park_keepalive_monitor' <<<"$_pkv_wizard"; then
+  ok "Q3v full wizard DYNAMIC branch installs park-keepalive monitor unconditionally"
+else
+  bad "Q3v full wizard DYNAMIC branch missing install_park_keepalive_monitor call"
 fi
 
 if (( fail != 0 )); then

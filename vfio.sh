@@ -81,6 +81,24 @@ REBOOT_FLR_UNIT="/etc/systemd/system/vfio-reboot-flr.service"
 # $CONF_FILE. Removed by --install-early-binding and by --reset.
 PARK_KEEPALIVE_SCRIPT="/usr/local/sbin/vfio-gpu-park-keepalive.sh"
 PARK_KEEPALIVE_UNIT="/etc/systemd/system/vfio-gpu-park-keepalive.service"
+# Park-keepalive extensions (all instant on, same rationale as above):
+# - STATE_FILE: persists the consecutive-failure streak across daemon restarts
+#   and one-shot invocations (udev/resume-triggered), so backoff + the
+#   one-time notify threshold work correctly regardless of trigger source.
+# - RESUME_HOOK: a systemd-sleep drop-in that runs one immediate check right
+#   after resume from suspend/hibernate (S3/S4 sleep is a common D3cold
+#   trigger), instead of waiting up to the full poll interval.
+# - CHECK_UNIT: a oneshot systemd service (ExecStart=... --once) triggered
+#   on-demand by the udev rule below; shares all logic with the daemon.
+# - UDEV_RULE: best-effort supplementary trigger. CAVEAT: the RX 9070/RDNA4
+#   zombie state does NOT emit a PCI "remove" uevent (that is the bug — the
+#   kernel does not know the device died), so this only helps for state
+#   changes that DO emit uevents (e.g. driver bind/unbind, our own
+#   remove+rescan). The poll + resume hook remain the primary defenses.
+PARK_KEEPALIVE_STATE_FILE="/var/lib/vfio-dynamic/park-keepalive.state"
+PARK_KEEPALIVE_RESUME_HOOK="/usr/lib/systemd/system-sleep/vfio-gpu-park-keepalive-resume.sh"
+PARK_KEEPALIVE_CHECK_UNIT="/etc/systemd/system/vfio-gpu-park-keepalive-check.service"
+PARK_KEEPALIVE_UDEV_RULE="/etc/udev/rules.d/99-vfio-park-keepalive.rules"
 
 DEBUG=0
 DRY_RUN=0
@@ -1468,12 +1486,14 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Dynamic-install override: apply stealth/perf VM XML tuning (SMBIOS spoofing,
                    hypervisor CPUID disable, e1000e NIC, randomized disk serials, memballoon=none,
                    iothreads/cputune) to detected guest-GPU VMs without prompting.
+                   DISCLAIMER: cosmetic/perf realism ONLY, NOT an anti-cheat/anti-tamper bypass.
   --no-stealth-vm-tuning
                    Dynamic-install override: skip stealth/perf VM XML tuning.
   --install-stealth-vm-tuning
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
                    Verifies the tuned XML (virt-xml-validate) and prompts before redefining each VM.
+                   DISCLAIMER: cosmetic/perf realism ONLY, NOT an anti-cheat/anti-tamper bypass.
   --reset-stealth-vm-tuning
                    Revert stealth/perf VM XML tuning by redefining each shut-off guest-GPU VM
                    from its most recent *_stealth_*.xml backup. Verifies the backup XML and
@@ -4292,6 +4312,25 @@ VFIO_DYNAMIC_PARK_KEEPALIVE="1"
 # next VM start on a typical workflow, yet infrequent enough to keep the sysfs
 # config-space polling overhead negligible.
 VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="30"
+# Park-keepalive consecutive-failure threshold (instant on, read by
+# vfio-gpu-park-keepalive.sh). After this many consecutive failed remove+rescan
+# recovery attempts on the same zombie card, the monitor (a) backs off its poll
+# interval instead of hammering the bus every cycle, and (b) sends a one-time
+# best-effort desktop notification (see VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY) so
+# you know the card needs a host reboot instead of only discovering it at the
+# next VM start.
+VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS="5"
+# Park-keepalive backoff cap in seconds (read by vfio-gpu-park-keepalive.sh).
+# Once VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS is reached, the effective poll
+# interval grows (base interval * consecutive-failure count) up to this cap,
+# instead of retrying a card that needs a host reboot every single interval.
+VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX="300"
+# Park-keepalive desktop notification (instant on, read by
+# vfio-gpu-park-keepalive.sh). 1 = best-effort notify-send to the desktop user
+# session once VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS consecutive recovery
+# failures is reached (silently no-ops if notify-send / a desktop session is
+# unavailable). 0 = never notify (recovery attempts + logging still happen).
+VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY="1"
 EOF
 }
 
@@ -8979,7 +9018,9 @@ install_park_keepalive_monitor() {
   fi
 
   if (( ! DRY_RUN )); then
-    mkdir -p "$(dirname "$PARK_KEEPALIVE_SCRIPT")" "$(dirname "$PARK_KEEPALIVE_UNIT")"
+    mkdir -p "$(dirname "$PARK_KEEPALIVE_SCRIPT")" "$(dirname "$PARK_KEEPALIVE_UNIT")" \
+             "$(dirname "$PARK_KEEPALIVE_RESUME_HOOK")" "$(dirname "$PARK_KEEPALIVE_UDEV_RULE")" \
+             "$(dirname "$PARK_KEEPALIVE_STATE_FILE")"
   fi
 
   backup_file "$PARK_KEEPALIVE_SCRIPT"
@@ -8987,16 +9028,23 @@ install_park_keepalive_monitor() {
 
   write_file_atomic "$PARK_KEEPALIVE_SCRIPT" 0755 "root:root" <<'EOF'
 #!/usr/bin/env bash
-set -euo pipefail
+# NOTE: deliberately no `-e` — every sysfs write / recovery step below checks
+# its own exit status; failures are expected sometimes (e.g. a still-dead
+# card) and must not abort the whole monitor process.
+set -uo pipefail
 
 # Managed by vfio.sh — park-keepalive monitor for dynamic GPU binding.
 # Periodically checks whether the guest GPU, parked on vfio-pci between VM
 # sessions, is still alive; proactively recovers it (remove+rescan) if it has
 # died (RX 9070 / RDNA4 reset bug) so the NEXT VM start does not hit a dead
 # card. PROACTIVE complement to the reactive --release-time zombie recovery.
+# Also serves as the --once single-pass check invoked by the udev rule and by
+# the post-resume (suspend/hibernate) systemd-sleep hook — all three trigger
+# paths share this same logic.
 # Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --install-early-binding)
 
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+STATE_FILE="/var/lib/vfio-dynamic/park-keepalive.state"
 
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-park-keepalive -- "$*" 2>/dev/null || true; }
 
@@ -9052,13 +9100,19 @@ _pci_dev_remove_rescan() {
   return 1
 }
 
-# Returns 0 if the guest GPU BDF is currently attached to a RUNNING libvirt
-# domain. Never attempt bus recovery on a card a running VM legitimately owns
-# — only act on a card that is idle/parked. If virsh is unavailable we cannot
-# verify this, so callers must treat that as "unknown, do not act" (fail-safe).
+# Returns:
+#   0 = a RUNNING libvirt domain owns the BDF (never touch it)
+#   1 = virsh connected fine and confirms no running domain owns it
+#   2 = cannot determine (virsh missing, OR virsh is installed but failed to
+#       connect — e.g. libvirtd itself crashed). Callers must fail safe by
+#       default, but see _vfio_device_in_use for the hard-kill-without-
+#       release-event fallback used when this returns 2.
 _gpu_owned_by_running_domain() {
-  local _bdf="$1" _dom _xml _bdfs
+  local _bdf="$1" _dom _xml _bdfs _list_out _list_rc
   command -v virsh >/dev/null 2>&1 || return 2
+  _list_out="$(virsh -c qemu:///system list --name 2>/dev/null)"
+  _list_rc=$?
+  (( _list_rc == 0 )) || return 2
   while IFS= read -r _dom; do
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
@@ -9084,41 +9138,126 @@ _gpu_owned_by_running_domain() {
     if grep -Fixq "$_bdf" <<<"$_bdfs" 2>/dev/null; then
       return 0
     fi
-  done < <(virsh -c qemu:///system list --name 2>/dev/null)
+  done <<<"$_list_out"
   return 1
 }
 
-_warned_no_virsh=0
-jlog "vfio-gpu-park-keepalive monitor started"
+# Returns:
+#   0 = some process holds the VFIO device node for this BDF open (in use)
+#   1 = confirmed NOT in use (device node found, nothing has it open)
+#   2 = inconclusive (no /dev/vfio/<iommu_group> node, or /proc unreadable)
+# HARD-KILL WATCHDOG FALLBACK: used only when _gpu_owned_by_running_domain
+# returns 2 (libvirt unreachable, e.g. libvirtd itself crashed). Lets a true
+# "VM died without a clean release event because libvirt is down" scenario
+# still be recovered, instead of only ever failing safe until libvirt comes
+# back. Mirrors the /proc/<pid>/fd scan already used elsewhere in vfio.sh for
+# Wayland-compositor detection.
+_vfio_device_in_use() {
+  local _bdf="$1" _grp_link _grp _node _pid _fd _tgt
+  _grp_link="/sys/bus/pci/devices/$_bdf/iommu_group"
+  [[ -e "$_grp_link" ]] || return 2
+  _grp="$(basename "$(readlink -f "$_grp_link" 2>/dev/null)" 2>/dev/null || true)"
+  [[ -n "$_grp" ]] || return 2
+  _node="/dev/vfio/$_grp"
+  [[ -e "$_node" ]] || return 1
+  [[ -d /proc ]] || return 2
+  for _pid in /proc/[0-9]*; do
+    [[ -d "$_pid/fd" ]] || continue
+    for _fd in "$_pid"/fd/*; do
+      [[ -L "$_fd" ]] || continue
+      _tgt="$(readlink "$_fd" 2>/dev/null || true)"
+      if [[ "$_tgt" == "$_node" ]]; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
 
-while true; do
+# Consecutive-failure streak, persisted in $STATE_FILE so backoff + the
+# one-time notify threshold work correctly across daemon restarts AND
+# one-shot invocations (udev rule / resume hook), which are separate processes.
+_pk_read_streak() {
+  local _v
+  [[ -f "$STATE_FILE" ]] || { echo 0; return 0; }
+  _v="$(head -n1 "$STATE_FILE" 2>/dev/null || echo 0)"
+  [[ "$_v" =~ ^[0-9]+$ ]] && echo "$_v" || echo 0
+}
+_pk_write_streak() {
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+  printf '%s\n' "$1" >"$STATE_FILE" 2>/dev/null || true
+}
+_pk_reset_streak() {
+  [[ "$(_pk_read_streak)" == "0" ]] || _pk_write_streak 0
+  return 0
+}
+_pk_bump_streak() {
+  local _n
+  _n=$(( $(_pk_read_streak) + 1 ))
+  _pk_write_streak "$_n"
+  printf '%s\n' "$_n"
+}
+
+# Best-effort desktop notification (never fatal if unavailable). Broadcasts to
+# every active desktop session under /run/user/<uid> rather than guessing a
+# single "the" desktop user, since this monitor runs as a system service.
+_notify_desktop() {
+  local _title="$1" _body="$2" _rt _uid _user
+  command -v notify-send >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  for _rt in /run/user/*; do
+    [[ -d "$_rt" ]] || continue
+    _uid="$(basename "$_rt")"
+    [[ "$_uid" =~ ^[0-9]+$ ]] || continue
+    _user="$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)"
+    [[ -n "$_user" ]] || continue
+    runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$_rt/bus" \
+      notify-send -u critical "$_title" "$_body" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
+_warned_no_virsh=0
+NEXT_SLEEP=30
+
+# One full check-and-recover pass. Shared by the daemon loop below AND the
+# --once entry point (udev rule / post-resume hook), so all three trigger
+# paths get identical safety gating and recovery logic.
+_run_once() {
+  local _enabled _interval _max_fails _backoff_max _notify_enabled
+  local _binding_mode _rebind_host _guest_gpu _drv _owned_rc _fb_rc _streak
+
   _enabled="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE)"
   _enabled="${_enabled:-1}"
   _interval="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL)"
   if [[ ! "$_interval" =~ ^[0-9]+$ ]] || (( _interval < 5 )); then
     _interval=30
   fi
+  _max_fails="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS)"
+  [[ "$_max_fails" =~ ^[0-9]+$ ]] && (( _max_fails >= 1 )) || _max_fails=5
+  _backoff_max="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX)"
+  [[ "$_backoff_max" =~ ^[0-9]+$ ]] && (( _backoff_max >= _interval )) || _backoff_max=300
+  _notify_enabled="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY)"
+  _notify_enabled="${_notify_enabled:-1}"
   _binding_mode="$(_conf_get VFIO_BINDING_MODE)"
   _rebind_host="$(_conf_get VFIO_DYNAMIC_REBIND_HOST)"
   _guest_gpu="$(_conf_get GUEST_GPU_BDF)"
 
+  NEXT_SLEEP="$_interval"
+
   if [[ "$_enabled" != "1" ]]; then
-    sleep "$_interval"
-    continue
+    return 0
   fi
   if [[ "${_binding_mode,,}" != "dynamic" ]]; then
-    sleep "$_interval"
-    continue
+    return 0
   fi
   if [[ "${_rebind_host:-0}" == "1" ]]; then
     # Card is meant to go back to the host driver on VM stop, not stay parked
     # on vfio-pci — nothing for the park-keepalive to watch.
-    sleep "$_interval"
-    continue
+    return 0
   fi
   if [[ -z "$_guest_gpu" || ! -d "/sys/bus/pci/devices/$_guest_gpu" ]]; then
-    sleep "$_interval"
-    continue
+    return 0
   fi
   _drv=""
   if [[ -L "/sys/bus/pci/devices/$_guest_gpu/driver" ]]; then
@@ -9126,36 +9265,79 @@ while true; do
   fi
   if [[ "$_drv" != "vfio-pci" ]]; then
     # Not currently parked on vfio-pci (e.g. still on amdgpu pre-first-bind).
-    sleep "$_interval"
-    continue
+    return 0
   fi
+
+  # Cheap prophylactic reassertion: guard against anything (udev, a power
+  # daemon, resume from suspend) quietly flipping d3cold_allowed back on
+  # while the card sits parked. Best-effort; never fatal.
+  echo 0 >"/sys/bus/pci/devices/$_guest_gpu/d3cold_allowed" 2>/dev/null || true
+
   _owned_rc=0
   _gpu_owned_by_running_domain "$_guest_gpu" || _owned_rc=$?
   if (( _owned_rc == 0 )); then
     # A running VM legitimately owns this device right now; never touch it.
-    sleep "$_interval"
-    continue
+    return 0
   elif (( _owned_rc == 2 )); then
-    # virsh unavailable: cannot verify the device is idle, so fail safe and
-    # skip any recovery action (log once to avoid spamming the journal).
-    if (( ! _warned_no_virsh )); then
-      jlog "virsh not available; park-keepalive cannot verify device is idle, skipping recovery checks"
-      _warned_no_virsh=1
+    # virsh missing OR unreachable (e.g. libvirtd itself crashed). Fall back
+    # to a direct "does any process hold the VFIO device open" check instead
+    # of always failing safe, so a true hard-kill-without-release-event (VM
+    # died AND libvirt is down) can still be recovered.
+    _fb_rc=0
+    _vfio_device_in_use "$_guest_gpu" || _fb_rc=$?
+    if (( _fb_rc == 0 )); then
+      if (( ! _warned_no_virsh )); then
+        jlog "virsh unreachable; /dev/vfio in-use fallback says device IS in use, skipping"
+        _warned_no_virsh=1
+      fi
+      return 0
+    elif (( _fb_rc == 2 )); then
+      if (( ! _warned_no_virsh )); then
+        jlog "virsh unreachable and /dev/vfio in-use fallback is inconclusive; failing safe, skipping recovery checks"
+        _warned_no_virsh=1
+      fi
+      return 0
     fi
-    sleep "$_interval"
-    continue
+    jlog "virsh unreachable but /dev/vfio in-use fallback confirms device is idle; proceeding (hard-kill-without-release watchdog)"
   fi
+
   if _pci_dev_alive "$_guest_gpu"; then
-    sleep "$_interval"
-    continue
+    _pk_reset_streak
+    return 0
   fi
+
   jlog "$_guest_gpu: zombie detected while parked (config space unreadable); attempting proactive remove+rescan recovery"
   if _pci_dev_remove_rescan "$_guest_gpu"; then
     jlog "$_guest_gpu: park-keepalive recovered parked device (alive again)"
-  else
-    jlog "$_guest_gpu: park-keepalive could not recover parked device; will retry next interval; may need a host reboot"
+    _pk_reset_streak
+    return 0
   fi
-  sleep "$_interval"
+
+  jlog "$_guest_gpu: park-keepalive could not recover parked device; may need a host reboot"
+  _streak="$(_pk_bump_streak)"
+  if (( _streak >= _max_fails )); then
+    # Back off instead of hammering remove+rescan on a card that needs a
+    # host reboot; each failed attempt itself briefly perturbs the bus.
+    local _backed_off=$(( _interval * _streak ))
+    (( _backed_off > _backoff_max )) && _backed_off="$_backoff_max"
+    NEXT_SLEEP="$_backed_off"
+    if (( _streak == _max_fails )) && [[ "$_notify_enabled" == "1" ]]; then
+      jlog "$_guest_gpu: $_streak consecutive recovery failures; sending one-time desktop notification and backing off to ${_backed_off}s"
+      _notify_desktop "VFIO passthrough" "Guest GPU ($_guest_gpu) needs a host reboot: it has failed to recover $_streak times in a row while parked."
+    fi
+  fi
+  return 0
+}
+
+if [[ "${1:-}" == "--once" ]]; then
+  _run_once
+  exit 0
+fi
+
+jlog "vfio-gpu-park-keepalive monitor started"
+while true; do
+  _run_once
+  sleep "$NEXT_SLEEP"
 done
 EOF
 
@@ -9174,14 +9356,75 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
+  # Oneshot check unit: shares all logic with the daemon via --once. Started
+  # on-demand by the udev rule below (ENV{SYSTEMD_WANTS}); not enabled/started
+  # here since it has no persistent state of its own.
+  write_file_atomic "$PARK_KEEPALIVE_CHECK_UNIT" 0644 "root:root" <<EOF
+[Unit]
+Description=vfio GPU park-keepalive one-shot check (triggered by udev)
+After=libvirtd.service virtqemud.service libvirtd.socket virtqemud.socket
+
+[Service]
+Type=oneshot
+ExecStart=$PARK_KEEPALIVE_SCRIPT --once
+EOF
+
+  # Post-resume (suspend/hibernate) hook: systemd-sleep calls every executable
+  # in this directory with ($1=pre|post, $2=suspend|hibernate|...). We only
+  # act on "post" so a fresh check runs immediately after resume instead of
+  # waiting for the next poll interval (S3/S4 sleep is a common D3cold trigger).
+  write_file_atomic "$PARK_KEEPALIVE_RESUME_HOOK" 0755 "root:root" <<EOF
+#!/usr/bin/env bash
+# Managed by vfio.sh — systemd-sleep hook for the park-keepalive monitor.
+# Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --install-early-binding)
+case "\${1:-}" in
+  post)
+    [[ -x "$PARK_KEEPALIVE_SCRIPT" ]] && "$PARK_KEEPALIVE_SCRIPT" --once 2>/dev/null || true
+    ;;
+esac
+exit 0
+EOF
+
+  # Best-effort supplementary udev trigger. CAVEAT (documented for the user
+  # below too): the RX 9070 / RDNA4 zombie state does NOT emit a PCI "remove"
+  # uevent (that is exactly the bug — the kernel does not know the device
+  # died), so this only helps for state changes that DO emit uevents (driver
+  # bind/unbind, our own remove+rescan reappearing). The poll + resume hook
+  # remain the primary defenses; only write this when we know the guest BDF.
+  local _pk_guest_gpu
+  _pk_guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -n "$_pk_guest_gpu" ]]; then
+    write_file_atomic "$PARK_KEEPALIVE_UDEV_RULE" 0644 "root:root" <<EOF
+# Generated by $SCRIPT_NAME on $(date -Is)
+# Best-effort supplementary trigger for the park-keepalive one-shot check.
+# CAVEAT: the RX 9070 / RDNA4 zombie state does NOT emit a PCI "remove"
+# uevent (that is exactly the bug: the kernel does not know the device
+# died), so this rule only helps for state changes that DO emit uevents.
+# The periodic poll (vfio-gpu-park-keepalive.service) and the post-resume
+# hook ($PARK_KEEPALIVE_RESUME_HOOK) are the primary defenses.
+SUBSYSTEM=="pci", KERNELS=="$_pk_guest_gpu", ACTION=="change", TAG+="systemd", ENV{SYSTEMD_WANTS}+="vfio-gpu-park-keepalive-check.service"
+SUBSYSTEM=="pci", KERNELS=="$_pk_guest_gpu", ACTION=="bind", TAG+="systemd", ENV{SYSTEMD_WANTS}+="vfio-gpu-park-keepalive-check.service"
+EOF
+    if have_cmd udevadm; then
+      run udevadm control --reload-rules 2>/dev/null || true
+    fi
+  else
+    note "WARN: could not determine GUEST_GPU_BDF from $CONF_FILE; skipping the udev supplementary trigger (poll + resume hook are unaffected)."
+  fi
+
   run systemctl daemon-reload 2>/dev/null || true
   run systemctl enable vfio-gpu-park-keepalive.service 2>/dev/null || true
   run systemctl start vfio-gpu-park-keepalive.service 2>/dev/null || true
   say "Installed park-keepalive monitor: $PARK_KEEPALIVE_SCRIPT (service: $PARK_KEEPALIVE_UNIT)"
+  say "Installed post-resume hook: $PARK_KEEPALIVE_RESUME_HOOK"
+  say "Installed one-shot check unit: $PARK_KEEPALIVE_CHECK_UNIT"
   note "Instant on: while the guest GPU is parked on vfio-pci between VM sessions, this"
   note "periodically checks it is alive and proactively recovers it if it died (RX 9070 /"
-  note "RDNA4 reset bug), so the NEXT VM start does not hit a dead card. Disable via"
-  note "VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
+  note "RDNA4 reset bug), so the NEXT VM start does not hit a dead card. It also re-checks"
+  note "right after host suspend/hibernate resume, falls back to a direct in-use check when"
+  note "libvirt itself is unreachable (hard-kill-without-release-event), and backs off +"
+  note "sends a one-time desktop notification after $VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS consecutive recovery failures."
+  note "Disable via VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
 }
 
 # Automatically hide the hypervisor on libvirt VMs that have the guest GPU
@@ -9357,7 +9600,13 @@ install_stealth_vm_tuning() {
   note "  - perf: iothreads=1, host-aware cputune, disk iothread assignment"
   note "Only shut-off VMs are touched; running VMs are skipped. The tuned XML is"
   note "validated (virt-xml-validate) and you are prompted before each redefine."
-  note "This is cosmetic realism + perf tuning, NOT an anti-cheat bypass."
+  if (( ENABLE_COLOR )); then
+    note "${C_BOLD}${C_YELLOW}DISCLAIMER:${C_RESET} this is COSMETIC/PERFORMANCE realism tuning ONLY. It is NOT"
+  else
+    note "DISCLAIMER: this is COSMETIC/PERFORMANCE realism tuning ONLY. It is NOT"
+  fi
+  note "intended to, and does NOT reliably, defeat or bypass anti-cheat / anti-tamper software."
+  note "Using it to evade anti-cheat in an online game may still violate that game's terms of service."
   say
 
   local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp _backup_dir _backup_xml
@@ -9868,12 +10117,21 @@ remove_reboot_flr_monitor() {
   fi
 }
 
-# Remove the park-keepalive monitor service + script (dynamic-binding only).
+# Remove the park-keepalive monitor service + script (dynamic-binding only),
+# plus all its extensions: the post-resume hook, the udev-triggered one-shot
+# check unit, the supplementary udev rule, and the persisted failure-streak
+# state file.
 remove_park_keepalive_monitor() {
   if command -v systemctl >/dev/null 2>&1; then
     run systemctl disable --now vfio-gpu-park-keepalive.service 2>/dev/null || true
+    run systemctl disable --now vfio-gpu-park-keepalive-check.service 2>/dev/null || true
   fi
-  run rm -f "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" 2>/dev/null || true
+  run rm -f "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" "$PARK_KEEPALIVE_CHECK_UNIT" \
+           "$PARK_KEEPALIVE_RESUME_HOOK" "$PARK_KEEPALIVE_UDEV_RULE" "$PARK_KEEPALIVE_STATE_FILE" \
+           2>/dev/null || true
+  if have_cmd udevadm; then
+    run udevadm control --reload-rules 2>/dev/null || true
+  fi
   if command -v systemctl >/dev/null 2>&1; then
     run systemctl daemon-reload 2>/dev/null || true
   fi
@@ -10947,10 +11205,21 @@ install_dynamic_binding_from_existing_config() {
     install_stealth_vm_tuning
   elif [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
     note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning). The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard if needed."
-  elif prompt_yn "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials/iothreads + hypervisor hide) to detected guest-GPU VMs now?" N "Stealth/perf VM tuning"; then
-    install_stealth_vm_tuning
   else
-    note "Skipping stealth/perf VM tuning. The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard."
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}${C_YELLOW}DISCLAIMER:${C_RESET} stealth/perf VM tuning is COSMETIC/PERFORMANCE realism only"
+    else
+      say "DISCLAIMER: stealth/perf VM tuning is COSMETIC/PERFORMANCE realism only"
+    fi
+    note "(SMBIOS spoofing, CPU/NIC/disk-serial values, hypervisor hide). It is NOT intended to,"
+    note "and does NOT reliably, defeat or bypass anti-cheat / anti-tamper software. Using it to"
+    note "evade anti-cheat in an online game may still violate that game's terms of service."
+    if prompt_yn "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials/iothreads + hypervisor hide) to detected guest-GPU VMs now?" N "Stealth/perf VM tuning"; then
+      install_stealth_vm_tuning
+    else
+      note "Skipping stealth/perf VM tuning. The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard."
+    fi
   fi
 
   # 3b. Pin KDE/KWin Wayland to the HOST GPU so binding the (Boot VGA) guest
@@ -14880,8 +15149,9 @@ reset_vfio_all() {
     run systemctl disable --now vfio-graphics-protocold.service 2>/dev/null || true
     # Reboot-FLR monitor (dynamic binding only)
     run systemctl disable --now vfio-reboot-flr.service 2>/dev/null || true
-    # Park-keepalive monitor (dynamic binding only)
+    # Park-keepalive monitor (dynamic binding only) + its one-shot check unit
     run systemctl disable --now vfio-gpu-park-keepalive.service 2>/dev/null || true
+    run systemctl disable --now vfio-gpu-park-keepalive-check.service 2>/dev/null || true
 
     # If we previously masked plymouth units as part of "disable splash",
     # unmask them on reset so the system can return to distro defaults.
@@ -14923,7 +15193,8 @@ reset_vfio_all() {
            "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
            "$KWIN_RENDER_PIN_FILE" "$WLR_RENDER_PIN_FILE" \
            "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" \
-           "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" \
+           "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" "$PARK_KEEPALIVE_CHECK_UNIT" \
+           "$PARK_KEEPALIVE_RESUME_HOOK" "$PARK_KEEPALIVE_UDEV_RULE" "$PARK_KEEPALIVE_STATE_FILE" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook
@@ -15887,10 +16158,21 @@ apply_configuration() {
       install_stealth_vm_tuning
     elif [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
       note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning). The minimal hypervisor hide is still available via the full wizard if needed."
-    elif prompt_yn "Apply stealth/perf VM tuning to detected guest-GPU VMs? (SMBIOS spoofing, CPU/NIC/disk serials, vmport off, iothreads — makes the VM look like a real desktop PC)" N "Stealth/perf VM tuning"; then
-      install_stealth_vm_tuning
     else
-      note "Skipping stealth/perf VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-stealth-vm-tuning"
+      say
+      if (( ENABLE_COLOR )); then
+        say "${C_BOLD}${C_YELLOW}DISCLAIMER:${C_RESET} stealth/perf VM tuning is COSMETIC/PERFORMANCE realism only"
+      else
+        say "DISCLAIMER: stealth/perf VM tuning is COSMETIC/PERFORMANCE realism only"
+      fi
+      note "(SMBIOS spoofing, CPU/NIC/disk-serial values, hypervisor hide). It is NOT intended to,"
+      note "and does NOT reliably, defeat or bypass anti-cheat / anti-tamper software. Using it to"
+      note "evade anti-cheat in an online game may still violate that game's terms of service."
+      if prompt_yn "Apply stealth/perf VM tuning to detected guest-GPU VMs? (SMBIOS spoofing, CPU/NIC/disk serials, vmport off, iothreads — makes the VM look like a real desktop PC)" N "Stealth/perf VM tuning"; then
+        install_stealth_vm_tuning
+      else
+        note "Skipping stealth/perf VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-stealth-vm-tuning"
+      fi
     fi
   fi
   if (( INSTALL_GRAPHICS_DAEMON )); then

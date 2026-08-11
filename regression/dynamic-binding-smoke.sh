@@ -1616,6 +1616,305 @@ else
   bad "Q3v full wizard DYNAMIC branch missing install_park_keepalive_monitor call"
 fi
 
+# --- Smoke Q3w: park-keepalive extensions (hard-kill fallback, d3cold
+# reassert, failure-streak backoff, desktop notify, --once, resume hook,
+# udev rule, extended install/remove/reset wiring) ---
+
+# Case 1: _vfio_device_in_use decision logic (hard-kill-without-release-event
+# fallback used when libvirt is unreachable). The real function hardcodes
+# /sys + /dev/vfio + /proc (production paths, same convention as _pci_dev_alive
+# etc.), so exercise a parameterized mirror for functional coverage (same
+# pattern as the Q3n/Q3q mocks above) and verify the ACTUAL code statically.
+cat > "$tmp/smoke_vfio_inuse.sh" <<'VIEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SYSROOT="${SYSROOT:?}" DEVROOT="${DEVROOT:?}" PROCROOT="${PROCROOT:?}"
+_vfio_device_in_use() {
+  local _bdf="$1" _grp_link _grp _node _pid _fd _tgt
+  _grp_link="$SYSROOT/$_bdf/iommu_group"
+  [[ -e "$_grp_link" ]] || return 2
+  _grp="$(basename "$(readlink -f "$_grp_link" 2>/dev/null)" 2>/dev/null || true)"
+  [[ -n "$_grp" ]] || return 2
+  _node="$DEVROOT/$_grp"
+  [[ -e "$_node" ]] || return 1
+  [[ -d "$PROCROOT" ]] || return 2
+  for _pid in "$PROCROOT"/[0-9]*; do
+    [[ -d "$_pid/fd" ]] || continue
+    for _fd in "$_pid"/fd/*; do
+      [[ -L "$_fd" ]] || continue
+      _tgt="$(readlink "$_fd" 2>/dev/null || true)"
+      if [[ "$_tgt" == "$_node" ]]; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+_rc=0
+_vfio_device_in_use "$1" || _rc=$?
+echo "rc=$_rc"
+VIEOF
+vi_sys="$tmp/vi_sys"; vi_dev="$tmp/vi_dev"; vi_proc="$tmp/vi_proc"; vi_grpdir="$tmp/vi_grpdir"
+mkdir -p "$vi_sys/0000:0e:00.0" "$vi_dev" "$vi_proc" "$vi_grpdir/7"
+# A: no iommu_group link at all -> rc=2 (inconclusive, fail-safe)
+vA="$(SYSROOT="$vi_sys" DEVROOT="$vi_dev" PROCROOT="$vi_proc" bash "$tmp/smoke_vfio_inuse.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$vA" | grep -Fq 'rc=2'; then ok "Q3w _vfio_device_in_use rc=2 when no iommu_group link (inconclusive)"; else bad "Q3w case A failed (got: $vA)"; fi
+# B: iommu_group present, /dev/vfio/<grp> node missing -> rc=1 (not in use)
+ln -s "$vi_grpdir/7" "$vi_sys/0000:0e:00.0/iommu_group"
+vB="$(SYSROOT="$vi_sys" DEVROOT="$vi_dev" PROCROOT="$vi_proc" bash "$tmp/smoke_vfio_inuse.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$vB" | grep -Fq 'rc=1'; then ok "Q3w _vfio_device_in_use rc=1 when /dev/vfio node missing (not in use)"; else bad "Q3w case B failed (got: $vB)"; fi
+# C: node present, no /proc/<pid>/fd points to it -> rc=1 (confirmed not in use)
+touch "$vi_dev/7"
+mkdir -p "$vi_proc/999/fd"
+ln -s /dev/null "$vi_proc/999/fd/3"
+vC="$(SYSROOT="$vi_sys" DEVROOT="$vi_dev" PROCROOT="$vi_proc" bash "$tmp/smoke_vfio_inuse.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$vC" | grep -Fq 'rc=1'; then ok "Q3w _vfio_device_in_use rc=1 when node exists but no process holds it"; else bad "Q3w case C failed (got: $vC)"; fi
+# D: a process fd points at the node -> rc=0 (in use, never touch it)
+ln -s "$vi_dev/7" "$vi_proc/999/fd/4"
+vD="$(SYSROOT="$vi_sys" DEVROOT="$vi_dev" PROCROOT="$vi_proc" bash "$tmp/smoke_vfio_inuse.sh" 0000:0e:00.0 2>&1 || true)"
+if echo "$vD" | grep -Fq 'rc=0'; then ok "Q3w _vfio_device_in_use rc=0 when a process fd holds the VFIO device node open"; else bad "Q3w case D failed (got: $vD)"; fi
+# Static: the actual generated script defines the helper and uses it as the
+# owned_rc==2 fallback with the hard-kill-without-release-event log message.
+if grep -Fq '_vfio_device_in_use()' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'iommu_group' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_node="/dev/vfio/$_grp"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_vfio_device_in_use "$_guest_gpu"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'hard-kill-without-release watchdog' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3w generated script defines _vfio_device_in_use + wires it as the owned_rc==2 fallback"
+else
+  bad "Q3w generated script missing _vfio_device_in_use definition or fallback wiring"
+fi
+
+# Case 2: d3cold_allowed prophylactic reassertion happens on every pass while
+# parked (before the owned-domain check), guarding against drift.
+if grep -Fq 'echo 0 >"/sys/bus/pci/devices/$_guest_gpu/d3cold_allowed"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'prophylactic reassertion' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3w park-keepalive reasserts d3cold_allowed=0 every pass while parked"
+else
+  bad "Q3w park-keepalive missing d3cold_allowed prophylactic reassertion"
+fi
+
+# Case 3: failure-streak persistence (read/write/bump/reset), extracted from
+# the real generated script and driven against a temp STATE_FILE.
+_pk_streak_fns="$(sed -n '/^_pk_read_streak()/,/^}/p; /^_pk_write_streak()/,/^}/p; /^_pk_reset_streak()/,/^}/p; /^_pk_bump_streak()/,/^}/p' "$tmp/gen_park_keepalive.sh")"
+cat > "$tmp/smoke_pk_streak.sh" <<PKSEOF
+#!/usr/bin/env bash
+set -uo pipefail
+STATE_FILE="\$1"
+$_pk_streak_fns
+case "\$2" in
+  read) _pk_read_streak ;;
+  bump) _pk_bump_streak ;;
+  reset) _pk_reset_streak; _pk_read_streak ;;
+esac
+PKSEOF
+statef="$tmp/pk_streak.state"
+rm -f "$statef"
+s1="$(bash "$tmp/smoke_pk_streak.sh" "$statef" read)"
+if [[ "$s1" == "0" ]]; then ok "Q3w streak defaults to 0 when state file missing"; else bad "Q3w streak default wrong (got: $s1)"; fi
+s2="$(bash "$tmp/smoke_pk_streak.sh" "$statef" bump)"
+s3="$(bash "$tmp/smoke_pk_streak.sh" "$statef" bump)"
+if [[ "$s2" == "1" && "$s3" == "2" ]]; then ok "Q3w streak increments across separate invocations (persisted via STATE_FILE)"; else bad "Q3w streak bump sequence wrong (got: $s2, $s3)"; fi
+s4="$(bash "$tmp/smoke_pk_streak.sh" "$statef" reset)"
+if [[ "$s4" == "0" ]]; then ok "Q3w streak resets to 0"; else bad "Q3w streak reset failed (got: $s4)"; fi
+
+# Case 4: backoff + one-time notify wiring — the streak is used to grow
+# NEXT_SLEEP up to the configured cap, and _notify_desktop fires exactly at
+# the MAX_FAILS threshold (not on every subsequent failure).
+if grep -Fq '_backed_off=$(( _interval * _streak ))' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_backed_off > _backoff_max' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'NEXT_SLEEP="$_backed_off"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_streak == _max_fails' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3w backoff grows NEXT_SLEEP with the streak (capped) and notifies once at the threshold"
+else
+  bad "Q3w backoff/notify-once wiring missing or changed"
+fi
+
+# Case 5: _notify_desktop is best-effort (no-op without notify-send/runuser)
+# and broadcasts via runuser+XDG_RUNTIME_DIR+DBUS_SESSION_BUS_ADDRESS to active
+# desktop sessions. The real function hardcodes /run/user/* (production path),
+# so functionally test a parameterized mirror and statically verify the actual
+# generated script's runuser/DBUS/notify-send pattern.
+nfake="$tmp/notifybin"; mkdir -p "$nfake"
+cat > "$nfake/notify-send" <<'NEOF'
+#!/usr/bin/env bash
+printf 'notify-send called: %s\n' "$*" >> "$NOTIFY_REC"
+NEOF
+cat > "$nfake/runuser" <<'NEOF'
+#!/usr/bin/env bash
+# runuser -u <user> -- env K=V... notify-send ...
+shift 2  # drop -u <user>
+shift    # drop --
+"$@"
+NEOF
+cat > "$nfake/getent" <<'NEOF'
+#!/usr/bin/env bash
+# getent passwd <uid> -> pretend uid 1000 is 'testuser'
+if [[ "$2" == "1000" ]]; then echo "testuser:x:1000:1000::/home/testuser:/bin/bash"; fi
+NEOF
+chmod +x "$nfake/notify-send" "$nfake/runuser" "$nfake/getent"
+runroot="$tmp/run_user"; mkdir -p "$runroot/1000"
+cat > "$tmp/smoke_pk_notify.sh" <<'PKNEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+RUNROOT="${RUNROOT:?}"
+_notify_desktop() {
+  local _title="$1" _body="$2" _rt _uid _user
+  command -v notify-send >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  for _rt in "$RUNROOT"/*; do
+    [[ -d "$_rt" ]] || continue
+    _uid="$(basename "$_rt")"
+    [[ "$_uid" =~ ^[0-9]+$ ]] || continue
+    _user="$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)"
+    [[ -n "$_user" ]] || continue
+    runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$_rt/bus" \
+      notify-send -u critical "$_title" "$_body" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+_notify_desktop "Title" "Body text"
+PKNEOF
+rm -f "$tmp/notify_rec"
+NOTIFY_REC="$tmp/notify_rec" RUNROOT="$runroot" PATH="$nfake:$PATH" bash "$tmp/smoke_pk_notify.sh" || true
+if [[ -f "$tmp/notify_rec" ]] && grep -Fq 'Title' "$tmp/notify_rec" && grep -Fq 'Body text' "$tmp/notify_rec"; then
+  ok "Q3w _notify_desktop mock broadcasts via runuser+notify-send to active sessions"
+else
+  bad "Q3w _notify_desktop mock did not call notify-send as expected (rec: $(cat "$tmp/notify_rec" 2>/dev/null || echo none))"
+fi
+# Static: the ACTUAL generated script defines _notify_desktop with the same
+# runuser + XDG_RUNTIME_DIR + DBUS_SESSION_BUS_ADDRESS + notify-send pattern.
+if grep -Fq '_notify_desktop()' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'command -v notify-send' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'DBUS_SESSION_BUS_ADDRESS="unix:path=$_rt/bus"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'runuser -u "$_user"' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3w generated script's _notify_desktop uses runuser+XDG_RUNTIME_DIR+DBUS_SESSION_BUS_ADDRESS"
+else
+  bad "Q3w generated script's _notify_desktop missing expected runuser/DBUS pattern"
+fi
+
+# Case 6: --once mode shares _run_once with the daemon loop and exits
+# immediately afterwards (used by the udev rule and the resume hook).
+if grep -Fq 'if [[ "${1:-}" == "--once" ]]; then' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '_run_once' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'while true; do' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'sleep "$NEXT_SLEEP"' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3w --once and the daemon loop both share _run_once"
+else
+  bad "Q3w --once entry point or shared _run_once loop missing"
+fi
+
+# Case 7 (static): the post-resume systemd-sleep hook only acts on "post" and
+# invokes the park-keepalive script with --once.
+_resume_block="$(sed -n '/write_file_atomic "$PARK_KEEPALIVE_RESUME_HOOK" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
+if echo "$_resume_block" | grep -Fq 'case "\${1:-}" in' \
+  && echo "$_resume_block" | grep -Fq '  post)' \
+  && echo "$_resume_block" | grep -Fq -- '--once'; then
+  ok "Q3w post-resume hook acts only on 'post' and invokes the script with --once"
+else
+  bad "Q3w post-resume hook missing post-only gate or --once invocation"
+fi
+
+# Case 8 (static): the udev rule documents the remove-uevent caveat and wires
+# the guest BDF to the one-shot check unit via SYSTEMD_WANTS (best-effort).
+_udev_block="$(sed -n '/write_file_atomic "$PARK_KEEPALIVE_UDEV_RULE" 0644/,/^EOF$/p' "$VFIO_SCRIPT")"
+if echo "$_udev_block" | grep -Fq 'does NOT emit a PCI "remove"' \
+  && echo "$_udev_block" | grep -Fq 'ENV{SYSTEMD_WANTS}+="vfio-gpu-park-keepalive-check.service"'; then
+  ok "Q3w udev rule documents the remove-uevent caveat and wires SYSTEMD_WANTS to the check unit"
+else
+  bad "Q3w udev rule missing caveat comment or SYSTEMD_WANTS wiring"
+fi
+
+# Case 9 (static): the one-shot check unit is a oneshot service running the
+# same script with --once (no [Install]/WantedBy — it is only ever
+# triggered on-demand by the udev rule above, never enabled at boot).
+_check_unit_block="$(sed -n '/write_file_atomic "$PARK_KEEPALIVE_CHECK_UNIT" 0644/,/^EOF$/p' "$VFIO_SCRIPT")"
+if echo "$_check_unit_block" | grep -Fq 'Type=oneshot' \
+  && echo "$_check_unit_block" | grep -Fq 'ExecStart=$PARK_KEEPALIVE_SCRIPT --once' \
+  && ! echo "$_check_unit_block" | grep -Fq '[Install]'; then
+  ok "Q3w one-shot check unit runs the script --once and is not self-enabling"
+else
+  bad "Q3w one-shot check unit definition wrong or unexpectedly self-enabling"
+fi
+
+# Case 10 (static): install/remove/reset wiring covers ALL park-keepalive
+# extension artifacts (resume hook, check unit, udev rule, state file), per
+# the "always update the uninstaller" rule. NOTE: install_park_keepalive_monitor
+# contains embedded heredocs with column-0 closing braces of its own (e.g. the
+# inner _pk_*_streak() helpers), so a naive /^fn()/,/^}/  sed range would stop
+# at the FIRST such brace instead of the function's real end — bound it with
+# the next function's leading comment instead (same trick as _pkv_wizard above).
+_pkw_install="$(sed -n '/^install_park_keepalive_monitor()/,/^# Automatically hide the hypervisor/p' "$VFIO_SCRIPT")"
+_pkw_remove="$(sed -n '/^remove_park_keepalive_monitor()/,/^}/p' "$VFIO_SCRIPT")"
+_pkw_reset="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'PARK_KEEPALIVE_RESUME_HOOK' <<<"$_pkw_install" \
+  && grep -Fq 'PARK_KEEPALIVE_CHECK_UNIT' <<<"$_pkw_install" \
+  && grep -Fq 'PARK_KEEPALIVE_UDEV_RULE' <<<"$_pkw_install"; then
+  ok "Q3w install_park_keepalive_monitor writes resume hook + check unit + udev rule"
+else
+  bad "Q3w install_park_keepalive_monitor missing one or more new artifacts"
+fi
+if grep -Fq 'PARK_KEEPALIVE_RESUME_HOOK' <<<"$_pkw_remove" \
+  && grep -Fq 'PARK_KEEPALIVE_CHECK_UNIT' <<<"$_pkw_remove" \
+  && grep -Fq 'PARK_KEEPALIVE_UDEV_RULE' <<<"$_pkw_remove" \
+  && grep -Fq 'PARK_KEEPALIVE_STATE_FILE' <<<"$_pkw_remove" \
+  && grep -Fq 'vfio-gpu-park-keepalive-check.service' <<<"$_pkw_remove"; then
+  ok "Q3w remove_park_keepalive_monitor removes resume hook + check unit + udev rule + state file"
+else
+  bad "Q3w remove_park_keepalive_monitor missing cleanup of one or more new artifacts"
+fi
+if grep -Fq 'PARK_KEEPALIVE_RESUME_HOOK' <<<"$_pkw_reset" \
+  && grep -Fq 'PARK_KEEPALIVE_CHECK_UNIT' <<<"$_pkw_reset" \
+  && grep -Fq 'PARK_KEEPALIVE_UDEV_RULE' <<<"$_pkw_reset" \
+  && grep -Fq 'PARK_KEEPALIVE_STATE_FILE' <<<"$_pkw_reset" \
+  && grep -Fq 'vfio-gpu-park-keepalive-check.service' <<<"$_pkw_reset"; then
+  ok "Q3w --reset removes resume hook + check unit + udev rule + state file"
+else
+  bad "Q3w --reset missing cleanup of one or more new park-keepalive artifacts"
+fi
+
+# Case 11 (static): new conf keys (max-fails/backoff-max/notify) are defined
+# with instant-on-consistent defaults, matching the existing park-keepalive
+# conf keys' "no prompt, instant on" pattern.
+if grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS="5"' "$VFIO_SCRIPT" \
+  && grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX="300"' "$VFIO_SCRIPT" \
+  && grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY="1"' "$VFIO_SCRIPT"; then
+  ok "Q3w new park-keepalive conf keys default to instant-on values"
+else
+  bad "Q3w new park-keepalive conf keys missing or wrong defaults"
+fi
+
+# --- Smoke Q3x: anti-cheat disclaimer on stealth/perf VM tuning ---
+# The disclaimer must appear BEFORE the user is asked to opt in (both the full
+# wizard and the --install-dynamic-binding switcher), AND inside
+# install_stealth_vm_tuning() itself so it always prints regardless of entry
+# path (prompt, --stealth-vm-tuning flag, or standalone --install-stealth-vm-tuning).
+_q3x_wizard="$(sed -n '/^apply_configuration()/,/^# Automatically hide the hypervisor/p' "$VFIO_SCRIPT")"
+_q3x_switcher="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_q3x_fn="$(sed -n '/^install_stealth_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_q3x_wizard" | grep -Fq 'DISCLAIMER' \
+  && echo "$_q3x_wizard" | grep -Fq 'defeat or bypass anti-cheat'; then
+  ok "Q3x full wizard shows anti-cheat disclaimer before the stealth-tuning prompt"
+else
+  bad "Q3x full wizard missing anti-cheat disclaimer before stealth-tuning prompt"
+fi
+if echo "$_q3x_switcher" | grep -Fq 'DISCLAIMER' \
+  && echo "$_q3x_switcher" | grep -Fq 'defeat or bypass anti-cheat'; then
+  ok "Q3x --install-dynamic-binding switcher shows anti-cheat disclaimer before the prompt"
+else
+  bad "Q3x switcher missing anti-cheat disclaimer before stealth-tuning prompt"
+fi
+if echo "$_q3x_fn" | grep -Fq 'DISCLAIMER' && echo "$_q3x_fn" | grep -Fq 'anti-tamper'; then
+  ok "Q3x install_stealth_vm_tuning() itself prints the disclaimer regardless of entry path"
+else
+  bad "Q3x install_stealth_vm_tuning() missing its own disclaimer"
+fi
+if grep -Fq 'DISCLAIMER: cosmetic/perf realism ONLY, NOT an anti-cheat/anti-tamper bypass.' "$VFIO_SCRIPT"; then
+  ok "Q3x --help text documents the disclaimer for stealth-tuning flags"
+else
+  bad "Q3x --help text missing disclaimer for stealth-tuning flags"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

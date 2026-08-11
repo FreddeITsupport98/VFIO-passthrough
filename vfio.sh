@@ -9423,7 +9423,8 @@ EOF
   note "RDNA4 reset bug), so the NEXT VM start does not hit a dead card. It also re-checks"
   note "right after host suspend/hibernate resume, falls back to a direct in-use check when"
   note "libvirt itself is unreachable (hard-kill-without-release-event), and backs off +"
-  note "sends a one-time desktop notification after $VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS consecutive recovery failures."
+  note "sends a one-time desktop notification after 5 consecutive recovery failures by default"
+  note "(VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS in $CONF_FILE)."
   note "Disable via VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
 }
 

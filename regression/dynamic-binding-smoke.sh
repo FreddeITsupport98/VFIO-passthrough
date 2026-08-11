@@ -1609,7 +1609,13 @@ else
   bad "Q3v install/remove wiring missing in switcher(s) or reset"
 fi
 # Case 7 (static): the full wizard's DYNAMIC branch also installs it unconditionally.
-_pkv_wizard="$(sed -n '/^apply_configuration()/,/^# Automatically hide the hypervisor/p' "$VFIO_SCRIPT")"
+# NOTE: bounded by the next top-level function (main()) rather than a comment
+# that happens to appear EARLIER in the file than apply_configuration() itself
+# (that comment precedes install_hypervisor_hiding(), which is defined well
+# before apply_configuration() near the end of the file) — using it as an end
+# marker here would make sed match "start-to-EOF" (thousands of extra lines:
+# wasteful and imprecise, since it can never find that marker AFTER the start).
+_pkv_wizard="$(sed -n '/^apply_configuration()/,/^main() {/p' "$VFIO_SCRIPT")"
 if grep -Fq 'install_park_keepalive_monitor' <<<"$_pkv_wizard"; then
   ok "Q3v full wizard DYNAMIC branch installs park-keepalive monitor unconditionally"
 else
@@ -1889,7 +1895,10 @@ fi
 # wizard and the --install-dynamic-binding switcher), AND inside
 # install_stealth_vm_tuning() itself so it always prints regardless of entry
 # path (prompt, --stealth-vm-tuning flag, or standalone --install-stealth-vm-tuning).
-_q3x_wizard="$(sed -n '/^apply_configuration()/,/^# Automatically hide the hypervisor/p' "$VFIO_SCRIPT")"
+# NOTE: bounded by main() (the next top-level function), not the earlier
+# "# Automatically hide the hypervisor" comment — see the Q3v Case 7 note above
+# for why that marker would make this an inefficient/imprecise start-to-EOF scan.
+_q3x_wizard="$(sed -n '/^apply_configuration()/,/^main() {/p' "$VFIO_SCRIPT")"
 _q3x_switcher="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
 _q3x_fn="$(sed -n '/^install_stealth_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
 if echo "$_q3x_wizard" | grep -Fq 'DISCLAIMER' \

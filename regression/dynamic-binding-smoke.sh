@@ -1582,10 +1582,10 @@ fi
 # Case 5 (static): conf keys default to instant-on (1) with a sane interval,
 # and the systemd unit is a Restart=always simple service like reboot-FLR.
 if grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE="1"' "$VFIO_SCRIPT" \
-  && grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="30"' "$VFIO_SCRIPT" \
+  && grep -Fq 'VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="10"' "$VFIO_SCRIPT" \
   && grep -Fq 'ExecStart=$PARK_KEEPALIVE_SCRIPT' "$VFIO_SCRIPT" \
   && grep -Fq 'vfio-gpu-park-keepalive.service' "$VFIO_SCRIPT"; then
-  ok "Q3v conf defaults to instant-on (1) + 30s interval; systemd unit defined"
+  ok "Q3v conf defaults to instant-on (1) + 10s interval; systemd unit defined"
 else
   bad "Q3v missing instant-on conf defaults or systemd unit definition"
 fi

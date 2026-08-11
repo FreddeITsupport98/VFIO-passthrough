@@ -4308,10 +4308,11 @@ STEALTH_VM_BACKUP_DIR=""
 #   bind-time recovery attempts).
 VFIO_DYNAMIC_PARK_KEEPALIVE="1"
 # Park-keepalive probe interval in seconds (read by vfio-gpu-park-keepalive.sh).
-# WHY this value: 30s is frequent enough to catch a dead card well before the
-# next VM start on a typical workflow, yet infrequent enough to keep the sysfs
-# config-space polling overhead negligible.
-VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="30"
+# WHY this value: 10s catches a dead card well before the next VM start on a
+# typical workflow, while staying cheap enough (a couple of sysfs reads + a
+# virsh ownership check) not to matter even while a VM is actively running.
+# Floor is 5s (values below 5, or non-numeric, fall back to this default).
+VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL="10"
 # Park-keepalive consecutive-failure threshold (instant on, read by
 # vfio-gpu-park-keepalive.sh). After this many consecutive failed remove+rescan
 # recovery attempts on the same zombie card, the monitor (a) backs off its poll
@@ -9218,7 +9219,7 @@ _notify_desktop() {
 }
 
 _warned_no_virsh=0
-NEXT_SLEEP=30
+NEXT_SLEEP=10
 
 # One full check-and-recover pass. Shared by the daemon loop below AND the
 # --once entry point (udev rule / post-resume hook), so all three trigger
@@ -9231,7 +9232,7 @@ _run_once() {
   _enabled="${_enabled:-1}"
   _interval="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL)"
   if [[ ! "$_interval" =~ ^[0-9]+$ ]] || (( _interval < 5 )); then
-    _interval=30
+    _interval=10
   fi
   _max_fails="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS)"
   [[ "$_max_fails" =~ ^[0-9]+$ ]] && (( _max_fails >= 1 )) || _max_fails=5

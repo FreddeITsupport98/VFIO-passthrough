@@ -12558,39 +12558,58 @@ install_dynamic_binding_from_existing_config() {
 
   say
   hdr "Switch to dynamic GPU binding (libvirt hook)"
-  note "This switches your existing setup from early binding to dynamic binding."
-  note "Dynamic binding lets amdgpu load first and a libvirt qemu hook switches the"
-  note "guest GPU to vfio-pci only when a VM that has it attached is started."
-  note "This is more reliable for RX 9070 / RDNA4 cards that hit the"
-  note "\"Unknown PCI header type 127\" reset bug when bound to vfio-pci too early."
+  # Intro: color-emphasized summary of what dynamic binding does.
+  if (( ENABLE_COLOR )); then
+    note "This switches your existing setup from ${C_BOLD}early binding${C_RESET} to ${C_BOLD}${C_GREEN}dynamic binding${C_RESET}."
+    note "Dynamic binding lets ${C_BOLD}amdgpu${C_RESET} load first and a libvirt qemu hook switches the"
+    note "guest GPU to ${C_BOLD}vfio-pci${C_RESET} only when a VM that has it attached is started."
+    note "This is more reliable for ${C_BOLD}RX 9070 / RDNA4${C_RESET} cards that hit the"
+    note "${C_YELLOW}\"Unknown PCI header type 127\"${C_RESET} reset bug when bound to vfio-pci too early."
+  else
+    note "This switches your existing setup from early binding to dynamic binding."
+    note "Dynamic binding lets amdgpu load first and a libvirt qemu hook switches the"
+    note "guest GPU to vfio-pci only when a VM that has it attached is started."
+    note "This is more reliable for RX 9070 / RDNA4 cards that hit the"
+    note "\"Unknown PCI header type 127\" reset bug when bound to vfio-pci too early."
+  fi
   say
-  note "What this will do:"
-  note "  1. Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
-  note "  2. Regenerate $BIND_SCRIPT (deploys the latest bind/hook-runtime logic)"
-  note "  3. Install the libvirt qemu hook ($LIBVIRT_HOOK_SCRIPT + $LIBVIRT_HOOK_ENTRY)"
-  note "  4. Strip vfio-pci.ids= and rd.driver.pre=vfio-pci from the kernel cmdline"
+  # "What this will do": numbered steps with green step numbers.
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}What this will do:${C_RESET}"
+  else
+    say "What this will do:"
+  fi
+  note "  ${C_GREEN}1${C_RESET}. Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
+  note "  ${C_GREEN}2${C_RESET}. Regenerate $BIND_SCRIPT (deploys the latest bind/hook-runtime logic)"
+  note "  ${C_GREEN}3${C_RESET}. Install the libvirt qemu hook ($LIBVIRT_HOOK_SCRIPT + $LIBVIRT_HOOK_ENTRY)"
+  note "  ${C_GREEN}4${C_RESET}. Strip vfio-pci.ids= and rd.driver.pre=vfio-pci from the kernel cmdline"
   note "     (so amdgpu is allowed to claim the guest GPU at boot)"
-  note "  4b. Ensure the AMD reset-bug kernel params (vfio-pci.disable_idle_d3=1,"
+  note "  ${C_GREEN}4b${C_RESET}. Ensure the AMD reset-bug kernel params (vfio-pci.disable_idle_d3=1,"
   note "      pcie_port_pm=off) are on the cmdline when the guest GPU is AMD"
   note "      (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both modes)"
-  note "  5. Sync BLS boot entries to the updated cmdline"
-  note "  6. Pin Wayland compositors (KDE/KWin + wlroots: sway/hyprland/labwc) to the"
+  note "  ${C_GREEN}5${C_RESET}. Sync BLS boot entries to the updated cmdline"
+  note "  ${C_GREEN}6${C_RESET}. Pin Wayland compositors (KDE/KWin + wlroots: sway/hyprland/labwc) to the"
   note "     HOST GPU so binding the guest GPU does not crash the host compositor"
   note "     when the guest is Boot VGA)"
-  note "  7. Install the reboot-FLR monitor (a systemd service that watches for guest"
+  note "  ${C_GREEN}7${C_RESET}. Install the reboot-FLR monitor (a systemd service that watches for guest"
   note "     warm reboot and does a soft FLR to clear the GPU display wedge so OVMF"
   note "     can re-POST without needing a host reboot — set on_reboot=restart in VM XML)"
-  note "  7b. Install the park-keepalive monitor (instant on, no prompt): a systemd"
+  note "  ${C_GREEN}7b${C_RESET}. Install the park-keepalive monitor (instant on, no prompt): a systemd"
   note "      service that periodically checks the guest GPU while parked on vfio-pci"
   note "      between VM sessions and proactively recovers it if it died. Disable via"
   note "      VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
-  note "  8. Stealth/perf VM tuning (optional, opt-in): on shut-off VMs with the guest GPU,"
+  note "  ${C_GREEN}8${C_RESET}. Stealth/perf VM tuning (optional, opt-in): on shut-off VMs with the guest GPU,"
   note "     apply SMBIOS spoofing + CPU hypervisor-bit disable + e1000e NIC + randomized"
   note "     disk serials + memballoon=none + iothreads/cputune + hypervisor hide"
   note "     (vendor_id=GENUINE00000 + kvm hidden). Verified (virt-xml-validate) + prompted."
   note "     Skipped unless --stealth-vm-tuning or you accept the prompt."
   say
-  note "What stays unchanged:"
+  # "What stays unchanged": dim/blue style to distinguish from action steps.
+  if (( ENABLE_COLOR )); then
+    say "${C_DIM}What stays unchanged:${C_RESET}"
+  else
+    say "What stays unchanged:"
+  fi
   note "  - IOMMU params (amd_iommu=on / intel_iommu=on, iommu=pt)"
   note "  - Optional AMD power-tradeoff params (amdgpu.runpm=0, amdgpu.noretry=0)"
   note "    are left as-is; only the reset-bug-critical pair is ensured (step 4b)"
@@ -12636,13 +12655,21 @@ install_dynamic_binding_from_existing_config() {
 
   # 1. Flip the conf key.
   rewrite_conf_key "VFIO_BINDING_MODE" "dynamic"
-  say "Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
+  else
+    say "  ✔ Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
+  fi
 
   # 2. Regenerate the bind script so the latest bind/hook-runtime logic (e.g.
   #    Boot-VGA host-assisted escape, d3cold pinning, retry/jlog behavior) is
   #    deployed without needing a full wizard re-run.
   install_bind_script
-  say "Regenerated $BIND_SCRIPT"
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Regenerated $BIND_SCRIPT"
+  else
+    say "  ✔ Regenerated $BIND_SCRIPT"
+  fi
 
   # 3. Install the libvirt hook.
   install_libvirt_hook
@@ -12727,8 +12754,12 @@ install_dynamic_binding_from_existing_config() {
   fi
 
   say
-  say "Dynamic binding is now active (takes effect on next boot)."
-  say "The guest GPU will stay on amdgpu until you start a libvirt VM that has it attached."
+  if (( ENABLE_COLOR )); then
+    say "${C_GREEN}${C_BOLD}✔ Dynamic binding is now active${C_RESET} ${C_DIM}(takes effect on next boot)${C_RESET}"
+  else
+    say "✔ Dynamic binding is now active (takes effect on next boot)"
+  fi
+  note "The guest GPU will stay on amdgpu until you start a libvirt VM that has it attached."
   note "Keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off on the kernel cmdline for both modes."
 }
 

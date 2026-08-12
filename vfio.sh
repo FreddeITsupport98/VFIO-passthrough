@@ -9101,6 +9101,35 @@ _pci_dev_remove_rescan() {
   return 1
 }
 
+# Recovery for the case where the guest GPU's sysfs directory is entirely
+# missing (not just a zombie with unreadable config space) — i.e. it fell
+# completely off the PCI bus. There is nothing to "remove" in this case, so
+# unlike _pci_dev_remove_rescan this only triggers a bus rescan and then
+# checks whether the device reappeared, binding it to vfio-pci if so. This
+# state has been observed on RX 9070 / RDNA4 hardware after a prior
+# remove+rescan attempt (the GPU function stays gone while its audio sibling
+# comes back) and is NOT guaranteed to recover via rescan alone — a host
+# reboot may still be required — but retrying costs nothing and this must not
+# be silently skipped forever (see _run_once's directory-missing branch).
+_pci_bus_rescan_only() {
+  local _bdf="$1" _sys
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  jlog "$_bdf: sysfs entry missing (fell off the bus); attempting bus rescan recovery"
+  echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+  sleep 1
+  [[ -d "$_sys" ]] || { jlog "$_bdf: still did not reappear after rescan"; return 1; }
+  echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+  echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+  sleep 0.3
+  if _pci_dev_alive "$_bdf"; then
+    jlog "$_bdf: park-keepalive recovered device after rescan (alive)"
+    return 0
+  fi
+  jlog "$_bdf: reappeared after rescan but is not alive/bound correctly"
+  return 1
+}
+
 # Returns:
 #   0 = a RUNNING libvirt domain owns the BDF (never touch it)
 #   1 = virsh connected fine and confirms no running domain owns it
@@ -9227,6 +9256,7 @@ NEXT_SLEEP=10
 _run_once() {
   local _enabled _interval _max_fails _backoff_max _notify_enabled
   local _binding_mode _rebind_host _guest_gpu _drv _owned_rc _fb_rc _streak
+  local _sys_dir_present
 
   _enabled="$(_conf_get VFIO_DYNAMIC_PARK_KEEPALIVE)"
   _enabled="${_enabled:-1}"
@@ -9257,23 +9287,17 @@ _run_once() {
     # on vfio-pci — nothing for the park-keepalive to watch.
     return 0
   fi
-  if [[ -z "$_guest_gpu" || ! -d "/sys/bus/pci/devices/$_guest_gpu" ]]; then
-    return 0
-  fi
-  _drv=""
-  if [[ -L "/sys/bus/pci/devices/$_guest_gpu/driver" ]]; then
-    _drv="$(basename "$(readlink "/sys/bus/pci/devices/$_guest_gpu/driver")" 2>/dev/null || echo "")"
-  fi
-  if [[ "$_drv" != "vfio-pci" ]]; then
-    # Not currently parked on vfio-pci (e.g. still on amdgpu pre-first-bind).
+  if [[ -z "$_guest_gpu" ]]; then
     return 0
   fi
 
-  # Cheap prophylactic reassertion: guard against anything (udev, a power
-  # daemon, resume from suspend) quietly flipping d3cold_allowed back on
-  # while the card sits parked. Best-effort; never fatal.
-  echo 0 >"/sys/bus/pci/devices/$_guest_gpu/d3cold_allowed" 2>/dev/null || true
-
+  # NOTE: deliberately NOT gated on "sysfs directory exists" here — a fully
+  # missing directory (device fell entirely off the bus, worse than a zombie
+  # with unreadable config space) must still reach the recovery logic below
+  # instead of being silently skipped forever. Ownership determination itself
+  # never depends on sysfs (virsh reads libvirt's view of running domains +
+  # their defined XML, not sysfs), so it is safe to check ownership before we
+  # even know whether the device still exists on the bus at all.
   _owned_rc=0
   _gpu_owned_by_running_domain "$_guest_gpu" || _owned_rc=$?
   if (( _owned_rc == 0 )); then
@@ -9302,16 +9326,46 @@ _run_once() {
     jlog "virsh unreachable but /dev/vfio in-use fallback confirms device is idle; proceeding (hard-kill-without-release watchdog)"
   fi
 
-  if _pci_dev_alive "$_guest_gpu"; then
-    _pk_reset_streak
-    return 0
-  fi
+  _sys_dir_present=0
+  [[ -d "/sys/bus/pci/devices/$_guest_gpu" ]] && _sys_dir_present=1
 
-  jlog "$_guest_gpu: zombie detected while parked (config space unreadable); attempting proactive remove+rescan recovery"
-  if _pci_dev_remove_rescan "$_guest_gpu"; then
-    jlog "$_guest_gpu: park-keepalive recovered parked device (alive again)"
-    _pk_reset_streak
-    return 0
+  if (( _sys_dir_present )); then
+    _drv=""
+    if [[ -L "/sys/bus/pci/devices/$_guest_gpu/driver" ]]; then
+      _drv="$(basename "$(readlink "/sys/bus/pci/devices/$_guest_gpu/driver")" 2>/dev/null || echo "")"
+    fi
+    if [[ "$_drv" != "vfio-pci" ]]; then
+      # Not currently parked on vfio-pci (e.g. still on amdgpu pre-first-bind).
+      return 0
+    fi
+
+    # Cheap prophylactic reassertion: guard against anything (udev, a power
+    # daemon, resume from suspend) quietly flipping d3cold_allowed back on
+    # while the card sits parked. Best-effort; never fatal.
+    echo 0 >"/sys/bus/pci/devices/$_guest_gpu/d3cold_allowed" 2>/dev/null || true
+
+    if _pci_dev_alive "$_guest_gpu"; then
+      _pk_reset_streak
+      return 0
+    fi
+
+    jlog "$_guest_gpu: zombie detected while parked (config space unreadable); attempting proactive remove+rescan recovery"
+    if _pci_dev_remove_rescan "$_guest_gpu"; then
+      jlog "$_guest_gpu: park-keepalive recovered parked device (alive again)"
+      _pk_reset_streak
+      return 0
+    fi
+  else
+    # Sysfs directory is entirely missing — the device fell completely off
+    # the bus (worse than a zombie with unreadable config space; observed on
+    # RX 9070 / RDNA4 hardware after a prior remove+rescan where the GPU
+    # function stays gone while its audio sibling comes back). There is
+    # nothing to "remove" here, so try a plain bus rescan instead of silently
+    # doing nothing forever.
+    if _pci_bus_rescan_only "$_guest_gpu"; then
+      _pk_reset_streak
+      return 0
+    fi
   fi
 
   jlog "$_guest_gpu: park-keepalive could not recover parked device; may need a host reboot"

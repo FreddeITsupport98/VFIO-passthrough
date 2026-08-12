@@ -11208,22 +11208,42 @@ install_vbios_romfile() {
   _tpu_list="$(_vbios_techpowerup_list_all "$_tpu_url" 2>/dev/null || true)"
   say
   hdr "vBIOS ROM auto-injection (fixes a black screen from an unreliable live ROM read)"
-  note "Guest GPU $_guest_gpu PCI ID: $_gpu_id (share this ID if you need to find/verify a vBIOS dump)."
-  note "techpowerup Device Id for vBIOS lookup: $_tpu_did"
+  # GPU + lookup info block: color-keyed labels (cyan key, bold value) so the
+  # operator can scan the identity + URLs at a glance instead of reading a wall
+  # of same-style dim note lines.
+  local _k _v
+  _kv() { # _kv <key> <value> -- prints "  key: value" with a cyan key
+    if (( ENABLE_COLOR )); then
+      say "  ${C_CYAN}${1}${C_RESET}: ${C_BOLD}${2}${C_RESET}"
+    else
+      say "  ${1}: ${2}"
+    fi
+  }
+  _kv "Guest GPU"        "$_guest_gpu"
+  _kv "PCI ID"           "$_gpu_id (share this ID if you need to find/verify a vBIOS dump)"
+  _kv "TPU Device Id"    "$_tpu_did"
   if [[ -n "$_tpu_detail" ]]; then
-    note "Exact vBIOS listing (resolved from the search): $_tpu_detail"
-    [[ -n "$_tpu_fname" ]] && note "Expected download filename: $_tpu_fname  (save it as <name>.rom into VBIOS/ next to this script)"
-    note "CAVEAT: techpowerup downloads are systematically byte-swapped (first 2 bytes aa55 instead of 55aa). This script AUTO-REPAIRS a swapped ROM whose embedded identity (version/PPID) matches your card, so a techpowerup download is usable directly. If auto-repair is not possible, dump your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
-    note "Search page (if the detail link is stale): $_tpu_url"
+    _kv "Exact listing"    "$_tpu_detail"
+    [[ -n "$_tpu_fname" ]] && _kv "Download filename" "$_tpu_fname  (save it as <name>.rom into VBIOS/ next to this script)"
+    _kv "Search page"     "$_tpu_url (if the detail link is stale)"
+    if (( ENABLE_COLOR )); then
+      say "  ${C_YELLOW}CAVEAT${C_RESET}: techpowerup downloads are systematically byte-swapped (first 2 bytes aa55 instead of 55aa). This script AUTO-REPAIRS a swapped ROM whose embedded identity (version/PPID) matches your card, so a techpowerup download is usable directly. If auto-repair is not possible, dump your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
+    else
+      say "  CAVEAT: techpowerup downloads are systematically byte-swapped (first 2 bytes aa55 instead of 55aa). This script AUTO-REPAIRS a swapped ROM whose embedded identity (version/PPID) matches your card, so a techpowerup download is usable directly. If auto-repair is not possible, dump your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
+    fi
   else
-    note "Find/verify a vBIOS dump at: $_tpu_url"
-    note "(could not auto-resolve the exact listing — the search page lists 2-3 duplicate uploads of the same BIOS; pick the one whose version matches your dump)"
+    _kv "Find/verify at"  "$_tpu_url"
+    note "  (could not auto-resolve the exact listing — the search page lists 2-3 duplicate uploads of the same BIOS; pick the one whose version matches your dump)"
   fi
 
   local _src_dir
   _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
   if [[ ! -d "$_src_dir" ]]; then
-    note "WARN: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
+    if (( ENABLE_COLOR )); then
+      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
+    else
+      say "  WARN: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
+    fi
     note "       Drop a matching *.rom dump into a VBIOS/ folder next to this script, then re-run to enable this automatically."
     _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
     return 0
@@ -11234,18 +11254,39 @@ install_vbios_romfile() {
     _candidates+=("$_f")
   done < <(find "$_src_dir" -maxdepth 1 -iname '*.rom' -print0 2>/dev/null)
   if (( ${#_candidates[@]} == 0 )); then
-    note "WARN: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
+    if (( ENABLE_COLOR )); then
+      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
+    else
+      say "  WARN: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
+    fi
     note "       Drop a matching *.rom dump into $_src_dir, then re-run to enable this automatically."
     _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
     return 0
   fi
 
+  # Candidates sub-header, then one color-coded verdict line per *.rom:
+  #   ✔ MATCH (green)        -- direct 55aa match
+  #   ✔ MATCH (green, repaired) -- aa55 techpowerup download, auto-repaired
+  #   ✖ no match (red)       -- wrong card / not a ROM
+  # The embedded identity (VER/PPID/board) follows on the same line so the
+  # operator can see WHICH dump matched at a glance, instead of a wall of
+  # same-style note lines.
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}Candidates in ${_src_dir}${C_RESET} (${#_candidates[@]}):"
+  else
+    say "Candidates in ${_src_dir} (${#_candidates[@]}):"
+  fi
   local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0 _match_count=0
   _match_err="$(mktemp)"
   for _f in "${_candidates[@]}"; do
     _f_name="$(basename "$_f")"
     if _f_desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_match_err")"; then
-      note "  candidate $_f_name -> MATCH: $_f_desc"
+      if (( ENABLE_COLOR )); then
+        say "  ${C_GREEN}✔ MATCH${C_RESET}: ${C_BOLD}$_f_name${C_RESET} -- $_f_desc"
+      else
+        say "  ✔ MATCH: $_f_name -- $_f_desc"
+      fi
       _match_count=$((_match_count+1))
       if [[ -z "$_match_file" ]]; then
         _match_file="$_f"
@@ -11264,7 +11305,11 @@ install_vbios_romfile() {
       local _repair_res _repair_path _repair_desc
       if _repair_res="$(_vbios_autorepair_byteswap "$_f" "$_guest_gpu" 2>/dev/null)"; then
         IFS='|' read -r _repair_path _repair_desc <<<"$_repair_res"
-        note "  candidate $_f_name -> byte-swapped (aa55); AUTO-REPAIRED first 2 bytes (55aa) -> MATCH: $_repair_desc"
+        if (( ENABLE_COLOR )); then
+          say "  ${C_GREEN}✔ MATCH${C_RESET} ${C_YELLOW}(byte-swap auto-repaired)${C_RESET}: ${C_BOLD}$_f_name${C_RESET} -- $_repair_desc"
+        else
+          say "  ✔ MATCH (byte-swap auto-repaired): $_f_name -- $_repair_desc"
+        fi
         _match_count=$((_match_count+1))
         if [[ -z "$_match_file" ]]; then
           _match_file="$_repair_path"
@@ -11275,14 +11320,22 @@ install_vbios_romfile() {
           rmdir "$(dirname "$_repair_path")" 2>/dev/null || true
         fi
       else
-        note "  candidate $_f_name -> no match: $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+        if (( ENABLE_COLOR )); then
+          say "  ${C_RED}✖ no match${C_RESET}: ${C_BOLD}$_f_name${C_RESET} -- $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+        else
+          say "  no match: $_f_name -- $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+        fi
       fi
     fi
   done
   rm -f "$_match_err" 2>/dev/null || true
 
   if [[ -z "$_match_file" ]]; then
-    note "WARN: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+    if (( ENABLE_COLOR )); then
+      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+    else
+      say "  WARN: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+    fi
     note "       Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
     note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
     _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
@@ -11313,7 +11366,12 @@ install_vbios_romfile() {
     fi
     return 0
   fi
-  say "Matched vBIOS dump: $(basename "$_match_file") ($_match_desc)"
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_GREEN}✔ Pinned vBIOS${C_RESET}: ${C_BOLD}$(basename "$_match_file")${C_RESET} -- $_match_desc"
+  else
+    say "✔ Pinned vBIOS: $(basename "$_match_file") -- $_match_desc"
+  fi
 
   if (( ! DRY_RUN )); then
     mkdir -p "$VBIOS_RUNTIME_DIR" 2>/dev/null || true
@@ -11324,7 +11382,7 @@ install_vbios_romfile() {
     run cp -f "$_match_file" "$_rom_runtime"
     run chmod 0644 "$_rom_runtime"
   fi
-  note "Installed vBIOS dump to $_rom_runtime"
+  _kv "Installed to" "$_rom_runtime"
   # If the match was an auto-repaired temp copy (not the original candidate),
   # clean up the temp dir now that the repaired content has been copied to the
   # stable runtime path.

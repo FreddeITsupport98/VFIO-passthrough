@@ -2240,10 +2240,10 @@ else
 fi
 _install_vbios_fn="$(sed -n '/^install_vbios_romfile() {/,/^}/p' "$VFIO_SCRIPT")"
 if echo "$_install_vbios_fn" | grep -Fq '_vbios_techpowerup_url "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq 'Find/verify a vBIOS dump at: $_tpu_url' \
-  && echo "$_install_vbios_fn" | grep -Fq 'techpowerup Device Id for vBIOS lookup: $_tpu_did' \
-  && echo "$_install_vbios_fn" | grep -Fq 'WARN: no *.rom files found' \
-  && echo "$_install_vbios_fn" | grep -Fq 'WARN: no VBIOS/ folder' \
+  && echo "$_install_vbios_fn" | grep -Fq 'Find/verify at' \
+  && echo "$_install_vbios_fn" | grep -Fq 'TPU Device Id' \
+  && echo "$_install_vbios_fn" | grep -Fq 'no *.rom files found' \
+  && echo "$_install_vbios_fn" | grep -Fq 'no VBIOS/ folder' \
   && ! echo "$_install_vbios_fn" | grep -Fq 'Asus.RX9070.16384.241204_1.rom'; then
   ok "Q3z install_vbios_romfile uses the dynamic techpowerup URL + Device Id serial up front, with WARN-prefixed skips, not a hardcoded example"
 else
@@ -2255,8 +2255,8 @@ fi
 # fetch (curl/wget, 6s timeout) guarded for set -e/pipefail; non-fatal fallback.
 if grep -Fq '_vbios_techpowerup_resolve_detail()' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_techpowerup_resolve_detail "$_tpu_url"' "$VFIO_SCRIPT" \
-  && grep -Fq 'Exact vBIOS listing (resolved from the search)' "$VFIO_SCRIPT" \
-  && grep -Fq 'Expected download filename' "$VFIO_SCRIPT" \
+  && grep -Fq 'Exact listing' "$VFIO_SCRIPT" \
+  && grep -Fq 'Download filename' "$VFIO_SCRIPT" \
   && grep -Fq 'could not auto-resolve the exact listing' "$VFIO_SCRIPT"; then
   ok "Q3z _vbios_techpowerup_resolve_detail() is defined + wired in with a detail/filename/fallback print block"
 else
@@ -2350,9 +2350,9 @@ if grep -Fq 'ROM signature is byte-swapped' "$VFIO_SCRIPT" \
   && grep -Fq 'dump your own card with amdvbflash/GPU-Z' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_autorepair_byteswap()' "$VFIO_SCRIPT" \
   && echo "$_install_vbios_fn" | grep -Fq '_vbios_autorepair_byteswap "$_f" "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq 'AUTO-REPAIRED first 2 bytes' \
-  && echo "$_install_vbios_fn" | grep -Fq 'techpowerup downloads are systematically byte-swapped' \
-  && echo "$_install_vbios_fn" | grep -Fq 'AUTO-REPAIRS a swapped ROM'; then
+  && echo "$_install_vbios_fn" | grep -Fq 'byte-swap auto-repaired' \
+  && grep -Fq 'techpowerup downloads are systematically byte-swapped' "$VFIO_SCRIPT" \
+  && grep -Fq 'AUTO-REPAIRS a swapped ROM' "$VFIO_SCRIPT"; then
   ok "Q3z matcher + resolver + autorepair wiring all present (aa55 detect, AUTO-REPAIRS caveat, candidate-loop repair + cleanup)"
 else
   bad "Q3z matcher/resolver/autorepair wiring missing (aa55 detect, AUTO-REPAIRS caveat, or candidate-loop repair)"

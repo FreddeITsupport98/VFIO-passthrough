@@ -2005,6 +2005,103 @@ else
   bad "Q3y VFIO_REBOOT_FLR_MAX_GEN doc comment not broadened beyond guest-reboot FLR"
 fi
 
+# --- Smoke Q3z: vBIOS ROM auto-injection (fixes a black screen caused by an
+# unreliable live sysfs ROM read at VM start). Static wiring checks plus a
+# LIVE functional test of the two-tier matcher (_vbios_rom_matches_gpu)
+# against the actual bundled VBIOS/*.rom dump, since a purely static/grep
+# check could not have caught the real bug found during development (the
+# strict PCIR tier alone rejects real-world AMD ATOMBIOS dumps that leave the
+# legacy PCIR pointer at 0 -- the fallback tier exists specifically for this).
+if [[ -d "$PROJECT_ROOT/VBIOS" ]] && compgen -G "$PROJECT_ROOT/VBIOS/*.rom" >/dev/null 2>&1; then
+  ok "Q3z VBIOS/ folder is bundled with at least one *.rom dump"
+else
+  bad "Q3z VBIOS/ folder missing or contains no *.rom dumps"
+fi
+
+if grep -Fq 'install_vbios_romfile()' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_rom_matches_gpu()' "$VFIO_SCRIPT" \
+  && grep -Fq 'remove_vbios_romfile()' "$VFIO_SCRIPT"; then
+  ok "Q3z install_vbios_romfile/_vbios_rom_matches_gpu/remove_vbios_romfile are all defined"
+else
+  bad "Q3z one or more vBIOS ROM auto-injection functions are missing"
+fi
+
+# install_vbios_romfile must be hooked into BOTH dynamic-binding install paths
+# (the --install-dynamic-binding switcher and the full wizard), matching
+# install_park_keepalive_monitor's existing call sites, so it runs
+# automatically without the user having to manually edit VM XML.
+_switcher_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_switcher_fn" | grep -Fq 'install_vbios_romfile'; then
+  ok "Q3z install_dynamic_binding_from_existing_config() calls install_vbios_romfile"
+else
+  bad "Q3z install_dynamic_binding_from_existing_config() missing install_vbios_romfile call"
+fi
+if grep -c 'install_vbios_romfile$' "$VFIO_SCRIPT" | grep -Fxq 2; then
+  ok "Q3z install_vbios_romfile is called from exactly 2 install paths (switcher + full wizard)"
+else
+  bad "Q3z install_vbios_romfile call-site count is not 2 (switcher + full wizard)"
+fi
+
+# remove_vbios_romfile must be hooked into BOTH removal paths (the
+# --install-early-binding switcher and --reset), per the "always update the
+# uninstaller" rule, matching remove_park_keepalive_monitor's call sites.
+_early_fn="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_early_fn" | grep -Fq 'remove_vbios_romfile'; then
+  ok "Q3z install_early_binding_from_existing_config() calls remove_vbios_romfile"
+else
+  bad "Q3z install_early_binding_from_existing_config() missing remove_vbios_romfile call"
+fi
+_reset_fn="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_reset_fn" | grep -Fq 'remove_vbios_romfile'; then
+  ok "Q3z reset_vfio_all() calls remove_vbios_romfile"
+else
+  bad "Q3z reset_vfio_all() missing remove_vbios_romfile call"
+fi
+
+# LIVE functional test: extract the real _vbios_rom_matches_gpu implementation
+# and run it against the actual bundled ROM with a simulated sysfs config +
+# mocked lspci, for both a matching GPU (RX 9070) and a non-matching one
+# (NVIDIA), so a regression in the matching logic itself (not just its
+# presence) would be caught.
+_vbios_fn_body="$(sed -n '/^_vbios_rom_matches_gpu() {/,/^}/p' "$VFIO_SCRIPT")"
+_vbios_rom_bin="$(compgen -G "$PROJECT_ROOT/VBIOS/*.rom" 2>/dev/null | head -1 || true)"
+if [[ -n "$_vbios_fn_body" && -n "$_vbios_rom_bin" ]]; then
+  vfake="$tmp/vbios_fake"
+  mkdir -p "$vfake/sys/0000:0e:00.0" "$vfake/sys/0000:01:00.0" "$vfake/bin"
+  printf '\x02\x10\x50\x75' > "$vfake/sys/0000:0e:00.0/config"   # 1002:7550 (RX 9070 family)
+  printf '\xde\x10\x00\x25' > "$vfake/sys/0000:01:00.0/config"   # 10de:2500 (unrelated NVIDIA)
+  cat > "$vfake/bin/lspci" <<'LEOF'
+#!/usr/bin/env bash
+case "$*" in
+  *0000:0e:00.0*) echo "0e:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT/9070 GRE] [1002:7550] (rev c3)" ;;
+  *) echo "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation Device [10de:2500] (rev a1)" ;;
+esac
+LEOF
+  chmod +x "$vfake/bin/lspci"
+  {
+    printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+    printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
+    printf '_vbios_rom_matches_gpu "%s" "0000:0e:00.0"\n' "$_vbios_rom_bin"
+  } > "$vfake/match_test.sh"
+  {
+    printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+    printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
+    printf '_vbios_rom_matches_gpu "%s" "0000:01:00.0"\n' "$_vbios_rom_bin"
+  } > "$vfake/nomatch_test.sh"
+  if PATH="$vfake/bin:$PATH" bash "$vfake/match_test.sh" >"$tmp/vbios_match_out.txt" 2>/dev/null; then
+    ok "Q3z _vbios_rom_matches_gpu matches the bundled ROM against a real RX 9070 (output: $(cat "$tmp/vbios_match_out.txt"))"
+  else
+    bad "Q3z _vbios_rom_matches_gpu failed to match the bundled ROM against a real RX 9070"
+  fi
+  if PATH="$vfake/bin:$PATH" bash "$vfake/nomatch_test.sh" >/dev/null 2>/dev/null; then
+    bad "Q3z _vbios_rom_matches_gpu incorrectly matched the bundled AMD ROM against an unrelated NVIDIA GPU"
+  else
+    ok "Q3z _vbios_rom_matches_gpu correctly rejects the bundled ROM for an unrelated NVIDIA GPU"
+  fi
+else
+  bad "Q3z could not extract _vbios_rom_matches_gpu or find a bundled *.rom to test against"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

@@ -99,6 +99,16 @@ PARK_KEEPALIVE_STATE_FILE="/var/lib/vfio-dynamic/park-keepalive.state"
 PARK_KEEPALIVE_RESUME_HOOK="/usr/lib/systemd/system-sleep/vfio-gpu-park-keepalive-resume.sh"
 PARK_KEEPALIVE_CHECK_UNIT="/etc/systemd/system/vfio-gpu-park-keepalive-check.service"
 PARK_KEEPALIVE_UDEV_RULE="/etc/udev/rules.d/99-vfio-park-keepalive.rules"
+# vBIOS ROM auto-injection (dynamic binding only): QEMU/vfio-pci reads the
+# guest GPU's option ROM live from sysfs at VM start, which can be unreliable
+# after a reset (dmesg: "Invalid PCI ROM header signature"), leaving the guest
+# with a black screen even though the PCI device itself is alive and bound.
+# install_vbios_romfile() auto-detects a matching *.rom dump in a VBIOS/ folder
+# next to this script (matched by the ROM's own embedded PCI Vendor:Device ID,
+# so a non-matching dump is never used), copies it to this stable runtime
+# location, and pins it via <rom file='...'/> in each shut-off guest-GPU VM's
+# hostdev. Removed by --install-early-binding and by --reset.
+VBIOS_RUNTIME_DIR="/var/lib/libvirt/vbios"
 
 DEBUG=0
 DRY_RUN=0
@@ -10720,6 +10730,381 @@ remove_park_keepalive_monitor() {
   fi
 }
 
+# Two-tier check for whether a ROM dump belongs to the guest GPU at $2.
+# Tier 1 (strict): parse the ROM's PCI Data Structure (PCIR), per the standard
+# header layout:
+#   offset 0x00: 0x55 0xAA                (ROM signature)
+#   offset 0x18: 2-byte LE pointer to the PCIR structure
+#   PCIR+0x00: 'PCIR' (4 ASCII bytes)     (PCI Data Structure signature)
+#   PCIR+0x04: 2-byte LE Vendor ID
+#   PCIR+0x06: 2-byte LE Device ID
+# and compare against the GPU's live Vendor:Device ID (from config space).
+# Tier 2 (fallback): real-world AMD ATOMBIOS dumps routinely leave the legacy
+# PCIR pointer at 0 (verified empirically against an actual RX 9070 dump --
+# the strict check alone would reject a perfectly valid, correctly-matching
+# file). When PCIR is absent, confirm the file is a genuine AMD ATOMBIOS vbios
+# via its signature string, then best-effort match its embedded human-readable
+# model strings against RX-series model tokens parsed from the GPU's own
+# `lspci` description (e.g. "RX9070" from "Radeon RX 9070/9070 XT/9070 GRE").
+# This is weaker than a strict PCI ID match (it confirms "looks like the right
+# GPU family", not the exact SKU/board), which is reflected in the printed
+# description.
+# Prints a human-readable description of the match (or near-miss, to stderr)
+# and returns 0 on match / 1 on no match or an unreadable/unrecognized file.
+_vbios_rom_matches_gpu() {
+  local _rom="$1" _bdf="$2"
+  local _sig _ptr_le _ptr_dec _pcir_sig _ven_le _dev_le _ven _dev
+  local _gpu_sys="/sys/bus/pci/devices/$_bdf" _gpu_cfg _gpu_ven _gpu_dev
+  [[ -r "$_rom" ]] || return 1
+  _sig="$(head -c 2 "$_rom" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ "$_sig" == "55aa" ]] || return 1
+  _gpu_cfg="$(head -c 4 "$_gpu_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_gpu_cfg" && "$_gpu_cfg" != "ffffffff" ]] || return 1
+  _gpu_ven="${_gpu_cfg:2:2}${_gpu_cfg:0:2}"
+  _gpu_dev="${_gpu_cfg:6:2}${_gpu_cfg:4:2}"
+
+  _ptr_le="$(dd if="$_rom" bs=1 skip=24 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ -n "$_ptr_le" && "$_ptr_le" != "0000" ]]; then
+    _ptr_dec="$(( 16#${_ptr_le:2:2}${_ptr_le:0:2} ))"
+    _pcir_sig="$(dd if="$_rom" bs=1 skip="$_ptr_dec" count=4 2>/dev/null | tr -d '\0')"
+    if [[ "$_pcir_sig" == "PCIR" ]]; then
+      _ven_le="$(dd if="$_rom" bs=1 skip=$(( _ptr_dec + 4 )) count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+      _dev_le="$(dd if="$_rom" bs=1 skip=$(( _ptr_dec + 6 )) count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+      if [[ -n "$_ven_le" && -n "$_dev_le" ]]; then
+        _ven="${_ven_le:2:2}${_ven_le:0:2}"; _dev="${_dev_le:2:2}${_dev_le:0:2}"
+        if [[ "${_ven,,}" == "${_gpu_ven,,}" && "${_dev,,}" == "${_gpu_dev,,}" ]]; then
+          printf 'PCI ID %s:%s (strict match, from ROM header)\n' "${_ven,,}" "${_dev,,}"
+          return 0
+        fi
+        printf 'PCI ID %s:%s from ROM header does NOT match guest GPU %s:%s\n' "${_ven,,}" "${_dev,,}" "${_gpu_ven,,}" "${_gpu_dev,,}" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  if [[ "${_gpu_ven,,}" == "1002" ]] && have_cmd strings && strings -n 4 "$_rom" 2>/dev/null | grep -q 'AMD ATOMBIOS'; then
+    local _gpu_desc _rom_strings _tok
+    _gpu_desc="$(have_cmd lspci && lspci -s "$_bdf" 2>/dev/null || true)"
+    _rom_strings="$(strings -n 4 "$_rom" 2>/dev/null | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+    while read -r _tok; do
+      [[ -n "$_tok" ]] || continue
+      _tok="$(tr -d ' ' <<<"$_tok" | tr '[:lower:]' '[:upper:]')"
+      if grep -Fq "$_tok" <<<"$_rom_strings"; then
+        printf 'AMD ATOMBIOS dump, model token "%s" found (best-effort family match, not a strict PCI ID check -- verify by eye)\n' "$_tok"
+        return 0
+      fi
+    done < <(grep -oEi 'RX ?[0-9]{3,4} ?(XT|GRE)?' <<<"$_gpu_desc")
+    printf 'AMD ATOMBIOS dump but no model token from "%s" found inside it (PCIR pointer also absent, no strict check possible)\n' "$_gpu_desc" >&2
+    return 1
+  fi
+  return 1
+}
+
+# Auto-detect and pin a matching vBIOS ROM dump into the guest GPU's PCI
+# hostdev, for every shut-off libvirt VM that has it attached (dynamic binding
+# only). Rationale: at --bind-now time, QEMU/vfio-pci reads the GPU's option
+# ROM live from sysfs, which can be unreliable after a reset (dmesg: "Invalid
+# PCI ROM header signature: expecting 0xaa55, got 0xffff"), leaving the guest
+# with a black screen even though the PCI device itself is alive and bound.
+# Pinning a known-good dump via <rom file='...'/> avoids that live read.
+#
+# SAFETY: scans a VBIOS/ folder next to this script for *.rom files, reads
+# each candidate's OWN embedded PCI Vendor:Device ID (see _vbios_rom_pci_id)
+# and ONLY auto-selects a dump whose embedded ID matches the guest GPU's LIVE
+# vendor:device ID (read straight from config space). This means the user
+# never has to manually pick a file: unrelated/mismatched dumps are reported
+# (with their embedded ID, so the user can share/search with it) but never
+# used, so a wrong ROM can never be silently wired in. Instant on (no prompt)
+# — mirrors the other dynamic-binding recovery features. Removed by
+# --install-early-binding and by --reset (see remove_vbios_romfile).
+install_vbios_romfile() {
+  if ! readable_file "$CONF_FILE"; then
+    note "Missing $CONF_FILE; skipping vBIOS ROM auto-injection."
+    return 0
+  fi
+  local _guest_gpu
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_guest_gpu" ]] || return 0
+  if ! have_cmd virsh; then
+    note "virsh not available; skipping vBIOS ROM auto-injection."
+    return 0
+  fi
+
+  local _gpu_sys="/sys/bus/pci/devices/$_guest_gpu" _gpu_cfg _gpu_ven _gpu_dev _gpu_id
+  if [[ ! -d "$_gpu_sys" ]]; then
+    note "Guest GPU $_guest_gpu not present in sysfs; skipping vBIOS ROM auto-injection."
+    return 0
+  fi
+  _gpu_cfg="$(head -c 4 "$_gpu_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ -z "$_gpu_cfg" || "$_gpu_cfg" == "ffffffff" ]]; then
+    note "Guest GPU $_guest_gpu config space is unreadable right now; skipping vBIOS ROM auto-injection (re-run once it is alive)."
+    return 0
+  fi
+  _gpu_ven="${_gpu_cfg:2:2}${_gpu_cfg:0:2}"
+  _gpu_dev="${_gpu_cfg:6:2}${_gpu_cfg:4:2}"
+  _gpu_id="${_gpu_ven,,}:${_gpu_dev,,}"
+
+  local _src_dir
+  _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
+  if [[ ! -d "$_src_dir" ]]; then
+    note "No VBIOS/ folder next to $SCRIPT_NAME; skipping vBIOS ROM auto-injection."
+    note "Guest GPU PCI ID is $_gpu_id — drop a matching *.rom dump into a VBIOS/ folder next to this script to enable this automatically."
+    return 0
+  fi
+  local -a _candidates=()
+  local _f
+  while IFS= read -r -d '' _f; do
+    _candidates+=("$_f")
+  done < <(find "$_src_dir" -maxdepth 1 -iname '*.rom' -print0 2>/dev/null)
+  if (( ${#_candidates[@]} == 0 )); then
+    note "No *.rom files found in $_src_dir; skipping vBIOS ROM auto-injection."
+    note "Guest GPU PCI ID is $_gpu_id — drop a matching *.rom dump into $_src_dir to enable this automatically."
+    return 0
+  fi
+
+  say
+  hdr "vBIOS ROM auto-injection (fixes a black screen from an unreliable live ROM read)"
+  note "Guest GPU $_guest_gpu PCI ID: $_gpu_id (share this ID if you need to find/verify a vBIOS dump)."
+
+  local _match_file="" _match_desc="" _f_desc _f_name _match_err
+  _match_err="$(mktemp)"
+  for _f in "${_candidates[@]}"; do
+    _f_name="$(basename "$_f")"
+    if _f_desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_match_err")"; then
+      note "  candidate $_f_name -> MATCH: $_f_desc"
+      if [[ -z "$_match_file" ]]; then
+        _match_file="$_f"
+        _match_desc="$_f_desc"
+      fi
+    else
+      note "  candidate $_f_name -> no match: $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+    fi
+  done
+  rm -f "$_match_err" 2>/dev/null || true
+
+  if [[ -z "$_match_file" ]]; then
+    note "No candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+    note "Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
+    return 0
+  fi
+  say "Matched vBIOS dump: $(basename "$_match_file") ($_match_desc)"
+
+  if (( ! DRY_RUN )); then
+    mkdir -p "$VBIOS_RUNTIME_DIR" 2>/dev/null || true
+  fi
+  local _rom_runtime
+  _rom_runtime="$VBIOS_RUNTIME_DIR/$(basename "$_match_file")"
+  if (( ! DRY_RUN )); then
+    run cp -f "$_match_file" "$_rom_runtime"
+    run chmod 0644 "$_rom_runtime"
+  fi
+  note "Installed vBIOS dump to $_rom_runtime"
+
+  local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp
+  local _gpu_dom_hex _gpu_bus_hex _gpu_slot_fn _gpu_slot_hex _gpu_fn_hex
+  IFS=: read -r _gpu_dom_hex _gpu_bus_hex _gpu_slot_fn <<<"$_guest_gpu"
+  _gpu_slot_hex="${_gpu_slot_fn%.*}"
+  _gpu_fn_hex="${_gpu_slot_fn#*.}"
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+      continue
+    fi
+    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping vBIOS ROM injection. Shut it off and re-run to update it."
+      _skipped_running=1
+      continue
+    fi
+    _tmp="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp"
+    python3 - "$_tmp" "$_gpu_bus_hex" "$_gpu_slot_hex" "$_gpu_fn_hex" "$_rom_runtime" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path, want_bus, want_slot, want_fn, romfile = sys.argv[1:6]
+def norm(h): return format(int(h, 16), 'x')
+want_bus, want_slot, want_fn = norm(want_bus), norm(want_slot), norm(want_fn)
+tree = ET.parse(path); root = tree.getroot()
+changed = False
+found = False
+for hostdev in root.findall('.//hostdev'):
+    if hostdev.get('type') != 'pci':
+        continue
+    source = hostdev.find('source')
+    if source is None:
+        continue
+    addr = source.find('address')
+    if addr is None:
+        continue
+    bus = norm(addr.get('bus', '0x0'))
+    slot = norm(addr.get('slot', '0x0'))
+    fn = norm(addr.get('function', '0x0'))
+    if (bus, slot, fn) != (want_bus, want_slot, want_fn):
+        continue
+    found = True
+    rom = hostdev.find('rom')
+    if rom is None:
+        rom = ET.Element('rom')
+        # Schema order inside <hostdev> is source, rom, address (guest-side) —
+        # insert right after <source>.
+        hostdev.insert(list(hostdev).index(source) + 1, rom)
+        changed = True
+    if rom.get('file') != romfile:
+        rom.set('file', romfile); changed = True
+    break
+if not found:
+    sys.exit(4)
+if not changed:
+    sys.exit(3)
+tree.write(path)
+PYEOF
+    local _py_status=$?
+    if (( _py_status == 3 )); then
+      say "VM '$_dom' already has this vBIOS ROM wired in (no changes needed)."
+      _updated=1
+      rm -f "$_tmp"
+      continue
+    elif (( _py_status == 4 )); then
+      note "WARN: could not locate the guest GPU's hostdev in '$_dom' XML; skipping."
+      rm -f "$_tmp"
+      continue
+    elif (( _py_status != 0 )); then
+      note "WARN: vBIOS ROM XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      rm -f "$_tmp"
+      continue
+    fi
+    if ! virt-xml-validate "$_tmp" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for '$_dom' after adding the vBIOS rom; skipping redefine."
+      rm -f "$_tmp"
+      continue
+    fi
+    local _define_rc=0 _define_err=""
+    if (( ! DRY_RUN )); then
+      _define_err="$(virsh -c qemu:///system define "$_tmp" 2>&1 >/dev/null)" || _define_rc=$?
+    fi
+    if (( _define_rc != 0 )); then
+      note "ERROR: virsh define failed for '$_dom' (exit $_define_rc): $_define_err"
+      rm -f "$_tmp"
+      continue
+    fi
+    say "Wired vBIOS ROM into VM '$_dom' — next boot uses the pinned dump ($_rom_runtime) instead of the live sysfs ROM read."
+    _updated=1
+    rm -f "$_tmp"
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  if (( ! _updated )); then
+    if (( _skipped_running )); then
+      note "No VMs were updated (running VMs must be shut off first). Shut off the VM and re-run."
+    else
+      note "No shut-off VMs with the guest GPU found; nothing to update."
+    fi
+  fi
+}
+
+# Remove the vBIOS ROM auto-injection: strips <rom file='...'/> from the guest
+# GPU's hostdev in every shut-off guest-GPU VM, but ONLY when that rom file
+# path is inside VBIOS_RUNTIME_DIR (never touches a user's own manually
+# configured romfile), then removes the runtime copy.
+remove_vbios_romfile() {
+  if readable_file "$CONF_FILE" && have_cmd virsh; then
+    local _guest_gpu
+    _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    if [[ -n "$_guest_gpu" ]]; then
+      local _dom _xml _bdfs _state _tmp
+      local _gpu_dom_hex _gpu_bus_hex _gpu_slot_fn _gpu_slot_hex _gpu_fn_hex
+      IFS=: read -r _gpu_dom_hex _gpu_bus_hex _gpu_slot_fn <<<"$_guest_gpu"
+      _gpu_slot_hex="${_gpu_slot_fn%.*}"
+      _gpu_fn_hex="${_gpu_slot_fn#*.}"
+      while IFS= read -r _dom; do
+        [[ -n "$_dom" ]] || continue
+        _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+        [[ -n "$_xml" ]] || continue
+        grep -Fq "$VBIOS_RUNTIME_DIR/" <<<"$_xml" 2>/dev/null || continue
+        _bdfs="$(printf '%s' "$_xml" | awk '
+          /<hostdev/ { in_hostdev=1; is_pci=0 }
+          in_hostdev && /type=.pci./ { is_pci=1 }
+          in_hostdev && is_pci && /<address/ {
+            line=$0; dom=""; bus=""; slot=""; fn=""
+            if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+            if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+            if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+            if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+            if (dom != "" && bus != "" && slot != "" && fn != "") {
+              while (length(dom) < 4) dom = "0" dom
+              while (length(bus) < 2) bus = "0" bus
+              while (length(slot) < 2) slot = "0" slot
+              printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+            }
+          }
+          /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+        ')"
+        grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null || continue
+        _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+        if [[ "$_state" != "shut off" ]]; then
+          note "WARN: VM '$_dom' is '$_state' (not shut off); leaving its vBIOS ROM pin in place. Shut it off and re-run --reset / --install-early-binding to remove it."
+          continue
+        fi
+        _tmp="$(mktemp)"
+        printf '%s\n' "$_xml" >"$_tmp"
+        python3 - "$_tmp" "$_gpu_bus_hex" "$_gpu_slot_hex" "$_gpu_fn_hex" "$VBIOS_RUNTIME_DIR/" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path, want_bus, want_slot, want_fn, romdir = sys.argv[1:6]
+def norm(h): return format(int(h, 16), 'x')
+want_bus, want_slot, want_fn = norm(want_bus), norm(want_slot), norm(want_fn)
+tree = ET.parse(path); root = tree.getroot()
+changed = False
+for hostdev in root.findall('.//hostdev'):
+    if hostdev.get('type') != 'pci':
+        continue
+    source = hostdev.find('source')
+    if source is None:
+        continue
+    addr = source.find('address')
+    if addr is None:
+        continue
+    bus = norm(addr.get('bus', '0x0'))
+    slot = norm(addr.get('slot', '0x0'))
+    fn = norm(addr.get('function', '0x0'))
+    if (bus, slot, fn) != (want_bus, want_slot, want_fn):
+        continue
+    rom = hostdev.find('rom')
+    if rom is not None and (rom.get('file') or '').startswith(romdir):
+        hostdev.remove(rom); changed = True
+    break
+if not changed:
+    sys.exit(3)
+tree.write(path)
+PYEOF
+        local _py_status=$?
+        if (( _py_status == 0 )) && (( ! DRY_RUN )); then
+          virsh -c qemu:///system define "$_tmp" 2>/dev/null || true
+          note "Removed vBIOS ROM pin from VM '$_dom'."
+        fi
+        rm -f "$_tmp"
+      done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+    fi
+  fi
+  run rm -rf "$VBIOS_RUNTIME_DIR" 2>/dev/null || true
+}
+
 ensure_graphics_daemon_deployment_safety() {
   # if a unit exists without its daemon script, disable and remove the stale unit.
   local changed=0
@@ -11779,6 +12164,10 @@ install_dynamic_binding_from_existing_config() {
   #      recovers the guest GPU while it is parked on vfio-pci between VM sessions.
   install_park_keepalive_monitor
 
+  # 3c3. Auto-detect + pin a matching vBIOS ROM dump (instant on, no prompt):
+  #      fixes a black screen caused by an unreliable live sysfs ROM read.
+  install_vbios_romfile
+
   # 3d. Stealth/perf VM tuning (opt-in) — supersedes the minimal hypervisor-hide
   #     helper for the dynamic path. Applies the full Stealthy-VM tuning (which
   #     includes the hypervisor hide as a subset with a realistic OEM vendor_id)
@@ -11916,6 +12305,9 @@ install_early_binding_from_existing_config() {
 
   # 3c2. Remove the park-keepalive monitor (dynamic-binding-only).
   remove_park_keepalive_monitor
+
+  # 3c3. Remove the vBIOS ROM auto-injection (dynamic-binding-only).
+  remove_vbios_romfile
 
   # 4. Re-add early-binding tokens to the kernel cmdline.
   local guest_ids
@@ -15738,6 +16130,9 @@ reset_vfio_all() {
 
     # If we previously masked plymouth units as part of "disable splash",
     # unmask them on reset so the system can return to distro defaults.
+    # (vBIOS ROM auto-injection has no systemd service of its own; its VM-XML
+    # <rom> pins and runtime dir are removed separately below via
+    # remove_vbios_romfile, before the CONF_FILE it depends on is deleted.)
     unmask_plymouth_services
 
     run systemctl daemon-reload 2>/dev/null || true
@@ -15747,6 +16142,10 @@ reset_vfio_all() {
   local bootlog_unit="/etc/systemd/system/vfio-dump-boot-log.service"
   local bootlog_bin
   bootlog_bin="$(bootlog_bin_path)"
+
+  # Remove the vBIOS ROM auto-injection (VM-XML <rom> pins + runtime dir).
+  # Must run BEFORE $CONF_FILE is deleted below (it reads GUEST_GPU_BDF from it).
+  remove_vbios_romfile
 
   # Libvirt hook cleanup: restore pre-existing user-managed qemu hook or remove our managed entry.
   if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
@@ -16733,6 +17132,9 @@ apply_configuration() {
     # Install the park-keepalive monitor (instant on, no prompt): proactively
     # recovers the guest GPU while it is parked on vfio-pci between VM sessions.
     install_park_keepalive_monitor
+    # Auto-detect + pin a matching vBIOS ROM dump (instant on, no prompt): fixes
+    # a black screen caused by an unreliable live sysfs ROM read.
+    install_vbios_romfile
     # Stealth/perf VM tuning (opt-in) — asks the user if they want the VM to
     # look like a real desktop PC (SMBIOS spoofing, CPU hypervisor-bit disable,
     # e1000e NIC, randomized disk serials, vmport off, iothreads/cputune).

@@ -10944,20 +10944,40 @@ install_vbios_romfile() {
   _gpu_ven="${_gpu_cfg:2:2}${_gpu_cfg:0:2}"
   _gpu_dev="${_gpu_cfg:6:2}${_gpu_cfg:4:2}"
   _gpu_id="${_gpu_ven,,}:${_gpu_dev,,}"
-  # Deep link derived ENTIRELY from live hardware detection (vendor + device +
-  # subsystem vendor + subsystem device, all read from sysfs) -- NOT a
-  # hardcoded example. See _vbios_techpowerup_url for the exact match this
-  # gives on techpowerup (chip AND board partner/SKU, not just a keyword).
-  local _tpu_url
+  # Deep link + techpowerup Device Id serial derived ENTIRELY from live
+  # hardware detection (vendor + device + subsystem vendor + subsystem device,
+  # all read from sysfs) -- NOT a hardcoded example. See _vbios_techpowerup_url
+  # for the exact match this gives on techpowerup (chip AND board partner/SKU,
+  # not just a keyword).
+  local _tpu_url _subven _subdev _tpu_did
   _tpu_url="$(_vbios_techpowerup_url "$_guest_gpu" 2>/dev/null || true)"
   [[ -n "$_tpu_url" ]] || _tpu_url="https://www.techpowerup.com/vgabios/"
+  _subven="$(cat "$_gpu_sys/subsystem_vendor" 2>/dev/null || true)"; _subven="${_subven#0x}"
+  _subdev="$(cat "$_gpu_sys/subsystem_device" 2>/dev/null || true)"; _subdev="${_subdev#0x}"
+  if [[ -n "$_subven" && -n "$_subdev" ]]; then
+    _tpu_did="${_gpu_ven^^}-${_gpu_dev^^}-${_subven^^}-${_subdev^^}"
+  else
+    _tpu_did="${_gpu_ven^^}-${_gpu_dev^^}"
+  fi
+
+  # Print the section header + the guest GPU's PCI ID + the techpowerup Device
+  # Id serial + a deep link ONCE, up front, so EVERY path below (no VBIOS/
+  # folder, no *.rom files, no candidate match, OR a successful match that says
+  # "verify by eye") leaves the operator with the concrete serial + URL needed
+  # to find/verify a dump. Without this, the skip paths only emitted quiet dim
+  # `note` lines with no header, and the success path said "verify by eye" but
+  # never printed the URL to actually do so.
+  say
+  hdr "vBIOS ROM auto-injection (fixes a black screen from an unreliable live ROM read)"
+  note "Guest GPU $_guest_gpu PCI ID: $_gpu_id (share this ID if you need to find/verify a vBIOS dump)."
+  note "techpowerup Device Id for vBIOS lookup: $_tpu_did"
+  note "Find/verify a vBIOS dump at: $_tpu_url"
 
   local _src_dir
   _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
   if [[ ! -d "$_src_dir" ]]; then
-    note "No VBIOS/ folder next to $SCRIPT_NAME; skipping vBIOS ROM auto-injection."
-    note "Guest GPU PCI ID is $_gpu_id — drop a matching *.rom dump into a VBIOS/ folder next to this script to enable this automatically."
-    note "Find one at: $_tpu_url"
+    note "WARN: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
+    note "       Drop a matching *.rom dump into a VBIOS/ folder next to this script, then re-run to enable this automatically."
     return 0
   fi
   local -a _candidates=()
@@ -10966,15 +10986,10 @@ install_vbios_romfile() {
     _candidates+=("$_f")
   done < <(find "$_src_dir" -maxdepth 1 -iname '*.rom' -print0 2>/dev/null)
   if (( ${#_candidates[@]} == 0 )); then
-    note "No *.rom files found in $_src_dir; skipping vBIOS ROM auto-injection."
-    note "Guest GPU PCI ID is $_gpu_id — drop a matching *.rom dump into $_src_dir to enable this automatically."
-    note "Find one at: $_tpu_url"
+    note "WARN: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
+    note "       Drop a matching *.rom dump into $_src_dir, then re-run to enable this automatically."
     return 0
   fi
-
-  say
-  hdr "vBIOS ROM auto-injection (fixes a black screen from an unreliable live ROM read)"
-  note "Guest GPU $_guest_gpu PCI ID: $_gpu_id (share this ID if you need to find/verify a vBIOS dump)."
 
   local _match_file="" _match_desc="" _f_desc _f_name _match_err
   _match_err="$(mktemp)"
@@ -10993,9 +11008,9 @@ install_vbios_romfile() {
   rm -f "$_match_err" 2>/dev/null || true
 
   if [[ -z "$_match_file" ]]; then
-    note "No candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
-    note "Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
-    note "Find one at: $_tpu_url"
+    note "WARN: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+    note "       Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
+    note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
     return 0
   fi
   say "Matched vBIOS dump: $(basename "$_match_file") ($_match_desc)"

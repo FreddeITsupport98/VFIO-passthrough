@@ -2121,11 +2121,14 @@ else
 fi
 _install_vbios_fn="$(sed -n '/^install_vbios_romfile() {/,/^}/p' "$VFIO_SCRIPT")"
 if echo "$_install_vbios_fn" | grep -Fq '_vbios_techpowerup_url "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq 'Find one at: $_tpu_url' \
+  && echo "$_install_vbios_fn" | grep -Fq 'Find/verify a vBIOS dump at: $_tpu_url' \
+  && echo "$_install_vbios_fn" | grep -Fq 'techpowerup Device Id for vBIOS lookup: $_tpu_did' \
+  && echo "$_install_vbios_fn" | grep -Fq 'WARN: no *.rom files found' \
+  && echo "$_install_vbios_fn" | grep -Fq 'WARN: no VBIOS/ folder' \
   && ! echo "$_install_vbios_fn" | grep -Fq 'Asus.RX9070.16384.241204_1.rom'; then
-  ok "Q3z install_vbios_romfile uses the dynamic techpowerup URL, not a hardcoded example"
+  ok "Q3z install_vbios_romfile uses the dynamic techpowerup URL + Device Id serial up front, with WARN-prefixed skips, not a hardcoded example"
 else
-  bad "Q3z install_vbios_romfile still references a hardcoded techpowerup example or is missing the dynamic URL"
+  bad "Q3z install_vbios_romfile still references a hardcoded techpowerup example or is missing the dynamic URL/serial/WARN skips"
 fi
 _tpu_fn_body="$(sed -n '/^_vbios_techpowerup_url() {/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_tpu_fn_body" ]]; then

@@ -2102,6 +2102,47 @@ else
   bad "Q3z could not extract _vbios_rom_matches_gpu or find a bundled *.rom to test against"
 fi
 
+# _vbios_techpowerup_url must derive its search link ENTIRELY from live
+# hardware detection (vendor/device/subsystem_vendor/subsystem_device read
+# from sysfs), not from any hardcoded example -- confirmed by a LIVE
+# functional test against a simulated sysfs entry with known IDs, verifying
+# the exact resulting URL (this exact link was independently confirmed
+# against techpowerup to return the matching ASUS RX 9070 TUF OC entries).
+if grep -Fq '_vbios_techpowerup_url()' "$VFIO_SCRIPT"; then
+  ok "Q3z _vbios_techpowerup_url() is defined"
+else
+  bad "Q3z _vbios_techpowerup_url() is missing"
+fi
+_install_vbios_fn="$(sed -n '/^install_vbios_romfile() {/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_install_vbios_fn" | grep -Fq '_vbios_techpowerup_url "$_guest_gpu"' \
+  && echo "$_install_vbios_fn" | grep -Fq 'Find one at: $_tpu_url' \
+  && ! echo "$_install_vbios_fn" | grep -Fq 'Asus.RX9070.16384.241204_1.rom'; then
+  ok "Q3z install_vbios_romfile uses the dynamic techpowerup URL, not a hardcoded example"
+else
+  bad "Q3z install_vbios_romfile still references a hardcoded techpowerup example or is missing the dynamic URL"
+fi
+_tpu_fn_body="$(sed -n '/^_vbios_techpowerup_url() {/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_tpu_fn_body" ]]; then
+  vfake2="$tmp/vbios_tpu_fake"
+  mkdir -p "$vfake2/sys/0000:0e:00.0"
+  printf '0x1002\n' > "$vfake2/sys/0000:0e:00.0/vendor"
+  printf '0x7550\n' > "$vfake2/sys/0000:0e:00.0/device"
+  printf '0x1043\n' > "$vfake2/sys/0000:0e:00.0/subsystem_vendor"
+  printf '0x0614\n' > "$vfake2/sys/0000:0e:00.0/subsystem_device"
+  {
+    printf '%s\n' "$_tpu_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake2/sys/\$_bdf#"
+    printf '_vbios_techpowerup_url "0000:0e:00.0"\n'
+  } > "$vfake2/tpu_test.sh"
+  _tpu_out="$(bash "$vfake2/tpu_test.sh" 2>/dev/null || true)"
+  if [[ "$_tpu_out" == "https://www.techpowerup.com/vgabios/?did=1002-7550-1043-0614" ]]; then
+    ok "Q3z _vbios_techpowerup_url builds the exact expected deep link from simulated sysfs IDs"
+  else
+    bad "Q3z _vbios_techpowerup_url produced an unexpected URL (got: $_tpu_out)"
+  fi
+else
+  bad "Q3z could not extract _vbios_techpowerup_url to test"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

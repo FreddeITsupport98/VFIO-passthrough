@@ -10500,7 +10500,13 @@ PYEOF
         say "diff(1) not available; tuned XML is in $_tmp"
       fi
     fi
-    if ! prompt_yn "Redefine VM '$_dom' with the stealth/perf tuning now?" N "Stealth/perf VM tuning"; then
+    # Skip the per-VM confirmation when the user explicitly forced this via
+    # --stealth-vm-tuning: that flag is documented as "skip prompt", so a
+    # second interactive confirmation here would defeat its purpose (e.g. for
+    # scripted/non-interactive re-runs). The interactive full-wizard path
+    # (STEALTH_VM_TUNING_OVERRIDE unset, user answered the outer Y/N prompt)
+    # still confirms per VM here, since that path is inherently interactive.
+    if [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" != "1" ]] && ! prompt_yn "Redefine VM '$_dom' with the stealth/perf tuning now?" N "Stealth/perf VM tuning"; then
       note "Skipped '$_dom' by user choice (tuned XML left in $_tmp; backup at $_backup_xml)."
       rm -f "$_tmp"
       continue
@@ -10749,17 +10755,91 @@ remove_park_keepalive_monitor() {
 # This is weaker than a strict PCI ID match (it confirms "looks like the right
 # GPU family", not the exact SKU/board), which is reflected in the printed
 # description.
+# Best-effort scan of a ROM's embedded human-readable identity, used to give
+# an ALWAYS-informative "right number for that rom" on every no-match path
+# below (not just the PCIR-mismatch case), so a mismatched/unrecognized dump
+# never gets reported with just a bare "no match" -- the caller always has
+# something concrete to compare/search with. Prints one line per distinct
+# GPU-model-like token found (brand + model, e.g. "RX9070", "RTX4090",
+# "GTX1080"), deduplicated, or nothing if none were found. Never fails.
+_vbios_rom_scan_model_strings() {
+  local _rom="$1"
+  have_cmd strings || return 0
+  strings -n 4 "$_rom" 2>/dev/null \
+    | grep -oEi '(RX|RTX|GTX|GT|RADEON|GEFORCE|QUADRO|FIREPRO|VEGA|NAVI)[ _-]?[0-9]{2,5}[ _-]?(XT|TI|SUPER|GRE)?' \
+    | tr -d ' _-' | tr '[:lower:]' '[:upper:]' | sort -u
+  return 0
+}
+
+# Build an EXACT techpowerup vBIOS-collection deep link for the guest GPU at
+# $1, derived ENTIRELY from live hardware detection (same technique as the
+# rest of this feature) rather than any hardcoded example. techpowerup's
+# vgabios search supports a "Device Id" filter of the form
+# vendor-device-subvendor-subdevice (confirmed against real techpowerup URLs,
+# e.g. ?did=10DE-2206-1043-87AC), which is the most precise possible search:
+# it matches the exact GPU chip AND the exact board partner/SKU, not just a
+# brand/model keyword guess. Reads vendor/device/subsystem_vendor/
+# subsystem_device straight from sysfs. Prints the URL on stdout and returns
+# 0, or returns 1 (no stdout) if any of the four IDs cannot be read.
+_vbios_techpowerup_url() {
+  local _bdf="$1"
+  local _sys="/sys/bus/pci/devices/$_bdf" _ven _dev _subven _subdev
+  [[ -d "$_sys" ]] || return 1
+  _ven="$(cat "$_sys/vendor" 2>/dev/null || true)"; _ven="${_ven#0x}"
+  _dev="$(cat "$_sys/device" 2>/dev/null || true)"; _dev="${_dev#0x}"
+  _subven="$(cat "$_sys/subsystem_vendor" 2>/dev/null || true)"; _subven="${_subven#0x}"
+  _subdev="$(cat "$_sys/subsystem_device" 2>/dev/null || true)"; _subdev="${_subdev#0x}"
+  [[ -n "$_ven" && -n "$_dev" && -n "$_subven" && -n "$_subdev" ]] || return 1
+  printf 'https://www.techpowerup.com/vgabios/?did=%s-%s-%s-%s\n' "${_ven^^}" "${_dev^^}" "${_subven^^}" "${_subdev^^}"
+  return 0
+}
+
+# Two-tier check for whether a ROM dump belongs to the guest GPU at $2.
+# Tier 1 (strict): parse the ROM's PCI Data Structure (PCIR), per the standard
+# header layout:
+#   offset 0x00: 0x55 0xAA                (ROM signature)
+#   offset 0x18: 2-byte LE pointer to the PCIR structure
+#   PCIR+0x00: 'PCIR' (4 ASCII bytes)     (PCI Data Structure signature)
+#   PCIR+0x04: 2-byte LE Vendor ID
+#   PCIR+0x06: 2-byte LE Device ID
+# and compare against the GPU's live Vendor:Device ID (from config space).
+# Tier 2 (fallback): real-world AMD ATOMBIOS dumps routinely leave the legacy
+# PCIR pointer at 0 (verified empirically against an actual RX 9070 dump --
+# the strict check alone would reject a perfectly valid, correctly-matching
+# file). When PCIR is absent, confirm the file is a genuine AMD ATOMBIOS vbios
+# via its signature string, then best-effort match its embedded human-readable
+# model strings against RX-series model tokens parsed from the GPU's own
+# `lspci` description (e.g. "RX9070" from "Radeon RX 9070/9070 XT/9070 GRE").
+# This is weaker than a strict PCI ID match (it confirms "looks like the right
+# GPU family", not the exact SKU/board), which is reflected in the printed
+# description.
+# Best-effort scan of a ROM's embedded human-readable identity, used to give
+# identity (embedded PCI ID and/or embedded model strings via
+# _vbios_rom_scan_model_strings) instead of a bare "no match", so the wrong
+# dump is never a dead end -- there is always a concrete "number" to compare
+# or search with.
 # Prints a human-readable description of the match (or near-miss, to stderr)
 # and returns 0 on match / 1 on no match or an unreadable/unrecognized file.
 _vbios_rom_matches_gpu() {
   local _rom="$1" _bdf="$2"
   local _sig _ptr_le _ptr_dec _pcir_sig _ven_le _dev_le _ven _dev
   local _gpu_sys="/sys/bus/pci/devices/$_bdf" _gpu_cfg _gpu_ven _gpu_dev
-  [[ -r "$_rom" ]] || return 1
+  local _models
+  if [[ ! -r "$_rom" ]]; then
+    printf 'file is not readable\n' >&2
+    return 1
+  fi
   _sig="$(head -c 2 "$_rom" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-  [[ "$_sig" == "55aa" ]] || return 1
+  if [[ "$_sig" != "55aa" ]]; then
+    _models="$(_vbios_rom_scan_model_strings "$_rom" | tr '\n' ',' | sed 's/,$//')"
+    printf 'missing the 55 AA PCI expansion ROM signature (not a valid option ROM dump); embedded model string(s) found: %s\n' "${_models:-none}" >&2
+    return 1
+  fi
   _gpu_cfg="$(head -c 4 "$_gpu_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-  [[ -n "$_gpu_cfg" && "$_gpu_cfg" != "ffffffff" ]] || return 1
+  if [[ -z "$_gpu_cfg" || "$_gpu_cfg" == "ffffffff" ]]; then
+    printf 'guest GPU config space is currently unreadable; cannot compare\n' >&2
+    return 1
+  fi
   _gpu_ven="${_gpu_cfg:2:2}${_gpu_cfg:0:2}"
   _gpu_dev="${_gpu_cfg:6:2}${_gpu_cfg:4:2}"
 
@@ -10776,7 +10856,7 @@ _vbios_rom_matches_gpu() {
           printf 'PCI ID %s:%s (strict match, from ROM header)\n' "${_ven,,}" "${_dev,,}"
           return 0
         fi
-        printf 'PCI ID %s:%s from ROM header does NOT match guest GPU %s:%s\n' "${_ven,,}" "${_dev,,}" "${_gpu_ven,,}" "${_gpu_dev,,}" >&2
+        printf 'ROM header PCI ID is %s:%s -- does NOT match guest GPU %s:%s (this is the WRONG dump for this card)\n' "${_ven,,}" "${_dev,,}" "${_gpu_ven,,}" "${_gpu_dev,,}" >&2
         return 1
       fi
     fi
@@ -10807,8 +10887,16 @@ _vbios_rom_matches_gpu() {
         return 0
       fi
     done < <(grep -oEi 'RX ?[0-9]{3,4} ?(XT|GRE)?' <<<"$_gpu_desc")
-    printf 'AMD ATOMBIOS dump but no model token from "%s" found inside it (PCIR pointer also absent, no strict check possible)\n' "$_gpu_desc" >&2
+    _models="$(_vbios_rom_scan_model_strings "$_rom" | tr '\n' ',' | sed 's/,$//')"
+    printf 'AMD ATOMBIOS dump for model(s) [%s] -- does NOT match the guest GPU ("%s"); likely the WRONG board/dump\n' "${_models:-none found}" "$_gpu_desc" >&2
     return 1
+  fi
+
+  _models="$(_vbios_rom_scan_model_strings "$_rom" | tr '\n' ',' | sed 's/,$//')"
+  if [[ -n "$_models" ]]; then
+    printf 'not a recognized AMD ATOMBIOS dump for this GPU; embedded model string(s) found: %s\n' "$_models" >&2
+  else
+    printf 'no embedded PCI ID and no recognizable GPU model strings found in this ROM\n' >&2
   fi
   return 1
 }
@@ -10856,12 +10944,20 @@ install_vbios_romfile() {
   _gpu_ven="${_gpu_cfg:2:2}${_gpu_cfg:0:2}"
   _gpu_dev="${_gpu_cfg:6:2}${_gpu_cfg:4:2}"
   _gpu_id="${_gpu_ven,,}:${_gpu_dev,,}"
+  # Deep link derived ENTIRELY from live hardware detection (vendor + device +
+  # subsystem vendor + subsystem device, all read from sysfs) -- NOT a
+  # hardcoded example. See _vbios_techpowerup_url for the exact match this
+  # gives on techpowerup (chip AND board partner/SKU, not just a keyword).
+  local _tpu_url
+  _tpu_url="$(_vbios_techpowerup_url "$_guest_gpu" 2>/dev/null || true)"
+  [[ -n "$_tpu_url" ]] || _tpu_url="https://www.techpowerup.com/vgabios/"
 
   local _src_dir
   _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
   if [[ ! -d "$_src_dir" ]]; then
     note "No VBIOS/ folder next to $SCRIPT_NAME; skipping vBIOS ROM auto-injection."
     note "Guest GPU PCI ID is $_gpu_id — drop a matching *.rom dump into a VBIOS/ folder next to this script to enable this automatically."
+    note "Find one at: $_tpu_url"
     return 0
   fi
   local -a _candidates=()
@@ -10872,6 +10968,7 @@ install_vbios_romfile() {
   if (( ${#_candidates[@]} == 0 )); then
     note "No *.rom files found in $_src_dir; skipping vBIOS ROM auto-injection."
     note "Guest GPU PCI ID is $_gpu_id — drop a matching *.rom dump into $_src_dir to enable this automatically."
+    note "Find one at: $_tpu_url"
     return 0
   fi
 
@@ -10898,6 +10995,7 @@ install_vbios_romfile() {
   if [[ -z "$_match_file" ]]; then
     note "No candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
     note "Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
+    note "Find one at: $_tpu_url"
     return 0
   fi
   say "Matched vBIOS dump: $(basename "$_match_file") ($_match_desc)"

@@ -1,0 +1,9 @@
+# vBIOS ROM dumps: large binary blobs (~2MB each), card-specific per user.
+# Each user dumps their own GPU's vBIOS into VBIOS/ for auto-injection; these
+# are NOT source code and should not be version-controlled. The matcher reads
+# the dump's own embedded PCI ID, so a non-matching dump is never used.
+# Keep VBIOS/README.md tracked (it documents how to obtain a dump).
+VBIOS/*.rom
+
+# Fallback: ignore any stray *.rom anywhere else in the repo.
+*.rom

@@ -11031,11 +11031,31 @@ _vbios_rom_matches_gpu() {
     [[ -n "$_idate" ]] && _extra+=" compiled $_idate"
     [[ -n "$_ippid" ]] && _extra+=", PPID $_ippid"
     [[ -n "$_iboard" ]] && _extra+=", board $_iboard"
+    # Read the guest GPU's live subsystem (subsystem_vendor:subsystem_device)
+    # so the family-match WARNING can name the exact subsystem this ROM was
+    # NOT independently verified against. AMD ATOMBIOS dumps do NOT carry a
+    # readable subsystem field (only the base vendor:device in the PCIR
+    # header, which tier 1 already checked), so a tier-2 family match cannot
+    # distinguish e.g. an ASUS TUF OC (1043:0614) from a Prime (1043:0618) or
+    # Prime EVO (1043:062D) -- they all share 1002:7550 + the RX9070 token.
+    # The script's _vbios_techpowerup_list_all search IS subsystem-filtered
+    # (?did=...-subven-subdev), so a ROM obtained from that list is safe; a
+    # ROM obtained any other way (manually dropped in) is NOT subsystem-
+    # verified, and the operator must be told that instead of silently
+    # accepting a possibly-wrong-subsystem dump.
+    local _gpu_subven _gpu_subdev _gpu_sub
+    _gpu_subven="$(cat "$_gpu_sys/subsystem_vendor" 2>/dev/null || true)"; _gpu_subven="${_gpu_subven#0x}"
+    _gpu_subdev="$(cat "$_gpu_sys/subsystem_device" 2>/dev/null || true)"; _gpu_subdev="${_gpu_subdev#0x}"
+    if [[ -n "$_gpu_subven" && -n "$_gpu_subdev" ]]; then
+      _gpu_sub="${_gpu_subven,,}:${_gpu_subdev,,}"
+    else
+      _gpu_sub="<unreadable>"
+    fi
     while read -r _tok; do
       [[ -n "$_tok" ]] || continue
       _tok="$(tr -d ' ' <<<"$_tok" | tr '[:lower:]' '[:upper:]')"
       if grep -Fq "$_tok" <<<"$_rom_strings"; then
-        printf 'AMD ATOMBIOS dump, model token "%s" found%s (best-effort family match -- verify VER/PPID match your exact board/SKU on techpowerup)\n' "$_tok" "$_extra"
+        printf 'AMD ATOMBIOS dump, model token "%s" found%s (FAMILY-ONLY match: subsystem %s was NOT independently verified from this ROM -- AMD ATOMBIOS dumps carry no readable subsystem field. SAFE if you got this ROM from the listed downloads this script prints (they are subsystem-filtered); if you dropped it in manually, confirm it is for subsystem %s before relying on it)\n' "$_tok" "$_extra" "$_gpu_sub" "$_gpu_sub"
         return 0
       fi
     done < <(grep -oEi 'RX ?[0-9]{3,4} ?(XT|GRE)?' <<<"$_gpu_desc")
@@ -11220,12 +11240,13 @@ install_vbios_romfile() {
     return 0
   fi
 
-  local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0
+  local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0 _match_count=0
   _match_err="$(mktemp)"
   for _f in "${_candidates[@]}"; do
     _f_name="$(basename "$_f")"
     if _f_desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_match_err")"; then
       note "  candidate $_f_name -> MATCH: $_f_desc"
+      _match_count=$((_match_count+1))
       if [[ -z "$_match_file" ]]; then
         _match_file="$_f"
         _match_desc="$_f_desc"
@@ -11244,6 +11265,7 @@ install_vbios_romfile() {
       if _repair_res="$(_vbios_autorepair_byteswap "$_f" "$_guest_gpu" 2>/dev/null)"; then
         IFS='|' read -r _repair_path _repair_desc <<<"$_repair_res"
         note "  candidate $_f_name -> byte-swapped (aa55); AUTO-REPAIRED first 2 bytes (55aa) -> MATCH: $_repair_desc"
+        _match_count=$((_match_count+1))
         if [[ -z "$_match_file" ]]; then
           _match_file="$_repair_path"
           _match_desc="$_repair_desc (auto-repaired from byte-swapped $_f_name)"
@@ -11264,6 +11286,31 @@ install_vbios_romfile() {
     note "       Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
     note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
     _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+    return 0
+  fi
+  # RESTRICTION: only ONE vBIOS may be pinned per graphics card. If more than
+  # one candidate matched (common: several techpowerup re-uploads + the
+  # operator's own dump dropped into VBIOS/), REFUSE to pin -- pinning an
+  # arbitrary "first" match is a footgun (filesystem order is not guaranteed,
+  # and a wrong-subsystem family-only false positive could be wired in). Force
+  # the operator to keep exactly one and re-run. The rest of the dynamic
+  # binding install still completes; only the vBIOS pin is skipped this run.
+  if (( _match_count > 1 )); then
+    if (( ENABLE_COLOR )); then
+      say "${C_RED}✖ REFUSED${C_RESET}: only ONE vBIOS is allowed per graphics card, but $_match_count candidates in $_src_dir matched the guest GPU ($_guest_gpu)."
+    else
+      say "REFUSED: only ONE vBIOS is allowed per graphics card, but $_match_count candidates in $_src_dir matched the guest GPU ($_guest_gpu)."
+    fi
+    note "       vBIOS ROM auto-injection was SKIPPED this run to avoid pinning an ambiguous match."
+    note "       Keep exactly ONE matching *.rom in $_src_dir (prefer a clean 55aa dump, or one techpowerup download this script auto-repairs) and delete the rest, then re-run:"
+    note "         sudo $SCRIPT_NAME --install-dynamic-binding"
+    note "       (The rest of the dynamic binding setup is unaffected; only the vBIOS pin is skipped.)"
+    # Clean up any auto-repaired temp copy from the matched candidate so we do
+    # not leak a temp dir when refusing.
+    if (( _match_repaired )); then
+      rm -f "$_match_file" 2>/dev/null || true
+      rmdir "$(dirname "$_match_file")" 2>/dev/null || true
+    fi
     return 0
   fi
   say "Matched vBIOS dump: $(basename "$_match_file") ($_match_desc)"
@@ -15528,6 +15575,108 @@ EOF
 
 # ---------------- Main ----------------
 
+# Scan the VBIOS/ folder next to this script for *.rom candidates and run the
+# full _vbios_rom_matches_gpu matcher (+ byte-swap auto-repair) against each,
+# so the operator can see which dump is correct for the configured guest GPU
+# when they have dropped multiple candidates into VBIOS/. Prints one verdict
+# line per candidate (MATCH / byte-swap-repaired MATCH / no match) with the
+# embedded identity, and a summary line. Read-only; never writes or defines.
+# Called from verify_setup() so `--verify` surfaces this automatically.
+verify_vbios_candidates() {
+  local _guest_gpu _src_dir _f _f_name _desc _err _n _ok _repaired
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_guest_gpu" ]] || return 0
+  _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}vBIOS candidate scan (VBIOS/ folder):${C_RESET}"
+  else
+    say "vBIOS candidate scan (VBIOS/ folder):"
+  fi
+  if [[ ! -d "$_src_dir" ]]; then
+    note "No VBIOS/ folder next to $SCRIPT_NAME (nothing to scan)."
+    return 0
+  fi
+  local -a _cands=()
+  while IFS= read -r -d '' _f; do
+    _cands+=("$_f")
+  done < <(find "$_src_dir" -maxdepth 1 -iname '*.rom' -print0 2>/dev/null)
+  _n=${#_cands[@]}
+  if (( _n == 0 )); then
+    note "No *.rom files found in $_src_dir (nothing to scan)."
+    return 0
+  fi
+  note "Scanning $_n candidate(s) in $_src_dir against guest GPU $_guest_gpu:"
+  _ok=0; _repaired=0
+  local _err_tmp
+  _err_tmp="$(mktemp)"
+  for _f in "${_cands[@]}"; do
+    _f_name="$(basename "$_f")"
+    if _desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_err_tmp")"; then
+      if (( ENABLE_COLOR )); then
+        say "  ${C_GREEN}✔ MATCH${C_RESET}: $_f_name -- $_desc"
+      else
+        say "  MATCH: $_f_name -- $_desc"
+      fi
+      _ok=$((_ok+1))
+    else
+      # Try byte-swap auto-repair (techpowerup downloads are aa55-swapped).
+      local _rr _rp _rdesc
+      if _rr="$(_vbios_autorepair_byteswap "$_f" "$_guest_gpu" 2>/dev/null)"; then
+        IFS='|' read -r _rp _rdesc <<<"$_rr"
+        if (( ENABLE_COLOR )); then
+          say "  ${C_GREEN}✔ MATCH${C_RESET} (byte-swap auto-repaired): $_f_name -- $_rdesc"
+        else
+          say "  MATCH (byte-swap auto-repaired): $_f_name -- $_rdesc"
+        fi
+        _ok=$((_ok+1)); _repaired=$((_repaired+1))
+        rm -f "$_rp" 2>/dev/null || true
+        rmdir "$(dirname "$_rp")" 2>/dev/null || true
+      else
+        local _emsg
+        _emsg="$(cat "$_err_tmp" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+        if (( ENABLE_COLOR )); then
+          say "  ${C_RED}✖ no match${C_RESET}: $_f_name -- $_emsg"
+        else
+          say "  no match: $_f_name -- $_emsg"
+        fi
+      fi
+    fi
+  done
+  rm -f "$_err_tmp" 2>/dev/null || true
+  say
+  if (( _ok > 0 )); then
+    local _sum_extra=""
+    (( _repaired > 0 )) && _sum_extra=" ($_repaired via byte-swap auto-repair)"
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}✔ vBIOS SUMMARY: $_ok/$_n candidate(s) match the guest GPU${C_RESET}$_sum_extra"
+    else
+      say "vBIOS SUMMARY: $_ok/$_n candidate(s) match the guest GPU$_sum_extra"
+    fi
+    note "Any MATCHed candidate is usable -- re-run --install-dynamic-binding to auto-inject the first MATCH."
+    # RESTRICTION: only one vBIOS may be pinned per graphics card. When more
+    # than one candidate matches (common: the operator dropped several
+    # techpowerup re-uploads + their own dump into VBIOS/), tell them to keep
+    # exactly one and delete the rest -- the installer pins only the first
+    # match anyway, and leaving duplicates is clutter + a footgun if the first
+    # match happens to be a wrong-subsystem family-only false positive.
+    if (( _ok > 1 )); then
+      if (( ENABLE_COLOR )); then
+        say "${C_YELLOW}⚠ RESTRICTION${C_RESET}: only ONE vBIOS is allowed per graphics card -- $_ok matched. Keep one (prefer a clean 55aa dump, or a techpowerup download this script auto-repairs) and delete the rest from $_src_dir."
+      else
+        say "RESTRICTION: only ONE vBIOS is allowed per graphics card -- $_ok matched. Keep one (prefer a clean 55aa dump, or a techpowerup download this script auto-repairs) and delete the rest from $_src_dir."
+      fi
+    fi
+  else
+    if (( ENABLE_COLOR )); then
+      say "${C_RED}✖ vBIOS SUMMARY: 0/$_n candidate(s) match the guest GPU${C_RESET}"
+    else
+      say "vBIOS SUMMARY: 0/$_n candidate(s) match the guest GPU"
+    fi
+    note "Drop a subsystem-matching *.rom into $_src_dir (use the listings this script prints at install time) and re-run."
+  fi
+}
+
 verify_setup() {
   hdr "VERIFY VFIO SETUP"
   VFIO_BRIEF_REPORT=1 detect_existing_vfio_report
@@ -15878,6 +16027,10 @@ verify_setup() {
     say "Stealth/perf VM tuning status:"
   fi
   stealth_vm_tuning_status || true
+  # vBIOS candidate scan: run the matcher against every *.rom in VBIOS/ so
+  # the operator can see which dump is correct when they have multiple
+  # candidates. Read-only; informational (does not affect PASS/FAIL grading).
+  verify_vbios_candidates || true
   say
   if (( ok )); then
     if (( ENABLE_COLOR )); then

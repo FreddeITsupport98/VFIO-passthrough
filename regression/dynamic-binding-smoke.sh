@@ -2039,10 +2039,10 @@ fi
 if grep -Fq '_vbios_rom_embedded_identity()' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_rom_embedded_identity "$_rom"' "$VFIO_SCRIPT" \
   && grep -Fq 'ATOMBIOSBK-AMD VER' "$VFIO_SCRIPT" \
-  && grep -Fq 'verify VER/PPID match your exact board/SKU' "$VFIO_SCRIPT"; then
-  ok "Q3z _vbios_rom_embedded_identity() is defined + wired into the matcher with a VER/PPID verify hint"
+  && grep -Fq 'FAMILY-ONLY match: subsystem' "$VFIO_SCRIPT"; then
+  ok "Q3z _vbios_rom_embedded_identity() is defined + wired into the matcher with a FAMILY-ONLY subsystem-not-verified hint"
 else
-  bad "Q3z _vbios_rom_embedded_identity() is missing, not wired into the matcher, or lacks the VER/PPID verify hint"
+  bad "Q3z _vbios_rom_embedded_identity() is missing, not wired into the matcher, or lacks the FAMILY-ONLY subsystem hint"
 fi
 
 # install_vbios_romfile must be hooked into BOTH dynamic-binding install paths
@@ -2107,10 +2107,26 @@ LEOF
     printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
     printf '_vbios_rom_matches_gpu "%s" "0000:01:00.0"\n' "$_vbios_rom_bin"
   } > "$vfake/nomatch_test.sh"
+  # The bundled ROM may be a clean 55aa dump (direct MATCH) or a techpowerup
+  # aa55 download (MATCH via byte-swap auto-repair). Accept either path so the
+  # test is robust to whichever ROM the operator dropped into VBIOS/.
+  _autorepair_fn_for_match="$(sed -n '/^_vbios_autorepair_byteswap() {/,/^}/p' "$VFIO_SCRIPT")"
   if PATH="$vfake/bin:$PATH" bash "$vfake/match_test.sh" >"$tmp/vbios_match_out.txt" 2>/dev/null; then
-    ok "Q3z _vbios_rom_matches_gpu matches the bundled ROM against a real RX 9070 (output: $(cat "$tmp/vbios_match_out.txt"))"
+    ok "Q3z _vbios_rom_matches_gpu matches the bundled ROM against a real RX 9070 (direct: $(cat "$tmp/vbios_match_out.txt"))"
   else
-    bad "Q3z _vbios_rom_matches_gpu failed to match the bundled ROM against a real RX 9070"
+    {
+      printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+      printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
+      printf '%s\n' "$_autorepair_fn_for_match"
+      printf '_vbios_autorepair_byteswap "%s" "0000:0e:00.0"\n' "$_vbios_rom_bin"
+    } > "$vfake/match_repair_test.sh"
+    if PATH="$vfake/bin:$PATH" bash "$vfake/match_repair_test.sh" >"$tmp/vbios_match_repair_out.txt" 2>/dev/null; then
+      ok "Q3z _vbios_rom_matches_gpu matches the bundled ROM against a real RX 9070 (byte-swap auto-repaired: $(cat "$tmp/vbios_match_repair_out.txt"))"
+      _rp="$(cut -d'|' -f1 "$tmp/vbios_match_repair_out.txt" 2>/dev/null)"
+      [[ -n "$_rp" ]] && { rm -f "$_rp" 2>/dev/null; rmdir "$(dirname "$_rp")" 2>/dev/null; }
+    else
+      bad "Q3z _vbios_rom_matches_gpu failed to match the bundled ROM against a real RX 9070 (neither direct nor byte-swap auto-repair matched)"
+    fi
   fi
   if PATH="$vfake/bin:$PATH" bash "$vfake/nomatch_test.sh" >/dev/null 2>/dev/null; then
     bad "Q3z _vbios_rom_matches_gpu incorrectly matched the bundled AMD ROM against an unrelated NVIDIA GPU"
@@ -2147,10 +2163,19 @@ LEOF
   # Asus.RX9070.16384.241204.rom from a techpowerup listing.
   _swapped="$tmp/swapped.rom"
   _first2="$(head -c 2 "$_vbios_rom_bin" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-  if [[ "$_first2" == "55aa" ]]; then
+  if [[ "$_first2" == "aa55" ]]; then
+    # The bundled ROM is itself a techpowerup aa55 download -- use it directly
+    # as the swapped test target (no need to build a synthetic swapped copy).
+    _swapped="$_vbios_rom_bin"
+  elif [[ "$_first2" == "55aa" ]]; then
     # Build a byte-swapped copy: first 2 bytes aa55, rest unchanged.
     printf '\xaa\x55' >"$_swapped"
     tail -c +3 "$_vbios_rom_bin" >>"$_swapped" 2>/dev/null
+  else
+    bad "Q3z bundled ROM does not start with 55aa or aa55; cannot test the byte-swap detector"
+    _swapped=""
+  fi
+  if [[ -n "$_swapped" ]]; then
     {
       printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
       printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
@@ -2197,8 +2222,6 @@ LEOF
     else
       bad "Q3z could not extract _vbios_autorepair_byteswap to test"
     fi
-  else
-    bad "Q3z bundled ROM does not start with 55aa; cannot build a swapped copy to test the byte-swap detector"
   fi
 else
   bad "Q3z could not extract _vbios_rom_matches_gpu or find a bundled *.rom to test against"
@@ -2304,6 +2327,18 @@ CEOF
   fi
 else
   bad "Q3z could not extract _vbios_techpowerup_list_all to test"
+fi
+# verify_vbios_candidates (new) must be defined AND called from verify_setup()
+# so --verify scans the VBIOS/ folder and shows which *.rom is correct when
+# the operator has dropped multiple candidates in. Read-only; informational.
+_verify_fn="$(sed -n '/^verify_setup() {/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'verify_vbios_candidates()' "$VFIO_SCRIPT" \
+  && echo "$_verify_fn" | grep -Fq 'verify_vbios_candidates || true' \
+  && grep -Fq 'vBIOS candidate scan (VBIOS/ folder)' "$VFIO_SCRIPT" \
+  && grep -Fq 'vBIOS SUMMARY:' "$VFIO_SCRIPT"; then
+  ok "Q3z verify_vbios_candidates() is defined + wired into --verify with a scan + summary"
+else
+  bad "Q3z verify_vbios_candidates() is missing, not wired into --verify, or lacks the scan/summary"
 fi
 # Static: the matcher must carry the aa55 byte-swap detector + targeted fix
 # message; the resolver print block must carry the byte-swap caveat with the

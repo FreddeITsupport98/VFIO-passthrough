@@ -10911,7 +10911,20 @@ _vbios_rom_matches_gpu() {
   _sig="$(head -c 2 "$_rom" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
   if [[ "$_sig" != "55aa" ]]; then
     _models="$(_vbios_rom_scan_model_strings "$_rom" | tr '\n' ',' | sed 's/,$//')"
-    printf 'missing the 55 AA PCI expansion ROM signature (not a valid option ROM dump); embedded model string(s) found: %s\n' "${_models:-none}" >&2
+    # Detect the techpowerup download byte-swap trap: techpowerup stores some
+    # dumps with the first 2 bytes swapped (aa55 instead of 55aa), so a file
+    # that LOOKS like the right BIOS (correct embedded model strings / version)
+    # fails the PCI expansion ROM signature check and is unusable by vfio-pci
+    # as-is. This is the exact failure seen downloading Asus.RX9070.16384.
+    # 241204.rom from a techpowerup listing this script resolved — the listing
+    # was correct but the download was byte-swapped. Point the operator at the
+    # fix (dump your own card, or swap the first 2 bytes) instead of a bare
+    # "not a valid option ROM dump" that hides the cause.
+    if [[ "$_sig" == "aa55" ]]; then
+      printf 'ROM signature is byte-swapped (first 2 bytes are aa 55, expected 55 aa) -- this is the techpowerup download format; the embedded BIOS looks like %s but vfio-pci cannot load a swapped ROM. Fix: dump your own card with amdvbflash/GPU-Z (recommended), or swap the first 2 bytes of this file.\n' "${_models:-an RX 9070 family BIOS}" >&2
+    else
+      printf 'missing the 55 AA PCI expansion ROM signature (not a valid option ROM dump); embedded model string(s) found: %s\n' "${_models:-none}" >&2
+    fi
     return 1
   fi
   _gpu_cfg="$(head -c 4 "$_gpu_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
@@ -11074,6 +11087,7 @@ install_vbios_romfile() {
   if [[ -n "$_tpu_detail" ]]; then
     note "Exact vBIOS listing (resolved from the search): $_tpu_detail"
     [[ -n "$_tpu_fname" ]] && note "Expected download filename: $_tpu_fname  (save it as <name>.rom into VBIOS/ next to this script)"
+    note "CAVEAT: techpowerup downloads are sometimes byte-swapped (first 2 bytes aa55 instead of 55aa) and this script will reject a swapped ROM. The RELIABLE source is dumping your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
     note "Search page (if the detail link is stale): $_tpu_url"
   else
     note "Find/verify a vBIOS dump at: $_tpu_url"

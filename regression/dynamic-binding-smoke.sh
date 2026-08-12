@@ -2139,6 +2139,34 @@ LEOF
   else
     bad "Q3z could not extract _vbios_rom_embedded_identity to test"
   fi
+  # LIVE: the matcher must detect the techpowerup byte-swap trap (first 2 bytes
+  # aa55 instead of 55aa) and emit the targeted, actionable error instead of
+  # the generic "not a valid option ROM dump". Build a swapped copy of the
+  # bundled ROM (swap its first 2 bytes) and assert the matcher rejects it with
+  # the byte-swap message — this is the exact failure seen downloading
+  # Asus.RX9070.16384.241204.rom from a techpowerup listing.
+  _swapped="$tmp/swapped.rom"
+  _first2="$(head -c 2 "$_vbios_rom_bin" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ "$_first2" == "55aa" ]]; then
+    # Build a byte-swapped copy: first 2 bytes aa55, rest unchanged.
+    printf '\xaa\x55' >"$_swapped"
+    tail -c +3 "$_vbios_rom_bin" >>"$_swapped" 2>/dev/null
+    {
+      printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+      printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
+      printf '_vbios_rom_matches_gpu "%s" "0000:0e:00.0"\n' "$_swapped"
+    } > "$vfake/swap_test.sh"
+    _swap_err="$(PATH="$vfake/bin:$PATH" bash "$vfake/swap_test.sh" 2>&1 >/dev/null || true)"
+    if printf '%s' "$_swap_err" | grep -Fq 'byte-swapped' \
+      && printf '%s' "$_swap_err" | grep -Fq 'aa 55' \
+      && printf '%s' "$_swap_err" | grep -Fq 'dump your own card'; then
+      ok "Q3z matcher detects the aa55 byte-swap and emits the targeted fix (dump your own card / swap first 2 bytes)"
+    else
+      bad "Q3z matcher failed to flag the aa55 byte-swap with the targeted message (got: $_swap_err)"
+    fi
+  else
+    bad "Q3z bundled ROM does not start with 55aa; cannot build a swapped copy to test the byte-swap detector"
+  fi
 else
   bad "Q3z could not extract _vbios_rom_matches_gpu or find a bundled *.rom to test against"
 fi
@@ -2186,8 +2214,17 @@ if echo "$_resolv_fn" | grep -Fq -- '--max-time 6' \
   && echo "$_resolv_fn" | grep -Fq '|| true' \
   && ! echo "$_resolv_fn" | grep -Eq 'strings[^|]*\| *grep'; then
   ok "Q3z resolver guards the fetch with a 6s timeout + capture-then-grep (pipefail-safe)"
+fi
+# Static: the matcher must carry the aa55 byte-swap detector + targeted fix
+# message, and the resolver print block must carry the byte-swap caveat, so a
+# techpowerup download that is byte-swapped is never a dead-end "not a valid
+# option ROM dump" — the operator is told the cause and the fix.
+if grep -Fq 'ROM signature is byte-swapped' "$VFIO_SCRIPT" \
+  && grep -Fq 'dump your own card with amdvbflash/GPU-Z' "$VFIO_SCRIPT" \
+  && echo "$_install_vbios_fn" | grep -Fq 'techpowerup downloads are sometimes byte-swapped'; then
+  ok "Q3z matcher + resolver print block document the aa55 byte-swap trap + the dump-your-own-card fix"
 else
-  bad "Q3z resolver missing the 6s timeout or pipefail-safe capture-then-grep"
+  bad "Q3z matcher or resolver print block missing the aa55 byte-swap detection/caveat"
 fi
 _tpu_fn_body="$(sed -n '/^_vbios_techpowerup_url() {/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_tpu_fn_body" ]]; then

@@ -8700,8 +8700,13 @@ EOF
 exec /usr/local/sbin/vfio-libvirt-hook.sh "$@"
 EOF
 
-  say "Installed libvirt qemu hook: $LIBVIRT_HOOK_ENTRY"
-  say "Installed libvirt hook script: $LIBVIRT_HOOK_SCRIPT"
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Installed libvirt qemu hook: ${C_BOLD}$LIBVIRT_HOOK_ENTRY${C_RESET}"
+    say "  ${C_GREEN}✔${C_RESET} Installed libvirt hook script: ${C_BOLD}$LIBVIRT_HOOK_SCRIPT${C_RESET}"
+  else
+    say "  ✔ Installed libvirt qemu hook: $LIBVIRT_HOOK_ENTRY"
+    say "  ✔ Installed libvirt hook script: $LIBVIRT_HOOK_SCRIPT"
+  fi
   note "Dynamic binding switches the guest GPU to vfio-pci only when a VM that has it attached is started."
 }
 
@@ -9278,7 +9283,11 @@ EOF
   run systemctl daemon-reload 2>/dev/null || true
   run systemctl enable vfio-reboot-flr.service 2>/dev/null || true
   run systemctl start vfio-reboot-flr.service 2>/dev/null || true
-  say "Installed reboot-FLR monitor: $REBOOT_FLR_SCRIPT (service: $REBOOT_FLR_UNIT)"
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Installed reboot-FLR monitor: ${C_BOLD}$REBOOT_FLR_SCRIPT${C_RESET} ${C_DIM}(service: $REBOOT_FLR_UNIT)${C_RESET}"
+  else
+    say "  ✔ Installed reboot-FLR monitor: $REBOOT_FLR_SCRIPT (service: $REBOOT_FLR_UNIT)"
+  fi
   note "On guest warm reboot (on_reboot=restart), the monitor does a soft FLR on the GPU"
   note "to clear the display wedge so OVMF can re-POST without a host reboot."
 }
@@ -10007,9 +10016,15 @@ EOF
   run systemctl daemon-reload 2>/dev/null || true
   run systemctl enable vfio-gpu-park-keepalive.service 2>/dev/null || true
   run systemctl start vfio-gpu-park-keepalive.service 2>/dev/null || true
-  say "Installed park-keepalive monitor: $PARK_KEEPALIVE_SCRIPT (service: $PARK_KEEPALIVE_UNIT)"
-  say "Installed post-resume hook: $PARK_KEEPALIVE_RESUME_HOOK"
-  say "Installed one-shot check unit: $PARK_KEEPALIVE_CHECK_UNIT"
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Installed park-keepalive monitor: ${C_BOLD}$PARK_KEEPALIVE_SCRIPT${C_RESET} ${C_DIM}(service: $PARK_KEEPALIVE_UNIT)${C_RESET}"
+    say "  ${C_GREEN}✔${C_RESET} Installed post-resume hook: ${C_BOLD}$PARK_KEEPALIVE_RESUME_HOOK${C_RESET}"
+    say "  ${C_GREEN}✔${C_RESET} Installed one-shot check unit: ${C_BOLD}$PARK_KEEPALIVE_CHECK_UNIT${C_RESET}"
+  else
+    say "  ✔ Installed park-keepalive monitor: $PARK_KEEPALIVE_SCRIPT (service: $PARK_KEEPALIVE_UNIT)"
+    say "  ✔ Installed post-resume hook: $PARK_KEEPALIVE_RESUME_HOOK"
+    say "  ✔ Installed one-shot check unit: $PARK_KEEPALIVE_CHECK_UNIT"
+  fi
   note "Instant on: while the guest GPU is parked on vfio-pci between VM sessions, this"
   note "periodically checks it is alive and proactively recovers it if it died (RX 9070 /"
   note "RDNA4 reset bug), so the NEXT VM start does not hit a dead card. It also re-checks"

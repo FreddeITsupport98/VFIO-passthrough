@@ -10782,10 +10782,23 @@ _vbios_rom_matches_gpu() {
     fi
   fi
 
-  if [[ "${_gpu_ven,,}" == "1002" ]] && have_cmd strings && strings -n 4 "$_rom" 2>/dev/null | grep -q 'AMD ATOMBIOS'; then
+  # NOTE: capture `strings` output into a variable FIRST, then grep the
+  # variable (not a live pipe). Piping `strings` directly into `grep -q`
+  # breaks under `set -o pipefail` (active for the whole of vfio.sh): `grep
+  # -q` exits as soon as it finds a match, which can close the pipe while
+  # `strings` is still writing the rest of a multi-MB file, killing it with
+  # SIGPIPE -- pipefail then reports that nonzero exit as the pipeline's
+  # result even though grep genuinely found a match, so the whole ATOMBIOS
+  # check would spuriously report "not found" on a real match (verified
+  # empirically: this exact pattern silently broke against a real ROM dump).
+  local _strings_out=""
+  if have_cmd strings; then
+    _strings_out="$(strings -n 4 "$_rom" 2>/dev/null || true)"
+  fi
+  if [[ "${_gpu_ven,,}" == "1002" ]] && grep -q 'AMD ATOMBIOS' <<<"$_strings_out"; then
     local _gpu_desc _rom_strings _tok
     _gpu_desc="$(have_cmd lspci && lspci -s "$_bdf" 2>/dev/null || true)"
-    _rom_strings="$(strings -n 4 "$_rom" 2>/dev/null | tr -d ' ' | tr '[:lower:]' '[:upper:]')"
+    _rom_strings="$(tr -d ' ' <<<"$_strings_out" | tr '[:lower:]' '[:upper:]')"
     while read -r _tok; do
       [[ -n "$_tok" ]] || continue
       _tok="$(tr -d ' ' <<<"$_tok" | tr '[:lower:]' '[:upper:]')"

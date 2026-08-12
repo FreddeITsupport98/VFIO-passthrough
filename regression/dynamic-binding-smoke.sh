@@ -2032,6 +2032,19 @@ else
   bad "Q3z one or more vBIOS ROM auto-injection functions are missing"
 fi
 
+# _vbios_rom_embedded_identity (new) must be defined AND called from the
+# tier-2 AMD ATOMBIOS branch of _vbios_rom_matches_gpu, so a matching dump is
+# reported with its exact embedded vBIOS version + board PPID (cross-checkable
+# on techpowerup) instead of a bare "model token found, verify by eye".
+if grep -Fq '_vbios_rom_embedded_identity()' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_rom_embedded_identity "$_rom"' "$VFIO_SCRIPT" \
+  && grep -Fq 'ATOMBIOSBK-AMD VER' "$VFIO_SCRIPT" \
+  && grep -Fq 'verify VER/PPID match your exact board/SKU' "$VFIO_SCRIPT"; then
+  ok "Q3z _vbios_rom_embedded_identity() is defined + wired into the matcher with a VER/PPID verify hint"
+else
+  bad "Q3z _vbios_rom_embedded_identity() is missing, not wired into the matcher, or lacks the VER/PPID verify hint"
+fi
+
 # install_vbios_romfile must be hooked into BOTH dynamic-binding install paths
 # (the --install-dynamic-binding switcher and the full wizard), matching
 # install_park_keepalive_monitor's existing call sites, so it runs
@@ -2103,6 +2116,28 @@ LEOF
     bad "Q3z _vbios_rom_matches_gpu incorrectly matched the bundled AMD ROM against an unrelated NVIDIA GPU"
   else
     ok "Q3z _vbios_rom_matches_gpu correctly rejects the bundled ROM for an unrelated NVIDIA GPU"
+  fi
+  # LIVE: _vbios_rom_embedded_identity must extract a dotted ATOMBIOS version
+  # + a non-empty board PPID from the bundled ROM, so the matcher can report
+  # the exact vBIOS version/SKU (the model token alone cannot distinguish e.g.
+  # an ASUS TUF OC from a white variant / non-OC, which share the RX9070 token
+  # but carry different subsystem device IDs / PPIDs / versions).
+  _vbios_id_fn_body="$(sed -n '/^_vbios_rom_embedded_identity() {/,/^}/p' "$VFIO_SCRIPT")"
+  if [[ -n "$_vbios_id_fn_body" ]]; then
+    {
+      printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+      printf '%s\n' "$_vbios_id_fn_body"
+      printf '_vbios_rom_embedded_identity "%s"\n' "$_vbios_rom_bin"
+    } > "$vfake/id_test.sh"
+    _id_out="$(bash "$vfake/id_test.sh" 2>/dev/null || true)"
+    IFS='|' read -r _id_ver _id_date _id_ppid _id_board <<<"$_id_out"
+    if [[ "$_id_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && [[ -n "$_id_ppid" ]]; then
+      ok "Q3z _vbios_rom_embedded_identity extracts version '$_id_ver' + PPID '$_id_ppid' from the bundled ROM"
+    else
+      bad "Q3z _vbios_rom_embedded_identity failed to extract version/PPID (got: $_id_out)"
+    fi
+  else
+    bad "Q3z could not extract _vbios_rom_embedded_identity to test"
   fi
 else
   bad "Q3z could not extract _vbios_rom_matches_gpu or find a bundled *.rom to test against"

@@ -10771,6 +10771,40 @@ _vbios_rom_scan_model_strings() {
   return 0
 }
 
+# Extract a ROM dump's embedded human-readable identity — the ATOMBIOS version
+# string (e.g. "023.008.000.068.000001"), its compile date (e.g.
+# "12/04/24,02:22:50" -> 2024-12-04, the field techpowerup lists as "Date
+# compiled"), and the board PPID / board-part string (e.g. ASUS
+# "TUF-RX9070-O16G-I3S" / "ASUS_G2951200_XT_16GB_APM7912_P"). This lets the
+# matcher report the EXACT vBIOS version + board SKU a candidate dump carries
+# (cross-checkable against a techpowerup listing by version+PPID) instead of
+# just the GPU family token — the model token alone cannot distinguish e.g. an
+# ASUS TUF OC from the white variant or a non-OC, which share the "RX9070"
+# token but carry different subsystem device IDs / PPIDs / versions.
+# Prints 4 pipe-delimited fields on stdout: "<ver>|<date>|<ppid>|<board>" (any
+# field may be empty if not found in the dump). Never fails (pipefail-safe:
+# each extraction is guarded with `|| true` and `strings` output is captured
+# into a variable first, not piped live). Requires `strings`.
+_vbios_rom_embedded_identity() {
+  local _rom="$1" _s _ver _date _ppid _board
+  if ! have_cmd strings; then
+    printf '|||\n'
+    return 0
+  fi
+  _s="$(strings -a -n 4 "$_rom" 2>/dev/null || true)"
+  _ver="$(printf '%s\n' "$_s" | grep -oE 'ATOMBIOSBK-AMD VER[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | sed 's/^ATOMBIOSBK-AMD VER//' || true)"
+  # The ATOMBIOS compile date is the bare "MM/DD/YY,hh:mm:ss" stamp that matches
+  # techpowerup's "Date compiled" field. Several build stamps coexist in a dump
+  # (PSP/GOP/ATOM); take the lexicographically latest (sort -u | tail -n1) since
+  # the ATOM wrapper compile date is the most recent and the one TPU lists.
+  _date="$(printf '%s\n' "$_s" | grep -oE '[0-9]{2}/[0-9]{2}/[0-9]{2},[0-9]{2}:[0-9]{2}:[0-9]{2}' | sort -u | tail -n1 || true)"
+  _ppid="$(printf '%s\n' "$_s" | grep -oE 'PPID[A-Z0-9._-]+' | head -n1 | sed 's/^PPID//' || true)"
+  _board="$(printf '%s\n' "$_s" | grep -oE 'ASUS_[A-Z0-9_]+' | head -n1 || true)"
+  [[ -n "$_board" ]] || _board="$(printf '%s\n' "$_s" | grep -oE '115-[A-Z0-9]+' | head -n1 || true)"
+  printf '%s|%s|%s|%s\n' "${_ver:-}" "${_date:-}" "${_ppid:-}" "${_board:-}"
+  return 0
+}
+
 # Build an EXACT techpowerup vBIOS-collection deep link for the guest GPU at
 # $1, derived ENTIRELY from live hardware detection (same technique as the
 # rest of this feature) rather than any hardcoded example. techpowerup's
@@ -10876,19 +10910,29 @@ _vbios_rom_matches_gpu() {
     _strings_out="$(strings -n 4 "$_rom" 2>/dev/null || true)"
   fi
   if [[ "${_gpu_ven,,}" == "1002" ]] && grep -q 'AMD ATOMBIOS' <<<"$_strings_out"; then
-    local _gpu_desc _rom_strings _tok
+    local _gpu_desc _rom_strings _tok _ident _iver _idate _ippid _iboard _extra
     _gpu_desc="$(have_cmd lspci && lspci -s "$_bdf" 2>/dev/null || true)"
     _rom_strings="$(tr -d ' ' <<<"$_strings_out" | tr '[:lower:]' '[:upper:]')"
+    # Pull the dump's embedded vBIOS version + compile date + board PPID so the
+    # match description names the EXACT version/SKU (cross-checkable on
+    # techpowerup by version+PPID) instead of just the GPU family token.
+    _ident="$(_vbios_rom_embedded_identity "$_rom")"
+    IFS='|' read -r _iver _idate _ippid _iboard <<<"$_ident"
+    _extra=""
+    [[ -n "$_iver" ]]  && _extra+=" VER$_iver"
+    [[ -n "$_idate" ]] && _extra+=" compiled $_idate"
+    [[ -n "$_ippid" ]] && _extra+=", PPID $_ippid"
+    [[ -n "$_iboard" ]] && _extra+=", board $_iboard"
     while read -r _tok; do
       [[ -n "$_tok" ]] || continue
       _tok="$(tr -d ' ' <<<"$_tok" | tr '[:lower:]' '[:upper:]')"
       if grep -Fq "$_tok" <<<"$_rom_strings"; then
-        printf 'AMD ATOMBIOS dump, model token "%s" found (best-effort family match, not a strict PCI ID check -- verify by eye)\n' "$_tok"
+        printf 'AMD ATOMBIOS dump, model token "%s" found%s (best-effort family match -- verify VER/PPID match your exact board/SKU on techpowerup)\n' "$_tok" "$_extra"
         return 0
       fi
     done < <(grep -oEi 'RX ?[0-9]{3,4} ?(XT|GRE)?' <<<"$_gpu_desc")
     _models="$(_vbios_rom_scan_model_strings "$_rom" | tr '\n' ',' | sed 's/,$//')"
-    printf 'AMD ATOMBIOS dump for model(s) [%s] -- does NOT match the guest GPU ("%s"); likely the WRONG board/dump\n' "${_models:-none found}" "$_gpu_desc" >&2
+    printf 'AMD ATOMBIOS dump for model(s) [%s]%s -- does NOT match the guest GPU ("%s"); likely the WRONG board/dump\n' "${_models:-none found}" "$_extra" "$_gpu_desc" >&2
     return 1
   fi
 

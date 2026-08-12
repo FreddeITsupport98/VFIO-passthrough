@@ -193,6 +193,26 @@ run() {
   fi
   "$@"
 }
+
+# Print a clickable file:// hyperlink for $1 (an absolute path). Uses the OSC 8
+# terminal hyperlink escape so modern terminals (Warp, iTerm2, kitty, etc.) make
+# the path clickable to open the file. Falls back to plain text when color is
+# disabled or the path does not exist. $2 (optional) overrides the display text
+# (defaults to the path itself).
+_link() {
+  local _path="$1" _text="${2:-$1}"
+  if (( ! ENABLE_COLOR )) || [[ ! -e "$_path" ]]; then
+    printf '%s' "$_text"
+    return 0
+  fi
+  local _abs
+  _abs="$(readlink -f "$_path" 2>/dev/null || echo "$_path")"
+  printf '\033]8;;file://%s\033\\%s\033]8;;\033\\' "$_abs" "$_text"
+}
+# Like _link but prints with a trailing newline (for use with `say`-style lines).
+_saylink() {
+  say "$(_link "$@")"
+}
 normalize_display_manager_name() {
   # Normalize service/script names to canonical display-manager IDs.
   # Examples:
@@ -8701,8 +8721,8 @@ exec /usr/local/sbin/vfio-libvirt-hook.sh "$@"
 EOF
 
   if (( ENABLE_COLOR )); then
-    say "  ${C_GREEN}✔${C_RESET} Installed libvirt qemu hook: ${C_BOLD}$LIBVIRT_HOOK_ENTRY${C_RESET}"
-    say "  ${C_GREEN}✔${C_RESET} Installed libvirt hook script: ${C_BOLD}$LIBVIRT_HOOK_SCRIPT${C_RESET}"
+    say "  ${C_GREEN}✔${C_RESET} Installed libvirt qemu hook: $(_link "$LIBVIRT_HOOK_ENTRY")"
+    say "  ${C_GREEN}✔${C_RESET} Installed libvirt hook script: $(_link "$LIBVIRT_HOOK_SCRIPT")"
   else
     say "  ✔ Installed libvirt qemu hook: $LIBVIRT_HOOK_ENTRY"
     say "  ✔ Installed libvirt hook script: $LIBVIRT_HOOK_SCRIPT"
@@ -9284,9 +9304,11 @@ EOF
   run systemctl enable vfio-reboot-flr.service 2>/dev/null || true
   run systemctl start vfio-reboot-flr.service 2>/dev/null || true
   if (( ENABLE_COLOR )); then
-    say "  ${C_GREEN}✔${C_RESET} Installed reboot-FLR monitor: ${C_BOLD}$REBOOT_FLR_SCRIPT${C_RESET} ${C_DIM}(service: $REBOOT_FLR_UNIT)${C_RESET}"
+    say "  ${C_GREEN}✔${C_RESET} Installed reboot-FLR monitor: $(_link "$REBOOT_FLR_SCRIPT")"
+    note "    service: $(_link "$REBOOT_FLR_UNIT")"
   else
-    say "  ✔ Installed reboot-FLR monitor: $REBOOT_FLR_SCRIPT (service: $REBOOT_FLR_UNIT)"
+    say "  ✔ Installed reboot-FLR monitor: $REBOOT_FLR_SCRIPT"
+    note "    service: $REBOOT_FLR_UNIT"
   fi
   note "On guest warm reboot (on_reboot=restart), the monitor does a soft FLR on the GPU"
   note "to clear the display wedge so OVMF can re-POST without a host reboot."
@@ -10017,22 +10039,28 @@ EOF
   run systemctl enable vfio-gpu-park-keepalive.service 2>/dev/null || true
   run systemctl start vfio-gpu-park-keepalive.service 2>/dev/null || true
   if (( ENABLE_COLOR )); then
-    say "  ${C_GREEN}✔${C_RESET} Installed park-keepalive monitor: ${C_BOLD}$PARK_KEEPALIVE_SCRIPT${C_RESET} ${C_DIM}(service: $PARK_KEEPALIVE_UNIT)${C_RESET}"
-    say "  ${C_GREEN}✔${C_RESET} Installed post-resume hook: ${C_BOLD}$PARK_KEEPALIVE_RESUME_HOOK${C_RESET}"
-    say "  ${C_GREEN}✔${C_RESET} Installed one-shot check unit: ${C_BOLD}$PARK_KEEPALIVE_CHECK_UNIT${C_RESET}"
+    say "  ${C_GREEN}✔${C_RESET} Installed park-keepalive monitor: $(_link "$PARK_KEEPALIVE_SCRIPT")"
+    note "    service: $(_link "$PARK_KEEPALIVE_UNIT")"
+    say "  ${C_GREEN}✔${C_RESET} Installed post-resume hook: $(_link "$PARK_KEEPALIVE_RESUME_HOOK")"
+    say "  ${C_GREEN}✔${C_RESET} Installed one-shot check unit: $(_link "$PARK_KEEPALIVE_CHECK_UNIT")"
   else
-    say "  ✔ Installed park-keepalive monitor: $PARK_KEEPALIVE_SCRIPT (service: $PARK_KEEPALIVE_UNIT)"
+    say "  ✔ Installed park-keepalive monitor: $PARK_KEEPALIVE_SCRIPT"
+    note "    service: $PARK_KEEPALIVE_UNIT"
     say "  ✔ Installed post-resume hook: $PARK_KEEPALIVE_RESUME_HOOK"
     say "  ✔ Installed one-shot check unit: $PARK_KEEPALIVE_CHECK_UNIT"
   fi
-  note "Instant on: while the guest GPU is parked on vfio-pci between VM sessions, this"
-  note "periodically checks it is alive and proactively recovers it if it died (RX 9070 /"
-  note "RDNA4 reset bug), so the NEXT VM start does not hit a dead card. It also re-checks"
-  note "right after host suspend/hibernate resume, falls back to a direct in-use check when"
-  note "libvirt itself is unreachable (hard-kill-without-release-event), and backs off +"
-  note "sends a one-time desktop notification after 5 consecutive recovery failures by default"
-  note "(VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS in $CONF_FILE)."
-  note "Disable via VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE if you do not want this."
+  note "Instant on:"
+  note "  - Polls the guest GPU while it is parked on vfio-pci between VM sessions"
+  note "    and proactively recovers it if it died (RX 9070 / RDNA4 reset bug),"
+  note "    so the NEXT VM start does not hit a dead card."
+  note "  - Re-checks right after host suspend/hibernate resume."
+  note "  - Falls back to a direct in-use check when libvirt is unreachable"
+  note "    (hard-kill-without-release-event)."
+  note "  - Backs off + sends a one-time desktop notification after"
+  note "    VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS (default 5) consecutive"
+  note "    recovery failures."
+  note ""
+  note "Disable via VFIO_DYNAMIC_PARK_KEEPALIVE=0 in $CONF_FILE."
 }
 
 # Automatically hide the hypervisor on libvirt VMs that have the guest GPU
@@ -11242,10 +11270,17 @@ install_vbios_romfile() {
     [[ -n "$_tpu_fname" ]] && _kv "Download filename" "$_tpu_fname  (save it as <name>.rom into VBIOS/ next to this script)"
     _kv "Search page"     "$_tpu_url (if the detail link is stale)"
     if (( ENABLE_COLOR )); then
-      say "  ${C_YELLOW}CAVEAT${C_RESET}: techpowerup downloads are systematically byte-swapped (first 2 bytes aa55 instead of 55aa). This script AUTO-REPAIRS a swapped ROM whose embedded identity (version/PPID) matches your card, so a techpowerup download is usable directly. If auto-repair is not possible, dump your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
+      say "  ${C_YELLOW}CAVEAT${C_RESET}: techpowerup downloads are byte-swapped"
     else
-      say "  CAVEAT: techpowerup downloads are systematically byte-swapped (first 2 bytes aa55 instead of 55aa). This script AUTO-REPAIRS a swapped ROM whose embedded identity (version/PPID) matches your card, so a techpowerup download is usable directly. If auto-repair is not possible, dump your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
+      say "  CAVEAT: techpowerup downloads are byte-swapped"
     fi
+    note "    (first 2 bytes aa55 instead of 55aa)."
+    note "    This script AUTO-REPAIRS a swapped ROM whose embedded"
+    note "    identity (version/PPID) matches your card, so a techpowerup"
+    note "    download is usable directly."
+    note "    If auto-repair is not possible, dump your own card with"
+    note "    amdvbflash (Linux) or GPU-Z (Windows); compare the embedded"
+    note "    version/PPID against this listing to confirm."
   else
     _kv "Find/verify at"  "$_tpu_url"
     note "  (could not auto-resolve the exact listing — the search page lists 2-3 duplicate uploads of the same BIOS; pick the one whose version matches your dump)"
@@ -11298,9 +11333,11 @@ install_vbios_romfile() {
     _f_name="$(basename "$_f")"
     if _f_desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_match_err")"; then
       if (( ENABLE_COLOR )); then
-        say "  ${C_GREEN}✔ MATCH${C_RESET}: ${C_BOLD}$_f_name${C_RESET} -- $_f_desc"
+        say "  ${C_GREEN}✔ MATCH${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
+        note "    $_f_desc"
       else
-        say "  ✔ MATCH: $_f_name -- $_f_desc"
+        say "  ✔ MATCH: $_f_name"
+        note "    $_f_desc"
       fi
       _match_count=$((_match_count+1))
       if [[ -z "$_match_file" ]]; then
@@ -11321,9 +11358,11 @@ install_vbios_romfile() {
       if _repair_res="$(_vbios_autorepair_byteswap "$_f" "$_guest_gpu" 2>/dev/null)"; then
         IFS='|' read -r _repair_path _repair_desc <<<"$_repair_res"
         if (( ENABLE_COLOR )); then
-          say "  ${C_GREEN}✔ MATCH${C_RESET} ${C_YELLOW}(byte-swap auto-repaired)${C_RESET}: ${C_BOLD}$_f_name${C_RESET} -- $_repair_desc"
+          say "  ${C_GREEN}✔ MATCH${C_RESET} ${C_YELLOW}(auto-repaired)${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
+          note "    $_repair_desc"
         else
-          say "  ✔ MATCH (byte-swap auto-repaired): $_f_name -- $_repair_desc"
+          say "  ✔ MATCH (auto-repaired): $_f_name"
+          note "    $_repair_desc"
         fi
         _match_count=$((_match_count+1))
         if [[ -z "$_match_file" ]]; then
@@ -11383,9 +11422,11 @@ install_vbios_romfile() {
   fi
   say
   if (( ENABLE_COLOR )); then
-    say "${C_GREEN}✔ Pinned vBIOS${C_RESET}: ${C_BOLD}$(basename "$_match_file")${C_RESET} -- $_match_desc"
+    say "${C_GREEN}✔ Pinned vBIOS${C_RESET}: ${C_BOLD}$(basename "$_match_file")${C_RESET}"
+    note "  $_match_desc"
   else
-    say "✔ Pinned vBIOS: $(basename "$_match_file") -- $_match_desc"
+    say "✔ Pinned vBIOS: $(basename "$_match_file")"
+    note "  $_match_desc"
   fi
 
   if (( ! DRY_RUN )); then
@@ -11397,7 +11438,11 @@ install_vbios_romfile() {
     run cp -f "$_match_file" "$_rom_runtime"
     run chmod 0644 "$_rom_runtime"
   fi
-  _kv "Installed to" "$_rom_runtime"
+  if (( ENABLE_COLOR )) && [[ -e "$_rom_runtime" ]]; then
+    say "  ${C_CYAN}Installed to${C_RESET}: $(_link "$_rom_runtime")"
+  else
+    say "  Installed to: $_rom_runtime"
+  fi
   # If the match was an auto-repaired temp copy (not the original candidate),
   # clean up the temp dir now that the repaired content has been copied to the
   # stable runtime path.
@@ -12671,7 +12716,7 @@ install_dynamic_binding_from_existing_config() {
   # 1. Flip the conf key.
   rewrite_conf_key "VFIO_BINDING_MODE" "dynamic"
   if (( ENABLE_COLOR )); then
-    say "  ${C_GREEN}✔${C_RESET} Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
+    say "  ${C_GREEN}✔${C_RESET} Set VFIO_BINDING_MODE=dynamic in $(_link "$CONF_FILE")"
   else
     say "  ✔ Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
   fi
@@ -12681,7 +12726,7 @@ install_dynamic_binding_from_existing_config() {
   #    deployed without needing a full wizard re-run.
   install_bind_script
   if (( ENABLE_COLOR )); then
-    say "  ${C_GREEN}✔${C_RESET} Regenerated $BIND_SCRIPT"
+    say "  ${C_GREEN}✔${C_RESET} Regenerated $(_link "$BIND_SCRIPT")"
   else
     say "  ✔ Regenerated $BIND_SCRIPT"
   fi

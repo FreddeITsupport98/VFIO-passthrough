@@ -2350,8 +2350,8 @@ if grep -Fq 'ROM signature is byte-swapped' "$VFIO_SCRIPT" \
   && grep -Fq 'dump your own card with amdvbflash/GPU-Z' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_autorepair_byteswap()' "$VFIO_SCRIPT" \
   && echo "$_install_vbios_fn" | grep -Fq '_vbios_autorepair_byteswap "$_f" "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq 'byte-swap auto-repaired' \
-  && grep -Fq 'techpowerup downloads are systematically byte-swapped' "$VFIO_SCRIPT" \
+  && echo "$_install_vbios_fn" | grep -Fq '(auto-repaired)' \
+  && grep -Fq 'techpowerup downloads are byte-swapped' "$VFIO_SCRIPT" \
   && grep -Fq 'AUTO-REPAIRS a swapped ROM' "$VFIO_SCRIPT"; then
   ok "Q3z matcher + resolver + autorepair wiring all present (aa55 detect, AUTO-REPAIRS caveat, candidate-loop repair + cleanup)"
 else

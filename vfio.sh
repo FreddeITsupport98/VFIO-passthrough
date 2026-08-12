@@ -10828,6 +10828,51 @@ _vbios_techpowerup_url() {
   return 0
 }
 
+# Best-effort resolver: fetch the techpowerup vgabios SEARCH page at $1 and
+# extract the FIRST detail-page link + the exact download filename from the
+# HTML, so the operator lands on ONE exact ROM instead of a list of duplicate
+# uploads of the same BIOS (techpowerup commonly lists 2-3 re-uploads of the
+# same dump for a given subsystem, identical version+date, which is confusing).
+# Prints "<detail_url>|<filename>" on stdout and returns 0 on success, or
+# returns 1 (no stdout) if the fetch fails, the page is unreachable, no
+# detail link is found, or no HTTP client is available. Fully guarded for
+# `set -euo pipefail`: every network call is wrapped in `|| true`, output is
+# captured into a variable before grepping (no live pipe that pipefail can
+# trip on), and a 6s timeout bounds the fetch so an unreachable host cannot
+# stall the install. Non-fatal: the caller falls back to the raw search URL.
+_vbios_techpowerup_resolve_detail() {
+  local _search_url="$1" _html _detail _slug _fname
+  [[ -n "$_search_url" ]] || return 1
+  local _client=""
+  if have_cmd curl; then
+    _client=curl
+  elif have_cmd wget; then
+    _client=wget
+  else
+    return 1
+  fi
+  if [[ "$_client" == curl ]]; then
+    _html="$(curl -sL --max-time 6 -A 'Mozilla/5.0 (vfio-helper)' "$_search_url" 2>/dev/null || true)"
+  else
+    _html="$(wget -q -T 6 -U 'Mozilla/5.0 (vfio-helper)' -O- "$_search_url" 2>/dev/null || true)"
+  fi
+  [[ -n "$_html" ]] || return 1
+  # First detail-page link of the form vgabios/<id>/<slug> (e.g.
+  # vgabios/274210/asus-rx9070-16384-241204). Dedup so re-uploads (_1, _2)
+  # don't shadow the canonical first listing.
+  _slug="$(printf '%s\n' "$_html" | grep -oE 'vgabios/[0-9]+/[a-z0-9-]+' | sort -u | head -n1 || true)"
+  [[ -n "$_slug" ]] || return 1
+  _detail="https://www.techpowerup.com/$_slug"
+  # The download filename carried by that same listing (e.g.
+  # Asus.RX9070.16384.241204.rom). Match the detail id so it belongs to the
+  # same upload, not a sibling re-upload.
+  local _did="${_slug#vgabios/}"; _did="${_did%%/*}"
+  _fname="$(printf '%s\n' "$_html" | grep -oE "vgabios/${_did}/[A-Za-z0-9._-]+\.rom" | head -n1 || true)"
+  _fname="$(basename "${_fname:-}")"
+  printf '%s|%s\n' "$_detail" "${_fname:-}"
+  return 0
+}
+
 # Two-tier check for whether a ROM dump belongs to the guest GPU at $2.
 # Tier 1 (strict): parse the ROM's PCI Data Structure (PCIR), per the standard
 # header layout:
@@ -11011,11 +11056,29 @@ install_vbios_romfile() {
   # to find/verify a dump. Without this, the skip paths only emitted quiet dim
   # `note` lines with no header, and the success path said "verify by eye" but
   # never printed the URL to actually do so.
+  #
+  # Best-effort: resolve the techpowerup SEARCH page to its first DETAIL page
+  # + exact download filename so the operator lands on ONE exact ROM instead
+  # of a list of 2-3 duplicate re-uploads of the same BIOS (identical
+  # version+date, confusing to pick from). Non-fatal: if the fetch fails
+  # (offline, timeout, page changed), fall back to the raw search URL.
+  local _tpu_detail="" _tpu_fname="" _tpu_res
+  _tpu_res="$(_vbios_techpowerup_resolve_detail "$_tpu_url" 2>/dev/null || true)"
+  if [[ -n "$_tpu_res" ]]; then
+    IFS='|' read -r _tpu_detail _tpu_fname <<<"$_tpu_res"
+  fi
   say
   hdr "vBIOS ROM auto-injection (fixes a black screen from an unreliable live ROM read)"
   note "Guest GPU $_guest_gpu PCI ID: $_gpu_id (share this ID if you need to find/verify a vBIOS dump)."
   note "techpowerup Device Id for vBIOS lookup: $_tpu_did"
-  note "Find/verify a vBIOS dump at: $_tpu_url"
+  if [[ -n "$_tpu_detail" ]]; then
+    note "Exact vBIOS listing (resolved from the search): $_tpu_detail"
+    [[ -n "$_tpu_fname" ]] && note "Expected download filename: $_tpu_fname  (save it as <name>.rom into VBIOS/ next to this script)"
+    note "Search page (if the detail link is stale): $_tpu_url"
+  else
+    note "Find/verify a vBIOS dump at: $_tpu_url"
+    note "(could not auto-resolve the exact listing — the search page lists 2-3 duplicate uploads of the same BIOS; pick the one whose version matches your dump)"
+  fi
 
   local _src_dir
   _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"

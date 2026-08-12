@@ -2165,6 +2165,30 @@ if echo "$_install_vbios_fn" | grep -Fq '_vbios_techpowerup_url "$_guest_gpu"' \
 else
   bad "Q3z install_vbios_romfile still references a hardcoded techpowerup example or is missing the dynamic URL/serial/WARN skips"
 fi
+# _vbios_techpowerup_resolve_detail (new) must be defined AND called from
+# install_vbios_romfile so the operator lands on ONE exact ROM listing instead
+# of the 2-3 duplicate re-uploads the raw search page lists. Best-effort network
+# fetch (curl/wget, 6s timeout) guarded for set -e/pipefail; non-fatal fallback.
+if grep -Fq '_vbios_techpowerup_resolve_detail()' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_techpowerup_resolve_detail "$_tpu_url"' "$VFIO_SCRIPT" \
+  && grep -Fq 'Exact vBIOS listing (resolved from the search)' "$VFIO_SCRIPT" \
+  && grep -Fq 'Expected download filename' "$VFIO_SCRIPT" \
+  && grep -Fq 'could not auto-resolve the exact listing' "$VFIO_SCRIPT"; then
+  ok "Q3z _vbios_techpowerup_resolve_detail() is defined + wired in with a detail/filename/fallback print block"
+else
+  bad "Q3z _vbios_techpowerup_resolve_detail() is missing, not wired in, or lacks the detail/filename/fallback print block"
+fi
+# Static: the resolver must guard the network fetch with a bounded timeout and
+# capture-then-grep (no live pipe) so set -e/pipefail cannot abort the install.
+_resolv_fn="$(sed -n '/^_vbios_techpowerup_resolve_detail() {/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_resolv_fn" | grep -Fq -- '--max-time 6' \
+  && echo "$_resolv_fn" | grep -Fq -- '-T 6' \
+  && echo "$_resolv_fn" | grep -Fq '|| true' \
+  && ! echo "$_resolv_fn" | grep -Eq 'strings[^|]*\| *grep'; then
+  ok "Q3z resolver guards the fetch with a 6s timeout + capture-then-grep (pipefail-safe)"
+else
+  bad "Q3z resolver missing the 6s timeout or pipefail-safe capture-then-grep"
+fi
 _tpu_fn_body="$(sed -n '/^_vbios_techpowerup_url() {/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_tpu_fn_body" ]]; then
   vfake2="$tmp/vbios_tpu_fake"

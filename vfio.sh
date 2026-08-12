@@ -10277,7 +10277,8 @@ install_stealth_vm_tuning() {
     cp "$_tmp" "$_backup_xml" 2>/dev/null || true
     # Run the python tuning (profile=all) on the temp XML.
     # Exit codes: 0 = changed, 3 = no changes needed (idempotent), 4 = unsupported domain.
-    python3 - "$_tmp" <<'PYEOF'
+    local _py_status=0
+    python3 - "$_tmp" <<'PYEOF' || _py_status=$?
 import sys, xml.etree.ElementTree as ET, os, uuid, secrets, string
 QEMU_NS = 'http://libvirt.org/schemas/domain/qemu/1.0'
 ET.register_namespace('qemu', QEMU_NS)
@@ -10469,7 +10470,6 @@ if devices is not None:
 if not changed: sys.exit(3)
 tree.write(path)
 PYEOF
-    local _py_status=$?
     if (( _py_status == 3 )); then
       say "VM '$_dom' is already tuned (no changes needed)."
       _updated=1
@@ -11049,7 +11049,8 @@ install_vbios_romfile() {
     fi
     _tmp="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp"
-    python3 - "$_tmp" "$_gpu_bus_hex" "$_gpu_slot_hex" "$_gpu_fn_hex" "$_rom_runtime" <<'PYEOF'
+    local _py_status=0
+    python3 - "$_tmp" "$_gpu_bus_hex" "$_gpu_slot_hex" "$_gpu_fn_hex" "$_rom_runtime" <<'PYEOF' || _py_status=$?
 import sys, xml.etree.ElementTree as ET
 path, want_bus, want_slot, want_fn, romfile = sys.argv[1:6]
 def norm(h): return format(int(h, 16), 'x')
@@ -11088,7 +11089,6 @@ if not changed:
     sys.exit(3)
 tree.write(path)
 PYEOF
-    local _py_status=$?
     if (( _py_status == 3 )); then
       say "VM '$_dom' already has this vBIOS ROM wired in (no changes needed)."
       _updated=1
@@ -11175,7 +11175,8 @@ remove_vbios_romfile() {
         fi
         _tmp="$(mktemp)"
         printf '%s\n' "$_xml" >"$_tmp"
-        python3 - "$_tmp" "$_gpu_bus_hex" "$_gpu_slot_hex" "$_gpu_fn_hex" "$VBIOS_RUNTIME_DIR/" <<'PYEOF'
+        local _py_status=0
+        python3 - "$_tmp" "$_gpu_bus_hex" "$_gpu_slot_hex" "$_gpu_fn_hex" "$VBIOS_RUNTIME_DIR/" <<'PYEOF' || _py_status=$?
 import sys, xml.etree.ElementTree as ET
 path, want_bus, want_slot, want_fn, romdir = sys.argv[1:6]
 def norm(h): return format(int(h, 16), 'x')
@@ -11204,7 +11205,6 @@ if not changed:
     sys.exit(3)
 tree.write(path)
 PYEOF
-        local _py_status=$?
         if (( _py_status == 0 )) && (( ! DRY_RUN )); then
           virsh -c qemu:///system define "$_tmp" 2>/dev/null || true
           note "Removed vBIOS ROM pin from VM '$_dom'."

@@ -1468,14 +1468,20 @@ if grep -Fq "vendor_id state='on'" "$tmp/mock_vm_has_hv.xml" \
 else
   bad "Q3u idempotent check failed to recognize already-hidden XML"
 fi
-# Case 5 (static): vfio.sh defines install_hypervisor_hiding + wiring
+# Case 5 (static): vfio.sh defines install_stealth_vm_tuning (which SUPERSEDES
+# install_hypervisor_hiding for the dynamic path — includes the hypervisor hide
+# as a subset with a realistic OEM vendor_id=GENUINE00000 instead of 'random',
+# avoiding a duplicate vendor_id) and wires it into install-dynamic. The old
+# standalone install_hypervisor_hiding() call must NOT be in the dynamic
+# installer anymore (it would double-add vendor_id).
 _q3u_dyn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
-if grep -Fq 'install_hypervisor_hiding()' "$VFIO_SCRIPT" \
-  && grep -Fq 'install_hypervisor_hiding' <<<"$_q3u_dyn" \
-  && grep -Fq 'Hide the hypervisor' "$VFIO_SCRIPT"; then
-  ok "Q3u vfio.sh defines install_hypervisor_hiding + wired into install-dynamic"
+if grep -Fq 'install_stealth_vm_tuning()' "$VFIO_SCRIPT" \
+  && grep -Fq 'install_stealth_vm_tuning' <<<"$_q3u_dyn" \
+  && grep -Fq 'GENUINE00000' "$VFIO_SCRIPT" \
+  && ! grep -Fq 'install_hypervisor_hiding' <<<"$_q3u_dyn"; then
+  ok "Q3u vfio.sh wires install_stealth_vm_tuning (not old install_hypervisor_hiding) into install-dynamic"
 else
-  bad "Q3u vfio.sh missing install_hypervisor_hiding or wiring"
+  bad "Q3u vfio.sh missing install_stealth_vm_tuning wiring or still calls install_hypervisor_hiding in install-dynamic"
 fi
 
 # --- Smoke Q3v: park-keepalive monitor (proactive zombie recovery while parked) ---

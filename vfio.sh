@@ -10873,6 +10873,56 @@ _vbios_techpowerup_resolve_detail() {
   return 0
 }
 
+# Best-effort list: fetch the techpowerup vgabios SEARCH page at $1 and return
+# ALL subsystem-compatible detail listings as "<id>|<detail_url>|<filename>"
+# per line on stdout. The ?did= filter in the search URL is built by
+# _vbios_techpowerup_url from the guest GPU's exact 4-part Device Id
+# (vendor-device-subvendor-subdevice), so EVERY listing on that page shares
+# the guest GPU's exact subsystem by construction -- no per-listing subsystem
+# check is needed (and the detail pages, which carry the subsystem/PPID/MD5,
+# are bot-blocked and cannot be fetched automatically). This is the automated
+# equivalent of the operator opening the techpowerup search and seeing every
+# matching TUF/Prime/EVO upload for their exact card subsystem: the script
+# lists them all so the operator can pick any (they are all the same BIOS
+# content for that subsystem, just different re-uploads), download it, drop it
+# into VBIOS/, and let the auto-repair handle the byte-swap.
+# Returns 0 and prints >=1 line on success; returns 1 (no stdout) if the fetch
+# fails, the page is unreachable, or no detail link is found. Same pipefail/
+# timeout guards as _vbios_techpowerup_resolve_detail (6s timeout, capture-
+# then-grep, every network call wrapped in `|| true`).
+_vbios_techpowerup_list_all() {
+  local _search_url="$1" _html _slug _did _fname _detail _slugs
+  [[ -n "$_search_url" ]] || return 1
+  local _client=""
+  if have_cmd curl; then
+    _client=curl
+  elif have_cmd wget; then
+    _client=wget
+  else
+    return 1
+  fi
+  if [[ "$_client" == curl ]]; then
+    _html="$(curl -sL --max-time 6 -A 'Mozilla/5.0 (vfio-helper)' "$_search_url" 2>/dev/null || true)"
+  else
+    _html="$(wget -q -T 6 -U 'Mozilla/5.0 (vfio-helper)' -O- "$_search_url" 2>/dev/null || true)"
+  fi
+  [[ -n "$_html" ]] || return 1
+  # All distinct detail slugs of the form vgabios/<id>/<slug> (e.g.
+  # vgabios/274376/asus-rx9070-16384-241204-2). Dedup so the 2-3 re-uploads
+  # of the same BIOS appear once each; sort -r so the newest id is first.
+  _slugs="$(printf '%s\n' "$_html" | grep -oE 'vgabios/[0-9]+/[a-z0-9-]+' | sort -u || true)"
+  [[ -n "$_slugs" ]] || return 1
+  while IFS= read -r _slug; do
+    [[ -n "$_slug" ]] || continue
+    _did="${_slug#vgabios/}"; _did="${_did%%/*}"
+    _detail="https://www.techpowerup.com/$_slug"
+    _fname="$(printf '%s\n' "$_html" | grep -oE "vgabios/${_did}/[A-Za-z0-9._-]+\.rom" | head -n1 || true)"
+    _fname="$(basename "${_fname:-}")"
+    printf '%s|%s|%s\n' "$_did" "$_detail" "${_fname:-}"
+  done <<<"$_slugs"
+  return 0
+}
+
 # Two-tier check for whether a ROM dump belongs to the guest GPU at $2.
 # Tier 1 (strict): parse the ROM's PCI Data Structure (PCIR), per the standard
 # header layout:
@@ -11003,6 +11053,55 @@ _vbios_rom_matches_gpu() {
   return 1
 }
 
+# Auto-repair the techpowerup download byte-swap (first 2 bytes aa55 -> 55aa)
+# into a temp copy and re-run the full matcher on the repaired copy. Returns 0
+# and prints "<repaired_path>|<match_desc>" on stdout if the repaired copy
+# matches the guest GPU at $2; returns 1 (no stdout) otherwise. SAFETY: the
+# full _vbios_rom_matches_gpu identity check (tier-1 PCI ID or tier-2 ATOMBIOS
+# family + PPID/board) runs on the repaired copy, so a WRONG-card ROM that
+# merely happens to be aa55-swapped is never repaired-and-used -- only a ROM
+# whose content actually belongs to this GPU is accepted. This makes
+# techpowerup downloads directly usable: they are systematically byte-swapped
+# in storage (verified across 3 different ASUS TUF RX 9070 OC uploads), but
+# the embedded content is the correct BIOS for the matching subsystem.
+# The repaired copy is written to a temp dir keeping the original basename so
+# the caller can copy it to the runtime dir under the right name; the caller
+# owns cleanup of the temp dir when _match_repaired is set.
+_vbios_autorepair_byteswap() {
+  local _rom="$1" _bdf="$2" _sig _fixed_dir _fixed _fdesc
+  _sig="$(head -c 2 "$_rom" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ "$_sig" == "aa55" ]] || return 1
+  _fixed_dir="$(mktemp -d 2>/dev/null || true)"
+  [[ -n "$_fixed_dir" ]] || return 1
+  _fixed="$_fixed_dir/$(basename "$_rom")"
+  { printf '\x55\xaa'; tail -c +3 "$_rom" 2>/dev/null; } >"$_fixed" 2>/dev/null || { rm -rf "$_fixed_dir" 2>/dev/null; return 1; }
+  if _fdesc="$(_vbios_rom_matches_gpu "$_fixed" "$_bdf" 2>/dev/null)"; then
+    printf '%s|%s\n' "$_fixed" "$_fdesc"
+    return 0
+  fi
+  rm -rf "$_fixed_dir" 2>/dev/null || true
+  return 1
+}
+
+# Print the full list of subsystem-compatible techpowerup vBIOS listings (the
+# output of _vbios_techpowerup_list_all) as numbered `note` lines, so the
+# operator sees every matching option when no local *.rom is available yet.
+# $1 = the list blob ("<id>|<detail_url>|<filename>" per line), $2 = the
+# 4-part techpowerup Device Id serial for the header line. No-op if the list
+# is empty (e.g. the search page fetch failed / was offline).
+_vbios_print_compatible_list() {
+  local _list="${1:-}" _did="${2:-}" _ln _lid _lurl _lfname
+  [[ -n "$_list" ]] || return 0
+  _ln="$(printf '%s\n' "$_list" | grep -c . 2>/dev/null || true)"
+  [[ "$_ln" =~ ^[0-9]+$ ]] || _ln=0
+  (( _ln > 0 )) || return 0
+  note "All ${_ln} compatible vBIOS listing(s) for your exact subsystem ${_did} (download any one, drop the *.rom into a VBIOS/ folder next to this script, then re-run -- this script AUTO-REPAIRS the techpowerup byte-swap):"
+  while IFS='|' read -r _lid _lurl _lfname; do
+    [[ -n "$_lid" ]] || continue
+    note "  - TPU #${_lid}: ${_lfname:-<unknown filename>} -> ${_lurl}"
+  done <<<"$_list"
+}
+
 # Auto-detect and pin a matching vBIOS ROM dump into the guest GPU's PCI
 # hostdev, for every shut-off libvirt VM that has it attached (dynamic binding
 # only). Rationale: at --bind-now time, QEMU/vfio-pci reads the GPU's option
@@ -11080,6 +11179,13 @@ install_vbios_romfile() {
   if [[ -n "$_tpu_res" ]]; then
     IFS='|' read -r _tpu_detail _tpu_fname <<<"$_tpu_res"
   fi
+  # Best-effort: fetch ALL compatible detail listings from the search page so
+  # the skip paths below (no VBIOS/ folder / no *.rom / no candidate match)
+  # can show the operator every subsystem-matching option to download. The
+  # ?did= filter guarantees every listing shares the guest GPU's exact 4-part
+  # Device Id. Non-fatal; reused across all skip paths to avoid re-fetching.
+  local _tpu_list=""
+  _tpu_list="$(_vbios_techpowerup_list_all "$_tpu_url" 2>/dev/null || true)"
   say
   hdr "vBIOS ROM auto-injection (fixes a black screen from an unreliable live ROM read)"
   note "Guest GPU $_guest_gpu PCI ID: $_gpu_id (share this ID if you need to find/verify a vBIOS dump)."
@@ -11087,7 +11193,7 @@ install_vbios_romfile() {
   if [[ -n "$_tpu_detail" ]]; then
     note "Exact vBIOS listing (resolved from the search): $_tpu_detail"
     [[ -n "$_tpu_fname" ]] && note "Expected download filename: $_tpu_fname  (save it as <name>.rom into VBIOS/ next to this script)"
-    note "CAVEAT: techpowerup downloads are sometimes byte-swapped (first 2 bytes aa55 instead of 55aa) and this script will reject a swapped ROM. The RELIABLE source is dumping your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
+    note "CAVEAT: techpowerup downloads are systematically byte-swapped (first 2 bytes aa55 instead of 55aa). This script AUTO-REPAIRS a swapped ROM whose embedded identity (version/PPID) matches your card, so a techpowerup download is usable directly. If auto-repair is not possible, dump your own card with amdvbflash (Linux) or GPU-Z (Windows); compare the embedded version/PPID against this listing to confirm."
     note "Search page (if the detail link is stale): $_tpu_url"
   else
     note "Find/verify a vBIOS dump at: $_tpu_url"
@@ -11099,6 +11205,7 @@ install_vbios_romfile() {
   if [[ ! -d "$_src_dir" ]]; then
     note "WARN: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
     note "       Drop a matching *.rom dump into a VBIOS/ folder next to this script, then re-run to enable this automatically."
+    _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
     return 0
   fi
   local -a _candidates=()
@@ -11109,10 +11216,11 @@ install_vbios_romfile() {
   if (( ${#_candidates[@]} == 0 )); then
     note "WARN: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
     note "       Drop a matching *.rom dump into $_src_dir, then re-run to enable this automatically."
+    _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
     return 0
   fi
 
-  local _match_file="" _match_desc="" _f_desc _f_name _match_err
+  local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0
   _match_err="$(mktemp)"
   for _f in "${_candidates[@]}"; do
     _f_name="$(basename "$_f")"
@@ -11121,9 +11229,32 @@ install_vbios_romfile() {
       if [[ -z "$_match_file" ]]; then
         _match_file="$_f"
         _match_desc="$_f_desc"
+        _match_repaired=0
       fi
     else
-      note "  candidate $_f_name -> no match: $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+      # Byte-swap auto-repair: techpowerup downloads are systematically
+      # aa55-swapped on the first 2 bytes, but the embedded content is usually
+      # the correct BIOS for the matching subsystem. Swap the first 2 bytes
+      # back into a temp copy and re-run the full matcher (which re-checks the
+      # embedded identity) -- if the repaired copy matches, use it so a
+      # techpowerup download works without the user having to dump their own
+      # card. SAFETY: the matcher's tier-1/tier-2 identity check runs on the
+      # repaired copy, so a wrong-card ROM is never repaired-and-used.
+      local _repair_res _repair_path _repair_desc
+      if _repair_res="$(_vbios_autorepair_byteswap "$_f" "$_guest_gpu" 2>/dev/null)"; then
+        IFS='|' read -r _repair_path _repair_desc <<<"$_repair_res"
+        note "  candidate $_f_name -> byte-swapped (aa55); AUTO-REPAIRED first 2 bytes (55aa) -> MATCH: $_repair_desc"
+        if [[ -z "$_match_file" ]]; then
+          _match_file="$_repair_path"
+          _match_desc="$_repair_desc (auto-repaired from byte-swapped $_f_name)"
+          _match_repaired=1
+        else
+          rm -f "$_repair_path" 2>/dev/null || true
+          rmdir "$(dirname "$_repair_path")" 2>/dev/null || true
+        fi
+      else
+        note "  candidate $_f_name -> no match: $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+      fi
     fi
   done
   rm -f "$_match_err" 2>/dev/null || true
@@ -11132,6 +11263,7 @@ install_vbios_romfile() {
     note "WARN: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
     note "       Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
     note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
+    _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
     return 0
   fi
   say "Matched vBIOS dump: $(basename "$_match_file") ($_match_desc)"
@@ -11146,6 +11278,13 @@ install_vbios_romfile() {
     run chmod 0644 "$_rom_runtime"
   fi
   note "Installed vBIOS dump to $_rom_runtime"
+  # If the match was an auto-repaired temp copy (not the original candidate),
+  # clean up the temp dir now that the repaired content has been copied to the
+  # stable runtime path.
+  if (( _match_repaired )); then
+    rm -f "$_match_file" 2>/dev/null || true
+    rmdir "$(dirname "$_match_file")" 2>/dev/null || true
+  fi
 
   local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp
   local _gpu_dom_hex _gpu_bus_hex _gpu_slot_fn _gpu_slot_hex _gpu_fn_hex

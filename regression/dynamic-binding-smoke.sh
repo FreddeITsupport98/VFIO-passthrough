@@ -2164,6 +2164,39 @@ LEOF
     else
       bad "Q3z matcher failed to flag the aa55 byte-swap with the targeted message (got: $_swap_err)"
     fi
+    # LIVE: _vbios_autorepair_byteswap must swap the first 2 bytes back (aa55
+    # -> 55aa) on the swapped copy and re-match -> return a repaired path +
+    # MATCH desc. This is the fix that makes techpowerup downloads (which are
+    # systematically byte-swapped in storage) directly usable without the user
+    # having to dump their own card. The full matcher re-runs on the repaired
+    # copy, so the embedded identity (version/PPID) is re-verified -- a
+    # wrong-card ROM is never repaired-and-used.
+    _autorepair_fn="$(sed -n '/^_vbios_autorepair_byteswap() {/,/^}/p' "$VFIO_SCRIPT")"
+    if [[ -n "$_autorepair_fn" ]]; then
+      {
+        printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }\n'
+        printf '%s\n' "$_vbios_fn_body" | sed "s#/sys/bus/pci/devices/\$_bdf#$vfake/sys/\$_bdf#"
+        printf '%s\n' "$_autorepair_fn"
+        printf '_vbios_autorepair_byteswap "%s" "0000:0e:00.0"\n' "$_swapped"
+      } > "$vfake/autorepair_test.sh"
+      _ar_out="$(PATH="$vfake/bin:$PATH" bash "$vfake/autorepair_test.sh" 2>/dev/null || true)"
+      _ar_path="${_ar_out%%|*}"
+      _ar_desc="${_ar_out#*|}"
+      if [[ -n "$_ar_path" && -f "$_ar_path" ]] \
+        && printf '%s' "$_ar_desc" | grep -Fq 'AMD ATOMBIOS dump' \
+        && printf '%s' "$_ar_desc" | grep -Fq 'RX9070'; then
+        ok "Q3z _vbios_autorepair_byteswap repairs the aa55 swap and re-matches (repaired copy MATCHes the guest GPU)"
+        # The repaired copy's first 2 bytes must now be 55 aa (valid ROM sig).
+        _ar_first2="$(head -c 2 "$_ar_path" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+        [[ "$_ar_first2" == "55aa" ]] && ok "Q3z repaired copy starts with 55 aa (valid PCI expansion ROM signature)" || bad "Q3z repaired copy still has a bad signature (got: $_ar_first2)"
+      else
+        bad "Q3z _vbios_autorepair_byteswap failed to repair+match the swapped copy (got: $_ar_out)"
+      fi
+      rm -f "$_ar_path" 2>/dev/null || true
+      rmdir "$(dirname "$_ar_path")" 2>/dev/null || true
+    else
+      bad "Q3z could not extract _vbios_autorepair_byteswap to test"
+    fi
   else
     bad "Q3z bundled ROM does not start with 55aa; cannot build a swapped copy to test the byte-swap detector"
   fi
@@ -2215,16 +2248,79 @@ if echo "$_resolv_fn" | grep -Fq -- '--max-time 6' \
   && ! echo "$_resolv_fn" | grep -Eq 'strings[^|]*\| *grep'; then
   ok "Q3z resolver guards the fetch with a 6s timeout + capture-then-grep (pipefail-safe)"
 fi
+# _vbios_techpowerup_list_all (new) must be defined AND called from
+# install_vbios_romfile so the skip paths can show EVERY subsystem-compatible
+# listing (the ?did= filter guarantees they all share the guest GPU's exact
+# subsystem). _vbios_print_compatible_list must be defined AND called from all
+# 3 skip paths (no folder / no *.rom / no match) so the operator sees the full
+# list of options to download when no local dump is available yet.
+if grep -Fq '_vbios_techpowerup_list_all()' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_techpowerup_list_all "$_tpu_url"' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_print_compatible_list()' "$VFIO_SCRIPT" \
+  && echo "$_install_vbios_fn" | grep -Fc '_vbios_print_compatible_list "$_tpu_list" "$_tpu_did"' | grep -Fxq 3; then
+  ok "Q3z _vbios_techpowerup_list_all + _vbios_print_compatible_list are defined + wired into all 3 skip paths"
+else
+  bad "Q3z _vbios_techpowerup_list_all or _vbios_print_compatible_list missing, not wired in, or not called from all 3 skip paths"
+fi
+# LIVE: feed _vbios_techpowerup_list_all a mock search-page HTML (via a fake
+# curl that echoes it) and assert it returns one "<id>|<detail>|<filename>"
+# line per distinct listing, with the exact detail URL + download filename.
+# This is the automated equivalent of the operator opening the techpowerup
+# search and seeing every matching upload for their exact subsystem.
+_list_fn="$(sed -n '/^_vbios_techpowerup_list_all() {/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_list_fn" ]]; then
+  vfake3="$tmp/vbios_list_fake"
+  mkdir -p "$vfake3/bin"
+  cat > "$vfake3/bin/curl" <<'CEOF'
+#!/usr/bin/env bash
+# Ignore args; echo a mock techpowerup search page with 3 distinct listings.
+cat <<'HEOF'
+<html><body>
+<a href="/vgabios/274210/asus-rx9070-16384-241204">Details</a>
+<a href="/vgabios/274210/Asus.RX9070.16384.241204.rom">Download</a>
+<a href="/vgabios/274211/asus-rx9070-16384-241204-1">Details</a>
+<a href="/vgabios/274211/Asus.RX9070.16384.241204_1.rom">Download</a>
+<a href="/vgabios/274376/asus-rx9070-16384-241204-2">Details</a>
+<a href="/vgabios/274376/Asus.RX9070.16384.241204_2.rom">Download</a>
+</body></html>
+HEOF
+CEOF
+  chmod +x "$vfake3/bin/curl"
+  {
+    printf 'have_cmd() { command -v "$1" >/dev/null 2>&1; }
+'
+    printf '%s\n' "$_list_fn"
+    printf '_vbios_techpowerup_list_all "https://www.techpowerup.com/vgabios/?did=1002-7550-1043-0614"\n'
+  } > "$vfake3/list_test.sh"
+  _list_out="$(PATH="$vfake3/bin:$PATH" bash "$vfake3/list_test.sh" 2>/dev/null || true)"
+  _list_n="$(printf '%s\n' "$_list_out" | grep -c . 2>/dev/null || true)"
+  if [[ "$_list_n" == 3 ]] \
+    && printf '%s\n' "$_list_out" | grep -Fxq '274210|https://www.techpowerup.com/vgabios/274210/asus-rx9070-16384-241204|Asus.RX9070.16384.241204.rom' \
+    && printf '%s\n' "$_list_out" | grep -Fxq '274211|https://www.techpowerup.com/vgabios/274211/asus-rx9070-16384-241204-1|Asus.RX9070.16384.241204_1.rom' \
+    && printf '%s\n' "$_list_out" | grep -Fxq '274376|https://www.techpowerup.com/vgabios/274376/asus-rx9070-16384-241204-2|Asus.RX9070.16384.241204_2.rom'; then
+    ok "Q3z _vbios_techpowerup_list_all returns all 3 distinct listings (id|detail|filename) from the mock search page"
+  else
+    bad "Q3z _vbios_techpowerup_list_all returned wrong/missing listings (n=$_list_n, got: $_list_out)"
+  fi
+else
+  bad "Q3z could not extract _vbios_techpowerup_list_all to test"
+fi
 # Static: the matcher must carry the aa55 byte-swap detector + targeted fix
-# message, and the resolver print block must carry the byte-swap caveat, so a
-# techpowerup download that is byte-swapped is never a dead-end "not a valid
-# option ROM dump" — the operator is told the cause and the fix.
+# message; the resolver print block must carry the byte-swap caveat with the
+# AUTO-REPAIRS wording (no longer a flat rejection); and _vbios_autorepair_byteswap
+# must be defined AND wired into the install_vbios_romfile candidate loop (with
+# temp-copy cleanup) so a techpowerup download is auto-repaired instead of
+# being a dead-end "not a valid option ROM dump".
 if grep -Fq 'ROM signature is byte-swapped' "$VFIO_SCRIPT" \
   && grep -Fq 'dump your own card with amdvbflash/GPU-Z' "$VFIO_SCRIPT" \
-  && echo "$_install_vbios_fn" | grep -Fq 'techpowerup downloads are sometimes byte-swapped'; then
-  ok "Q3z matcher + resolver print block document the aa55 byte-swap trap + the dump-your-own-card fix"
+  && grep -Fq '_vbios_autorepair_byteswap()' "$VFIO_SCRIPT" \
+  && echo "$_install_vbios_fn" | grep -Fq '_vbios_autorepair_byteswap "$_f" "$_guest_gpu"' \
+  && echo "$_install_vbios_fn" | grep -Fq 'AUTO-REPAIRED first 2 bytes' \
+  && echo "$_install_vbios_fn" | grep -Fq 'techpowerup downloads are systematically byte-swapped' \
+  && echo "$_install_vbios_fn" | grep -Fq 'AUTO-REPAIRS a swapped ROM'; then
+  ok "Q3z matcher + resolver + autorepair wiring all present (aa55 detect, AUTO-REPAIRS caveat, candidate-loop repair + cleanup)"
 else
-  bad "Q3z matcher or resolver print block missing the aa55 byte-swap detection/caveat"
+  bad "Q3z matcher/resolver/autorepair wiring missing (aa55 detect, AUTO-REPAIRS caveat, or candidate-loop repair)"
 fi
 _tpu_fn_body="$(sed -n '/^_vbios_techpowerup_url() {/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_tpu_fn_body" ]]; then

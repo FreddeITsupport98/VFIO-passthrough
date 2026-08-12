@@ -4280,18 +4280,22 @@ VFIO_RESTORE_D3COLD_ON_RELEASE="0"
 # hung bind is aborted. Lower it only if your hook deadline is shorter; raise it
 # only if a legitimately slow bind keeps getting aborted (rare).
 VFIO_HOOK_BIND_TIMEOUT="20"
-# Reboot-FLR monitor: optional max PCIe generation cap for the post-FLR link
-# restore (read by vfio-reboot-flr-monitor.sh). The RX 9070 family Gen1
-# downtrain + adaptive restore normally targets the hardware's detected link
-# capability (Gen5 on Gen5 boards, Gen4 on slower slots). On boards that
-# reliably retrain at a lower gen but NOT the card's full capability after an
-# FLR, set this to clamp the restore target so it does not keep failing up to
-# the higher gen and falling back every warm reboot.
+# Optional max PCIe generation cap for the post-reset adaptive link restore.
+# Originally introduced for the reboot-FLR monitor (guest warm reboot), but now
+# shared by EVERY RX 9070 family PCIe Gen1-downtrain/adaptive-restore recovery
+# path in this script: the reboot-FLR soft FLR, the bind script's remove+rescan
+# and function-level-reset recovery (--release / --bind-now / bind_one), and
+# the park-keepalive monitor's remove+rescan and rescan-only recovery. All of
+# them normally target the hardware's detected link capability (Gen5 on Gen5
+# boards, Gen4 on slower slots). On boards that reliably retrain at a lower gen
+# but NOT the card's full capability after a reset, set this to clamp the
+# restore target so none of these recovery paths keep failing up to the higher
+# gen and falling back every time.
 # - empty (default): no cap; restore targets the detected capability.
 # - 1..6: clamp the restore target to at most this generation.
 # WHY this value: empty lets the adaptive logic pick the best gen per hardware.
 # Set 4 (for example) only if your board reliably retrains Gen4 but not Gen5
-# after an FLR and you want to skip the Gen5 retrain attempt.
+# after a reset and you want every recovery path to skip the Gen5 attempt.
 VFIO_REBOOT_FLR_MAX_GEN=""
 # Stealth/perf VM tuning backup directory for *_stealth_*.xml VM XML backups
 # (read by install_stealth_vm_tuning / reset_stealth_vm_tuning). Default empty
@@ -7665,6 +7669,250 @@ _pci_dev_alive() {
   return 0
 }
 
+# RX 9070 family / RDNA4 (Navi 48, gfx1201) device ID. Gates the PCIe Gen1
+# downtrain/adaptive-restore wrapping below (see _pre_reset_gen1_downtrain) to
+# this specific card family only — other cards do not need it, or may be
+# harmed by it. All 9070 / 9070 XT / 9070 GRE SKUs share device ID 0x7550.
+_RX9070_DEVICE_ID="7550"
+
+# Returns 0 if the PCI device at $1 is vendor 1002 / device 7550 (RX 9070
+# family). Reads vendor+device straight from live config space (first 4
+# bytes) rather than sysfs, so it still works on a device that is mid-recovery.
+_is_rx9070() {
+  local _bdf="$1" _sys _cfg _vendor _device
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_cfg" ]] || return 1
+  _vendor="${_cfg:2:2}${_cfg:0:2}"
+  _device="${_cfg:6:2}${_cfg:4:2}"
+  [[ "${_vendor,,}" == "1002" ]] || return 1
+  [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
+}
+
+# Read a 16-bit PCI config word via setpci as a clean 4-hex-digit lowercase
+# string. Returns 1 on failure/non-hex so callers can bail out safely.
+_setpci_word() {
+  local _bdf="$1" _off="$2" _v
+  _v="$(setpci -s "$_bdf" "$_off" 2>/dev/null || true)"
+  [[ -n "$_v" ]] || return 1
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  [[ "$_v" =~ ^[0-9a-fA-F]+$ ]] || return 1
+  while (( ${#_v} < 4 )); do _v="0$_v"; done
+  printf '%s\n' "${_v,,}"
+}
+
+# Map a PCIe link-speed string (e.g. "16 GT/s") to a generation integer
+# (1=Gen1 .. 6=Gen6). Returns 1 on unknown/empty.
+_speed_to_gen() {
+  local _s="${1:-}" _n
+  [[ -n "$_s" ]] || return 1
+  _n="$(printf '%s' "$_s" | tr -cd '0-9.')"
+  [[ -n "$_n" ]] || return 1
+  case "$_n" in
+    2.5) echo 1 ;;
+    5|5.0) echo 2 ;;
+    8|8.0) echo 3 ;;
+    16|16.0) echo 4 ;;
+    32|32.0) echo 5 ;;
+    64|64.0) echo 6 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# Read a sysfs link-speed attribute for a PCI BDF and echo its generation.
+_port_speed_gen() {
+  local _bdf="$1" _attr="$2" _f _v
+  _f="/sys/bus/pci/devices/$_bdf/$_attr"
+  [[ -r "$_f" ]] || return 1
+  _v="$(cat "$_f" 2>/dev/null)" || _v=""
+  [[ -n "$_v" ]] || return 1
+  _speed_to_gen "$_v"
+}
+
+# Read the current PCIe link width from sysfs for a PCI BDF.
+_port_link_width() {
+  local _bdf="$1" _f _v
+  _f="/sys/bus/pci/devices/$_bdf/current_link_width"
+  [[ -r "$_f" ]] || return 1
+  _v="$(cat "$_f" 2>/dev/null || true)"
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  printf '%s\n' "$_v"
+}
+
+# Find the upstream PCIe switch downstream port for a PCI BDF. Primary: walk
+# sysfs (the device is a child of its upstream bridge in the device tree).
+# Fallback: if the device's OWN sysfs entry is missing entirely (fell off the
+# bus — exactly the case a rescan-only recovery needs this for), resolve the
+# upstream bridge via its pci_bus/<domain:bus> subdirectory instead, which
+# represents the bus topology independent of whether any downstream device is
+# currently enumerated on it.
+_gpu_upstream_port() {
+  local _gpu="$1" _parent_dir _upstream _dom _bus _p
+  [[ -n "$_gpu" ]] || return 1
+  _parent_dir="$(ls -d /sys/bus/pci/devices/*/"$_gpu" 2>/dev/null | head -1)"
+  if [[ -n "$_parent_dir" ]]; then
+    _upstream="$(basename "$(dirname "$_parent_dir")")"
+    if [[ -n "$_upstream" ]]; then
+      printf '%s\n' "$_upstream"
+      return 0
+    fi
+  fi
+  _dom="${_gpu:0:4}"
+  _bus="${_gpu:5:2}"
+  [[ -n "$_dom" && -n "$_bus" ]] || return 1
+  for _p in /sys/bus/pci/devices/*/pci_bus/"${_dom}:${_bus}"; do
+    [[ -d "$_p" ]] || continue
+    basename "$(dirname "$(dirname "$_p")")"
+    return 0
+  done
+  return 1
+}
+
+# Pre-reset Gen1 downtrain, reused from the reboot-FLR monitor's proven fix for
+# the SAME underlying issue on this card family (see install_reboot_flr_monitor):
+# the on-card PCIe switch's post-reset link retrain at its max gen (Gen5) can
+# fail, but forcing the target to Gen1 BEFORE the reset/remove makes the
+# retrain reliable (Gen1 retrains fast and succeeds). Applied here to
+# remove+rescan / plain function-level-reset recovery at VM-stop/bind time, not
+# just the guest-reboot FLR path. Callers gate this to the RX 9070 family via
+# _is_rx9070 first (except the fully-missing-directory rescan-only recovery,
+# where _is_rx9070 cannot read the device's own config space and this is
+# attempted unconditionally instead — see _pci_bus_rescan_only). Stashes
+# hardware-detection globals for the matching _post_reset_restore_link call in
+# the same recovery attempt.
+_pre_reset_gen1_downtrain() {
+  local _bdf="$1" _upstream _ctl2 _ctl _sta _i
+  _upstream="$(_gpu_upstream_port "$_bdf" 2>/dev/null || true)"
+  if [[ -z "$_upstream" ]]; then
+    jlog "$_bdf: pre-reset Gen1 downtrain skipped (could not find upstream port)"
+    return 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    jlog "$_bdf: pre-reset Gen1 downtrain skipped (setpci not installed)"
+    return 1
+  fi
+  _RESET_DETECTED_CAP="$(_port_speed_gen "$_upstream" max_link_speed 2>/dev/null || true)"
+  _RESET_DETECTED_CUR="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
+  _RESET_DETECTED_WIDTH="$(_port_link_width "$_upstream" 2>/dev/null || true)"
+  jlog "$_bdf: pre-reset Gen1 downtrain on upstream $_upstream (cap=Gen${_RESET_DETECTED_CAP:-?} cur=Gen${_RESET_DETECTED_CUR:-?} width=x${_RESET_DETECTED_WIDTH:-?})"
+  _ctl2="$(_setpci_word "$_upstream" 88.w 2>/dev/null || true)"
+  if [[ -z "$_ctl2" ]]; then
+    jlog "$_bdf: pre-reset downtrain aborted (could not read LnkCtl2 from $_upstream)"
+    return 1
+  fi
+  _RESET_SAVED_TARGET="$(printf '%d' "0x${_ctl2:3:1}" 2>/dev/null)" || true
+  local _saved_hi="${_ctl2:0:3}"
+  local _gen1_ctl2="${_saved_hi}1"
+  setpci -s "$_upstream" 88.w="$_gen1_ctl2" 2>/dev/null || true
+  jlog "$_bdf: LnkCtl2 set to $_gen1_ctl2 (was $_ctl2) — target Gen1"
+  _ctl="$(_setpci_word "$_upstream" 68.w 2>/dev/null || true)"
+  if [[ -n "$_ctl" ]]; then
+    setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+  fi
+  jlog "$_bdf: forced link retrain at Gen1 (LnkCtl bit 5 set)"
+  for _i in $(seq 1 20); do
+    _sta="$(_setpci_word "$_upstream" 6A.w 2>/dev/null || true)"
+    if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
+      jlog "$_bdf: link active at Gen1 after $(( _i * 100 ))ms"
+      return 0
+    fi
+    sleep 0.1
+  done
+  jlog "$_bdf: WARN link did not come back at Gen1 within 2s (continuing anyway)"
+  return 0
+}
+
+# Post-reset adaptive link restore (bounded descent). See
+# _pre_reset_gen1_downtrain for the rationale; callers gate this to the RX 9070
+# family via _is_rx9070 first, and must call _pre_reset_gen1_downtrain in the
+# SAME recovery attempt first so the *_DETECTED_*/_RESET_SAVED_TARGET globals
+# are fresh.
+_post_reset_restore_link() {
+  local _bdf="$1" _upstream _ctl _sta _i _target _neg_gen _g _ctl2 _width _p _best _saved_hi
+  _upstream="$(_gpu_upstream_port "$_bdf" 2>/dev/null || true)"
+  [[ -n "$_upstream" ]] || return 1
+  command -v setpci >/dev/null 2>&1 || return 1
+  for _i in $(seq 1 50); do
+    _sta="$(_setpci_word "$_upstream" 6A.w 2>/dev/null || true)"
+    if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
+      jlog "$_bdf: link active after reset (waited $(( _i * 100 ))ms)"
+      break
+    fi
+    sleep 0.1
+  done
+  local _cap="${_RESET_DETECTED_CAP:-}"
+  local _cur="${_RESET_DETECTED_CUR:-}"
+  local _sav="${_RESET_SAVED_TARGET:-}"
+  if [[ -n "$_cap" && -n "$_cur" ]]; then
+    if (( _cur < _cap )) 2>/dev/null; then
+      _target="$_cur"
+      jlog "$_bdf: link was running Gen$_cur < cap Gen$_cap; adapting restore to Gen$_cur"
+    else
+      _target="$_cap"
+      jlog "$_bdf: restoring to detected link capability Gen$_cap"
+    fi
+  elif [[ -n "$_cap" ]]; then
+    _target="$_cap"
+  elif [[ -n "$_sav" ]]; then
+    _target="$_sav"
+  else
+    _target=5
+  fi
+  # Optional operator cap shared with the reboot-FLR monitor: applies to ALL
+  # RX 9070 link-retrain recovery now, not just guest reboot.
+  local _max="${VFIO_REBOOT_FLR_MAX_GEN:-}"
+  if [[ -n "$_max" ]] && (( _max >= 1 && _max <= 6 )) 2>/dev/null; then
+    if (( _target > _max )) 2>/dev/null; then
+      jlog "$_bdf: VFIO_REBOOT_FLR_MAX_GEN=$_max clamps restore target to Gen$_max"
+      _target="$_max"
+    fi
+  fi
+  if ! (( _target >= 1 && _target <= 6 )) 2>/dev/null; then
+    _target=5
+  fi
+  _best=0
+  for (( _g = _target; _g >= 1; _g-- )); do
+    _ctl2="$(_setpci_word "$_upstream" 88.w 2>/dev/null || true)"
+    if [[ -n "$_ctl2" ]]; then
+      _saved_hi="${_ctl2:0:3}"
+      setpci -s "$_upstream" 88.w="${_saved_hi}$(printf '%x' "$_g")" 2>/dev/null || true
+    fi
+    _ctl="$(_setpci_word "$_upstream" 68.w 2>/dev/null || true)"
+    if [[ -n "$_ctl" ]]; then
+      setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+    fi
+    jlog "$_bdf: forced link retrain to Gen$_g"
+    _neg_gen=""
+    for _p in $(seq 1 6); do
+      sleep 0.1
+      _neg_gen="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
+      if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _g )) 2>/dev/null; then
+        break
+      fi
+    done
+    _width="$(_port_link_width "$_upstream" 2>/dev/null || true)"
+    if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _g )) 2>/dev/null; then
+      _best="$_neg_gen"
+      jlog "$_bdf: restore OK — link back at Gen$_neg_gen x${_width:-?}"
+      break
+    fi
+    if (( _g > 1 )); then
+      jlog "$_bdf: WARN link below Gen$_g (got Gen${_neg_gen:-?}); descending to Gen$((_g - 1))"
+    fi
+  done
+  if (( _best == 0 )) 2>/dev/null; then
+    jlog "$_bdf: WARN link restore did not settle at any gen >= 1 (cap=Gen${_RESET_DETECTED_CAP:-?}, pre=Gen${_RESET_DETECTED_CUR:-?} x${_RESET_DETECTED_WIDTH:-?}); possible hardware/signal-integrity issue"
+  elif (( _best < _target )) 2>/dev/null; then
+    jlog "$_bdf: WARN link restore settled at Gen$_best x${_width:-?} (wanted Gen$_target); link up but degraded"
+  fi
+  return 0
+}
+
 # Last-resort recovery for a dead PCI device: remove it from the bus, rescan
 # the whole PCI bus to force re-enumeration, then re-bind to vfio-pci. This is
 # the final recovery step before telling the user to reboot the host. On RX
@@ -7674,14 +7922,22 @@ _pci_dev_alive() {
 # does NOT always work on the RX 9070 (the GPU function may stay gone while the
 # audio function comes back), but it is worth attempting as a final step before
 # requiring a host reboot, since it recovers the card in some borderline cases.
+# RX 9070 family: wraps the remove+rescan with the SAME pre/post Gen1-downtrain
+# and adaptive link restore already proven for the guest-reboot FLR path (see
+# _pre_reset_gen1_downtrain), since a plain `rescan` has no mechanism of its own
+# to force the PCIe link to retrain if it is already down when the card zombies.
 # Returns 0 if the device is alive and on vfio-pci after recovery, 1 otherwise.
 _pci_dev_remove_rescan() {
-  local _bdf="$1" _sys
+  local _bdf="$1" _sys _rx9070=0
   [[ -n "$_bdf" ]] || return 1
   _sys="/sys/bus/pci/devices/$_bdf"
   [[ -d "$_sys" ]] || return 1
   jlog "$_bdf: attempting remove+rescan recovery (last resort before host reboot)"
   say "WARN: $_bdf attempting remove+rescan bus recovery (last resort before requiring a host reboot)." >&2
+  if _is_rx9070 "$_bdf"; then
+    _rx9070=1
+    _pre_reset_gen1_downtrain "$_bdf"
+  fi
   # 1. Remove the device from the bus (forces the kernel to drop it).
   if [[ -w "$_sys/remove" ]]; then
     echo 1 >"$_sys/remove" 2>/dev/null || true
@@ -7695,6 +7951,11 @@ _pci_dev_remove_rescan() {
   # 3. Check if the device came back at the same BDF. After remove, the sysfs
   #    path is gone; after rescan it may or may not reappear.
   [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after rescan"; return 1; }
+  # 3b. RX 9070 family: adaptively restore the link speed now that the device
+  #     is back in sysfs, before touching driver binding.
+  if (( _rx9070 )); then
+    _post_reset_restore_link "$_bdf"
+  fi
   # 4. Set driver_override so amdgpu does not grab the rescanned device first,
   #    then bind to vfio-pci.
   echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
@@ -7739,9 +8000,17 @@ bind_one() {
       fi
       jlog "$dev: on vfio-pci but config space unreadable (header type 127 / card gone); attempting PCI reset + re-probe"
       say "WARN: $dev is bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: card fell off the bus). Attempting a PCI function-level reset + re-probe." >&2
+      local _reset_rx9070=0
+      if _is_rx9070 "$dev"; then
+        _reset_rx9070=1
+        _pre_reset_gen1_downtrain "$dev"
+      fi
       if [[ -w "$sys/reset" ]]; then
         echo 1 >"$sys/reset" 2>/dev/null || true
         sleep 0.3
+      fi
+      if (( _reset_rx9070 )); then
+        _post_reset_restore_link "$dev"
       fi
       if _pci_dev_alive "$dev"; then
         jlog "$dev: recovered after PCI reset (alive); keeping on vfio-pci"
@@ -7778,9 +8047,17 @@ bind_one() {
   # device must be unbound). Default OFF: a reset on a healthy card is unnecessary
   # and on a mid-reset card can worsen the state; enable only on repeated failures.
   if [[ "${VFIO_DYNAMIC_PCI_RESET:-0}" == "1" && -w "$sys/reset" ]]; then
+    local _prebind_rx9070=0
+    if _is_rx9070 "$dev"; then
+      _prebind_rx9070=1
+      _pre_reset_gen1_downtrain "$dev"
+    fi
     echo 1 >"$sys/reset" 2>/dev/null || true
     jlog "$dev: pci reset attempted"
     sleep 0.1
+    if (( _prebind_rx9070 )); then
+      _post_reset_restore_link "$dev"
+    fi
   fi
 
   echo vfio-pci >"$sys/driver_override"
@@ -9076,13 +9353,250 @@ _pci_dev_alive() {
   return 0
 }
 
-# Same last-resort recovery as the bind script's _pci_dev_remove_rescan.
+# RX 9070 family / RDNA4 device ID. Gates the PCIe Gen1 downtrain/adaptive-
+# restore wrapping below (see _pre_reset_gen1_downtrain) to this specific card
+# family only. Duplicated from the bind script (each generated helper script
+# is standalone, not sourced).
+_RX9070_DEVICE_ID="7550"
+
+_is_rx9070() {
+  local _bdf="$1" _sys _cfg _vendor _device
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -d "$_sys" ]] || return 1
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_cfg" ]] || return 1
+  _vendor="${_cfg:2:2}${_cfg:0:2}"
+  _device="${_cfg:6:2}${_cfg:4:2}"
+  [[ "${_vendor,,}" == "1002" ]] || return 1
+  [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
+}
+
+_setpci_word() {
+  local _bdf="$1" _off="$2" _v
+  _v="$(setpci -s "$_bdf" "$_off" 2>/dev/null || true)"
+  [[ -n "$_v" ]] || return 1
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  [[ "$_v" =~ ^[0-9a-fA-F]+$ ]] || return 1
+  while (( ${#_v} < 4 )); do _v="0$_v"; done
+  printf '%s\n' "${_v,,}"
+}
+
+_speed_to_gen() {
+  local _s="${1:-}" _n
+  [[ -n "$_s" ]] || return 1
+  _n="$(printf '%s' "$_s" | tr -cd '0-9.')"
+  [[ -n "$_n" ]] || return 1
+  case "$_n" in
+    2.5) echo 1 ;;
+    5|5.0) echo 2 ;;
+    8|8.0) echo 3 ;;
+    16|16.0) echo 4 ;;
+    32|32.0) echo 5 ;;
+    64|64.0) echo 6 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+_port_speed_gen() {
+  local _bdf="$1" _attr="$2" _f _v
+  _f="/sys/bus/pci/devices/$_bdf/$_attr"
+  [[ -r "$_f" ]] || return 1
+  _v="$(cat "$_f" 2>/dev/null)" || _v=""
+  [[ -n "$_v" ]] || return 1
+  _speed_to_gen "$_v"
+}
+
+_port_link_width() {
+  local _bdf="$1" _f _v
+  _f="/sys/bus/pci/devices/$_bdf/current_link_width"
+  [[ -r "$_f" ]] || return 1
+  _v="$(cat "$_f" 2>/dev/null || true)"
+  _v="$(printf '%s' "$_v" | tr -d '[:space:]')"
+  [[ -n "$_v" ]] || return 1
+  printf '%s\n' "$_v"
+}
+
+# Primary: walk sysfs (the device is a child of its upstream bridge). Fallback:
+# if the device's OWN sysfs entry is missing entirely (fell off the bus --
+# exactly the case _pci_bus_rescan_only needs this for), resolve the upstream
+# bridge via its pci_bus/<domain:bus> subdirectory instead, which represents
+# the bus topology independent of whether any downstream device is currently
+# enumerated on it.
+_gpu_upstream_port() {
+  local _gpu="$1" _parent_dir _upstream _dom _bus _p
+  [[ -n "$_gpu" ]] || return 1
+  _parent_dir="$(ls -d /sys/bus/pci/devices/*/"$_gpu" 2>/dev/null | head -1)"
+  if [[ -n "$_parent_dir" ]]; then
+    _upstream="$(basename "$(dirname "$_parent_dir")")"
+    if [[ -n "$_upstream" ]]; then
+      printf '%s\n' "$_upstream"
+      return 0
+    fi
+  fi
+  _dom="${_gpu:0:4}"
+  _bus="${_gpu:5:2}"
+  [[ -n "$_dom" && -n "$_bus" ]] || return 1
+  for _p in /sys/bus/pci/devices/*/pci_bus/"${_dom}:${_bus}"; do
+    [[ -d "$_p" ]] || continue
+    basename "$(dirname "$(dirname "$_p")")"
+    return 0
+  done
+  return 1
+}
+
+# Pre-reset Gen1 downtrain, reused from the reboot-FLR monitor's proven fix for
+# the SAME underlying issue on this card family: the on-card PCIe switch's
+# post-reset link retrain at its max gen (Gen5) can fail, but forcing the
+# target to Gen1 BEFORE the reset/remove makes the retrain reliable. Applied
+# here to park-keepalive's remove+rescan / rescan-only recovery. Callers gate
+# this to the RX 9070 family via _is_rx9070 first (except the fully-missing-
+# directory rescan-only recovery, where _is_rx9070 cannot read the device's own
+# config space and this is attempted unconditionally instead -- see
+# _pci_bus_rescan_only).
+_pre_reset_gen1_downtrain() {
+  local _bdf="$1" _upstream _ctl2 _ctl _sta _i
+  _upstream="$(_gpu_upstream_port "$_bdf" 2>/dev/null || true)"
+  if [[ -z "$_upstream" ]]; then
+    jlog "$_bdf: pre-reset Gen1 downtrain skipped (could not find upstream port)"
+    return 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    jlog "$_bdf: pre-reset Gen1 downtrain skipped (setpci not installed)"
+    return 1
+  fi
+  _RESET_DETECTED_CAP="$(_port_speed_gen "$_upstream" max_link_speed 2>/dev/null || true)"
+  _RESET_DETECTED_CUR="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
+  _RESET_DETECTED_WIDTH="$(_port_link_width "$_upstream" 2>/dev/null || true)"
+  jlog "$_bdf: pre-reset Gen1 downtrain on upstream $_upstream (cap=Gen${_RESET_DETECTED_CAP:-?} cur=Gen${_RESET_DETECTED_CUR:-?} width=x${_RESET_DETECTED_WIDTH:-?})"
+  _ctl2="$(_setpci_word "$_upstream" 88.w 2>/dev/null || true)"
+  if [[ -z "$_ctl2" ]]; then
+    jlog "$_bdf: pre-reset downtrain aborted (could not read LnkCtl2 from $_upstream)"
+    return 1
+  fi
+  _RESET_SAVED_TARGET="$(printf '%d' "0x${_ctl2:3:1}" 2>/dev/null)" || true
+  local _saved_hi="${_ctl2:0:3}"
+  local _gen1_ctl2="${_saved_hi}1"
+  setpci -s "$_upstream" 88.w="$_gen1_ctl2" 2>/dev/null || true
+  jlog "$_bdf: LnkCtl2 set to $_gen1_ctl2 (was $_ctl2) — target Gen1"
+  _ctl="$(_setpci_word "$_upstream" 68.w 2>/dev/null || true)"
+  if [[ -n "$_ctl" ]]; then
+    setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+  fi
+  jlog "$_bdf: forced link retrain at Gen1 (LnkCtl bit 5 set)"
+  for _i in $(seq 1 20); do
+    _sta="$(_setpci_word "$_upstream" 6A.w 2>/dev/null || true)"
+    if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
+      jlog "$_bdf: link active at Gen1 after $(( _i * 100 ))ms"
+      return 0
+    fi
+    sleep 0.1
+  done
+  jlog "$_bdf: WARN link did not come back at Gen1 within 2s (continuing anyway)"
+  return 0
+}
+
+# Post-reset adaptive link restore (bounded descent). See
+# _pre_reset_gen1_downtrain for the rationale; callers gate this to the RX 9070
+# family via _is_rx9070 first, and must call _pre_reset_gen1_downtrain in the
+# SAME recovery attempt first so the *_DETECTED_*/_RESET_SAVED_TARGET globals
+# are fresh.
+_post_reset_restore_link() {
+  local _bdf="$1" _upstream _ctl _sta _i _target _neg_gen _g _ctl2 _width _p _best _saved_hi
+  _upstream="$(_gpu_upstream_port "$_bdf" 2>/dev/null || true)"
+  [[ -n "$_upstream" ]] || return 1
+  command -v setpci >/dev/null 2>&1 || return 1
+  for _i in $(seq 1 50); do
+    _sta="$(_setpci_word "$_upstream" 6A.w 2>/dev/null || true)"
+    if [[ -n "$_sta" ]] && (( (0x$_sta & 0x2000) != 0 )); then
+      jlog "$_bdf: link active after reset (waited $(( _i * 100 ))ms)"
+      break
+    fi
+    sleep 0.1
+  done
+  local _cap="${_RESET_DETECTED_CAP:-}"
+  local _cur="${_RESET_DETECTED_CUR:-}"
+  local _sav="${_RESET_SAVED_TARGET:-}"
+  if [[ -n "$_cap" && -n "$_cur" ]]; then
+    if (( _cur < _cap )) 2>/dev/null; then
+      _target="$_cur"
+      jlog "$_bdf: link was running Gen$_cur < cap Gen$_cap; adapting restore to Gen$_cur"
+    else
+      _target="$_cap"
+      jlog "$_bdf: restoring to detected link capability Gen$_cap"
+    fi
+  elif [[ -n "$_cap" ]]; then
+    _target="$_cap"
+  elif [[ -n "$_sav" ]]; then
+    _target="$_sav"
+  else
+    _target=5
+  fi
+  local _max="${VFIO_REBOOT_FLR_MAX_GEN:-}"
+  if [[ -n "$_max" ]] && (( _max >= 1 && _max <= 6 )) 2>/dev/null; then
+    if (( _target > _max )) 2>/dev/null; then
+      jlog "$_bdf: VFIO_REBOOT_FLR_MAX_GEN=$_max clamps restore target to Gen$_max"
+      _target="$_max"
+    fi
+  fi
+  if ! (( _target >= 1 && _target <= 6 )) 2>/dev/null; then
+    _target=5
+  fi
+  _best=0
+  for (( _g = _target; _g >= 1; _g-- )); do
+    _ctl2="$(_setpci_word "$_upstream" 88.w 2>/dev/null || true)"
+    if [[ -n "$_ctl2" ]]; then
+      _saved_hi="${_ctl2:0:3}"
+      setpci -s "$_upstream" 88.w="${_saved_hi}$(printf '%x' "$_g")" 2>/dev/null || true
+    fi
+    _ctl="$(_setpci_word "$_upstream" 68.w 2>/dev/null || true)"
+    if [[ -n "$_ctl" ]]; then
+      setpci -s "$_upstream" 68.w="$(printf '%04x' $(( 0x$_ctl | 0x0020 )))" 2>/dev/null || true
+    fi
+    jlog "$_bdf: forced link retrain to Gen$_g"
+    _neg_gen=""
+    for _p in $(seq 1 6); do
+      sleep 0.1
+      _neg_gen="$(_port_speed_gen "$_upstream" current_link_speed 2>/dev/null || true)"
+      if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _g )) 2>/dev/null; then
+        break
+      fi
+    done
+    _width="$(_port_link_width "$_upstream" 2>/dev/null || true)"
+    if [[ -n "$_neg_gen" ]] && (( _neg_gen >= _g )) 2>/dev/null; then
+      _best="$_neg_gen"
+      jlog "$_bdf: restore OK — link back at Gen$_neg_gen x${_width:-?}"
+      break
+    fi
+    if (( _g > 1 )); then
+      jlog "$_bdf: WARN link below Gen$_g (got Gen${_neg_gen:-?}); descending to Gen$((_g - 1))"
+    fi
+  done
+  if (( _best == 0 )) 2>/dev/null; then
+    jlog "$_bdf: WARN link restore did not settle at any gen >= 1 (cap=Gen${_RESET_DETECTED_CAP:-?}, pre=Gen${_RESET_DETECTED_CUR:-?} x${_RESET_DETECTED_WIDTH:-?}); possible hardware/signal-integrity issue"
+  elif (( _best < _target )) 2>/dev/null; then
+    jlog "$_bdf: WARN link restore settled at Gen$_best x${_width:-?} (wanted Gen$_target); link up but degraded"
+  fi
+  return 0
+}
+
+# Same last-resort recovery as the bind script's _pci_dev_remove_rescan. RX
+# 9070 family: wrapped with the SAME pre/post Gen1-downtrain and adaptive link
+# restore proven for the guest-reboot FLR path, since a plain `rescan` has no
+# mechanism of its own to force the PCIe link to retrain if it is already
+# down when the card zombies.
 _pci_dev_remove_rescan() {
-  local _bdf="$1" _sys
+  local _bdf="$1" _sys _rx9070=0
   [[ -n "$_bdf" ]] || return 1
   _sys="/sys/bus/pci/devices/$_bdf"
   [[ -d "$_sys" ]] || return 1
   jlog "$_bdf: park-keepalive attempting remove+rescan recovery"
+  if _is_rx9070 "$_bdf"; then
+    _rx9070=1
+    _pre_reset_gen1_downtrain "$_bdf"
+  fi
   if [[ -w "$_sys/remove" ]]; then
     echo 1 >"$_sys/remove" 2>/dev/null || true
     sleep 1
@@ -9090,6 +9604,9 @@ _pci_dev_remove_rescan() {
   echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
   sleep 1
   [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after rescan"; return 1; }
+  if (( _rx9070 )); then
+    _post_reset_restore_link "$_bdf"
+  fi
   echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
   echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
   sleep 0.3
@@ -9111,14 +9628,24 @@ _pci_dev_remove_rescan() {
 # comes back) and is NOT guaranteed to recover via rescan alone — a host
 # reboot may still be required — but retrying costs nothing and this must not
 # be silently skipped forever (see _run_once's directory-missing branch).
+# Also wrapped with the pre/post Gen1-downtrain (see _gpu_upstream_port's
+# pci_bus/<domain:bus> fallback, which resolves the upstream port even though
+# the device's own sysfs entry -- and therefore _is_rx9070's config-space
+# read -- is unavailable here). Attempted UNCONDITIONALLY rather than gated on
+# _is_rx9070: the device is already missing from the bus in this branch, so
+# there is no healthy card to harm, and a non-RX-9070 board simply gets a
+# harmless Gen1-then-adaptive-restore retrain attempt on its own already-dead
+# slot before the plain rescan.
 _pci_bus_rescan_only() {
   local _bdf="$1" _sys
   [[ -n "$_bdf" ]] || return 1
   _sys="/sys/bus/pci/devices/$_bdf"
   jlog "$_bdf: sysfs entry missing (fell off the bus); attempting bus rescan recovery"
+  _pre_reset_gen1_downtrain "$_bdf"
   echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
   sleep 1
   [[ -d "$_sys" ]] || { jlog "$_bdf: still did not reappear after rescan"; return 1; }
+  _post_reset_restore_link "$_bdf"
   echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
   echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
   sleep 0.3

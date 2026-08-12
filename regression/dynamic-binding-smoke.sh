@@ -1924,6 +1924,87 @@ else
   bad "Q3x --help text missing disclaimer for stealth-tuning flags"
 fi
 
+# --- Smoke Q3y: PCIe Gen1-downtrain/adaptive-restore wrapping on VM-stop
+# zombie recovery (remove+rescan / plain reset), reusing the same technique
+# already proven for the guest-reboot FLR path (install_reboot_flr_monitor).
+# Static checks only (no live PCIe hardware in CI); confirms the helper
+# functions exist in BOTH generated scripts and are actually called at each
+# wrapped recovery site, not just present-but-unused.
+for _gen in "$tmp/gen_bind.sh" "$tmp/gen_park_keepalive.sh"; do
+  _gen_name="$(basename "$_gen")"
+  if grep -Fq '_is_rx9070()' "$_gen" \
+    && grep -Fq '_pre_reset_gen1_downtrain()' "$_gen" \
+    && grep -Fq '_post_reset_restore_link()' "$_gen" \
+    && grep -Fq '_gpu_upstream_port()' "$_gen"; then
+    ok "Q3y $_gen_name defines _is_rx9070/_pre_reset_gen1_downtrain/_post_reset_restore_link/_gpu_upstream_port"
+  else
+    bad "Q3y $_gen_name missing one or more PCIe downtrain/restore helpers"
+  fi
+  # _gpu_upstream_port must fall back to the bridge's own pci_bus/<domain:bus>
+  # topology when the device's own sysfs entry is missing (needed for the
+  # fully-missing-directory rescan-only recovery path).
+  if grep -Fq 'pci_bus/' "$_gen"; then
+    ok "Q3y $_gen_name _gpu_upstream_port has a pci_bus/<domain:bus> fallback for a missing device entry"
+  else
+    bad "Q3y $_gen_name _gpu_upstream_port missing the pci_bus/ fallback"
+  fi
+done
+
+# Main bind script: _pci_dev_remove_rescan (used by --release's zombie
+# recovery and by bind_one's own remove+rescan fallbacks) must call both
+# halves of the wrap, gated on _is_rx9070.
+_bind_rr="$(sed -n '/^_pci_dev_remove_rescan()/,/^}/p' "$tmp/gen_bind.sh")"
+if echo "$_bind_rr" | grep -Fq '_is_rx9070 "$_bdf"' \
+  && echo "$_bind_rr" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
+  && echo "$_bind_rr" | grep -Fq '_post_reset_restore_link "$_bdf"'; then
+  ok "Q3y bind script _pci_dev_remove_rescan wraps remove+rescan with gated downtrain/restore"
+else
+  bad "Q3y bind script _pci_dev_remove_rescan missing gated downtrain/restore wrap"
+fi
+
+# bind_one(): both reset call sites (already-bound-but-dead recovery, and the
+# optional VFIO_DYNAMIC_PCI_RESET=1 pre-bind reset) must be wrapped too.
+_bind_one_fn="$(sed -n '/^bind_one()/,/^}/p' "$tmp/gen_bind.sh")"
+if echo "$_bind_one_fn" | grep -Fq 'config space unreadable' \
+  && echo "$_bind_one_fn" | grep -Fc '_pre_reset_gen1_downtrain "$dev"' | grep -Fxq 2 \
+  && echo "$_bind_one_fn" | grep -Fc '_post_reset_restore_link "$dev"' | grep -Fxq 2; then
+  ok "Q3y bind_one wraps BOTH reset call sites (dead-card recovery + opt-in pre-bind reset)"
+else
+  bad "Q3y bind_one missing gated downtrain/restore wrap on one or both reset call sites"
+fi
+
+# Park-keepalive script: _pci_dev_remove_rescan (zombie-while-parked recovery)
+# must be gated on _is_rx9070, same as the bind script's copy.
+_pk_rr="$(sed -n '/^_pci_dev_remove_rescan()/,/^}/p' "$tmp/gen_park_keepalive.sh")"
+if echo "$_pk_rr" | grep -Fq '_is_rx9070 "$_bdf"' \
+  && echo "$_pk_rr" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
+  && echo "$_pk_rr" | grep -Fq '_post_reset_restore_link "$_bdf"'; then
+  ok "Q3y park-keepalive _pci_dev_remove_rescan wraps remove+rescan with gated downtrain/restore"
+else
+  bad "Q3y park-keepalive _pci_dev_remove_rescan missing gated downtrain/restore wrap"
+fi
+
+# Park-keepalive script: _pci_bus_rescan_only (fully-missing-directory
+# recovery) cannot gate on _is_rx9070 (the device's own config space is
+# unreadable once it is gone from sysfs), so it must call the downtrain/
+# restore helpers UNCONDITIONALLY instead.
+_pk_rso="$(sed -n '/^_pci_bus_rescan_only()/,/^}/p' "$tmp/gen_park_keepalive.sh")"
+if echo "$_pk_rso" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
+  && echo "$_pk_rso" | grep -Fq '_post_reset_restore_link "$_bdf"' \
+  && ! echo "$_pk_rso" | grep -Fq '_is_rx9070'; then
+  ok "Q3y park-keepalive _pci_bus_rescan_only calls downtrain/restore unconditionally (no config-space read possible)"
+else
+  bad "Q3y park-keepalive _pci_bus_rescan_only missing unconditional downtrain/restore wrap"
+fi
+
+# VFIO_REBOOT_FLR_MAX_GEN's doc comment must reflect that it now caps ALL RX
+# 9070 link-retrain recovery paths, not just the original guest-reboot FLR.
+if grep -Fq 'shared by EVERY RX 9070 family PCIe Gen1-downtrain/adaptive-restore recovery' "$VFIO_SCRIPT"; then
+  ok "Q3y VFIO_REBOOT_FLR_MAX_GEN doc comment documents it caps every RX 9070 recovery path"
+else
+  bad "Q3y VFIO_REBOOT_FLR_MAX_GEN doc comment not broadened beyond guest-reboot FLR"
+fi
+
 if (( fail != 0 )); then
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1

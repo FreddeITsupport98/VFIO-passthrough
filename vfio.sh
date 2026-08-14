@@ -11498,12 +11498,20 @@ install_vbios_romfile() {
   fi
 
   # Candidates sub-header, then one color-coded verdict line per *.rom:
-  #   ✔ MATCH (green)        -- direct 55aa match
-  #   ✔ MATCH (green, repaired) -- aa55 techpowerup download, auto-repaired
+  #   ✔ MATCH (green)        -- direct 55aa match + EXACT/PADDED byte match to the card live ROM
+  #   ✔ MATCH (green, repaired) -- aa55 techpowerup download, auto-repaired + EXACT/PADDED byte match
+  #   ⚠ SKIPPED (yellow)    -- right PCI ID but WRONG content (BYTES DIFFER from the card live ROM);
+  #                           pinning it would give a black screen, so it is skipped + explained
   #   ✖ no match (red)       -- wrong card / not a ROM
   # The embedded identity (VER/PPID/board) follows on the same line so the
   # operator can see WHICH dump matched at a glance, instead of a wall of
-  # same-style note lines.
+  # same-style note lines. The live-ROM byte comparison (see
+  # _vbios_dump_live_rom / _vbios_compare_rom_to_live) is the guard that catches
+  # a dump with the right PCI ID but garbage content -- the exact trap seen with
+  # a generic tuf-gaming.rom that matched 1002:7550 in the header but was a wrong
+  # image (different sha256 from the card's actual ROM) and gave a black screen
+  # when pinned. If the live ROM cannot be read (not root / device busy under a
+  # running VM), fall back to PCI-ID-only matching with a skip note.
   say
   if (( ENABLE_COLOR )); then
     say "${C_CYAN}Candidates in ${_src_dir}${C_RESET} (${#_candidates[@]}):"
@@ -11512,21 +11520,72 @@ install_vbios_romfile() {
   fi
   local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0 _match_count=0
   _match_err="$(mktemp)"
+  # Dump the guest GPU's live option ROM from sysfs ONCE (best-effort) so each
+  # PCI-ID-matched candidate can be byte-compared against it BEFORE pinning.
+  # A BYTES-DIFFER candidate (right PCI ID, wrong content) is SKIPPED -- not
+  # pinned, not counted as a match -- with a clear explanation, so the operator
+  # knows their dump is bad instead of getting a silent black screen on next
+  # VM start. If the live ROM cannot be read (not root / device busy under a
+  # running VM), fall back to PCI-ID-only matching (current behavior) with a
+  # skip note.
+  local _live_rom="" _live_rom_skipped=0 _skipped_bytes=0 _skipped_nomatch=0 _bv
+  _live_rom="$(_vbios_dump_live_rom "$_guest_gpu" 2>/dev/null || true)"
+  if [[ -z "$_live_rom" ]]; then
+    _live_rom_skipped=1
+  fi
   for _f in "${_candidates[@]}"; do
     _f_name="$(basename "$_f")"
     if _f_desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_match_err")"; then
-      if (( ENABLE_COLOR )); then
-        say "  ${C_GREEN}✔ MATCH${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
-        note "    $_f_desc"
+      # PCI-ID match. Gate on the live-ROM byte comparison before counting it.
+      if (( _live_rom_skipped )); then
+        if (( ENABLE_COLOR )); then
+          say "  ${C_GREEN}✔ MATCH${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
+          note "    $_f_desc"
+          note "    ${C_YELLOW}(live ROM byte-comparison skipped — could not read sysfs ROM; run as root with the VM shut off to verify content)${C_RESET}"
+        else
+          say "  ✔ MATCH: $_f_name"
+          note "    $_f_desc"
+          note "    (live ROM byte-comparison skipped — could not read sysfs ROM; run as root with the VM shut off to verify content)"
+        fi
+        _match_count=$((_match_count+1))
+        if [[ -z "$_match_file" ]]; then
+          _match_file="$_f"
+          _match_desc="$_f_desc"
+          _match_repaired=0
+        fi
+      elif _bv="$(_vbios_compare_rom_to_live "$_f" "$_live_rom" 2>/dev/null)"; then
+        # EXACT or PADDED byte match -- safe to pin.
+        if (( ENABLE_COLOR )); then
+          say "  ${C_GREEN}✔ MATCH${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
+          note "    $_f_desc"
+          note "    ${C_GREEN}✔ $_bv${C_RESET}"
+        else
+          say "  ✔ MATCH: $_f_name"
+          note "    $_f_desc"
+          note "    + $_bv"
+        fi
+        _match_count=$((_match_count+1))
+        if [[ -z "$_match_file" ]]; then
+          _match_file="$_f"
+          _match_desc="$_f_desc"
+          _match_repaired=0
+        fi
       else
-        say "  ✔ MATCH: $_f_name"
-        note "    $_f_desc"
-      fi
-      _match_count=$((_match_count+1))
-      if [[ -z "$_match_file" ]]; then
-        _match_file="$_f"
-        _match_desc="$_f_desc"
-        _match_repaired=0
+        # BYTES DIFFER -- right PCI ID but wrong content. SKIP pinning this
+        # candidate and explain why, so the operator knows their dump is bad
+        # (not that the script silently refused or the card is broken).
+        _skipped_bytes=$((_skipped_bytes+1))
+        if (( ENABLE_COLOR )); then
+          say "  ${C_YELLOW}⚠ SKIPPED${C_RESET} (right PCI ID, wrong content): ${C_BOLD}$_f_name${C_RESET}"
+          note "    $_f_desc"
+          note "    ${C_RED}✖ $_bv${C_RESET}"
+          note "    ${C_YELLOW}Pinning this dump would give a black screen (no OVMF/BIOS logo), so it was skipped. Dump your own card with amdvbflash (Linux) or GPU-Z (Windows), or download a subsystem-matching dump from the listings above, then re-run.${C_RESET}"
+        else
+          say "  SKIPPED (right PCI ID, wrong content): $_f_name"
+          note "    $_f_desc"
+          note "    - $_bv"
+          note "    Pinning this dump would give a black screen (no OVMF/BIOS logo), so it was skipped. Dump your own card with amdvbflash (Linux) or GPU-Z (Windows), or download a subsystem-matching dump from the listings above, then re-run."
+        fi
       fi
     else
       # Byte-swap auto-repair: techpowerup downloads are systematically
@@ -11540,38 +11599,122 @@ install_vbios_romfile() {
       local _repair_res _repair_path _repair_desc
       if _repair_res="$(_vbios_autorepair_byteswap "$_f" "$_guest_gpu" 2>/dev/null)"; then
         IFS='|' read -r _repair_path _repair_desc <<<"$_repair_res"
-        if (( ENABLE_COLOR )); then
-          say "  ${C_GREEN}✔ MATCH${C_RESET} ${C_YELLOW}(auto-repaired)${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
-          note "    $_repair_desc"
+        # PCI-ID match on the repaired copy. Gate on the live-ROM byte comparison
+        # (compare the REPAIRED temp, which is what would actually be pinned).
+        if (( _live_rom_skipped )); then
+          if (( ENABLE_COLOR )); then
+            say "  ${C_GREEN}✔ MATCH${C_RESET} ${C_YELLOW}(auto-repaired)${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
+            note "    $_repair_desc"
+            note "    ${C_YELLOW}(live ROM byte-comparison skipped — could not read sysfs ROM)${C_RESET}"
+          else
+            say "  ✔ MATCH (auto-repaired): $_f_name"
+            note "    $_repair_desc"
+            note "    (live ROM byte-comparison skipped — could not read sysfs ROM)"
+          fi
+          _match_count=$((_match_count+1))
+          if [[ -z "$_match_file" ]]; then
+            _match_file="$_repair_path"
+            _match_desc="$_repair_desc (auto-repaired from byte-swapped $_f_name)"
+            _match_repaired=1
+          else
+            rm -f "$_repair_path" 2>/dev/null || true
+            rmdir "$(dirname "$_repair_path")" 2>/dev/null || true
+          fi
+        elif _bv="$(_vbios_compare_rom_to_live "$_repair_path" "$_live_rom" 2>/dev/null)"; then
+          if (( ENABLE_COLOR )); then
+            say "  ${C_GREEN}✔ MATCH${C_RESET} ${C_YELLOW}(auto-repaired)${C_RESET}: ${C_BOLD}$_f_name${C_RESET}"
+            note "    $_repair_desc"
+            note "    ${C_GREEN}✔ $_bv${C_RESET}"
+          else
+            say "  ✔ MATCH (auto-repaired): $_f_name"
+            note "    $_repair_desc"
+            note "    + $_bv"
+          fi
+          _match_count=$((_match_count+1))
+          if [[ -z "$_match_file" ]]; then
+            _match_file="$_repair_path"
+            _match_desc="$_repair_desc (auto-repaired from byte-swapped $_f_name)"
+            _match_repaired=1
+          else
+            rm -f "$_repair_path" 2>/dev/null || true
+            rmdir "$(dirname "$_repair_path")" 2>/dev/null || true
+          fi
         else
-          say "  ✔ MATCH (auto-repaired): $_f_name"
-          note "    $_repair_desc"
-        fi
-        _match_count=$((_match_count+1))
-        if [[ -z "$_match_file" ]]; then
-          _match_file="$_repair_path"
-          _match_desc="$_repair_desc (auto-repaired from byte-swapped $_f_name)"
-          _match_repaired=1
-        else
+          # Repaired copy has right PCI ID but wrong content -- SKIP + clean up temp.
+          _skipped_bytes=$((_skipped_bytes+1))
           rm -f "$_repair_path" 2>/dev/null || true
           rmdir "$(dirname "$_repair_path")" 2>/dev/null || true
+          if (( ENABLE_COLOR )); then
+            say "  ${C_YELLOW}⚠ SKIPPED${C_RESET} (right PCI ID, wrong content): ${C_BOLD}$_f_name${C_RESET} ${C_YELLOW}(auto-repaired)${C_RESET}"
+            note "    $_repair_desc"
+            note "    ${C_RED}✖ $_bv${C_RESET}"
+            note "    ${C_YELLOW}Pinning this dump would give a black screen (no OVMF/BIOS logo), so it was skipped. Dump your own card with amdvbflash (Linux) or GPU-Z (Windows), or download a subsystem-matching dump from the listings above, then re-run.${C_RESET}"
+          else
+            say "  SKIPPED (right PCI ID, wrong content): $_f_name (auto-repaired)"
+            note "    $_repair_desc"
+            note "    - $_bv"
+            note "    Pinning this dump would give a black screen (no OVMF/BIOS logo), so it was skipped. Dump your own card with amdvbflash (Linux) or GPU-Z (Windows), or download a subsystem-matching dump from the listings above, then re-run."
+          fi
         fi
       else
+        # No PCI-ID match (wrong card / not a valid ROM / byte-swap repair
+        # also failed). SKIP pinning this candidate and explain why, so the
+        # operator knows their dump is for the wrong GPU (or not a ROM at all)
+        # instead of wondering why nothing got injected.
+        _skipped_nomatch=$((_skipped_nomatch+1))
+        local _nomatch_reason
+        _nomatch_reason="$(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
         if (( ENABLE_COLOR )); then
-          say "  ${C_RED}✖ no match${C_RESET}: ${C_BOLD}$_f_name${C_RESET} -- $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+          say "  ${C_RED}✖ SKIPPED${C_RESET} (does not match the guest GPU): ${C_BOLD}$_f_name${C_RESET}"
+          note "    $_nomatch_reason"
+          note "    ${C_YELLOW}This dump is NOT for your guest GPU (PCI ID $_gpu_id), so it was skipped to avoid pinning a wrong-card ROM. Use a dump whose embedded PCI ID is $_gpu_id (dump your own card, or download a subsystem-matching dump from the listings above), then re-run.${C_RESET}"
         else
-          say "  no match: $_f_name -- $(cat "$_match_err" 2>/dev/null || echo "not a recognized GPU vBIOS dump")"
+          say "  SKIPPED (does not match the guest GPU): $_f_name"
+          note "    $_nomatch_reason"
+          note "    This dump is NOT for your guest GPU (PCI ID $_gpu_id), so it was skipped to avoid pinning a wrong-card ROM. Use a dump whose embedded PCI ID is $_gpu_id (dump your own card, or download a subsystem-matching dump from the listings above), then re-run."
         fi
       fi
     fi
   done
-  rm -f "$_match_err" 2>/dev/null || true
+  rm -f "$_match_err" "$_live_rom" 2>/dev/null || true
 
   if [[ -z "$_match_file" ]]; then
+    if (( _skipped_bytes > 0 )); then
+      # A candidate matched the PCI ID but had wrong content (BYTES DIFFER) and
+      # was skipped -- give a clearer message than the generic "no match" so the
+      # operator knows their dump is bad, not that no dump matched.
+      if (( ENABLE_COLOR )); then
+        say "  ${C_YELLOW}⚠ WARN${C_RESET}: $_skipped_bytes candidate(s) matched the guest GPU PCI ID ($_gpu_id) but had WRONG content (BYTES DIFFER from the card live ROM) and were SKIPPED to avoid a black screen."
+      else
+        say "  WARN: $_skipped_bytes candidate(s) matched the guest GPU PCI ID ($_gpu_id) but had WRONG content (BYTES DIFFER from the card live ROM) and were SKIPPED to avoid a black screen."
+      fi
+      note "       vBIOS ROM auto-injection was skipped this run. Replace the bad dump(s) in $_src_dir with a clean one (dump your own card with amdvbflash/GPU-Z, or download a subsystem-matching dump from the listings below), then re-run."
+      _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+      return 0
+    fi
+    if (( _skipped_nomatch > 0 )); then
+      # No candidate matched the guest GPU PCI ID at all (wrong card / not a
+      # valid ROM). Explain WHY nothing was pinned so the operator knows their
+      # dump is for the wrong GPU, not that the script silently did nothing.
+      if (( ENABLE_COLOR )); then
+        say "  ${C_YELLOW}⚠ WARN${C_RESET}: $_skipped_nomatch candidate(s) in $_src_dir do NOT match the guest GPU (PCI ID $_gpu_id) and were SKIPPED to avoid pinning a wrong-card ROM."
+      else
+        say "  WARN: $_skipped_nomatch candidate(s) in $_src_dir do NOT match the guest GPU (PCI ID $_gpu_id) and were SKIPPED to avoid pinning a wrong-card ROM."
+      fi
+      note "       vBIOS ROM auto-injection was skipped this run. Add a *.rom dump whose embedded PCI ID is $_gpu_id to $_src_dir (dump your own card with amdvbflash/GPU-Z, or download a subsystem-matching dump from the listings below), then re-run."
+      note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
+      _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+      return 0
+    fi
+    # Defensive fallback: _match_file empty with no skip counters incremented
+    # should not be reachable (every non-matching candidate increments
+    # _skipped_nomatch, and every PCI-ID match either sets _match_file or
+    # increments _skipped_bytes), but keep a clear message just in case a
+    # future logic change introduces a gap.
     if (( ENABLE_COLOR )); then
-      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no candidate ROM could be pinned for the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
     else
-      say "  WARN: no candidate ROM matches the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
+      say "  WARN: no candidate ROM could be pinned for the guest GPU (PCI ID $_gpu_id); nothing auto-injected."
     fi
     note "       Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
     note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"

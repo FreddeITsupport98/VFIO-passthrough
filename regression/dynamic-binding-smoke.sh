@@ -2291,15 +2291,16 @@ fi
 # install_vbios_romfile so the skip paths can show EVERY subsystem-compatible
 # listing (the ?did= filter guarantees they all share the guest GPU's exact
 # subsystem). _vbios_print_compatible_list must be defined AND called from all
-# 3 skip paths (no folder / no *.rom / no match) so the operator sees the full
-# list of options to download when no local dump is available yet.
+# 5 skip paths (no folder / no *.rom / BYTES-DIFFER skip / no-PCI-ID-match
+# skip / defensive fallback) so the operator sees the full list of options to
+# download when no local dump is available yet.
 if grep -Fq '_vbios_techpowerup_list_all()' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_techpowerup_list_all "$_tpu_url"' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_print_compatible_list()' "$VFIO_SCRIPT" \
-  && echo "$_install_vbios_fn" | grep -Fc '_vbios_print_compatible_list "$_tpu_list" "$_tpu_did"' | grep -Fxq 3; then
-  ok "Q3z _vbios_techpowerup_list_all + _vbios_print_compatible_list are defined + wired into all 3 skip paths"
+  && echo "$_install_vbios_fn" | grep -Fc '_vbios_print_compatible_list "$_tpu_list" "$_tpu_did"' | grep -Fxq 5; then
+  ok "Q3z _vbios_techpowerup_list_all + _vbios_print_compatible_list are defined + wired into all 5 skip paths"
 else
-  bad "Q3z _vbios_techpowerup_list_all or _vbios_print_compatible_list missing, not wired in, or not called from all 3 skip paths"
+  bad "Q3z _vbios_techpowerup_list_all or _vbios_print_compatible_list missing, not wired in, or not called from all 5 skip paths"
 fi
 # LIVE: feed _vbios_techpowerup_list_all a mock search-page HTML (via a fake
 # curl that echoes it) and assert it returns one "<id>|<detail>|<filename>"
@@ -2453,6 +2454,33 @@ if grep -Fq 'ROM signature is byte-swapped' "$VFIO_SCRIPT" \
   ok "Q3z matcher + resolver + autorepair wiring all present (aa55 detect, AUTO-REPAIRS caveat, candidate-loop repair + cleanup)"
 else
   bad "Q3z matcher/resolver/autorepair wiring missing (aa55 detect, AUTO-REPAIRS caveat, or candidate-loop repair)"
+fi
+# Static: install_vbios_romfile must gate pinning on the live-ROM byte
+# comparison — a candidate that PASSES the PCI-ID matcher but has WRONG content
+# (BYTES DIFFER from the card live ROM) must be SKIPPED (not pinned, not counted
+# as a match) with a clear explanation, so the operator knows their dump is bad
+# instead of getting a silent black screen on next VM start. This is the exact
+# tuf-gaming.rom trap: matched 1002:7550 in the header but was a garbage image.
+if echo "$_install_vbios_fn" | grep -Fq '_vbios_dump_live_rom "$_guest_gpu"' \
+  && echo "$_install_vbios_fn" | grep -Fq '_vbios_compare_rom_to_live "$_f" "$_live_rom"' \
+  && echo "$_install_vbios_fn" | grep -Fq '_skipped_bytes=$((_skipped_bytes+1))' \
+  && echo "$_install_vbios_fn" | grep -Fq 'SKIPPED (right PCI ID, wrong content)' \
+  && echo "$_install_vbios_fn" | grep -Fq 'Pinning this dump would give a black screen' \
+  && echo "$_install_vbios_fn" | grep -Fq 'were SKIPPED to avoid a black screen'; then
+  ok "Q3z install_vbios_romfile gates on live-ROM byte comparison + SKIPS+explains on BYTES DIFFER (right PCI ID, wrong content)"
+else
+  bad "Q3z install_vbios_romfile missing the live-ROM gate or the BYTES-DIFFER skip+explanation"
+fi
+# Static: install_vbios_romfile must SKIP a candidate that does NOT match the
+# guest GPU PCI ID (wrong card / not a valid ROM) and explain why, instead of a
+# bare "no match" line — so the operator knows their dump is for the wrong GPU.
+if echo "$_install_vbios_fn" | grep -Fq '_skipped_nomatch=$((_skipped_nomatch+1))' \
+  && echo "$_install_vbios_fn" | grep -Fq 'SKIPPED (does not match the guest GPU)' \
+  && echo "$_install_vbios_fn" | grep -Fq 'NOT for your guest GPU' \
+  && echo "$_install_vbios_fn" | grep -Fq 'were SKIPPED to avoid pinning a wrong-card ROM'; then
+  ok "Q3z install_vbios_romfile SKIPS+explains on no-PCI-ID-match (wrong card / not a valid ROM)"
+else
+  bad "Q3z install_vbios_romfile missing the no-PCI-ID-match skip+explanation"
 fi
 _tpu_fn_body="$(sed -n '/^_vbios_techpowerup_url() {/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_tpu_fn_body" ]]; then

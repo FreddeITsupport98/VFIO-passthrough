@@ -7960,6 +7960,45 @@ _post_reset_restore_link() {
   return 0
 }
 
+# Gated soft function-level reset for the RX 9070 family, wrapping the SAME
+# pre-reset Gen1 downtrain + post-reset adaptive link restore already proven in
+# the reboot-FLR monitor (see _pre_reset_gen1_downtrain / _post_reset_restore_link).
+# Shared by bind_one()'s THREE reset call sites - (1) already-bound-but-ALIVE
+# soft FLR to clear a parked-session display wedge after shutdown->start,
+# (2) already-bound-but-DEAD recovery (config space unreadable), and (3) the
+# opt-in VFIO_DYNAMIC_PCI_RESET=1 pre-bind reset - so the three sites cannot
+# drift out of sync. Non-RX-9070 cards get a plain reset (harmless on a healthy
+# card). The caller owns the post-reset alive check + logging, since those
+# differ per site.
+#   $1 = BDF
+#   $2 = optional jlog message emitted right after the reset write (empty = none)
+#   $3 = guard the reset write behind [[ -w $sys/reset ]] (1=yes [default],
+#        0=no, for callers that already verified writability)
+#   $4 = post-reset sleep in seconds (default 0.3)
+_rx9070_gated_soft_flr() {
+  local _bdf="$1" _msg="${2:-}" _guard="${3:-1}" _sleep="${4:-0.3}" _sys _rx=0
+  _sys="/sys/bus/pci/devices/$_bdf"
+  if _is_rx9070 "$_bdf"; then
+    _rx=1
+    _pre_reset_gen1_downtrain "$_bdf"
+  fi
+  if (( _guard )); then
+    if [[ -w "$_sys/reset" ]]; then
+      echo 1 >"$_sys/reset" 2>/dev/null || true
+      if [[ -n "$_msg" ]]; then jlog "$_bdf: $_msg"; fi
+      sleep "$_sleep"
+    fi
+  else
+    echo 1 >"$_sys/reset" 2>/dev/null || true
+    if [[ -n "$_msg" ]]; then jlog "$_bdf: $_msg"; fi
+    sleep "$_sleep"
+  fi
+  if (( _rx )); then
+    _post_reset_restore_link "$_bdf"
+  fi
+  return 0
+}
+
 # Last-resort recovery for a dead PCI device: remove it from the bus, rescan
 # the whole PCI bus to force re-enumeration, then re-bind to vfio-pci. This is
 # the final recovery step before telling the user to reboot the host. On RX
@@ -8055,19 +8094,7 @@ bind_one() {
         # Gated to RX 9070 family for the Gen1 downtrain/adaptive restore
         # (other cards do a plain reset, which is harmless on a healthy card).
         jlog "$dev: already on vfio-pci (alive); applying soft FLR to clear display state from previous VM session"
-        local _flr_rx9070=0
-        if _is_rx9070 "$dev"; then
-          _flr_rx9070=1
-          _pre_reset_gen1_downtrain "$dev"
-        fi
-        if [[ -w "$sys/reset" ]]; then
-          echo 1 >"$sys/reset" 2>/dev/null || true
-          jlog "$dev: soft FLR applied (display wedge clear for next VM session)"
-          sleep 0.3
-        fi
-        if (( _flr_rx9070 )); then
-          _post_reset_restore_link "$dev"
-        fi
+        _rx9070_gated_soft_flr "$dev" "soft FLR applied (display wedge clear for next VM session)" 1 0.3
         # Verify still alive after the FLR. If the FLR killed it (rare but
         # possible on a borderline card), fall through to the dead-card
         # recovery path below instead of returning success.
@@ -8080,18 +8107,7 @@ bind_one() {
       fi
       jlog "$dev: on vfio-pci but config space unreadable (header type 127 / card gone); attempting PCI reset + re-probe"
       say "WARN: $dev is bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: card fell off the bus). Attempting a PCI function-level reset + re-probe." >&2
-      local _reset_rx9070=0
-      if _is_rx9070 "$dev"; then
-        _reset_rx9070=1
-        _pre_reset_gen1_downtrain "$dev"
-      fi
-      if [[ -w "$sys/reset" ]]; then
-        echo 1 >"$sys/reset" 2>/dev/null || true
-        sleep 0.3
-      fi
-      if (( _reset_rx9070 )); then
-        _post_reset_restore_link "$dev"
-      fi
+      _rx9070_gated_soft_flr "$dev" "" 1 0.3
       if _pci_dev_alive "$dev"; then
         jlog "$dev: recovered after PCI reset (alive); keeping on vfio-pci"
         return 0
@@ -8127,17 +8143,7 @@ bind_one() {
   # device must be unbound). Default OFF: a reset on a healthy card is unnecessary
   # and on a mid-reset card can worsen the state; enable only on repeated failures.
   if [[ "${VFIO_DYNAMIC_PCI_RESET:-0}" == "1" && -w "$sys/reset" ]]; then
-    local _prebind_rx9070=0
-    if _is_rx9070 "$dev"; then
-      _prebind_rx9070=1
-      _pre_reset_gen1_downtrain "$dev"
-    fi
-    echo 1 >"$sys/reset" 2>/dev/null || true
-    jlog "$dev: pci reset attempted"
-    sleep 0.1
-    if (( _prebind_rx9070 )); then
-      _post_reset_restore_link "$dev"
-    fi
+    _rx9070_gated_soft_flr "$dev" "pci reset attempted" 0 0.1
   fi
 
   echo vfio-pci >"$sys/driver_override"

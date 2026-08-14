@@ -851,8 +851,8 @@ assert_contains_text \
   'if _pci_dev_alive "$dev"; then' \
   "$bind_block"
 assert_contains_text \
-  "Q3n early-return attempts PCI reset when dead" \
-  'echo 1 >"$sys/reset" 2>/dev/null || true' \
+  "Q3n early-return attempts PCI reset when dead (via _rx9070_gated_soft_flr)" \
+  'echo 1 >"$_sys/reset" 2>/dev/null || true' \
   "$bind_block"
 assert_contains_text \
   "Q3n early-return dies with header 127 message when unrecoverable" \
@@ -1856,8 +1856,8 @@ assert_contains_text \
   '-w "$sys/reset"' \
   "$bind_block"
 assert_contains_text \
-  "R6 bind_one writes reset" \
-  'echo 1 >"$sys/reset"' \
+  "R6 bind_one writes reset (via _rx9070_gated_soft_flr)" \
+  'echo 1 >"$_sys/reset"' \
   "$bind_block"
 assert_contains_file \
   "R6 write_conf persists VFIO_DYNAMIC_PCI_RESET" \

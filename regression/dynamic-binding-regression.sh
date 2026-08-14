@@ -1975,6 +1975,28 @@ assert_contains_text \
   'jlog "$dev: already on vfio-pci (alive); applying soft FLR' \
   "$bind_block"
 
+# --- Functional P1b: after the alive-parked soft FLR, rebind vfio-pci to restore the ROM BAR ---
+# The soft FLR zeroes the ROM BAR -> qemu's live option-ROM read at the fresh VM
+# start returns 0xffff (dmesg: "Invalid PCI ROM header signature: expecting
+# 0xaa55, got 0xffff") -> OVMF cannot run the GPU's UEFI GOP -> no firmware logo /
+# signal but black until the Windows driver loads. This is exactly why a warm
+# reboot (qemu never re-reads the ROM, display already POSTed) works but a
+# shutdown->start does not. The fix: unbind vfio-pci and rebind so the PCI core
+# re-enables the device and restores the ROM BAR (same as a cold amdgpu ->
+# vfio-pci handoff). bind_one must NOT return 0 immediately after the FLR.
+assert_contains_text \
+  "P1b bind_one jlogs soft-FLR rebind to restore ROM/BARs" \
+  'jlog "$dev: alive after soft FLR; rebinding vfio-pci to restore ROM/BARs' \
+  "$bind_block"
+assert_contains_text \
+  "P1b bind_one unbinds vfio-pci after the soft FLR (post-FLR rebind)" \
+  'echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/unbind"' \
+  "$bind_block"
+assert_contains_text \
+  "P1b bind_one rebinds vfio-pci after the soft FLR" \
+  'jlog "$dev: bound to vfio-pci (verified, alive) after soft-FLR rebind"' \
+  "$bind_block"
+
 # --- Functional P2: retry loop logs which attempt succeeded ---
 assert_contains_text \
   "P2 bind_one jlogs bound-on-attempt" \

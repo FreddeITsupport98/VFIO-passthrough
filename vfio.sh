@@ -8099,10 +8099,41 @@ bind_one() {
         # possible on a borderline card), fall through to the dead-card
         # recovery path below instead of returning success.
         if _pci_dev_alive "$dev"; then
-          jlog "$dev: alive after soft FLR; ready for VM start"
-          return 0
+          # Soft FLR zeroed the ROM BAR, so qemu's live option-ROM read at the
+          # fresh VM start returns 0xffff (dmesg: "Invalid PCI ROM header
+          # signature: expecting 0xaa55, got 0xffff") -> OVMF cannot run the
+          # GPU's UEFI GOP -> no firmware logo / signal but black until the
+          # Windows driver loads. This is exactly why a warm reboot (qemu
+          # never re-reads the ROM, display already POSTed) works but a
+          # shutdown->start does not. Fix: rebind vfio-pci so the PCI core
+          # re-enables the device and restores the ROM BAR, the same way a
+          # cold amdgpu -> vfio-pci handoff does.
+          jlog "$dev: alive after soft FLR; rebinding vfio-pci to restore ROM/BARs (prevents 0xffff ROM read so OVMF can re-POST)"
+          if [[ -w "/sys/bus/pci/drivers/vfio-pci/unbind" ]]; then
+            echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/unbind" 2>/dev/null || true
+            jlog "$dev: unbind from vfio-pci (post-FLR rebind)"
+            sleep 0.3
+          fi
+          echo vfio-pci >"$sys/driver_override" 2>/dev/null || true
+          local _rb_att _rb_maxa=3 _rb_bound=0 _rb_drv
+          for _rb_att in $(seq 1 "$_rb_maxa"); do
+            echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" 2>/dev/null || true
+            _rb_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+            if [[ "$_rb_drv" == "vfio-pci" ]]; then
+              jlog "$dev: rebound on attempt $_rb_att"
+              _rb_bound=1
+              break
+            fi
+            (( _rb_att < _rb_maxa )) && sleep 0.2
+          done
+          if (( _rb_bound )) && _pci_dev_alive "$dev"; then
+            jlog "$dev: bound to vfio-pci (verified, alive) after soft-FLR rebind"
+            return 0
+          fi
+          jlog "$dev: WARN soft-FLR rebind failed; falling through to dead-card recovery"
+        else
+          jlog "$dev: WARN dead after soft FLR (borderline card); falling through to dead-card recovery"
         fi
-        jlog "$dev: WARN dead after soft FLR (borderline card); falling through to dead-card recovery"
         # Fall through to the dead-card recovery below (do NOT return 0).
       fi
       jlog "$dev: on vfio-pci but config space unreadable (header type 127 / card gone); attempting PCI reset + re-probe"

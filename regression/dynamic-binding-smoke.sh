@@ -1968,15 +1968,18 @@ else
   bad "Q3y bind script _pci_dev_remove_rescan missing gated downtrain/restore wrap"
 fi
 
-# bind_one(): both reset call sites (already-bound-but-dead recovery, and the
-# optional VFIO_DYNAMIC_PCI_RESET=1 pre-bind reset) must be wrapped too.
+# bind_one(): all THREE reset call sites must be wrapped with the gated Gen1
+# downtrain + adaptive restore — (1) already-bound-but-ALIVE soft FLR to clear
+# the display wedge after a parked shutdown->start, (2) already-bound-but-DEAD
+# recovery (config space unreadable), and (3) the optional
+# VFIO_DYNAMIC_PCI_RESET=1 pre-bind reset.
 _bind_one_fn="$(sed -n '/^bind_one()/,/^}/p' "$tmp/gen_bind.sh")"
 if echo "$_bind_one_fn" | grep -Fq 'config space unreadable' \
-  && echo "$_bind_one_fn" | grep -Fc '_pre_reset_gen1_downtrain "$dev"' | grep -Fxq 2 \
-  && echo "$_bind_one_fn" | grep -Fc '_post_reset_restore_link "$dev"' | grep -Fxq 2; then
-  ok "Q3y bind_one wraps BOTH reset call sites (dead-card recovery + opt-in pre-bind reset)"
+  && echo "$_bind_one_fn" | grep -Fc '_pre_reset_gen1_downtrain "$dev"' | grep -Fxq 3 \
+  && echo "$_bind_one_fn" | grep -Fc '_post_reset_restore_link "$dev"' | grep -Fxq 3; then
+  ok "Q3y bind_one wraps ALL THREE reset call sites (alive soft-FLR + dead-card recovery + opt-in pre-bind reset)"
 else
-  bad "Q3y bind_one missing gated downtrain/restore wrap on one or both reset call sites"
+  bad "Q3y bind_one missing gated downtrain/restore wrap on one or more of the three reset call sites"
 fi
 
 # Park-keepalive script: _pci_dev_remove_rescan (zombie-while-parked recovery)

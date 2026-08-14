@@ -8042,8 +8042,41 @@ bind_one() {
     _already_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
     if [[ "$_already_drv" == "vfio-pci" ]]; then
       if _pci_dev_alive "$dev"; then
-        jlog "$dev: already on vfio-pci (alive), skipping rebind"
-        return 0
+        # Card is alive AND already on vfio-pci from a previous VM session
+        # (parked after shutdown). BUT the display engine may still be in a
+        # stale state from that previous session — OVMF cannot re-POST on a
+        # wedged display even though the PCI device itself is alive (config
+        # space readable, vendor not 0xffff). This is the exact gap between a
+        # warm reboot (where the reboot-FLR monitor does a soft FLR to clear
+        # the display wedge) and a normal shutdown→start (where no FLR was
+        # done, so the display stays wedged and the monitor gets no signal).
+        # Fix: do a soft FLR here — same technique as do_flr() in the
+        # reboot-FLR monitor — to clear the display engine so OVMF can re-POST.
+        # Gated to RX 9070 family for the Gen1 downtrain/adaptive restore
+        # (other cards do a plain reset, which is harmless on a healthy card).
+        jlog "$dev: already on vfio-pci (alive); applying soft FLR to clear display state from previous VM session"
+        local _flr_rx9070=0
+        if _is_rx9070 "$dev"; then
+          _flr_rx9070=1
+          _pre_reset_gen1_downtrain "$dev"
+        fi
+        if [[ -w "$sys/reset" ]]; then
+          echo 1 >"$sys/reset" 2>/dev/null || true
+          jlog "$dev: soft FLR applied (display wedge clear for next VM session)"
+          sleep 0.3
+        fi
+        if (( _flr_rx9070 )); then
+          _post_reset_restore_link "$dev"
+        fi
+        # Verify still alive after the FLR. If the FLR killed it (rare but
+        # possible on a borderline card), fall through to the dead-card
+        # recovery path below instead of returning success.
+        if _pci_dev_alive "$dev"; then
+          jlog "$dev: alive after soft FLR; ready for VM start"
+          return 0
+        fi
+        jlog "$dev: WARN dead after soft FLR (borderline card); falling through to dead-card recovery"
+        # Fall through to the dead-card recovery below (do NOT return 0).
       fi
       jlog "$dev: on vfio-pci but config space unreadable (header type 127 / card gone); attempting PCI reset + re-probe"
       say "WARN: $dev is bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: card fell off the bus). Attempting a PCI function-level reset + re-probe." >&2

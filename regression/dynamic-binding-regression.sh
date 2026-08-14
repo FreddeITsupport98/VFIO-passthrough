@@ -1966,10 +1966,13 @@ else
   printf 'PASS: B2 --release routed through _release\n'
 fi
 
-# --- Functional P1: already-on-vfio-pci early-return is journal-logged (alive) ---
+# --- Functional P1: already-on-vfio-pci applies a soft FLR to clear display state ---
+# (was: "skipping rebind" — now does a soft FLR so OVMF can re-POST after a
+# normal shutdown or forced kill, same as the reboot-FLR monitor does for a
+# warm reboot.)
 assert_contains_text \
-  "P1 bind_one jlogs already-on-vfio-pci skip" \
-  'jlog "$dev: already on vfio-pci (alive), skipping rebind"' \
+  "P1 bind_one jlogs already-on-vfio-pci soft FLR" \
+  'jlog "$dev: already on vfio-pci (alive); applying soft FLR' \
   "$bind_block"
 
 # --- Functional P2: retry loop logs which attempt succeeded ---

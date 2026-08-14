@@ -11233,6 +11233,102 @@ _vbios_autorepair_byteswap() {
   return 1
 }
 
+# Dump the guest GPU's live option ROM from sysfs to a temp file and echo the
+# temp path on stdout. The live ROM is what qemu/vfio-pci reads at VM start
+# when no <rom file=.../> pin is set, so comparing a candidate *.rom file
+# against it catches a dump that has the RIGHT embedded PCI ID (passes the
+# matcher) but WRONG content -- the exact trap seen with a generic/
+# mis-extracted tuf-gaming.rom that matched 1002:7550 in the header but was a
+# garbage image (doubled 55 aa 55 signature, real image buried at 0x40000,
+# different sha256 from the card's actual 116736-byte ROM), which gave a black
+# screen when pinned. Best-effort: enabling the ROM BAR needs root and the
+# device not exclusively held by a running VM's vfio-pci; on failure prints
+# nothing and returns 1 (caller falls back to PCI-ID-only matching with a
+# "live ROM comparison skipped" note). Caller owns cleanup of the temp file.
+# $1 = BDF.
+_vbios_dump_live_rom() {
+  local _bdf="$1" _sys _sysrom _romf _sig
+  _sys="/sys/bus/pci/devices/$_bdf"
+  _sysrom="$_sys/rom"
+  [[ -r "$_sysrom" ]] || return 1
+  _romf="$(mktemp 2>/dev/null)" || return 1
+  # Enable the ROM BAR (maps the option ROM into CPU MMIO), read it, disable.
+  # Safe: the ROM BAR is separate from the guest framebuffer / VRAM MMIO
+  # aperture, so reading it does not touch a running VM's display memory.
+  if ! echo 1 >"$_sysrom" 2>/dev/null; then
+    rm -f "$_romf" 2>/dev/null
+    return 1
+  fi
+  cat "$_sysrom" >"$_romf" 2>/dev/null || true
+  echo 0 >"$_sysrom" 2>/dev/null || true
+  # Validate the dump is a real ROM (55aa signature), not empty/garbage.
+  _sig="$(head -c 2 "$_romf" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ "$_sig" != "55aa" ]]; then
+    rm -f "$_romf" 2>/dev/null
+    return 1
+  fi
+  printf '%s\n' "$_romf"
+  return 0
+}
+
+# Compare a candidate *.rom file ($1) against the guest GPU's live option ROM
+# (already dumped to $2). Prints a verdict on stdout and returns 0 on an exact
+# or padded byte match (safe to pin), 1 on a content mismatch (the file has the
+# right PCI ID per the matcher but DIFFERENT bytes -- a wrong-SKU / garbage /
+# different-version dump that would give a black screen if pinned). Verdict:
+#   EXACT byte match ... -- safe to pin
+#   PADDED byte match ... -- safe to pin (live ROM + trailing data)
+#   BYTES DIFFER ... -- NOT safe to pin (risks a black screen / 0xffff)
+_vbios_compare_rom_to_live() {
+  local _file="$1" _live="$2"
+  local _fsize _lsize _fsha _lsha
+  [[ -r "$_file" && -r "$_live" ]] || return 1
+  _fsize="$(stat -c%s "$_file" 2>/dev/null || echo 0)"
+  _lsize="$(stat -c%s "$_live" 2>/dev/null || echo 0)"
+  _fsha="$(sha256sum "$_file" 2>/dev/null | cut -d' ' -f1)"
+  _lsha="$(sha256sum "$_live" 2>/dev/null | cut -d' ' -f1)"
+  if [[ "$_fsha" == "$_lsha" ]]; then
+    printf 'EXACT byte match to the card live ROM (%s bytes) -- safe to pin\n' "$_fsize"
+    return 0
+  fi
+  # File larger than the live ROM: check if the live ROM is a prefix (a padded
+  # dump -- common for ROM dumps zero-padded to a power-of-2 size).
+  if (( _fsize > _lsize )); then
+    local _fpre_sha
+    _fpre_sha="$(head -c "$_lsize" "$_file" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+    if [[ "$_fpre_sha" == "$_lsha" ]]; then
+      printf 'PADDED byte match (card live ROM %s bytes + trailing data to %s bytes) -- safe to pin\n' "$_lsize" "$_fsize"
+      return 0
+    fi
+  fi
+  printf 'BYTES DIFFER from the card live ROM (file %s bytes, live %s bytes) -- NOT safe to pin: this dump has the right PCI ID but wrong content (wrong SKU / garbage / different version); pinning it risks a black screen\n' "$_fsize" "$_lsize"
+  return 1
+}
+
+# Print the byte-comparison verdict sub-note for a matched candidate. Used by
+# verify_vbios_candidates() so each MATCHED dump also shows whether it is a
+# BYTE match to the card's live ROM (green EXACT/PADDED = safe to pin) or has
+# the right PCI ID but wrong content (red BYTES DIFFER = garbage / wrong-SKU,
+# risks a black screen if pinned). $1 = candidate file (or repaired temp),
+# $2 = live ROM dump path. No-op if $2 is empty (live ROM could not be read).
+_vbios_print_live_rom_verdict() {
+  local _file="$1" _live="$2" _bv
+  [[ -n "$_live" ]] || return 0
+  if _bv="$(_vbios_compare_rom_to_live "$_file" "$_live" 2>/dev/null)"; then
+    if (( ENABLE_COLOR )); then
+      note "    ${C_GREEN}✔ $_bv"
+    else
+      note "    + $_bv"
+    fi
+  else
+    if (( ENABLE_COLOR )); then
+      note "    ${C_RED}✖ $_bv"
+    else
+      note "    - $_bv"
+    fi
+  fi
+}
+
 # Print the full list of subsystem-compatible techpowerup vBIOS listings (the
 # output of _vbios_techpowerup_list_all) as numbered `note` lines, so the
 # operator sees every matching option when no local *.rom is available yet.
@@ -15840,9 +15936,15 @@ EOF
 # Scan the VBIOS/ folder next to this script for *.rom candidates and run the
 # full _vbios_rom_matches_gpu matcher (+ byte-swap auto-repair) against each,
 # so the operator can see which dump is correct for the configured guest GPU
-# when they have dropped multiple candidates into VBIOS/. Prints one verdict
-# line per candidate (MATCH / byte-swap-repaired MATCH / no match) with the
-# embedded identity, and a summary line. Read-only; never writes or defines.
+# when they have dropped multiple candidates into VBIOS/. For each candidate
+# that PASSES the PCI-ID matcher, ALSO byte-compares it against the card's
+# LIVE sysfs option ROM (see _vbios_dump_live_rom / _vbios_compare_rom_to_live)
+# so a dump with the right PCI ID but WRONG content (a garbage / wrong-SKU /
+# different-version dump that would give a black screen if pinned) is flagged
+# BYTES DIFFER instead of a bare MATCH. Prints one verdict line per candidate
+# (MATCH / byte-swap-repaired MATCH / no match) with the embedded identity,
+# plus a green EXACT/PADDED or red BYTES-DIFFER sub-line per match, and a
+# summary line. Read-only; never writes or defines.
 # Called from verify_setup() so `--verify` surfaces this automatically.
 verify_vbios_candidates() {
   local _guest_gpu _src_dir _f _f_name _desc _err _n _ok _repaired
@@ -15872,6 +15974,20 @@ verify_vbios_candidates() {
   _ok=0; _repaired=0
   local _err_tmp
   _err_tmp="$(mktemp)"
+  # Dump the guest GPU's live option ROM from sysfs ONCE (best-effort) so each
+  # matched candidate can be byte-compared against it. This catches a dump that
+  # has the RIGHT embedded PCI ID (passes the matcher) but WRONG content -- the
+  # exact trap seen with a generic/mis-extracted tuf-gaming.rom that matched
+  # 1002:7550 in the header but was a garbage image (different sha256 + size
+  # from the card's actual 116736-byte ROM), which gave a black screen when
+  # pinned. If the live ROM cannot be read (not root, device busy under a
+  # running VM), the byte comparison is skipped and only the PCI-ID match is
+  # shown.
+  local _live_rom="" _live_rom_note=""
+  _live_rom="$(_vbios_dump_live_rom "$_guest_gpu" 2>/dev/null || true)"
+  if [[ -z "$_live_rom" ]]; then
+    _live_rom_note=" (live ROM byte-comparison skipped — could not read sysfs ROM; run as root with the VM shut off)"
+  fi
   for _f in "${_cands[@]}"; do
     _f_name="$(basename "$_f")"
     if _desc="$(_vbios_rom_matches_gpu "$_f" "$_guest_gpu" 2>"$_err_tmp")"; then
@@ -15881,6 +15997,10 @@ verify_vbios_candidates() {
         say "  MATCH: $_f_name -- $_desc"
       fi
       _ok=$((_ok+1))
+      # Byte-compare the matched file against the card's live ROM (best-effort):
+      # green EXACT/PADDED = safe to pin; red BYTES DIFFER = right PCI ID but
+      # wrong content (garbage / wrong-SKU) — pinning it risks a black screen.
+      _vbios_print_live_rom_verdict "$_f" "$_live_rom"
     else
       # Try byte-swap auto-repair (techpowerup downloads are aa55-swapped).
       local _rr _rp _rdesc
@@ -15892,6 +16012,9 @@ verify_vbios_candidates() {
           say "  MATCH (byte-swap auto-repaired): $_f_name -- $_rdesc"
         fi
         _ok=$((_ok+1)); _repaired=$((_repaired+1))
+        # Byte-compare the REPAIRED temp (what would actually be pinned) against
+        # the card's live ROM before cleaning up the repaired temp.
+        _vbios_print_live_rom_verdict "$_rp" "$_live_rom"
         rm -f "$_rp" 2>/dev/null || true
         rmdir "$(dirname "$_rp")" 2>/dev/null || true
       else
@@ -15905,15 +16028,15 @@ verify_vbios_candidates() {
       fi
     fi
   done
-  rm -f "$_err_tmp" 2>/dev/null || true
+  rm -f "$_err_tmp" "$_live_rom" 2>/dev/null || true
   say
   if (( _ok > 0 )); then
     local _sum_extra=""
     (( _repaired > 0 )) && _sum_extra=" ($_repaired via byte-swap auto-repair)"
     if (( ENABLE_COLOR )); then
-      say "${C_GREEN}✔ vBIOS SUMMARY: $_ok/$_n candidate(s) match the guest GPU${C_RESET}$_sum_extra"
+      say "${C_GREEN}✔ vBIOS SUMMARY: $_ok/$_n candidate(s) match the guest GPU${C_RESET}$_sum_extra$_live_rom_note"
     else
-      say "vBIOS SUMMARY: $_ok/$_n candidate(s) match the guest GPU$_sum_extra"
+      say "vBIOS SUMMARY: $_ok/$_n candidate(s) match the guest GPU$_sum_extra$_live_rom_note"
     fi
     note "Any MATCHed candidate is usable -- re-run --install-dynamic-binding to auto-inject the first MATCH."
     # RESTRICTION: only one vBIOS may be pinned per graphics card. When more

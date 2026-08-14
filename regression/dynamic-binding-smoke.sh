@@ -2356,6 +2356,87 @@ if grep -Fq 'verify_vbios_candidates()' "$VFIO_SCRIPT" \
 else
   bad "Q3z verify_vbios_candidates() is missing, not wired into --verify, or lacks the scan/summary"
 fi
+# Static: the live-ROM byte-comparison helpers must be defined and wired into
+# verify_vbios_candidates() so --verify flags a dump with the RIGHT PCI ID but
+# WRONG content (the exact tuf-gaming.rom trap: matched 1002:7550 in the header
+# but was a garbage image with a different sha256 from the card's actual ROM,
+# which gave a black screen when pinned). The comparison uses sha256sum on the
+# candidate file vs the card's live sysfs ROM dump; the verdict strings
+# EXACT/PADDED (safe to pin) and BYTES DIFFER (not safe) must be present.
+if grep -Fq '_vbios_dump_live_rom()' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_compare_rom_to_live()' "$VFIO_SCRIPT" \
+  && grep -Fq '_vbios_print_live_rom_verdict()' "$VFIO_SCRIPT" \
+  && grep -Fq 'sha256sum "$_file"' "$VFIO_SCRIPT" \
+  && grep -Fq 'sha256sum "$_live"' "$VFIO_SCRIPT" \
+  && grep -Fq 'EXACT byte match to the card live ROM' "$VFIO_SCRIPT" \
+  && grep -Fq 'PADDED byte match' "$VFIO_SCRIPT" \
+  && grep -Fq 'BYTES DIFFER from the card live ROM' "$VFIO_SCRIPT" \
+  && grep -Fq 'NOT safe to pin' "$VFIO_SCRIPT"; then
+  ok "Q3z _vbios_dump_live_rom/_vbios_compare_rom_to_live/_vbios_print_live_rom_verdict defined with sha256 verdict strings (EXACT/PADDED/BYTES DIFFER)"
+else
+  bad "Q3z live-ROM byte-comparison helpers missing, lack sha256, or lack the EXACT/PADDED/BYTES DIFFER verdict strings"
+fi
+# verify_vbios_candidates must call _vbios_print_live_rom_verdict at BOTH match
+# sites (direct match + byte-swap-repaired match) so every MATCHED candidate
+# gets a byte verdict — not just defined-but-unused.
+_verify_cand_fn="$(sed -n '/^verify_vbios_candidates() {/,/^}/p' "$VFIO_SCRIPT")"
+if echo "$_verify_cand_fn" | grep -Fq '_vbios_dump_live_rom "$_guest_gpu"' \
+  && echo "$_verify_cand_fn" | grep -Fc '_vbios_print_live_rom_verdict' | grep -Fxq 2; then
+  ok "Q3z verify_vbios_candidates dumps the live ROM + calls the byte-verdict at BOTH match sites (direct + repaired)"
+else
+  bad "Q3z verify_vbios_candidates missing the live-ROM dump or the byte-verdict call at one/both match sites"
+fi
+# LIVE functional test of _vbios_compare_rom_to_live: a file byte-identical to
+# the live ROM must return 0 + print EXACT; a file with different content must
+# return 1 + print BYTES DIFFER; a file that is the live ROM + zero padding
+# must return 0 + print PADDED. Pure-logic (no hardware): mock the live ROM as
+# a temp file with a valid 55aa signature.
+_cmp_fn="$(sed -n '/^_vbios_compare_rom_to_live() {/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_cmp_fn" ]]; then
+  vfake4="$tmp/vbios_cmp_fake"
+  mkdir -p "$vfake4"
+  # Mock live ROM: 55 aa + 32 bytes of payload.
+  printf '\x55\xaa' > "$vfake4/live.rom"
+  head -c 32 /dev/urandom >> "$vfake4/live.rom"
+  # Case 1: exact copy of the live ROM -> EXACT, return 0.
+  cp "$vfake4/live.rom" "$vfake4/exact.rom"
+  # Case 2: different content (same size) -> BYTES DIFFER, return 1.
+  printf '\x55\xaa' > "$vfake4/differ.rom"
+  head -c 32 /dev/urandom >> "$vfake4/differ.rom"
+  # Case 3: live ROM + 64 bytes of zero padding -> PADDED, return 0.
+  cp "$vfake4/live.rom" "$vfake4/padded.rom"
+  head -c 64 /dev/zero >> "$vfake4/padded.rom"
+  {
+    printf '%s\n' "$_cmp_fn"
+    printf '_vbios_compare_rom_to_live "%s/exact.rom" "%s/live.rom"\n' "$vfake4" "$vfake4"
+    printf 'echo "EXIT=$?"\n'
+    printf '_vbios_compare_rom_to_live "%s/differ.rom" "%s/live.rom"\n' "$vfake4" "$vfake4"
+    printf 'echo "EXIT=$?"\n'
+    printf '_vbios_compare_rom_to_live "%s/padded.rom" "%s/live.rom"\n' "$vfake4" "$vfake4"
+    printf 'echo "EXIT=$?"\n'
+  } > "$vfake4/cmp_test.sh"
+  _cmp_out="$(bash "$vfake4/cmp_test.sh" 2>/dev/null || true)"
+  _exact_ok=0; _differ_ok=0; _padded_ok=0
+  echo "$_cmp_out" | grep -Fq 'EXACT byte match' && echo "$_cmp_out" | grep -A0 'EXACT byte match' | head -1 >/dev/null
+  _exact_line="$(printf '%s\n' "$_cmp_out" | grep -F 'EXACT byte match' | head -1)"
+  _differ_line="$(printf '%s\n' "$_cmp_out" | grep -F 'BYTES DIFFER' | head -1)"
+  _padded_line="$(printf '%s\n' "$_cmp_out" | grep -F 'PADDED byte match' | head -1)"
+  # The 3 EXIT= lines follow each verdict; parse them in order.
+  _exits="$(printf '%s\n' "$_cmp_out" | grep -F 'EXIT=' | head -3)"
+  _e1="$(printf '%s\n' "$_exits" | sed -n 1p | cut -d= -f2)"
+  _e2="$(printf '%s\n' "$_exits" | sed -n 2p | cut -d= -f2)"
+  _e3="$(printf '%s\n' "$_exits" | sed -n 3p | cut -d= -f2)"
+  if [[ -n "$_exact_line" && "$_e1" == "0" ]]; then _exact_ok=1; fi
+  if [[ -n "$_differ_line" && "$_e2" == "1" ]]; then _differ_ok=1; fi
+  if [[ -n "$_padded_line" && "$_e3" == "0" ]]; then _padded_ok=1; fi
+  if (( _exact_ok && _differ_ok && _padded_ok )); then
+    ok "Q3z _vbios_compare_rom_to_live returns 0/EXACT for identical, 1/BYTES DIFFER for different, 0/PADDED for zero-padded"
+  else
+    bad "Q3z _vbios_compare_rom_to_live logic wrong (exact=$_exact_ok e$_e1, differ=$_differ_ok e$_e2, padded=$_padded_ok e$_e3; out: $_cmp_out)"
+  fi
+else
+  bad "Q3z could not extract _vbios_compare_rom_to_live to test"
+fi
 # Static: the matcher must carry the aa55 byte-swap detector + targeted fix
 # message; the resolver print block must carry the byte-swap caveat with the
 # AUTO-REPAIRS wording (no longer a flat rejection); and _vbios_autorepair_byteswap

@@ -2055,10 +2055,16 @@ if echo "$_switcher_fn" | grep -Fq 'install_vbios_romfile'; then
 else
   bad "Q3z install_dynamic_binding_from_existing_config() missing install_vbios_romfile call"
 fi
-if grep -c 'install_vbios_romfile$' "$VFIO_SCRIPT" | grep -Fxq 2; then
-  ok "Q3z install_vbios_romfile is called from exactly 2 install paths (switcher + full wizard)"
+# install_vbios_romfile must be reachable from BOTH install paths (the switcher
+# and the full wizard). It is now prompt-based in the switcher (multiple call
+# sites inside if/elif/else branches), so check both functions reference it
+# rather than asserting an exact grep count.
+_wizard_fn="$(sed -n '/^apply_configuration()/,/^main() {/p' "$VFIO_SCRIPT")"
+if echo "$_switcher_fn" | grep -Fq 'install_vbios_romfile' \
+  && echo "$_wizard_fn" | grep -Fq 'install_vbios_romfile'; then
+  ok "Q3z install_vbios_romfile is wired into both install paths (switcher + full wizard)"
 else
-  bad "Q3z install_vbios_romfile call-site count is not 2 (switcher + full wizard)"
+  bad "Q3z install_vbios_romfile is not wired into both install paths (switcher + full wizard)"
 fi
 
 # remove_vbios_romfile must be hooked into BOTH removal paths (the

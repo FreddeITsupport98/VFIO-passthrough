@@ -123,6 +123,7 @@ AMD_NORETRY_OVERRIDE=""       # 1=force add, 0=force skip, empty=prompt (install
 AMD_D3_OVERRIDE=""            # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install mode only)
 STEALTH_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: stealth/perf VM XML tuning)
+VBIOS_INJECTION_OVERRIDE=""   # 1=force on, 0=force skip+remove, empty=prompt (dynamic install: vBIOS ROM pin)
 BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
 GRAPHICS_DAEMON_INTERVAL_DEFAULT=1
@@ -708,6 +709,8 @@ complete -c $cmd -l no-amd-pcie-port-pm-off -d 'Skip pcie_port_pm=off for AMD gu
 complete -c $cmd -l binding-mode -r -a 'early dynamic' -d 'Install-mode GPU binding strategy (early|dynamic)'
 complete -c $cmd -l stealth-vm-tuning -d 'Dynamic-install: apply stealth/perf VM XML tuning (skip prompt)'
 complete -c $cmd -l no-stealth-vm-tuning -d 'Dynamic-install: skip stealth/perf VM XML tuning'
+complete -c $cmd -l vbios -d 'Dynamic-install: inject matching vBIOS ROM dump (skip prompt)'
+complete -c $cmd -l no-vbios -d 'Dynamic-install: skip vBIOS injection + remove existing script-installed pin'
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
@@ -751,7 +754,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -803,6 +806,8 @@ _vfio_sh_complete() {
     '--binding-mode=[Install-mode GPU binding strategy]:mode:(early dynamic)' \\
     '--stealth-vm-tuning[Dynamic-install: apply stealth/perf VM XML tuning (skip prompt)]' \\
     '--no-stealth-vm-tuning[Dynamic-install: skip stealth/perf VM XML tuning]' \\
+    '--vbios[Dynamic-install: inject matching vBIOS ROM dump (skip prompt)]' \\
+    '--no-vbios[Dynamic-install: skip vBIOS injection + remove existing script-installed pin]' \\
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
@@ -1428,7 +1433,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1519,6 +1524,12 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    DISCLAIMER: cosmetic/perf realism ONLY, NOT an anti-cheat/anti-tamper bypass.
   --no-stealth-vm-tuning
                    Dynamic-install override: skip stealth/perf VM XML tuning.
+  --vbios           Dynamic-install override: inject a matching vBIOS ROM dump
+                   into guest-GPU VMs (skip prompt).
+  --no-vbios        Dynamic-install override: skip vBIOS injection AND remove any
+                   script-installed vBIOS pin so VMs use the live ROM read (or
+                   your manual XML config). Use this if you already have a vBIOS
+                   configured in your VM XML manually.
   --install-stealth-vm-tuning
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
@@ -1760,6 +1771,12 @@ parse_args() {
         ;;
       --no-stealth-vm-tuning)
         STEALTH_VM_TUNING_OVERRIDE=0
+        ;;
+      --vbios)
+        VBIOS_INJECTION_OVERRIDE=1
+        ;;
+      --no-vbios)
+        VBIOS_INJECTION_OVERRIDE=0
         ;;
       --install-usb-bt-mitigation)
         MODE="install-usb-bt-mitigation"
@@ -12742,19 +12759,43 @@ install_dynamic_binding_from_existing_config() {
   #      recovers the guest GPU while it is parked on vfio-pci between VM sessions.
   install_park_keepalive_monitor
 
-  # 3c3. Auto-detect + pin a matching vBIOS ROM dump (instant on, no prompt):
-  #      fixes a black screen caused by an unreliable live sysfs ROM read.
-  install_vbios_romfile
+  # 3c3. vBIOS ROM auto-injection (opt-in prompt): pin a matching *.rom dump
+  #       from VBIOS/ into each shut-off guest-GPU VM's hostdev, fixing a black
+  #       screen caused by an unreliable live sysfs ROM read. If the user already
+  #       has a vBIOS configured in their VM XML manually (or does not want one),
+  #       they can skip this -- and selecting "no" REMOVES any script-installed
+  #       vBIOS pin so the VM uses the live ROM read (or their manual config).
+  #       Honors --vbios (force on) / --no-vbios (force skip + remove).
+  if [[ "${VBIOS_INJECTION_OVERRIDE:-}" == "1" ]]; then
+    install_vbios_romfile
+  elif [[ "${VBIOS_INJECTION_OVERRIDE:-}" == "0" ]]; then
+    note "vBIOS ROM auto-injection skipped (--no-vbios)."
+    note "Removing any script-installed vBIOS pin so VMs use the live ROM read (or your manual config)..."
+    remove_vbios_romfile
+  else
+    say
+    if prompt_yn "Inject a matching vBIOS ROM dump into detected guest-GPU VMs? (say NO if you already have a vBIOS configured in your VM XML -- selecting NO will remove any script-installed vBIOS pin)" N "vBIOS ROM injection"; then
+      install_vbios_romfile
+    else
+      note "Skipping vBIOS ROM auto-injection."
+      note "Removing any script-installed vBIOS pin so VMs use the live ROM read (or your manual config)..."
+      remove_vbios_romfile
+    fi
+  fi
 
   # 3d. Stealth/perf VM tuning (opt-in) — supersedes the minimal hypervisor-hide
   #     helper for the dynamic path. Applies the full Stealthy-VM tuning (which
   #     includes the hypervisor hide as a subset with a realistic OEM vendor_id)
-  #     to each shut-off guest-GPU VM, verified + prompted. The old minimal
-  #     hypervisor-hide call is no longer used here to avoid a duplicate vendor_id.
+  #     to each shut-off guest-GPU VM, verified + prompted. If the user selects
+  #     "no", any previously-applied stealth tuning is REVERTED from the backup
+  #     XML so the VM XML is clean (no leftover stealth config).
+  #     Honors --stealth-vm-tuning (force on) / --no-stealth-vm-tuning (force skip + revert).
   if [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "1" ]]; then
     install_stealth_vm_tuning
   elif [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
-    note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning). The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard if needed."
+    note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning)."
+    note "Reverting any previously-applied stealth tuning from backup XML..."
+    reset_stealth_vm_tuning
   else
     say
     if (( ENABLE_COLOR )); then
@@ -12768,7 +12809,9 @@ install_dynamic_binding_from_existing_config() {
     if prompt_yn "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials/iothreads + hypervisor hide) to detected guest-GPU VMs now?" N "Stealth/perf VM tuning"; then
       install_stealth_vm_tuning
     else
-      note "Skipping stealth/perf VM tuning. The minimal hypervisor hide (vendor_id=random + kvm hidden) is still available via the full wizard."
+      note "Skipping stealth/perf VM tuning."
+      note "Reverting any previously-applied stealth tuning from backup XML..."
+      reset_stealth_vm_tuning
     fi
   fi
 
@@ -17820,17 +17863,37 @@ apply_configuration() {
     # Install the park-keepalive monitor (instant on, no prompt): proactively
     # recovers the guest GPU while it is parked on vfio-pci between VM sessions.
     install_park_keepalive_monitor
-    # Auto-detect + pin a matching vBIOS ROM dump (instant on, no prompt): fixes
-    # a black screen caused by an unreliable live sysfs ROM read.
-    install_vbios_romfile
+    # vBIOS ROM auto-injection (opt-in prompt): pin a matching *.rom dump
+    # from VBIOS/ into each shut-off guest-GPU VM's hostdev. If the user
+    # already has a vBIOS configured manually (or does not want one), they can
+    # skip -- selecting "no" removes any script-installed pin.
+    # Honors --vbios / --no-vbios overrides.
+    if [[ "${VBIOS_INJECTION_OVERRIDE:-}" == "1" ]]; then
+      install_vbios_romfile
+    elif [[ "${VBIOS_INJECTION_OVERRIDE:-}" == "0" ]]; then
+      note "vBIOS ROM auto-injection skipped (--no-vbios)."
+      note "Removing any script-installed vBIOS pin..."
+      remove_vbios_romfile
+    else
+      if prompt_yn "Inject a matching vBIOS ROM dump into detected guest-GPU VMs? (say NO if you already have a vBIOS in your VM XML -- NO will remove any script-installed pin)" N "vBIOS ROM injection"; then
+        install_vbios_romfile
+      else
+        note "Skipping vBIOS ROM auto-injection."
+        note "Removing any script-installed vBIOS pin..."
+        remove_vbios_romfile
+      fi
+    fi
     # Stealth/perf VM tuning (opt-in) — asks the user if they want the VM to
     # look like a real desktop PC (SMBIOS spoofing, CPU hypervisor-bit disable,
     # e1000e NIC, randomized disk serials, vmport off, iothreads/cputune).
     # Honors --stealth-vm-tuning / --no-stealth-vm-tuning overrides.
+    # Selecting "no" reverts any previously-applied stealth tuning.
     if [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "1" ]]; then
       install_stealth_vm_tuning
     elif [[ "${STEALTH_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
-      note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning). The minimal hypervisor hide is still available via the full wizard if needed."
+      note "Stealth/perf VM tuning skipped (--no-stealth-vm-tuning)."
+      note "Reverting any previously-applied stealth tuning..."
+      reset_stealth_vm_tuning
     else
       say
       if (( ENABLE_COLOR )); then
@@ -17845,6 +17908,8 @@ apply_configuration() {
         install_stealth_vm_tuning
       else
         note "Skipping stealth/perf VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-stealth-vm-tuning"
+        note "Reverting any previously-applied stealth tuning..."
+        reset_stealth_vm_tuning
       fi
     fi
   fi

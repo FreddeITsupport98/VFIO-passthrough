@@ -4314,11 +4314,15 @@ VFIO_DYNAMIC_COOLDOWN_SECONDS="10"
 #   too, so D3cold stays disabled. Safer default.
 # - 1: restore d3cold_allowed=1 when handing the card back to the host, for lower
 #   host idle power between VM sessions. Only enable if you never hit the reset
-#   bug on the host.
+#   bug on the host. This also restores power/control=auto so the host driver
+#   can runtime-manage the card again (the default keeps power/control=on, i.e.
+#   the card pinned in D0, to avoid both D3hot and D3cold reset-bug exits).
 # WHY this value: 0 prevents the RX 9070 from dropping off the bus on a D3cold
-# exit while the host owns it. Set 1 only if your card has NEVER hit the reset bug
-# and you want lower host idle power between VM sessions (do NOT enable just
-# because a guide suggests restoring D3cold — that reintroduces the reset bug).
+# exit while the host owns it (and keeps it in D0 via power/control=on, also
+# avoiding the D3hot "stuck in D3" wedge at the next VM start). Set 1 only if
+# your card has NEVER hit the reset bug and you want lower host idle power
+# between VM sessions (do NOT enable just because a guide suggests restoring
+# D3cold — that reintroduces the reset bug).
 VFIO_RESTORE_D3COLD_ON_RELEASE="0"
 # Dynamic-mode libvirt-hook bind timeout (seconds, read by the hook at runtime):
 # - default 20 leaves margin under libvirt's ~30s qemu hook timeout.
@@ -7683,10 +7687,21 @@ if [[ "$ACTION" == "boot" && "$binding_mode" == "DYNAMIC" ]]; then
       _sys="/sys/bus/pci/devices/$_bdf"
       [[ -d "$_sys" ]] || continue
       echo 0 >"$_sys/d3cold_allowed" 2>/dev/null || true
+      # Pin the device in D0 (disable PCI runtime PM) so it cannot slip into
+      # D3hot while parked on vfio-pci between VM sessions. d3cold_allowed=0
+      # only blocks D3cold; without this, runtime PM (power/control=auto) can
+      # still drop the card to D3hot, and on RX 9070 / RDNA4 vfio-pci then
+      # fails to power it back on at the next VM start (qemu log: "Unable to
+      # power on device, stuck in D3") -> no OVMF/BIOS logo, black until the
+      # Windows driver re-initializes the display. vfio-pci.disable_idle_d3=1
+      # should do this but is not honored for every device/kernel, so set it
+      # explicitly. Writing "on" also forces a runtime resume if the card is
+      # already in D3 (pm_runtime_allow -> resume), so bind-time sees D0.
+      echo on >"$_sys/power/control" 2>/dev/null || true
     done
   }
   set_d3cold_for_guest_bdfs
-  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start); pinned d3cold_allowed=0 on guest BDFs (GPU + audio)."
+  say "Dynamic binding mode: skipping boot-time vfio-pci bind (libvirt hook will bind on VM start); pinned d3cold_allowed=0 + power/control=on (D0) on guest BDFs (GPU + audio)."
   exit 0
 fi
 
@@ -8070,6 +8085,12 @@ bind_one() {
   # This is set both at bind time and (in dynamic mode) by the boot unit so the card
   # cannot enter D3cold even while it is still on amdgpu, before VM start.
   echo 0 >"$sys/d3cold_allowed" 2>/dev/null || true
+  # Pin in D0 (disable runtime PM). Same rationale as set_d3cold_for_guest_bdfs:
+  # d3cold_allowed=0 alone does not stop D3hot, and a D3hot card wedges at the
+  # next qemu attach ("stuck in D3"). Writing "on" here ALSO resumes the card if
+  # it already slipped to D3 while parked, so the fresh VM start sees D0 and
+  # OVMF can run the GPU GOP -> BIOS logo shows on shutdown->start.
+  echo on >"$sys/power/control" 2>/dev/null || true
 
   # Already on vfio-pci: avoid a wasteful unbind -> sleep -> rebind cycle on a
   # rapid VM stop/start. BUT verify the device is actually alive first — the
@@ -8271,6 +8292,13 @@ reprobe_to_host() {
   # and want lower host idle power between VM sessions (VFIO_RESTORE_D3COLD_ON_RELEASE=1).
   if [[ "${VFIO_RESTORE_D3COLD_ON_RELEASE:-0}" == "1" ]]; then
     echo 1 >"$sys/d3cold_allowed" 2>/dev/null || true
+    # Let the host driver manage runtime PM again (lower idle power between
+    # VM sessions). Only when the operator opted into D3cold restore.
+    echo auto >"$sys/power/control" 2>/dev/null || true
+  else
+    # Default: keep the card pinned in D0 (no D3hot, no D3cold) to avoid the
+    # RX 9070 / RDNA4 reset bug on the host too. Mirrors d3cold_allowed=0 above.
+    echo on >"$sys/power/control" 2>/dev/null || true
   fi
 }
 
@@ -8434,6 +8462,17 @@ case "$ACTION" in
       say "Released guest devices back to host driver: $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
     else
       say "Dynamic release: leaving guest GPU on vfio-pci (VFIO_DYNAMIC_REBIND_HOST=0)."
+      # Pin the parked guest BDFs in D0 (disable runtime PM) the moment the VM
+      # stops, so they cannot slip into D3hot in the gap between VM stop and the
+      # next park-keepalive pass. Reasserted every pass by the park-keepalive
+      # monitor. d3cold_allowed=0 is re-pinned here too (was set at bind, but
+      # reassert in case anything flipped it during the session).
+      for _rb in "$GUEST_GPU_BDF" $(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}"); do
+        [[ -n "$_rb" ]] || continue
+        [[ -d "/sys/bus/pci/devices/$_rb" ]] || continue
+        echo on >"/sys/bus/pci/devices/$_rb/power/control" 2>/dev/null || true
+        echo 0 >"/sys/bus/pci/devices/$_rb/d3cold_allowed" 2>/dev/null || true
+      done
     fi
     # Zombie-card recovery at release time: the RX 9070 / RDNA4 reset bug can
     # drop the guest GPU off the PCI bus on the D3cold exit that happens DURING
@@ -10001,6 +10040,12 @@ _run_once() {
     # daemon, resume from suspend) quietly flipping d3cold_allowed back on
     # while the card sits parked. Best-effort; never fatal.
     echo 0 >"/sys/bus/pci/devices/$_guest_gpu/d3cold_allowed" 2>/dev/null || true
+    # Same for runtime PM: keep the parked card pinned in D0 (power/control=on)
+    # so it cannot slip into D3hot between sessions. d3cold_allowed=0 alone does
+    # NOT prevent D3hot, and a D3hot card wedges at the next qemu attach
+    # ("Unable to power on device, stuck in D3" -> no OVMF logo, black until
+    # the Windows driver re-inits). Reasserted every pass.
+    echo on >"/sys/bus/pci/devices/$_guest_gpu/power/control" 2>/dev/null || true
 
     if _pci_dev_alive "$_guest_gpu"; then
       _pk_reset_streak

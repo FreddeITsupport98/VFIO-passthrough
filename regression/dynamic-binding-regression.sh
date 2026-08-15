@@ -593,7 +593,7 @@ assert_contains_text \
   "$bind_block"
 assert_contains_text \
   "Q3g dynamic boot no-op logs d3cold pinning" \
-  "pinned d3cold_allowed=0 on guest BDFs" \
+  "pinned d3cold_allowed=0 + power/control=on (D0) on guest BDFs" \
   "$bind_block"
 
 # --- Functional Q3h: hook non-zero-exit comment (intentional fail-fast) ---
@@ -1791,7 +1791,7 @@ else
 fi
 assert_contains_text \
   "R1 dynamic boot pins GPU + audio" \
-  "pinned d3cold_allowed=0 on guest BDFs (GPU + audio)" \
+  "pinned d3cold_allowed=0 + power/control=on (D0) on guest BDFs (GPU + audio)" \
   "$bind_block"
 
 # --- Functional R2: bind_one skips rebind when already on vfio-pci ---

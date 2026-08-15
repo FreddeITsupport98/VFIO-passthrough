@@ -1708,6 +1708,50 @@ else
   bad "Q3w park-keepalive missing d3cold_allowed prophylactic reassertion"
 fi
 
+# Case 2b: power/control=on (D0 pin) is reasserted every pass while parked,
+# alongside d3cold_allowed=0. d3cold_allowed=0 alone only blocks D3cold; without
+# power/control=on, runtime PM (auto) can still drop the card to D3hot, and on
+# RX 9070 / RDNA4 vfio-pci then fails to power it on at the next VM start (qemu
+# log: "Unable to power on device, stuck in D3") -> no OVMF/BIOS logo, black
+# until the Windows driver re-inits. This is the root-cause fix for the
+# shutdown->start black screen.
+if grep -Fq 'echo on >"/sys/bus/pci/devices/$_guest_gpu/power/control"' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq 'runtime PM: keep the parked card pinned in D0' "$tmp/gen_park_keepalive.sh"; then
+  ok "Q3w park-keepalive reasserts power/control=on (D0 pin) every pass while parked"
+else
+  bad "Q3w park-keepalive missing power/control=on reassertion (D3hot wedge fix)"
+fi
+# Case 2c: the bind script pins power/control=on at the boot set_d3cold path
+# AND at bind_one (the latter ALSO resumes the card if it already slipped to D3
+# while parked, so the fresh VM start sees D0 and OVMF can run the GPU GOP).
+if grep -Fq 'echo on >"$_sys/power/control"' "$tmp/gen_bind.sh" \
+  && grep -Fq 'echo on >"$sys/power/control"' "$tmp/gen_bind.sh" \
+  && grep -Fq 'Pin in D0 (disable runtime PM)' "$tmp/gen_bind.sh"; then
+  ok "Q3w bind script pins power/control=on at boot (set_d3cold) AND bind_one (D0 resume at VM start)"
+else
+  bad "Q3w bind script missing power/control=on at boot or bind_one (D0 pin / D3 resume)"
+fi
+# Case 2d: the release park-path (REBIND_HOST=0) pins power/control=on for the
+# parked guest BDFs (GPU + audio) the moment the VM stops, so they cannot slip
+# to D3hot in the gap between VM stop and the next park-keepalive pass.
+if grep -Fq 'Dynamic release: leaving guest GPU on vfio-pci' "$tmp/gen_bind.sh" \
+  && grep -Fq 'echo on >"/sys/bus/pci/devices/$_rb/power/control"' "$tmp/gen_bind.sh" \
+  && grep -Fq 'for _rb in "$GUEST_GPU_BDF"' "$tmp/gen_bind.sh"; then
+  ok "Q3w bind script release park-path pins power/control=on for GPU + audio at VM stop"
+else
+  bad "Q3w bind script release park-path missing power/control=on D0 pin loop"
+fi
+# Case 2e: reprobe_to_host (host rebind) restores power/control=auto ONLY in the
+# VFIO_RESTORE_D3COLD_ON_RELEASE=1 branch; the default keeps power/control=on
+# (D0 pin) to avoid both D3hot and D3cold reset-bug exits on the host too.
+if grep -Fq 'echo auto >"$sys/power/control"' "$tmp/gen_bind.sh" \
+  && grep -Fq 'echo on >"$sys/power/control"' "$tmp/gen_bind.sh" \
+  && grep -Fq 'VFIO_RESTORE_D3COLD_ON_RELEASE:-0' "$tmp/gen_bind.sh"; then
+  ok "Q3w reprobe_to_host restores power/control=auto only on opt-in; default keeps on (D0 pin)"
+else
+  bad "Q3w reprobe_to_host missing power/control auto/restore branch or default on"
+fi
+
 # Case 3: failure-streak persistence (read/write/bump/reset), extracted from
 # the real generated script and driven against a temp STATE_FILE.
 _pk_streak_fns="$(sed -n '/^_pk_read_streak()/,/^}/p; /^_pk_write_streak()/,/^}/p; /^_pk_reset_streak()/,/^}/p; /^_pk_bump_streak()/,/^}/p' "$tmp/gen_park_keepalive.sh")"

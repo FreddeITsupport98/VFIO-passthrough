@@ -208,6 +208,9 @@ _link() {
   fi
   local _abs
   _abs="$(readlink -f "$_path" 2>/dev/null || echo "$_path")"
+  # The \\ in the printf below is intentional: it emits the OSC 8 hyperlink
+  # ST (String Terminator) byte. It is NOT a mis-escaped single quote.
+  # shellcheck disable=SC1003
   printf '\033]8;;file://%s\033\\%s\033]8;;\033\\' "$_abs" "$_text"
 }
 # Like _link but prints with a trailing newline (for use with `say`-style lines).
@@ -11471,67 +11474,54 @@ install_vbios_romfile() {
 
   local _src_dir
   _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
-  if [[ ! -d "$_src_dir" ]]; then
-    if (( ENABLE_COLOR )); then
-      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
-    else
-      say "  WARN: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
-    fi
-    note "       Drop a matching *.rom dump into a VBIOS/ folder next to this script, then re-run to enable this automatically."
-    _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
-    return 0
-  fi
   local -a _candidates=()
   local _f
   while IFS= read -r -d '' _f; do
     _candidates+=("$_f")
   done < <(find "$_src_dir" -maxdepth 1 -iname '*.rom' -print0 2>/dev/null)
-  if (( ${#_candidates[@]} == 0 )); then
-    if (( ENABLE_COLOR )); then
-      say "  ${C_YELLOW}⚠ WARN${C_RESET}: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
-    else
-      say "  WARN: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
-    fi
-    note "       Drop a matching *.rom dump into $_src_dir, then re-run to enable this automatically."
-    _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
-    return 0
-  fi
-
-  # Candidates sub-header, then one color-coded verdict line per *.rom:
-  #   ✔ MATCH (green)        -- direct 55aa match + EXACT/PADDED byte match to the card live ROM
-  #   ✔ MATCH (green, repaired) -- aa55 techpowerup download, auto-repaired + EXACT/PADDED byte match
-  #   ⚠ SKIPPED (yellow)    -- right PCI ID but WRONG content (BYTES DIFFER from the card live ROM);
-  #                           pinning it would give a black screen, so it is skipped + explained
-  #   ✖ no match (red)       -- wrong card / not a ROM
-  # The embedded identity (VER/PPID/board) follows on the same line so the
-  # operator can see WHICH dump matched at a glance, instead of a wall of
-  # same-style note lines. The live-ROM byte comparison (see
-  # _vbios_dump_live_rom / _vbios_compare_rom_to_live) is the guard that catches
-  # a dump with the right PCI ID but garbage content -- the exact trap seen with
-  # a generic tuf-gaming.rom that matched 1002:7550 in the header but was a wrong
-  # image (different sha256 from the card's actual ROM) and gave a black screen
-  # when pinned. If the live ROM cannot be read (not root / device busy under a
-  # running VM), fall back to PCI-ID-only matching with a skip note.
-  say
-  if (( ENABLE_COLOR )); then
-    say "${C_CYAN}Candidates in ${_src_dir}${C_RESET} (${#_candidates[@]}):"
-  else
-    say "Candidates in ${_src_dir} (${#_candidates[@]}):"
-  fi
-  local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0 _match_count=0
-  _match_err="$(mktemp)"
-  # Dump the guest GPU's live option ROM from sysfs ONCE (best-effort) so each
-  # PCI-ID-matched candidate can be byte-compared against it BEFORE pinning.
-  # A BYTES-DIFFER candidate (right PCI ID, wrong content) is SKIPPED -- not
-  # pinned, not counted as a match -- with a clear explanation, so the operator
-  # knows their dump is bad instead of getting a silent black screen on next
-  # VM start. If the live ROM cannot be read (not root / device busy under a
-  # running VM), fall back to PCI-ID-only matching (current behavior) with a
-  # skip note.
+  # Dump the guest GPU's live option ROM from sysfs ONCE, up front (best-effort).
+  # It serves TWO purposes: (1) byte-compare each PCI-ID-matched candidate
+  # BEFORE pinning -- a BYTES-DIFFER candidate (right PCI ID, wrong content) is
+  # SKIPPED, the exact tuf-gaming.rom garbage trap that gave a black screen; and
+  # (2) the LIVE-ROM FALLBACK below: when NO candidate matches (no VBIOS/ folder,
+  # no *.rom files, or all candidates skipped as wrong-content / wrong-card), pin
+  # the card's OWN live sysfs ROM. That dump is byte-exact to what qemu reads
+  # live on a cold start (when the OVMF/BIOS logo DOES show), and a pinned
+  # <rom file=.../> is read by qemu from the FILE -- so it survives qemu's own
+  # attach-time function-level reset that otherwise re-zeroes the ROM BAR
+  # (0xffff) and leaves no OVMF/BIOS logo on shutdown->start / force-kill->start.
+  # If the live ROM cannot be read (not root / device busy under a running VM),
+  # _live_rom_skipped=1: the candidate loop falls back to PCI-ID-only matching,
+  # and the decision block below skips with guidance (no fallback is possible
+  # without a readable live ROM).
   local _live_rom="" _live_rom_skipped=0 _skipped_bytes=0 _skipped_nomatch=0 _bv
   _live_rom="$(_vbios_dump_live_rom "$_guest_gpu" 2>/dev/null || true)"
   if [[ -z "$_live_rom" ]]; then
     _live_rom_skipped=1
+  fi
+  # Match accumulators (_live_fallback marks the pinned file as the live-ROM
+  # named-temp copy so the shared pin logic can clean it up after copying).
+  local _match_file="" _match_desc="" _f_desc _f_name _match_err _match_repaired=0 _match_count=0 _live_fallback=0
+  _match_err="$(mktemp)"
+  # Candidates sub-header + one color-coded verdict line per *.rom (only when
+  # there are candidates to verdict; with zero candidates this is skipped and the
+  # decision block below handles the no-folder / no-files case directly).
+  #   ✔ MATCH (green)          -- direct 55aa match + EXACT/PADDED byte match to the card live ROM
+  #   ✔ MATCH (green, repaired) -- aa55 techpowerup download, auto-repaired + EXACT/PADDED byte match
+  #   ⚠ SKIPPED (yellow)       -- right PCI ID but WRONG content (BYTES DIFFER from the card live ROM);
+  #                              pinning it would give a black screen, so it is skipped + explained
+  #   ✖ no match (red)          -- wrong card / not a ROM
+  # The embedded identity (VER/PPID/board) follows on the same line so the
+  # operator can see WHICH dump matched at a glance. If the live ROM cannot be
+  # read (not root / device busy under a running VM), fall back to PCI-ID-only
+  # matching with a skip note.
+  if (( ${#_candidates[@]} > 0 )); then
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_CYAN}Candidates in ${_src_dir}${C_RESET} (${#_candidates[@]}):"
+    else
+      say "Candidates in ${_src_dir} (${#_candidates[@]}):"
+    fi
   fi
   for _f in "${_candidates[@]}"; do
     _f_name="$(basename "$_f")"
@@ -11676,9 +11666,110 @@ install_vbios_romfile() {
       fi
     fi
   done
-  rm -f "$_match_err" "$_live_rom" 2>/dev/null || true
+  rm -f "$_match_err" 2>/dev/null || true
+
+  if [[ -z "$_match_file" && -n "$_live_rom" ]]; then
+    # LIVE-ROM FALLBACK: no candidate matched (no VBIOS/ folder, no *.rom files,
+    # or every candidate was skipped as wrong-content / wrong-card), BUT the
+    # card's own live sysfs ROM was dumped successfully. Pin THAT -- it is
+    # byte-exact to what qemu reads live on a cold start (when the OVMF/BIOS
+    # logo DOES show), and a pinned <rom file=.../> is read by qemu from the
+    # FILE, so it survives qemu's own attach-time function-level reset that
+    # otherwise re-zeroes the ROM BAR (0xffff) and leaves no OVMF/BIOS logo on
+    # shutdown->start / force-kill->start. This is the "inject your own ROM"
+    # path, automated: works with no VBIOS/ folder at all, and rescues a setup
+    # whose only dump is garbage. The named temp below is copied to the stable
+    # runtime path by the shared pin logic after this block, then cleaned up via
+    # _live_fallback. (_match_count stays 0 here, so the >1 REFUSED check below
+    # is a no-op for the fallback.)
+    local _live_basename="live-$_guest_gpu.rom"
+    local _live_named_dir
+    _live_named_dir="$(mktemp -d 2>/dev/null || true)"
+    if [[ -n "$_live_named_dir" && -f "$_live_rom" ]] \
+      && cp -f "$_live_rom" "$_live_named_dir/$_live_basename" 2>/dev/null; then
+      _match_file="$_live_named_dir/$_live_basename"
+      _match_desc="dumped from the card's live sysfs ROM (byte-exact copy; immune to qemu's attach-time reset that otherwise zeroes the ROM BAR -> 0xffff -> no OVMF/BIOS logo)"
+      _match_repaired=0
+      _live_fallback=1
+      rm -f "$_live_rom" 2>/dev/null || true
+      say
+      local _live_size _live_sig
+      _live_size="$(stat -c%s "$_match_file" 2>/dev/null || echo 0)"
+      _live_sig="$(head -c 2 "$_match_file" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+      if (( ENABLE_COLOR )); then
+        say "  ${C_YELLOW}⚠ No matching candidate in VBIOS/${C_RESET} — dumping the card's LIVE ROM as the pinned file:"
+      else
+        say "  WARN: No matching candidate in VBIOS/ — dumping the card's LIVE ROM as the pinned file:"
+      fi
+      if [[ "$_live_sig" == "55aa" ]]; then
+        if (( ENABLE_COLOR )); then
+          note "    ${C_GREEN}✔ Live ROM dumped${C_RESET}: $_live_size bytes, valid 55aa signature (this is the same GOP ROM qemu reads on a cold start, when the logo DOES show)"
+          note "    ${C_GREEN}✔ EXACT byte match to the card live ROM${C_RESET} -- safe to pin"
+        else
+          note "    + Live ROM dumped: $_live_size bytes, valid 55aa signature (this is the same GOP ROM qemu reads on a cold start, when the logo DOES show)"
+          note "    + EXACT byte match to the card live ROM -- safe to pin"
+        fi
+      else
+        if (( ENABLE_COLOR )); then
+          note "    ${C_YELLOW}⚠ Live ROM dumped${C_RESET}: $_live_size bytes, signature $_live_sig (unexpected -- pinning anyway as the byte-exact live copy)"
+        else
+          note "    ! Live ROM dumped: $_live_size bytes, signature $_live_sig (unexpected -- pinning anyway as the byte-exact live copy)"
+        fi
+      fi
+      note "    Pinning this byte-exact copy so qemu reads it from the file instead of the live sysfs ROM —"
+      note "    immune to qemu's attach-time reset that otherwise zeroes the ROM BAR -> 0xffff -> no OVMF/BIOS logo on shutdown->start / force-kill->start."
+      if (( _skipped_bytes > 0 )); then
+        if (( ENABLE_COLOR )); then
+          note "    ${C_YELLOW}($_skipped_bytes candidate(s) in VBIOS/ had the right PCI ID but WRONG content and were skipped — pinning the card's live ROM instead.)${C_RESET}"
+        else
+          note "    ($_skipped_bytes candidate(s) in VBIOS/ had the right PCI ID but WRONG content and were skipped — pinning the card's live ROM instead.)"
+        fi
+      elif (( _skipped_nomatch > 0 )); then
+        if (( ENABLE_COLOR )); then
+          note "    ${C_YELLOW}($_skipped_nomatch candidate(s) in VBIOS/ do NOT match the guest GPU and were skipped — pinning the card's live ROM instead.)${C_RESET}"
+        else
+          note "    ($_skipped_nomatch candidate(s) in VBIOS/ do NOT match the guest GPU and were skipped — pinning the card's live ROM instead.)"
+        fi
+      fi
+      # Fall through to the shared pin + XML-wire logic below.
+    else
+      # mktemp -d or the copy failed: clean up any partial temp and fall through
+      # to the skip-with-guidance path below (do not pretend a fallback was set up).
+      if [[ -n "$_live_named_dir" ]]; then
+        rm -f "$_live_named_dir/$_live_basename" 2>/dev/null || true
+        rmdir "$_live_named_dir" 2>/dev/null || true
+      fi
+    fi
+  fi
 
   if [[ -z "$_match_file" ]]; then
+    # No candidate matched AND the live-ROM fallback was not set up (either the
+    # live ROM could not be read, or the named-temp copy failed). Skip with
+    # guidance so the operator knows exactly why nothing was pinned and what to
+    # do next. The 5 branches below cover every "no candidate" cause and each
+    # prints the full subsystem-compatible techpowerup listing to download.
+    if [[ ! -d "$_src_dir" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "  ${C_YELLOW}⚠ WARN${C_RESET}: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
+      else
+        say "  WARN: no VBIOS/ folder next to $SCRIPT_NAME; vBIOS ROM auto-injection skipped (no dump to pin)."
+      fi
+      note "       Dump your own card with amdvbflash (Linux) or GPU-Z (Windows) and drop the *.rom into a VBIOS/ folder next to this script, then re-run — OR re-run as root with the VM shut off so the live-ROM fallback can pin the card's own ROM automatically."
+      _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+      rm -f "$_live_rom" 2>/dev/null || true
+      return 0
+    fi
+    if (( ${#_candidates[@]} == 0 )); then
+      if (( ENABLE_COLOR )); then
+        say "  ${C_YELLOW}⚠ WARN${C_RESET}: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
+      else
+        say "  WARN: no *.rom files found in $_src_dir; vBIOS ROM auto-injection skipped (no dump to pin)."
+      fi
+      note "       Dump your own card with amdvbflash (Linux) or GPU-Z (Windows) and drop the *.rom into $_src_dir, then re-run — OR re-run as root with the VM shut off so the live-ROM fallback can pin the card's own ROM automatically."
+      _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+      rm -f "$_live_rom" 2>/dev/null || true
+      return 0
+    fi
     if (( _skipped_bytes > 0 )); then
       # A candidate matched the PCI ID but had wrong content (BYTES DIFFER) and
       # was skipped -- give a clearer message than the generic "no match" so the
@@ -11688,8 +11779,9 @@ install_vbios_romfile() {
       else
         say "  WARN: $_skipped_bytes candidate(s) matched the guest GPU PCI ID ($_gpu_id) but had WRONG content (BYTES DIFFER from the card live ROM) and were SKIPPED to avoid a black screen."
       fi
-      note "       vBIOS ROM auto-injection was skipped this run. Replace the bad dump(s) in $_src_dir with a clean one (dump your own card with amdvbflash/GPU-Z, or download a subsystem-matching dump from the listings below), then re-run."
+      note "       vBIOS ROM auto-injection was skipped this run. Replace the bad dump(s) in $_src_dir with a clean one (dump your own card with amdvbflash/GPU-Z, or download a subsystem-matching dump from the listings below), then re-run — OR re-run as root with the VM shut off so the live-ROM fallback can pin the card's own ROM automatically."
       _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+      rm -f "$_live_rom" 2>/dev/null || true
       return 0
     fi
     if (( _skipped_nomatch > 0 )); then
@@ -11701,9 +11793,10 @@ install_vbios_romfile() {
       else
         say "  WARN: $_skipped_nomatch candidate(s) in $_src_dir do NOT match the guest GPU (PCI ID $_gpu_id) and were SKIPPED to avoid pinning a wrong-card ROM."
       fi
-      note "       vBIOS ROM auto-injection was skipped this run. Add a *.rom dump whose embedded PCI ID is $_gpu_id to $_src_dir (dump your own card with amdvbflash/GPU-Z, or download a subsystem-matching dump from the listings below), then re-run."
+      note "       vBIOS ROM auto-injection was skipped this run. Add a *.rom dump whose embedded PCI ID is $_gpu_id to $_src_dir (dump your own card with amdvbflash/GPU-Z, or download a subsystem-matching dump from the listings below), then re-run — OR re-run as root with the VM shut off so the live-ROM fallback can pin the card's own ROM automatically."
       note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
       _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+      rm -f "$_live_rom" 2>/dev/null || true
       return 0
     fi
     # Defensive fallback: _match_file empty with no skip counters incremented
@@ -11719,8 +11812,10 @@ install_vbios_romfile() {
     note "       Add a *.rom dump for this exact GPU to $_src_dir and re-run to enable this automatically."
     note "       (techpowerup Device Id $_tpu_did — find/verify at: $_tpu_url)"
     _vbios_print_compatible_list "$_tpu_list" "$_tpu_did"
+    rm -f "$_live_rom" 2>/dev/null || true
     return 0
   fi
+  rm -f "$_live_rom" 2>/dev/null || true
   # RESTRICTION: only ONE vBIOS may be pinned per graphics card. If more than
   # one candidate matched (common: several techpowerup re-uploads + the
   # operator's own dump dropped into VBIOS/), REFUSE to pin -- pinning an
@@ -11738,9 +11833,11 @@ install_vbios_romfile() {
     note "       Keep exactly ONE matching *.rom in $_src_dir (prefer a clean 55aa dump, or one techpowerup download this script auto-repairs) and delete the rest, then re-run:"
     note "         sudo $SCRIPT_NAME --install-dynamic-binding"
     note "       (The rest of the dynamic binding setup is unaffected; only the vBIOS pin is skipped.)"
-    # Clean up any auto-repaired temp copy from the matched candidate so we do
-    # not leak a temp dir when refusing.
-    if (( _match_repaired )); then
+    # Clean up any auto-repaired temp copy (or live-ROM fallback named temp)
+    # from the matched candidate so we do not leak a temp dir when refusing.
+    # (_live_fallback is normally unreachable here since the fallback path has
+    # _match_count=0, but the guard is cheap insurance against a future leak.)
+    if (( _match_repaired )) || (( _live_fallback )); then
       rm -f "$_match_file" 2>/dev/null || true
       rmdir "$(dirname "$_match_file")" 2>/dev/null || true
     fi
@@ -11773,6 +11870,13 @@ install_vbios_romfile() {
   # clean up the temp dir now that the repaired content has been copied to the
   # stable runtime path.
   if (( _match_repaired )); then
+    rm -f "$_match_file" 2>/dev/null || true
+    rmdir "$(dirname "$_match_file")" 2>/dev/null || true
+  fi
+  # If the pinned file was the LIVE-ROM fallback's named temp copy (not an
+  # original candidate and not a byte-swap repair), clean up its temp dir now
+  # that the byte-exact content has been copied to the stable runtime path.
+  if (( _live_fallback )); then
     rm -f "$_match_file" 2>/dev/null || true
     rmdir "$(dirname "$_match_file")" 2>/dev/null || true
   fi

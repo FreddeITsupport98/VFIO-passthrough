@@ -15,8 +15,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 fail=0
+_fails_arr=()
 ok() { printf 'SMOKE PASS: %s\n' "$1"; }
-bad() { printf 'SMOKE FAIL: %s\n' "$1" >&2; fail=1; }
+bad() { printf 'SMOKE FAIL: %s\n' "$1" >&2; fail=1; _fails_arr+=("$1"); }
+skip() { printf 'SMOKE SKIP: %s\n' "$1"; }
 
 [[ -f "$VFIO_SCRIPT" ]] || { printf 'SMOKE FAIL: missing vfio.sh at %s\n' "$VFIO_SCRIPT" >&2; exit 1; }
 
@@ -2031,7 +2033,7 @@ fi
 if [[ -d "$PROJECT_ROOT/VBIOS" ]] && compgen -G "$PROJECT_ROOT/VBIOS/*.rom" >/dev/null 2>&1; then
   ok "Q3z VBIOS/ folder is bundled with at least one *.rom dump"
 else
-  bad "Q3z VBIOS/ folder missing or contains no *.rom dumps"
+  skip "Q3z no *.rom bundled in VBIOS/ (the candidate-file path is OPTIONAL now -- the live-ROM fallback pins the card's own ROM with no bundled dump); LIVE tests below that need a bundled ROM are skipped"
 fi
 
 if grep -Fq 'install_vbios_romfile()' "$VFIO_SCRIPT" \
@@ -2229,7 +2231,11 @@ LEOF
         ok "Q3z _vbios_autorepair_byteswap repairs the aa55 swap and re-matches (repaired copy MATCHes the guest GPU)"
         # The repaired copy's first 2 bytes must now be 55 aa (valid ROM sig).
         _ar_first2="$(head -c 2 "$_ar_path" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-        [[ "$_ar_first2" == "55aa" ]] && ok "Q3z repaired copy starts with 55 aa (valid PCI expansion ROM signature)" || bad "Q3z repaired copy still has a bad signature (got: $_ar_first2)"
+        if [[ "$_ar_first2" == "55aa" ]]; then
+          ok "Q3z repaired copy starts with 55 aa (valid PCI expansion ROM signature)"
+        else
+          bad "Q3z repaired copy still has a bad signature (got: $_ar_first2)"
+        fi
       else
         bad "Q3z _vbios_autorepair_byteswap failed to repair+match the swapped copy (got: $_ar_out)"
       fi
@@ -2239,8 +2245,10 @@ LEOF
       bad "Q3z could not extract _vbios_autorepair_byteswap to test"
     fi
   fi
+elif [[ -z "$_vbios_fn_body" ]]; then
+  bad "Q3z could not extract _vbios_rom_matches_gpu to test"
 else
-  bad "Q3z could not extract _vbios_rom_matches_gpu or find a bundled *.rom to test against"
+  skip "Q3z no bundled *.rom to run the matcher LIVE test against (optional -- the live-ROM fallback pins the card's own ROM with no bundled dump)"
 fi
 
 # _vbios_techpowerup_url must derive its search link ENTIRELY from live
@@ -2255,12 +2263,13 @@ else
   bad "Q3z _vbios_techpowerup_url() is missing"
 fi
 _install_vbios_fn="$(sed -n '/^install_vbios_romfile() {/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_install_vbios_fn" | grep -Fq '_vbios_techpowerup_url "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq 'Find/verify at' \
-  && echo "$_install_vbios_fn" | grep -Fq 'TPU Device Id' \
-  && echo "$_install_vbios_fn" | grep -Fq 'no *.rom files found' \
-  && echo "$_install_vbios_fn" | grep -Fq 'no VBIOS/ folder' \
-  && ! echo "$_install_vbios_fn" | grep -Fq 'Asus.RX9070.16384.241204_1.rom'; then
+_ivf="$tmp/install_vbios_fn.txt"; printf '%s\n' "$_install_vbios_fn" > "$_ivf" 2>/dev/null || true
+if grep -Fq '_vbios_techpowerup_url "$_guest_gpu"' "$_ivf" \
+  && grep -Fq 'Find/verify at' "$_ivf" \
+  && grep -Fq 'TPU Device Id' "$_ivf" \
+  && grep -Fq 'no *.rom files found' "$_ivf" \
+  && grep -Fq 'no VBIOS/ folder' "$_ivf" \
+  && ! grep -Fq 'Asus.RX9070.16384.241204_1.rom' "$_ivf"; then
   ok "Q3z install_vbios_romfile uses the dynamic techpowerup URL + Device Id serial up front, with WARN-prefixed skips, not a hardcoded example"
 else
   bad "Q3z install_vbios_romfile still references a hardcoded techpowerup example or is missing the dynamic URL/serial/WARN skips"
@@ -2447,8 +2456,8 @@ fi
 if grep -Fq 'ROM signature is byte-swapped' "$VFIO_SCRIPT" \
   && grep -Fq 'dump your own card with amdvbflash/GPU-Z' "$VFIO_SCRIPT" \
   && grep -Fq '_vbios_autorepair_byteswap()' "$VFIO_SCRIPT" \
-  && echo "$_install_vbios_fn" | grep -Fq '_vbios_autorepair_byteswap "$_f" "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq '(auto-repaired)' \
+  && grep -Fq '_vbios_autorepair_byteswap "$_f" "$_guest_gpu"' "$_ivf" \
+  && grep -Fq '(auto-repaired)' "$_ivf" \
   && grep -Fq 'techpowerup downloads are byte-swapped' "$VFIO_SCRIPT" \
   && grep -Fq 'AUTO-REPAIRS a swapped ROM' "$VFIO_SCRIPT"; then
   ok "Q3z matcher + resolver + autorepair wiring all present (aa55 detect, AUTO-REPAIRS caveat, candidate-loop repair + cleanup)"
@@ -2461,12 +2470,12 @@ fi
 # as a match) with a clear explanation, so the operator knows their dump is bad
 # instead of getting a silent black screen on next VM start. This is the exact
 # tuf-gaming.rom trap: matched 1002:7550 in the header but was a garbage image.
-if echo "$_install_vbios_fn" | grep -Fq '_vbios_dump_live_rom "$_guest_gpu"' \
-  && echo "$_install_vbios_fn" | grep -Fq '_vbios_compare_rom_to_live "$_f" "$_live_rom"' \
-  && echo "$_install_vbios_fn" | grep -Fq '_skipped_bytes=$((_skipped_bytes+1))' \
-  && echo "$_install_vbios_fn" | grep -Fq 'SKIPPED (right PCI ID, wrong content)' \
-  && echo "$_install_vbios_fn" | grep -Fq 'Pinning this dump would give a black screen' \
-  && echo "$_install_vbios_fn" | grep -Fq 'were SKIPPED to avoid a black screen'; then
+if grep -Fq '_vbios_dump_live_rom "$_guest_gpu"' "$_ivf" \
+  && grep -Fq '_vbios_compare_rom_to_live "$_f" "$_live_rom"' "$_ivf" \
+  && grep -Fq '_skipped_bytes=$((_skipped_bytes+1))' "$_ivf" \
+  && grep -Fq 'SKIPPED (right PCI ID, wrong content)' "$_ivf" \
+  && grep -Fq 'Pinning this dump would give a black screen' "$_ivf" \
+  && grep -Fq 'were SKIPPED to avoid a black screen' "$_ivf"; then
   ok "Q3z install_vbios_romfile gates on live-ROM byte comparison + SKIPS+explains on BYTES DIFFER (right PCI ID, wrong content)"
 else
   bad "Q3z install_vbios_romfile missing the live-ROM gate or the BYTES-DIFFER skip+explanation"
@@ -2474,10 +2483,10 @@ fi
 # Static: install_vbios_romfile must SKIP a candidate that does NOT match the
 # guest GPU PCI ID (wrong card / not a valid ROM) and explain why, instead of a
 # bare "no match" line — so the operator knows their dump is for the wrong GPU.
-if echo "$_install_vbios_fn" | grep -Fq '_skipped_nomatch=$((_skipped_nomatch+1))' \
-  && echo "$_install_vbios_fn" | grep -Fq 'SKIPPED (does not match the guest GPU)' \
-  && echo "$_install_vbios_fn" | grep -Fq 'NOT for your guest GPU' \
-  && echo "$_install_vbios_fn" | grep -Fq 'were SKIPPED to avoid pinning a wrong-card ROM'; then
+if grep -Fq '_skipped_nomatch=$((_skipped_nomatch+1))' "$_ivf" \
+  && grep -Fq 'SKIPPED (does not match the guest GPU)' "$_ivf" \
+  && grep -Fq 'NOT for your guest GPU' "$_ivf" \
+  && grep -Fq 'were SKIPPED to avoid pinning a wrong-card ROM' "$_ivf"; then
   ok "Q3z install_vbios_romfile SKIPS+explains on no-PCI-ID-match (wrong card / not a valid ROM)"
 else
   bad "Q3z install_vbios_romfile missing the no-PCI-ID-match skip+explanation"
@@ -2504,7 +2513,117 @@ else
   bad "Q3z could not extract _vbios_techpowerup_url to test"
 fi
 
+# --- Smoke Q3z: live-ROM FALLBACK in install_vbios_romfile (the "inject your
+# own ROM" path). When NO candidate matches (no VBIOS/ folder, no *.rom files, or
+# all candidates skipped as wrong-content / wrong-card) BUT the card's live sysfs
+# ROM was dumped, install_vbios_romfile pins THAT -- byte-exact, immune to
+# qemu's attach-time reset that otherwise zeroes the ROM BAR (0xffff) -> no
+# OVMF/BIOS logo on shutdown->start. Static wiring checks + a LIVE functional
+# test of the fallback block (mock _live_rom temp + empty _match_file -> asserts
+# _match_file becomes a live-<bdf>.rom named temp whose content byte-matches
+# the live ROM, and _live_fallback flips to 1).
+if grep -Fq 'if [[ -z "$_match_file" && -n "$_live_rom" ]]; then' "$_ivf" \
+  && grep -Fq '_live_fallback=1' "$_ivf" \
+  && grep -Fq '_live_fallback=0' "$_ivf" \
+  && grep -Fq 'live-$_guest_gpu.rom' "$_ivf" \
+  && grep -Fq 'dumping the card'"'"'s LIVE ROM as the pinned file' "$_ivf" \
+  && grep -Fq 'immune to qemu'"'"'s attach-time reset' "$_ivf"; then
+  ok "Q3z install_vbios_romfile has the live-ROM fallback decision + messaging + _live_fallback flag"
+else
+  bad "Q3z install_vbios_romfile missing the live-ROM fallback decision/messaging/flag"
+fi
+# Static: the live-ROM dump must be called EXACTLY ONCE in install_vbios_romfile
+# (moved up front to serve both candidate byte-comparison AND the fallback -- a
+# duplicate dump would be wasteful and a missing dump would break both paths).
+if printf '%s\n' "$_install_vbios_fn" | grep -Fc '_vbios_dump_live_rom "$_guest_gpu"' | grep -Fxq 1; then
+  ok "Q3z install_vbios_romfile calls _vbios_dump_live_rom exactly once (up front, shared by compare + fallback)"
+else
+  bad "Q3z install_vbios_romfile calls _vbios_dump_live_rom a wrong number of times (expected 1)"
+fi
+# Static: the live-ROM fallback named temp must be cleaned up after the pin copy
+# (post-runtime-copy) AND defensively in the >1 REFUSED path, so a temp dir is
+# never leaked.
+if grep -Fq 'if (( _live_fallback )); then' "$_ivf" \
+  && grep -Fq 'if (( _match_repaired )) || (( _live_fallback )); then' "$_ivf"; then
+  ok "Q3z install_vbios_romfile cleans up the live-ROM fallback named temp after pin + in the REFUSED path"
+else
+  bad "Q3z install_vbios_romfile missing the _live_fallback temp cleanup (post-pin and/or REFUSED)"
+fi
+# Static: the consolidated skip block must still print the subsystem-compatible
+# techpowerup list from ALL 5 no-candidate paths (no-folder / no-files / bytes-
+# differ / no-PCI-ID / defensive) so the operator sees options to download when
+# the live ROM could not be read. Count must remain 5 (the fallback does NOT call
+# it -- it pins instead).
+if printf '%s\n' "$_install_vbios_fn" | grep -Fc '_vbios_print_compatible_list "$_tpu_list" "$_tpu_did"' | grep -Fxq 5; then
+  ok "Q3z install_vbios_romfile still calls _vbios_print_compatible_list from all 5 no-candidate skip paths (count=5)"
+else
+  bad "Q3z install_vbios_romfile _vbios_print_compatible_list count is not 5 after the fallback refactor"
+fi
+# Static: the consolidated skip block must keep the no-folder / no-files WARN
+# strings (moved out of the old early-returns) so the operator still sees WHY
+# nothing was pinned when there is no VBIOS/ folder or no *.rom files.
+if grep -Fq 'no VBIOS/ folder next to $SCRIPT_NAME' "$_ivf" \
+  && grep -Fq 'no *.rom files found in $_src_dir' "$_ivf"; then
+  ok "Q3z install_vbios_romfile keeps the no-folder + no-files WARN strings in the consolidated skip block"
+else
+  bad "Q3z install_vbios_romfile lost the no-folder/no-files WARN strings in the refactor"
+fi
+# LIVE functional test of the live-ROM fallback block: extract it from
+# install_vbios_romfile (from the fallback `if [[ -z $_match_file && -n $_live_rom ]]`
+# up to the consolidated skip `if [[ -z $_match_file ]]`), feed it a mock _live_rom
+# temp (valid 55aa) + an empty _match_file, and assert it sets _match_file to a
+# live-<bdf>.rom named temp whose content byte-matches the live ROM, with
+# _live_fallback flipped to 1.
+_fallback_blk="$(awk 'BEGIN{p=0} /^  if \[\[ -z "\$_match_file" && -n "\$_live_rom" \]\]; then/{p=1} /^  if \[\[ -z "\$_match_file" \]\]; then/{p=0} p{print}' "$VFIO_SCRIPT")"
+if [[ -n "$_fallback_blk" ]]; then
+  vfake5="$tmp/vbios_fallback_fake"
+  mkdir -p "$vfake5"
+  _mock_live="$vfake5/live.rom"
+  printf '\x55\xaa' > "$_mock_live"
+  head -c 32 /dev/urandom >> "$_mock_live" || true
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' 'say() { :; }'
+    printf '%s\n' 'note() { :; }'
+    printf '%s\n' 'C_YELLOW=""; C_GREEN=""; C_RESET=""; C_RED=""'
+    printf '%s\n' 'ENABLE_COLOR=0'
+    printf '%s\n' '_guest_gpu="0000:0e:00.0"'
+    printf '%s\n' '_match_file=""'
+    printf '%s\n' '_live_fallback=0'
+    printf '%s\n' '_skipped_bytes=0'
+    printf '%s\n' '_skipped_nomatch=0'
+    printf '_live_rom=%q\n' "$_mock_live"
+    # Snapshot the live ROM hash BEFORE run_fallback: the fallback block deletes
+    # $_live_rom (rm -f) after copying it to the named temp, so a cmp against
+    # $_live_rom afterwards would falsely fail (the file is gone).
+    printf '%s\n' '_live_sha="$(sha256sum "$_live_rom" 2>/dev/null | cut -d" " -f1)"'
+    printf '%s\n' 'run_fallback() {'
+    printf '%s\n' "$_fallback_blk" | sed 's/^/  /'
+    printf '%s\n' '}'
+    printf '%s\n' 'run_fallback'
+    printf '%s\n' '[[ "$_live_fallback" == "1" ]] || { echo "FAIL_FLAG"; exit 2; }'
+    printf '%s\n' '_bn="$(basename "$_match_file")"'
+    printf '%s\n' '[[ "$_bn" == "live-0000:0e:00.0.rom" ]] || { echo "FAIL_BASENAME:$_bn"; exit 3; }'
+    printf '%s\n' '_pin_sha="$(sha256sum "$_match_file" 2>/dev/null | cut -d" " -f1)"'
+    printf '%s\n' '[[ -n "$_pin_sha" && "$_pin_sha" == "$_live_sha" ]] || { echo "FAIL_CONTENT pin=$_pin_sha live=$_live_sha"; exit 4; }'
+    printf '%s\n' 'echo "FALLBACK_LIVE_OK"'
+    printf '%s\n' 'rm -f "$_match_file" 2>/dev/null || true'
+    printf '%s\n' 'rmdir "$(dirname "$_match_file")" 2>/dev/null || true'
+  } > "$vfake5/fallback_test.sh"
+  _fb_out="$(bash "$vfake5/fallback_test.sh" 2>&1 || true)"
+  if [[ "$_fb_out" == "FALLBACK_LIVE_OK" ]]; then
+    ok "Q3z live-ROM fallback pins a byte-exact live-<bdf>.rom named temp (content matches live ROM, _live_fallback=1)"
+  else
+    bad "Q3z live-ROM fallback LIVE test failed (got: $_fb_out)"
+  fi
+else
+  bad "Q3z could not extract the live-ROM fallback block to LIVE-test"
+fi
+
 if (( fail != 0 )); then
+  printf '\nFAIL SUMMARY (%d):\n' "${#_fails_arr[@]}" >&2
+  printf '  - %s\n' "${_fails_arr[@]}" >&2
   printf '\nSMOKE SUMMARY: FAIL\n' >&2
   exit 1
 fi

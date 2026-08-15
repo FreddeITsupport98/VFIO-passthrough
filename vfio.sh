@@ -4289,6 +4289,25 @@ VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 # failures with "header type 127" after amdgpu teardown and a plain retry does not
 # recover it.
 VFIO_DYNAMIC_PCI_RESET="0"
+# Dynamic-mode soft FLR on the alive-parked bind path (advanced):
+# - 0 (default): when --bind-now finds the guest GPU already on vfio-pci AND alive
+#   (the normal shutdown->start case), do NOT do a soft function-level reset +
+#   unbind + rebind. The vBIOS file pin (<rom file=.../>, installed by
+#   install_vbios_romfile) lets qemu read the GOP ROM from the FILE, so the soft
+#   FLR (originally added to clear the live ROM BAR 0xffff) is no longer needed.
+#   AND the soft FLR + rebind destabilizes the RX 9070 / RDNA4: the card passes
+#   the alive-check right after the rebind but falls off the bus ~3s later
+#   (config space -> ff ff ff ff), so qemu's vfio-pci attach hits a dead card
+#   ("Unable to power on device, stuck in D3") -> no OVMF/BIOS logo, black until
+#   Windows re-initializes the display. Skipping the FLR keeps the card alive so
+#   qemu attaches a live card and OVMF POSTs from the file-pinned ROM.
+# - 1: opt back into the soft FLR + unbind + rebind on the alive-parked path. Only
+#   use this if you have NO vBIOS file pin AND you hit the live-ROM 0xffff on
+#   shutdown->start. With a file pin this is never needed and is harmful on RX 9070.
+# WHY this value: 0 is correct for any setup with the vBIOS file pin (the default
+# after --install-dynamic-binding --vbios). Set 1 ONLY for the no-file-pin +
+# live-ROM-0xffff edge case; otherwise leave at 0 to avoid the reset-bug zombie.
+VFIO_DYNAMIC_SOFT_FLR_ON_BIND="0"
 # Dynamic-mode rapid stop/start cooldown (seconds, read by the bind script at VM start):
 # - 0: disable the cooldown (--bind-now proceeds immediately even right after a VM stop).
 # - N>0 (default 10): when the libvirt hook calls --bind-now within N seconds of the
@@ -8105,6 +8124,29 @@ bind_one() {
     _already_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
     if [[ "$_already_drv" == "vfio-pci" ]]; then
       if _pci_dev_alive "$dev"; then
+        # Default (VFIO_DYNAMIC_SOFT_FLR_ON_BIND != 1): the card is alive and
+        # already on vfio-pci from a previous VM session. The vBIOS file pin
+        # (<rom file=.../>, installed by install_vbios_romfile) lets qemu read
+        # the GOP ROM from the FILE, so the soft FLR + unbind + rebind below
+        # (originally added to clear the live ROM BAR 0xffff) is NO LONGER
+        # NEEDED. And worse: that soft FLR + rebind DESTABILIZES the RX 9070 /
+        # RDNA4 -- the card passes the alive-check right after the rebind but
+        # falls off the bus ~3s later (config space -> ff ff ff ff), so qemu's
+        # vfio-pci attach hits a dead card and reports "Unable to power on
+        # device, stuck in D3" -> no OVMF/BIOS logo, black until Windows
+        # re-initializes the display. Keeping the card as-is (skip the FLR),
+        # re-pinning D0, and returning success lets qemu attach a LIVE card
+        # that reads the GOP ROM from the file -> OVMF POSTs -> logo shows on
+        # shutdown->start. Set VFIO_DYNAMIC_SOFT_FLR_ON_BIND=1 to opt back into
+        # the soft FLR (only if you have NO vBIOS file pin AND you hit the
+        # live-ROM 0xffff).
+        if [[ "${VFIO_DYNAMIC_SOFT_FLR_ON_BIND:-0}" != "1" ]]; then
+          echo on >"$sys/power/control" 2>/dev/null || true
+          jlog "$dev: already on vfio-pci (alive); keeping as-is (vBIOS file pin handles the ROM; soft FLR skipped to avoid the RX 9070 reset-bug zombie) so qemu attaches a live card"
+          return 0
+        fi
+        # Opt-in soft FLR (VFIO_DYNAMIC_SOFT_FLR_ON_BIND=1): for setups with NO
+        # vBIOS file pin that still hit the live-ROM 0xffff.
         # Card is alive AND already on vfio-pci from a previous VM session
         # (parked after shutdown). BUT the display engine may still be in a
         # stale state from that previous session — OVMF cannot re-POST on a

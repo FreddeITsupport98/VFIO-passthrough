@@ -1765,6 +1765,32 @@ if grep -Fq 're-pinned power/control=on (D0) after soft-FLR rebind' "$tmp/gen_bi
 else
   bad "Q3w bind_one missing the post-(re)bind power/control=on re-pin (stuck-in-D3 fix)"
 fi
+# Case 2g: the alive-parked soft FLR + unbind + rebind is SKIPPED by default
+# (VFIO_DYNAMIC_SOFT_FLR_ON_BIND != 1). Root cause: the soft FLR + rebind
+# destabilizes the RX 9070 / RDNA4 -- the card passes the alive-check right after
+# the rebind but falls off the bus ~3s later (config -> ff ff ff ff), so qemu's
+# vfio-pci attach hits a dead card ("Unable to power on device, stuck in D3") ->
+# no OVMF/BIOS logo, black until Windows re-inits the display. The vBIOS file pin
+# (<rom file=.../>) lets qemu read the GOP ROM from the file, so the soft FLR
+# (originally for the live ROM BAR 0xffff) is no longer needed. Default skip keeps
+# the card alive so qemu attaches a live card and OVMF POSTs from the file-pinned
+# ROM -> logo shows on shutdown->start.
+if grep -Fq 'VFIO_DYNAMIC_SOFT_FLR_ON_BIND:-0' "$tmp/gen_bind.sh" \
+  && grep -Fq 'soft FLR skipped to avoid the RX 9070 reset-bug zombie' "$tmp/gen_bind.sh" \
+  && grep -Fq 'vBIOS file pin handles the ROM' "$tmp/gen_bind.sh"; then
+  ok "Q3w bind_one skips the alive-parked soft FLR by default (VFIO_DYNAMIC_SOFT_FLR_ON_BIND=0) so the card survives to qemu attach"
+else
+  bad "Q3w bind_one missing the soft-FLR skip-by-default gate (reset-bug zombie fix)"
+fi
+# Case 2h: the VFIO_DYNAMIC_SOFT_FLR_ON_BIND conf key is defined with a WHY
+# rationale in write_conf, defaulting to 0 (skip), so operators can discover it.
+if grep -Fq 'VFIO_DYNAMIC_SOFT_FLR_ON_BIND="0"' "$VFIO_SCRIPT" \
+  && grep -Fq 'soft FLR + rebind destabilizes the RX 9070' "$VFIO_SCRIPT" \
+  && grep -Fq 'vBIOS file pin' "$VFIO_SCRIPT"; then
+  ok "Q3w write_conf defines VFIO_DYNAMIC_SOFT_FLR_ON_BIND=0 with WHY rationale (file pin supersedes soft FLR; FLR triggers reset bug)"
+else
+  bad "Q3w write_conf missing VFIO_DYNAMIC_SOFT_FLR_ON_BIND conf key or its WHY rationale"
+fi
 
 # Case 3: failure-streak persistence (read/write/bump/reset), extracted from
 # the real generated script and driven against a temp STATE_FILE.

@@ -1751,6 +1751,20 @@ if grep -Fq 'echo auto >"$sys/power/control"' "$tmp/gen_bind.sh" \
 else
   bad "Q3w reprobe_to_host missing power/control auto/restore branch or default on"
 fi
+# Case 2f: bind_one re-pins power/control=on AFTER the vfio-pci (re)bind, as the
+# LAST write before qemu attaches. The vfio-pci probe resets power/control to
+# auto (disable_idle_d3=1 is not honored for this device), so the top-of-bind_one
+# `on` write gets overwritten; without a post-(re)bind re-pin the idle card
+# runtime-suspends to D3hot in the ~3s gap before qemu attaches -> qemu reports
+# "Unable to power on device, stuck in D3" -> no OVMF logo on shutdown->start.
+# Both the alive-parked rebind path AND the cold-start bind path must re-pin.
+if grep -Fq 're-pinned power/control=on (D0) after soft-FLR rebind' "$tmp/gen_bind.sh" \
+  && grep -Fq 're-pinned power/control=on (D0) after bind' "$tmp/gen_bind.sh" \
+  && grep -Fq 'Re-pin D0 AFTER the rebind' "$tmp/gen_bind.sh"; then
+  ok "Q3w bind_one re-pins power/control=on AFTER the vfio-pci (re)bind (alive-parked + cold-start) so qemu attaches a D0 card"
+else
+  bad "Q3w bind_one missing the post-(re)bind power/control=on re-pin (stuck-in-D3 fix)"
+fi
 
 # Case 3: failure-streak persistence (read/write/bump/reset), extracted from
 # the real generated script and driven against a temp STATE_FILE.

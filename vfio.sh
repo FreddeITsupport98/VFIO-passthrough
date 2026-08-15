@@ -8151,6 +8151,17 @@ bind_one() {
             (( _rb_att < _rb_maxa )) && sleep 0.2
           done
           if (( _rb_bound )) && _pci_dev_alive "$dev"; then
+            # Re-pin D0 AFTER the rebind: the vfio-pci probe above resets
+            # power/control to auto (vfio-pci.disable_idle_d3=1 is NOT honored
+            # for this device on this kernel), and with auto the idle card
+            # runtime-suspends to D3hot in the ~3s gap before qemu attaches --
+            # qemu then reports "Unable to power on device, stuck in D3" and
+            # OVMF cannot POST (no BIOS logo, black until the Windows driver
+            # re-inits). This re-pin is the LAST write before qemu attaches, so
+            # the card stays D0 through qemu's attach-time reset -> OVMF GOP
+            # runs -> logo shows on shutdown->start.
+            echo on >"$sys/power/control" 2>/dev/null || true
+            jlog "$dev: re-pinned power/control=on (D0) after soft-FLR rebind so qemu attaches a powered-on card"
             jlog "$dev: bound to vfio-pci (verified, alive) after soft-FLR rebind"
             return 0
           fi
@@ -8251,6 +8262,13 @@ bind_one() {
     fi
   fi
 
+  # Re-pin D0 as the LAST write before qemu attaches: the vfio-pci bind above
+  # (cold-start path) resets power/control to auto (disable_idle_d3=1 is not
+  # honored for this device), and with auto the idle card can runtime-suspend
+  # to D3hot before qemu attaches -> "stuck in D3" -> no OVMF logo. Same fix
+  # as the alive-parked rebind path above.
+  echo on >"$sys/power/control" 2>/dev/null || true
+  jlog "$dev: re-pinned power/control=on (D0) after bind so qemu attaches a powered-on card"
   jlog "$dev: bound to vfio-pci (verified, alive)"
 }
 

@@ -4353,6 +4353,18 @@ VFIO_RESTORE_D3COLD_ON_RELEASE="0"
 # hung bind is aborted. Lower it only if your hook deadline is shorter; raise it
 # only if a legitimately slow bind keeps getting aborted (rare).
 VFIO_HOOK_BIND_TIMEOUT="20"
+# Dynamic-mode host-rebind verify timeout (seconds, read by reprobe_to_host at
+# --release when VFIO_DYNAMIC_REBIND_HOST=1): after kicking
+# /sys/bus/pci/drivers_probe to make amdgpu/snd re-grab the guest GPU, poll
+# this long for the host driver to actually bind. The kernel re-probe is
+# async, so without a settle+verify the next step can run on a still-unbound
+# card (racing the probe) and a later segfault/hang is invisible. The poll is
+# 0.2s ticks, so 2s = 10 ticks.
+# WHY this value: 2s is enough for amdgpu to rebind on observed RX 9070
+# hardware; raise it if your card is slow to re-probe, lower it if you want the
+# release to return faster (the release-time remove+rescan recovery still
+# catches a card that fell off regardless of this value).
+VFIO_REBIND_VERIFY_TIMEOUT="2"
 # Optional max PCIe generation cap for the post-reset adaptive link restore.
 # Originally introduced for the reboot-FLR monitor (guest warm reboot), but now
 # shared by EVERY RX 9070 family PCIe Gen1-downtrain/adaptive-restore recovery
@@ -8234,12 +8246,17 @@ bind_one() {
   # Unbind from current driver if any (amdgpu/snd), then wait briefly for the
   # driver teardown to settle. Some AMD cards need a short delay between unbind
   # and the vfio-pci bind attempt or the first bind races the async teardown.
+  # INSTRUMENTED: the unbind write is bracketed by before/after jlog so a
+  # D-state hang (observed: --bind-now wedged in uninterruptible sleep on the
+  # amdgpu unbind after a prior failed rebind) shows the EXACT sysfs path that
+  # blocked in journalctl -t vfio-dynamic.
   if [[ -L "$sys/driver" ]]; then
     local drv
     drv="$(basename "$(readlink "$sys/driver")")"
     if [[ -w "/sys/bus/pci/drivers/$drv/unbind" ]]; then
+      jlog "$dev: unbind from $drv (before)"
       echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" || true
-      jlog "$dev: unbind from $drv"
+      jlog "$dev: unbind from $drv (after)"
     fi
     sleep 0.3
   fi
@@ -8263,7 +8280,12 @@ bind_one() {
   _max_attempts=3
   _drv=""
   for _attempt in $(seq 1 "$_max_attempts"); do
+    # INSTRUMENTED: bracket the bind write so a D-state hang here (observed on
+    # a card left in a bad state by a prior failed rebind) is attributable to
+    # this exact sysfs path in journalctl -t vfio-dynamic.
+    jlog "$dev: vfio-pci bind attempt $_attempt/$_max_attempts (before)"
     echo "$dev" >"/sys/bus/pci/drivers/vfio-pci/bind" 2>/dev/null || true
+    jlog "$dev: vfio-pci bind attempt $_attempt/$_max_attempts (after)"
     _drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
     if [[ "$_drv" == "vfio-pci" ]]; then
       jlog "$dev: bound on attempt $_attempt"
@@ -8327,6 +8349,20 @@ reprobe_to_host() {
   # generic driver re-probe so the normal host driver (amdgpu/snd) can reclaim
   # the device. Used by --release when VFIO_DYNAMIC_REBIND_HOST=1.
   #
+  # INSTRUMENTED: every sysfs write is bracketed by a before/after jlog so the
+  # journal (journalctl -t vfio-dynamic) shows the EXACT last step that
+  # succeeded if a later step segfaults (observed: --release exited 139/SIGSEGV
+  # on an RX 9070 during this handoff) or hangs in D-state (observed: a bind-now
+  # after a failed rebind wedged libvirt). Without this instrumentation the
+  # crash site was invisible.
+  #
+  # ROBUST: after the drivers_probe kick, the kernel re-probe is ASYNC -- we
+  # settle (sleep 0.5s) then VERIFY the host driver (amdgpu/snd) actually bound
+  # with a bounded poll (VFIO_REBIND_VERIFY_TIMEOUT, default 2s). Previously the
+  # next step ran on a still-unbound card, racing the probe. The caller (the
+  # release case) re-checks _pci_dev_alive after this returns and runs
+  # remove+rescan recovery if the card fell off.
+  #
   # NOTE: d3cold_allowed is deliberately left at 0 by default here. The RX 9070 /
   # RDNA4 reset bug means the card can fall off the bus on D3cold exit even on the
   # host, so D3cold stays disabled after release. Do NOT restore it to 1 unless you
@@ -8334,32 +8370,64 @@ reprobe_to_host() {
   local dev="$1"
   [[ -n "$dev" ]] || return 0
   local sys="/sys/bus/pci/devices/$dev"
-  [[ -d "$sys" ]] || return 0
+  [[ -d "$sys" ]] || { jlog "$dev: reprobe_to_host: sysfs dir gone, nothing to rebind"; return 0; }
+  local _was_drv
+  _was_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo none)"
+  jlog "$dev: reprobe_to_host start (was driver=${_was_drv:-none})"
+  # 1/4. unbind from vfio-pci (bracketed so a crash here is attributable).
   if [[ -L "$sys/driver" ]]; then
     local drv
     drv="$(basename "$(readlink "$sys/driver")")"
     if [[ "$drv" == "vfio-pci" ]] && [[ -w "/sys/bus/pci/drivers/$drv/unbind" ]]; then
-      echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" || true
+      jlog "$dev: reprobe step 1/4 unbind from $drv (before)"
+      echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" 2>/dev/null || true
+      jlog "$dev: reprobe step 1/4 unbind from $drv (after)"
+      sleep 0.3
     fi
   fi
+  # 2/4. clear driver_override so the re-probe is not forced to vfio-pci.
+  jlog "$dev: reprobe step 2/4 clear driver_override (before)"
   echo "" >"$sys/driver_override" 2>/dev/null || true
+  jlog "$dev: reprobe step 2/4 clear driver_override (after)"
+  # 3/4. trigger a generic driver re-probe (kick amdgpu/snd to reclaim).
   if [[ -w /sys/bus/pci/drivers_probe ]]; then
+    jlog "$dev: reprobe step 3/4 drivers_probe write (before)"
     echo "$dev" >/sys/bus/pci/drivers_probe 2>/dev/null || true
+    jlog "$dev: reprobe step 3/4 drivers_probe write (after)"
+    sleep 0.5  # kernel re-probe is async; let amdgpu/snd probe settle
+  else
+    jlog "$dev: reprobe step 3/4 drivers_probe unavailable (no re-probe kick)"
   fi
-  # Optional: restore d3cold_allowed=1 when handing the card back to the host.
-  # OFF by default because the RX 9070 / RDNA4 reset bug means D3cold exit can drop
-  # the card off the bus even on the host; enable only if you never hit that bug
-  # and want lower host idle power between VM sessions (VFIO_RESTORE_D3COLD_ON_RELEASE=1).
+  # 3b/4. VERIFY a host driver actually bound, with a bounded poll. The verify
+  # is diagnostic + a settle gate; reprobe_to_host stays best-effort (returns 0)
+  # so set -e in the caller cannot abort the release -- the caller does its own
+  # _pci_dev_alive check and remove+rescan recovery if the card fell off.
+  local _vp_att _vp_max _vp_drv=""
+  _vp_max=10
+  [[ "${VFIO_REBIND_VERIFY_TIMEOUT:-}" =~ ^[0-9]+$ ]] && _vp_max=$(( VFIO_REBIND_VERIFY_TIMEOUT * 5 ))
+  for _vp_att in $(seq 1 "$_vp_max"); do
+    _vp_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+    [[ "$_vp_drv" == "amdgpu" || "$_vp_drv" == "snd_hda_intel" ]] && break
+    sleep 0.2
+  done
+  if [[ -n "$_vp_drv" ]]; then
+    jlog "$dev: reprobe step 3b/4 verified on $_vp_drv (poll $_vp_att/$_vp_max)"
+  else
+    jlog "$dev: reprobe step 3b/4 WARN no host driver bound after $_vp_max polls (last=${_vp_drv:-none}); card may have fallen off the bus"
+  fi
+  # 4/4. d3cold_allowed + power/control. Default keeps the card pinned in D0
+  # (no D3hot, no D3cold) to avoid the RX 9070 / RDNA4 reset bug on the host.
   if [[ "${VFIO_RESTORE_D3COLD_ON_RELEASE:-0}" == "1" ]]; then
     echo 1 >"$sys/d3cold_allowed" 2>/dev/null || true
-    # Let the host driver manage runtime PM again (lower idle power between
-    # VM sessions). Only when the operator opted into D3cold restore.
     echo auto >"$sys/power/control" 2>/dev/null || true
+    jlog "$dev: reprobe step 4/4 d3cold=1 power/control=auto (opt-in RESTORE_D3COLD)"
   else
-    # Default: keep the card pinned in D0 (no D3hot, no D3cold) to avoid the
-    # RX 9070 / RDNA4 reset bug on the host too. Mirrors d3cold_allowed=0 above.
     echo on >"$sys/power/control" 2>/dev/null || true
+    jlog "$dev: reprobe step 4/4 power/control=on (D0 pin default)"
   fi
+  local _now_drv
+  _now_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo none)"
+  jlog "$dev: reprobe_to_host done (now driver=${_now_drv:-none})"
 }
 
 # Safety pre-flight: refuse if the guest GPU or any guest audio BDF is also
@@ -8513,13 +8581,37 @@ boot_vga_guard() {
 
 case "$ACTION" in
   release)
+    jlog "=== --release start (REBIND_HOST=${VFIO_DYNAMIC_REBIND_HOST:-0}) ==="
     if [[ "${VFIO_DYNAMIC_REBIND_HOST:-0}" == "1" ]]; then
-      reprobe_to_host "$GUEST_GPU_BDF"
-      while IFS= read -r dev; do
-        [[ -n "$dev" ]] || continue
-        reprobe_to_host "$dev"
-      done < <(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}")
+      # INSTRUMENTED + ROBUST: reprobe_to_host logs every step (so a segfault
+      # is attributable) and verifies the host driver bound. Here we ALSO
+      # re-check _pci_dev_alive after each reprobe and run remove+rescan
+      # recovery if the card fell off (RX 9070 / RDNA4 reset bug on the
+      # vfio-pci -> amdgpu handoff). Previously a dead card after reprobe was
+      # silent until the next --bind-now wedged libvirt in D-state.
+      _rh_dead=0
+      for _rh_dev in "$GUEST_GPU_BDF" $(csv_to_array "${GUEST_AUDIO_BDFS_CSV:-}"); do
+        [[ -n "$_rh_dev" ]] || continue
+        reprobe_to_host "$_rh_dev"
+        if ! _pci_dev_alive "$_rh_dev"; then
+          jlog "$_rh_dev: DEAD after reprobe_to_host (RX 9070 reset bug); attempting remove+rescan recovery at release"
+          say "WARN: $_rh_dev is dead after the vfio-pci -> host-driver rebind (RX 9070 / RDNA4 reset bug). Attempting remove+rescan recovery." >&2
+          if _pci_dev_remove_rescan "$_rh_dev"; then
+            jlog "$_rh_dev: recovered after remove+rescan at release (alive)"
+            say "Recovered $_rh_dev after remove+rescan at release."
+          else
+            jlog "$_rh_dev: still dead after remove+rescan at release; next --bind-now will report it needs a host reboot"
+            say "WARN: $_rh_dev is still dead after remove+rescan at release. The next VM start will report it needs a host reboot." >&2
+            _rh_dead=1
+          fi
+        fi
+      done
       say "Released guest devices back to host driver: $GUEST_GPU_BDF ${GUEST_AUDIO_BDFS_CSV:-}"
+      if (( _rh_dead )); then
+        jlog "=== --release done with DEAD device(s); next start may abort ==="
+      else
+        jlog "=== --release done (all devices alive on host driver) ==="
+      fi
     else
       say "Dynamic release: leaving guest GPU on vfio-pci (VFIO_DYNAMIC_REBIND_HOST=0)."
       # Pin the parked guest BDFs in D0 (disable runtime PM) the moment the VM

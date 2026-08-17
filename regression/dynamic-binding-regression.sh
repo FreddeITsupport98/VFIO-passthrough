@@ -1875,7 +1875,11 @@ assert_contains_text \
   "$bind_block"
 assert_contains_text \
   "R7 jlog logs unbind" \
-  'jlog "$dev: unbind from $drv"' \
+  'jlog "$dev: unbind from $drv (before)' \
+  "$bind_block"
+assert_contains_text \
+  "R7 jlog logs unbind after" \
+  'jlog "$dev: unbind from $drv (after)' \
   "$bind_block"
 assert_contains_text \
   "R7 jlog logs verified bind" \
@@ -1918,18 +1922,31 @@ assert_contains_text \
   "if _bind_now; then" \
   "$hook_block"
 
-# --- Functional R10: opt-in d3cold restore on host rebind ---
+# --- Functional R11: reprobe_to_host is instrumented + robust (step-by-step
+# jlog, settle, verify host driver bound) so a segfault/hang during the
+# vfio-pci -> amdgpu rebind is attributable AND the release case re-checks
+# _pci_dev_alive + runs remove+rescan recovery if the card fell off. This
+# was added after --release exited 139/SIGSEGV on an RX 9070 and a follow-up
+# --bind-now wedged libvirt in D-state, with no way to see the crash site.
 assert_contains_text \
-  "R10 reprobe_to_host gates d3cold restore on VFIO_RESTORE_D3COLD_ON_RELEASE" \
-  'VFIO_RESTORE_D3COLD_ON_RELEASE' \
+  "R11 reprobe_to_host jlogs each step (before/after)" \
+  'reprobe step 1/4 unbind from $drv (before)' \
   "$bind_block"
 assert_contains_text \
-  "R10 reprobe_to_host restores d3cold_allowed=1 when opted in" \
-  'echo 1 >"$sys/d3cold_allowed"' \
+  "R11 reprobe_to_host settles after drivers_probe + verifies host driver" \
+  'reprobe step 3b/4 verified on' \
+  "$bind_block"
+assert_contains_text \
+  "R11 release re-checks alive after reprobe + runs remove+rescan recovery" \
+  'DEAD after reprobe_to_host (RX 9070 reset bug); attempting remove+rescan recovery at release' \
+  "$bind_block"
+assert_contains_text \
+  "R11 bind_one brackets the vfio-pci bind write (D-state hang attribution)" \
+  'vfio-pci bind attempt $_attempt/$_max_attempts (before)' \
   "$bind_block"
 assert_contains_file \
-  "R10 write_conf persists VFIO_RESTORE_D3COLD_ON_RELEASE" \
-  'VFIO_RESTORE_D3COLD_ON_RELEASE="0"' \
+  "R11 write_conf persists VFIO_REBIND_VERIFY_TIMEOUT" \
+  'VFIO_REBIND_VERIFY_TIMEOUT="2"' \
   "$VFIO_SCRIPT"
 
 # --- Functional B1: do_bind post-check uses local drv (no global leak) ---

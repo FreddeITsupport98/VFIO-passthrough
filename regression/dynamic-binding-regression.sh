@@ -2053,6 +2053,44 @@ assert_contains_file \
   'VFIO_HOOK_BIND_TIMEOUT="20"' \
   "$VFIO_SCRIPT"
 
+# --- Functional R12: _sync_conf_defaults closes the conf-drift gap ---
+# The binding switchers (--install-dynamic-binding / --install-early-binding)
+# only flip VFIO_BINDING_MODE via rewrite_conf_key; they never call write_conf
+# (which needs full wizard context), so advanced keys added to write_conf in
+# later releases never land in an older live conf. _sync_conf_defaults merges
+# any MISSING fixed-default keys into the existing conf (preserving user values),
+# and BOTH switchers must call it so the conf stays in sync with the script.
+assert_contains_file \
+  "R12 _sync_conf_defaults helper is defined" \
+  '_sync_conf_defaults()' \
+  "$VFIO_SCRIPT"
+_dyn_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+_early_fn="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if printf '%s\n' "$_dyn_fn" | grep -Fq '_sync_conf_defaults'; then
+  printf 'PASS: R12 install_dynamic_binding_from_existing_config calls _sync_conf_defaults\n'
+else
+  printf 'FAIL: R12 install_dynamic_binding_from_existing_config missing _sync_conf_defaults call\n' >&2
+  record_failure "R12 install_dynamic_binding calls _sync_conf_defaults"
+fi
+if printf '%s\n' "$_early_fn" | grep -Fq '_sync_conf_defaults'; then
+  printf 'PASS: R12 install_early_binding_from_existing_config calls _sync_conf_defaults\n'
+else
+  printf 'FAIL: R12 install_early_binding_from_existing_config missing _sync_conf_defaults call\n' >&2
+  record_failure "R12 install_early_binding calls _sync_conf_defaults"
+fi
+# The helper must be idempotent (only add MISSING keys) and must NOT touch
+# computed/identity keys (HOST_GPU_BDF, GUEST_*, VFIO_BINDING_MODE). Verify it
+# uses a fixed-default map and a grep presence check, not a full rewrite.
+_sync_fn="$(sed -n '/^_sync_conf_defaults()/,/^}/p' "$VFIO_SCRIPT")"
+if printf '%s\n' "$_sync_fn" | grep -Fq 'local -A _defs=' \
+  && printf '%s\n' "$_sync_fn" | grep -Fq 'grep -Eq "^${_k}="' \
+  && printf '%s\n' "$_sync_fn" | grep -Fq 'Synced $_added missing default conf key(s)'; then
+  printf 'PASS: R12 _sync_conf_defaults is idempotent (missing-only merge) with a fixed-default map\n'
+else
+  printf 'FAIL: R12 _sync_conf_defaults missing idempotent merge logic or fixed-default map\n' >&2
+  record_failure "R12 _sync_conf_defaults is idempotent missing-only merge"
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

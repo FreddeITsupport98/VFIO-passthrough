@@ -4162,6 +4162,90 @@ discover_vfio_modules() {
   printf '%s\n' "${have[@]}"
 }
 
+# Idempotently merge any MISSING fixed-default conf keys into an existing
+# $CONF_FILE, preserving all existing user-set values. The binding switchers
+# (--install-dynamic-binding / --install-early-binding) only flip
+# VFIO_BINDING_MODE via rewrite_conf_key; they never call write_conf (which
+# needs full wizard context), so advanced keys added to write_conf in later
+# releases never land in an older live conf. That drift left keys like
+# VFIO_REBIND_VERIFY_TIMEOUT and VFIO_DYNAMIC_SOFT_FLR_ON_BIND absent from the
+# live conf even after --install-dynamic-binding regenerated the bind script
+# that reads them (they fell back to defaults, which is functional but not
+# documented/tunable for the operator).
+#
+# This helper closes that gap: for each fixed-default KEY in write_conf's
+# heredoc that is ABSENT from the live conf, append a short comment +
+# KEY="default" at the end. It never edits or reorders existing lines, so a
+# user's values and comments are untouched. It is safe to run repeatedly
+# (idempotent: only adds keys that are missing). Computed/identity keys
+# (HOST_GPU_BDF, GUEST_*, VFIO_BINDING_MODE, GRAPHICS_PROTOCOL_MODE,
+# VFIO_GRAPHICS_DAEMON_INTERVAL, VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU,
+# VFIO_BOOT_VGA_POLICY, HOST_AUDIO_*) are intentionally NOT merged here --
+# those depend on wizard context / topology and are the wizard's job; merging
+# a default for them would be wrong.
+_sync_conf_defaults() {
+  readable_file "$CONF_FILE" || return 0
+  # Fixed-default keys -> default value. Keep this set in sync with the
+  # write_conf() heredoc below. (A short comment is appended with each missing
+  # key so the operator has a hint; the full WHY rationale lives in write_conf.)
+  local -A _defs=(
+    [VFIO_GRAPHICS_WATCHDOG_RETENTION_DAYS]="10"
+    [VFIO_GRAPHICS_WATCHDOG_MAX_LINES]="5000"
+    [VFIO_GRAPHICS_AUTO_X11_PINNING]="1"
+    [VFIO_DYNAMIC_REBIND_HOST]="0"
+    [VFIO_DYNAMIC_ALLOW_BOOT_VGA]="0"
+    [VFIO_DYNAMIC_PCI_RESET]="0"
+    [VFIO_DYNAMIC_SOFT_FLR_ON_BIND]="0"
+    [VFIO_DYNAMIC_COOLDOWN_SECONDS]="10"
+    [VFIO_RESTORE_D3COLD_ON_RELEASE]="0"
+    [VFIO_HOOK_BIND_TIMEOUT]="20"
+    [VFIO_REBIND_VERIFY_TIMEOUT]="2"
+    [VFIO_REBOOT_FLR_MAX_GEN]=""
+    [STEALTH_VM_BACKUP_DIR]=""
+    [VFIO_DYNAMIC_PARK_KEEPALIVE]="1"
+    [VFIO_DYNAMIC_PARK_KEEPALIVE_INTERVAL]="10"
+    [VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS]="5"
+    [VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX]="300"
+    [VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY]="1"
+  )
+  local _added=0 _k _val _tmp
+  _tmp="$(mktemp)"
+  # Copy the existing conf verbatim into the temp, then append any missing
+  # fixed-default keys at the end with a short comment.
+  cat "$CONF_FILE" >"$_tmp"
+  for _k in "${!_defs[@]}"; do
+    # Present? (match the key at start of a line).
+    if grep -Eq "^${_k}=" "$_tmp" 2>/dev/null; then
+      continue
+    fi
+    _val="${_defs[$_k]}"
+    if (( _added == 0 )); then
+      printf '\n# --- Synced defaults (added by %s on %s; see write_conf for full rationale) ---\n' \
+        "$SCRIPT_NAME" "$(date -Is)" >>"$_tmp"
+    fi
+    printf '# %s (default; tune here): advanced dynamic-binding/park-keepalive knob.\n' "$_k" >>"$_tmp"
+    printf '%s="%s"\n' "$_k" "$_val" >>"$_tmp"
+    _added=$((_added+1))
+  done
+  if (( _added > 0 )); then
+    if (( DRY_RUN )); then
+      rm -f "$_tmp" 2>/dev/null || true
+      note "DRY-RUN: would add $_added missing fixed-default conf key(s) to $CONF_FILE"
+      return 0
+    fi
+    install -o root -g root -m 0644 "$_tmp" "$CONF_FILE" 2>/dev/null || cp -f "$_tmp" "$CONF_FILE"
+    rm -f "$_tmp" 2>/dev/null || true
+    if (( ENABLE_COLOR )); then
+      say "  ${C_GREEN}✔${C_RESET} Synced $_added missing default conf key(s) into $(_link "$CONF_FILE")"
+    else
+      say "  ✔ Synced $_added missing default conf key(s) into $CONF_FILE"
+    fi
+  else
+    rm -f "$_tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
 write_conf() {
   local host_gpu="$1"
   local host_audio_bdfs_csv="$2"
@@ -13348,6 +13432,13 @@ install_dynamic_binding_from_existing_config() {
     say "  ✔ Set VFIO_BINDING_MODE=dynamic in $CONF_FILE"
   fi
 
+  # 1b. Sync any missing fixed-default conf keys (advanced dynamic-binding /
+  # park-keepalive / vBIOS knobs added to write_conf in later releases) into the
+  # live conf, preserving existing user values. The switcher does not call
+  # write_conf (it needs full wizard context), so without this step new keys
+  # drift out of the live conf even after the bind script is regenerated.
+  _sync_conf_defaults
+
   # 2. Regenerate the bind script so the latest bind/hook-runtime logic (e.g.
   #    Boot-VGA host-assisted escape, d3cold pinning, retry/jlog behavior) is
   #    deployed without needing a full wizard re-run.
@@ -13505,6 +13596,13 @@ install_early_binding_from_existing_config() {
   # 1. Flip the conf key.
   rewrite_conf_key "VFIO_BINDING_MODE" "early"
   say "Set VFIO_BINDING_MODE=early in $CONF_FILE"
+
+  # 1b. Sync any missing fixed-default conf keys (advanced dynamic-binding /
+  # park-keepalive / vBIOS knobs added to write_conf in later releases) into the
+  # live conf, preserving existing user values. The switcher does not call
+  # write_conf (it needs full wizard context), so without this step new keys
+  # drift out of the live conf even after the bind script is regenerated.
+  _sync_conf_defaults
 
   # 2. Regenerate the bind script so the latest bind/boot-time logic is deployed
   #    without needing a full wizard re-run.

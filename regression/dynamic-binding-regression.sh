@@ -2158,6 +2158,58 @@ assert_contains_file \
   'VFIO_AMDGPU_READY_TIMEOUT="5"' \
   "$VFIO_SCRIPT"
 
+# --- Functional R15: opt-in Secondary Bus Reset (SBR) before the host-driver
+# rebind -- a HEAVIER reset than the R14 soft FLR, for the case where the soft
+# FLR did NOT fix the amdgpu rebind hang (observed 16:16:25 on Navi 48: the FLR
+# fired cleanly but the direct amdgpu/bind still hung in D-state, amdgpu's probe
+# never finished, DRM card never came up). R15 adds:
+#  (a) _secondary_bus_reset helper (pulses RST# on the upstream port's secondary
+#      bus via setpci Bridge Control offset 0x3E bit 6 = 0x0040, wrapped in the
+#      SAME Gen1 downtrain + adaptive link restore as the other reset paths);
+#  (b) reprobe_to_host step 2c/4 opt-in SBR gate (VFIO_DYNAMIC_SBR_BEFORE_REBIND),
+#      GPU BDF only (one SBR resets the audio sibling too), taking PRECEDENCE
+#      over the 2b/4 soft FLR (heavier, supersedes);
+#  (c) the new conf key persisted in write_conf + _sync_conf_defaults.
+assert_contains_text \
+  "R15 _secondary_bus_reset helper defined (pulses RST# on the upstream port)" \
+  '_secondary_bus_reset()' \
+  "$bind_block"
+assert_contains_text \
+  "R15 _secondary_bus_reset reads Bridge Control at offset 0x3E" \
+  '3E.w' \
+  "$bind_block"
+assert_contains_text \
+  "R15 _secondary_bus_reset asserts SBR bit 6 (0x0040)" \
+  '0x0040' \
+  "$bind_block"
+assert_contains_text \
+  "R15 _secondary_bus_reset de-asserts SBR (clears bit 6 via 0xFFBF)" \
+  '0xFFBF' \
+  "$bind_block"
+assert_contains_text \
+  "R15 reprobe_to_host has opt-in pre-rebind SBR gate (step 2c/4)" \
+  'reprobe step 2c/4 pre-rebind SBR' \
+  "$bind_block"
+assert_contains_text \
+  "R15 SBR gate is GPU BDF only (avoids double-resetting the audio sibling)" \
+  '"$dev" == "${GUEST_GPU_BDF:-}"' \
+  "$bind_block"
+assert_contains_text \
+  "R15 SBR takes precedence over the soft FLR (elif on FLR after SBR if)" \
+  'VFIO_DYNAMIC_SBR_BEFORE_REBIND' \
+  "$bind_block"
+assert_contains_file \
+  "R15 write_conf persists VFIO_DYNAMIC_SBR_BEFORE_REBIND" \
+  'VFIO_DYNAMIC_SBR_BEFORE_REBIND="0"' \
+  "$VFIO_SCRIPT"
+_sync_fn_sbr="$(sed -n '/^_sync_conf_defaults()/,/^}/p' "$VFIO_SCRIPT")"
+if printf '%s\n' "$_sync_fn_sbr" | grep -Fq '[VFIO_DYNAMIC_SBR_BEFORE_REBIND]'; then
+  printf 'PASS: R15 _sync_conf_defaults merges VFIO_DYNAMIC_SBR_BEFORE_REBIND\n'
+else
+  printf 'FAIL: R15 _sync_conf_defaults missing VFIO_DYNAMIC_SBR_BEFORE_REBIND\n' >&2
+  record_failure "R15 _sync_conf_defaults merges SBR key"
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

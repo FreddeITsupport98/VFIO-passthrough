@@ -4202,6 +4202,7 @@ _sync_conf_defaults() {
     [VFIO_REBIND_VERIFY_TIMEOUT]="2"
     [VFIO_AMDGPU_READY_TIMEOUT]="5"
     [VFIO_DYNAMIC_FLR_BEFORE_REBIND]="0"
+    [VFIO_DYNAMIC_SBR_BEFORE_REBIND]="0"
     [VFIO_REBOOT_FLR_MAX_GEN]=""
     [STEALTH_VM_BACKUP_DIR]=""
     [VFIO_DYNAMIC_PARK_KEEPALIVE]="1"
@@ -4482,6 +4483,25 @@ VFIO_AMDGPU_READY_TIMEOUT="5"
 # WHY this value: 0 avoids an unnecessary FLR on a card that rebinds cleanly.
 # Set 1 only if REBIND_HOST=1's amdgpu rebind hangs or leaves the card dead.
 VFIO_DYNAMIC_FLR_BEFORE_REBIND="0"
+# Dynamic-mode opt-in Secondary Bus Reset before the host-driver rebind at
+# release (advanced, read by reprobe_to_host, HEAVIER than the soft FLR above):
+# - 0 (default): do NOT do an SBR before rebinding. An SBR pulses RST# on the
+#   upstream switch port's secondary bus (setpci Bridge Control 0x3E bit 6),
+#   hot-resetting the GPU AND every device behind the same upstream port (e.g.
+#   the GPU's audio sibling) -- a heavier reset than the function-level FLR,
+#   so it is opt-in.
+# - 1: after unbind from vfio-pci + clear driver_override, do an SBR on the
+#   upstream port BEFORE binding amdgpu. Resets more of the card's internal
+#   state (PSP/MC, which the function-level FLR does not fully clear) so
+#   amdgpu's probe can complete. Use this ONLY if REBIND_HOST=1's amdgpu rebind
+#   still hangs (D-state / "amdgpu NOT ready after 5s") with the soft FLR
+#   (VFIO_DYNAMIC_FLR_BEFORE_REBIND=1) enabled. Takes PRECEDENCE over the soft
+#   FLR when both are set (it supersedes the FLR). GPU BDF only -- one SBR
+#   resets the audio sibling too, so it runs once on the GPU iteration.
+# WHY this value: 0 avoids an unnecessary heavy bus reset (and a sibling-device
+# reset) on a card that rebinds cleanly. Set 1 only if the soft FLR did not fix
+# the amdgpu rebind hang (the 2b/4 FLR is always the first thing to try).
+VFIO_DYNAMIC_SBR_BEFORE_REBIND="0"
 # Optional max PCIe generation cap for the post-reset adaptive link restore.
 # Originally introduced for the reboot-FLR monitor (guest warm reboot), but now
 # shared by EVERY RX 9070 family PCIe Gen1-downtrain/adaptive-restore recovery
@@ -8165,6 +8185,72 @@ _rx9070_gated_soft_flr() {
   return 0
 }
 
+# Secondary Bus Reset (SBR) of the upstream PCIe switch port for $1 (the GPU).
+# A HEAVIER reset than the function-level FLR (_rx9070_gated_soft_flr): it
+# pulses RST# on the upstream port's secondary bus (setpci Bridge Control
+# register at offset 0x3E, bit 6 = 0x0040), hot-resetting the GPU AND every
+# other device behind the same upstream port (e.g. the GPU's audio sibling).
+# Used at --release (REBIND_HOST=1) when the pre-rebind soft FLR is NOT enough:
+# on Navi 48 / RX 9070 the direct amdgpu/bind after vfio-pci hangs in D-state
+# even after a soft FLR (amdgpu's probe never finishes, DRM card never comes up
+# -- observed 16:16:25: the FLR fired cleanly but the amdgpu/bind still hung);
+# the SBR resets more of the card's internal state (PSP/MC, which the
+# function-level FLR does not fully clear) so amdgpu's probe can complete.
+#
+# Wraps the SAME pre-reset Gen1 downtrain + post-reset adaptive link restore
+# already proven for the reboot-FLR / remove+rescan / soft-FLR paths (see
+# _pre_reset_gen1_downtrain / _post_reset_restore_link): an SBR drops the PCIe
+# link and it must retrain reliably (Gen1 first, then adapt back up to the
+# detected capability), exactly the pattern that makes the other resets work on
+# this card family. The upstream port is NOT itself reset by the SBR, so its
+# LnkCtl2 Gen1 target set by _pre_reset_gen1_downtrain persists across the RST#
+# pulse and the link retrains at Gen1 after de-assert.
+#
+# Caller MUST gate this to the GPU BDF only (reprobe_to_host step 2c/4 checks
+# dev == GUEST_GPU_BDF): the audio sibling shares this upstream bridge, and one
+# SBR resets BOTH, so running it once on the GPU iteration is enough -- a second
+# SBR on the audio iteration would be a redundant double reset of the same bus.
+# The caller also owns the unbind + clear_driver_override BEFORE and the direct
+# amdgpu bind AFTER. Best-effort: returns 0 even if a setpci step fails (the
+# caller proceeds to the bind; a failed SBR is no worse than no SBR).
+_secondary_bus_reset() {
+  local _bdf="$1" _upstream _brctl _brctl_set _brctl_clr
+  [[ -n "$_bdf" ]] || return 1
+  _upstream="$(_gpu_upstream_port "$_bdf" 2>/dev/null || true)"
+  if [[ -z "$_upstream" ]]; then
+    jlog "$_bdf: SBR skipped (could not find upstream port)"
+    return 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    jlog "$_bdf: SBR skipped (setpci not installed)"
+    return 1
+  fi
+  # Pre-reset Gen1 downtrain (stashes detected cap/cur/width globals for the
+  # matching _post_reset_restore_link call below -- same as _rx9070_gated_soft_flr).
+  _pre_reset_gen1_downtrain "$_bdf"
+  # Read the upstream port's Bridge Control register (offset 0x3E, 16-bit).
+  _brctl="$(_setpci_word "$_upstream" 3E.w 2>/dev/null || true)"
+  if [[ -z "$_brctl" ]]; then
+    jlog "$_bdf: SBR aborted (could not read Bridge Control from $_upstream)"
+    return 1
+  fi
+  # Assert Secondary Bus Reset (bit 6 = 0x0040): pulses RST# on the secondary
+  # bus, hot-resetting the GPU and every device behind the same upstream port.
+  _brctl_set="$(printf '%04x' $(( 0x$_brctl | 0x0040 )) )"
+  setpci -s "$_upstream" 3E.w="$_brctl_set" 2>/dev/null || true
+  jlog "$_bdf: SBR assert on $_upstream (BridgeCtl 0x$_brctl -> 0x$_brctl_set, bit6 RST# set)"
+  # Hold reset: PCIe TPerst must be asserted >= 2ms; give a generous margin.
+  sleep 0.05
+  # De-assert SBR (clear bit 6 via AND ~0x0040 = 0xFFBF) so the link retrains.
+  _brctl_clr="$(printf '%04x' $(( 0x$_brctl & 0xFFBF )) )"
+  setpci -s "$_upstream" 3E.w="$_brctl_clr" 2>/dev/null || true
+  jlog "$_bdf: SBR de-assert on $_upstream (BridgeCtl -> 0x$_brctl_clr, RST# cleared); link retraining"
+  # Post-reset adaptive link restore (bounded descent back to detected cap).
+  _post_reset_restore_link "$_bdf"
+  jlog "$_bdf: SBR complete (upstream $_upstream reset, link restored)"
+  return 0
+}
+
 # Last-resort recovery for a dead PCI device: remove it from the bus, rescan
 # the whole PCI bus to force re-enumeration, then re-bind to vfio-pci. This is
 # the final recovery step before telling the user to reboot the host. On RX
@@ -8517,12 +8603,30 @@ reprobe_to_host() {
   jlog "$dev: reprobe step 2/4 clear driver_override (before)"
   echo "" >"$sys/driver_override" 2>/dev/null || true
   jlog "$dev: reprobe step 2/4 clear driver_override (after)"
-  # 2b/4. Opt-in soft FLR BEFORE the amdgpu rebind: reset the card to a clean
-  # state amdgpu expects before it re-grabs it. Gated behind
-  # VFIO_DYNAMIC_FLR_BEFORE_REBIND=1 (default 0: an FLR can itself destabilize
-  # some cards, so it is opt-in). Only when the device is unbound (reset file
-  # writable) -- it is, after step 1/4 unbind + step 2/4 clear override.
-  if [[ "${VFIO_DYNAMIC_FLR_BEFORE_REBIND:-0}" == "1" && -w "$sys/reset" ]]; then
+  # 2b/4 + 2c/4. Opt-in pre-rebind reset BEFORE the amdgpu rebind: reset the
+  # card to a clean state amdgpu expects before it re-grabs it. Two levels,
+  # mutually exclusive (SBR takes precedence -- it is strictly heavier and
+  # supersedes the FLR):
+  #   - 2c/4 Secondary Bus Reset (VFIO_DYNAMIC_SBR_BEFORE_REBIND=1): pulses RST#
+  #     on the upstream port's secondary bus via setpci Bridge Control 0x3E
+  #     bit 6, hot-resetting the GPU AND every device behind the same upstream
+  #     port (e.g. the audio sibling). HEAVIER than the FLR -- resets more of
+  #     the card's internal state (PSP/MC) so amdgpu's probe can complete when
+  #     the soft FLR was not enough (observed 16:16:25: FLR fired but amdgpu/bind
+  #     still hung in D-state). GPU BDF ONLY: one SBR resets the audio sibling
+  #     too, so it runs once on the GPU iteration and is skipped for audio (a
+  #     second SBR on the audio iteration would double-reset the same bus).
+  #   - 2b/4 soft FLR (VFIO_DYNAMIC_FLR_BEFORE_REBIND=1): function-level reset of
+  #     the GPU only (echo 1 > sys/reset). Lighter; the first thing to try. Only
+  #     when the device is unbound (reset file writable) -- it is, after step
+  #     1/4 unbind + step 2/4 clear override.
+  # Both default 0 (opt-in): an unnecessary reset on a card that rebinds cleanly
+  # is wasted work and can itself destabilize a borderline card.
+  if [[ "${VFIO_DYNAMIC_SBR_BEFORE_REBIND:-0}" == "1" && "$dev" == "${GUEST_GPU_BDF:-}" ]]; then
+    jlog "$dev: reprobe step 2c/4 pre-rebind SBR (before)"
+    _secondary_bus_reset "$dev"
+    jlog "$dev: reprobe step 2c/4 pre-rebind SBR (after)"
+  elif [[ "${VFIO_DYNAMIC_FLR_BEFORE_REBIND:-0}" == "1" && -w "$sys/reset" ]]; then
     jlog "$dev: reprobe step 2b/4 pre-rebind soft FLR (before)"
     _rx9070_gated_soft_flr "$dev" "pre-rebind FLR applied (card reset to clean state before amdgpu re-grabs)" 0 0.3
     jlog "$dev: reprobe step 2b/4 pre-rebind soft FLR (after)"

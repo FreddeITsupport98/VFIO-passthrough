@@ -4200,6 +4200,8 @@ _sync_conf_defaults() {
     [VFIO_RESTORE_D3COLD_ON_RELEASE]="0"
     [VFIO_HOOK_BIND_TIMEOUT]="20"
     [VFIO_REBIND_VERIFY_TIMEOUT]="2"
+    [VFIO_AMDGPU_READY_TIMEOUT]="5"
+    [VFIO_DYNAMIC_FLR_BEFORE_REBIND]="0"
     [VFIO_REBOOT_FLR_MAX_GEN]=""
     [STEALTH_VM_BACKUP_DIR]=""
     [VFIO_DYNAMIC_PARK_KEEPALIVE]="1"
@@ -4340,6 +4342,11 @@ VFIO_BINDING_MODE="$binding_mode"
 #   RX 9070 reset bug; the host cannot use the GPU between VM sessions without reboot
 #   or a manual rebind).
 # - 1: rebind the guest GPU back to its normal host driver (amdgpu/snd) on VM stop.
+#   reprobe_to_host now binds DIRECTLY to the remembered pre-vfio-pci host driver
+#   via /sys/bus/pci/drivers/<prev>/bind (a different kernel code path than the
+#   generic /sys/bus/pci/drivers_probe re-probe, which SEGFAULTS on Navi 48 /
+#   RX 9070 after vfio-pci), falling back to drivers_probe only if no prior
+#   driver was remembered. So REBIND_HOST=1 is now safer on RX 9070 than before.
 # WHY this value: 0 keeps the RX 9070 parked on vfio-pci so it cannot fall off the
 # bus on a D3cold exit between sessions. Set 1 only on cards that have NEVER hit
 # the reset bug AND where you want the host to reuse the GPU between VM runs.
@@ -4449,6 +4456,32 @@ VFIO_HOOK_BIND_TIMEOUT="20"
 # release to return faster (the release-time remove+rescan recovery still
 # catches a card that fell off regardless of this value).
 VFIO_REBIND_VERIFY_TIMEOUT="2"
+# Dynamic-mode amdgpu-readiness timeout (seconds, read by _wait_amdgpu_ready
+# in the bind script): how long to wait for amdgpu to FINISH probing (DRM card
+# node up) after a release rebind or before a --bind-now unbind. amdgpu's probe
+# is ASYNC -- the driver symlink appears early but the DRM card appears at the
+# END of probe. Unbinding amdgpu mid-probe can hang the kernel in D-state on
+# Navi 48 / RX 9070 (observed: --bind-now D-stated 9s after a release rebind).
+# The poll is 0.2s ticks, so 5s = 25 ticks. Keep this under VFIO_HOOK_BIND_TIMEOUT
+# (default 20) so the readiness wait cannot hit the hook deadline.
+# WHY this value: 5s is enough for amdgpu to finish probing on observed RX 9070
+# hardware after a direct rebind; raise it if your card is slow to probe, lower
+# it if you want the bind to proceed sooner (the bind proceeds anyway on
+# timeout -- this is a best-effort settle gate, not a hard fail).
+VFIO_AMDGPU_READY_TIMEOUT="5"
+# Dynamic-mode opt-in soft FLR before the host-driver rebind at release
+# (advanced, read by reprobe_to_host):
+# - 0 (default): do NOT do a soft function-level reset before rebinding the
+#   card to amdgpu/snd at --release. An FLR can itself destabilize some cards,
+#   so it is opt-in.
+# - 1: after unbind from vfio-pci + clear driver_override, do a soft FLR
+#   (echo 1 > sys/reset, RX 9070 family gated Gen1-downtrain/restore) BEFORE
+#   binding amdgpu. This resets the card to a clean state amdgpu expects, which
+#   can help if the card is left in a bad state by vfio-pci and amdgpu's probe
+#   then hangs/fails. Only enable if the rebind hangs without it.
+# WHY this value: 0 avoids an unnecessary FLR on a card that rebinds cleanly.
+# Set 1 only if REBIND_HOST=1's amdgpu rebind hangs or leaves the card dead.
+VFIO_DYNAMIC_FLR_BEFORE_REBIND="0"
 # Optional max PCIe generation cap for the post-reset adaptive link restore.
 # Originally introduced for the reboot-FLR monitor (guest warm reboot), but now
 # shared by EVERY RX 9070 family PCIe Gen1-downtrain/adaptive-restore recovery
@@ -8334,9 +8367,20 @@ bind_one() {
   # D-state hang (observed: --bind-now wedged in uninterruptible sleep on the
   # amdgpu unbind after a prior failed rebind) shows the EXACT sysfs path that
   # blocked in journalctl -t vfio-dynamic.
+  # REMEMBER the pre-vfio-pci host driver: persist it to the state dir so
+  # reprobe_to_host (--release, REBIND_HOST=1) can bind DIRECTLY to it later
+  # via /sys/bus/pci/drivers/<prev>/bind -- which is a different kernel code
+  # path than /sys/bus/pci/drivers_probe and avoids the confirmed SIGSEGV
+  # (exit 139) the generic PCI-core re-probe hits on Navi 48 after vfio-pci.
+  # Best-effort; never fatal.
   if [[ -L "$sys/driver" ]]; then
     local drv
     drv="$(basename "$(readlink "$sys/driver")")"
+    if [[ -n "$drv" && "$drv" != "vfio-pci" ]]; then
+      mkdir -p "$(dirname "$COOLDOWN_TS_FILE")" 2>/dev/null || true
+      printf '%s\n' "$drv" >"$(dirname "$COOLDOWN_TS_FILE")/$dev.prev_driver" 2>/dev/null || true
+      jlog "$dev: remembered pre-vfio-pci host driver=$drv (for direct rebind on release)"
+    fi
     if [[ -w "/sys/bus/pci/drivers/$drv/unbind" ]]; then
       jlog "$dev: unbind from $drv (before)"
       echo "$dev" >"/sys/bus/pci/drivers/$drv/unbind" || true
@@ -8473,14 +8517,53 @@ reprobe_to_host() {
   jlog "$dev: reprobe step 2/4 clear driver_override (before)"
   echo "" >"$sys/driver_override" 2>/dev/null || true
   jlog "$dev: reprobe step 2/4 clear driver_override (after)"
-  # 3/4. trigger a generic driver re-probe (kick amdgpu/snd to reclaim).
-  if [[ -w /sys/bus/pci/drivers_probe ]]; then
-    jlog "$dev: reprobe step 3/4 drivers_probe write (before)"
+  # 2b/4. Opt-in soft FLR BEFORE the amdgpu rebind: reset the card to a clean
+  # state amdgpu expects before it re-grabs it. Gated behind
+  # VFIO_DYNAMIC_FLR_BEFORE_REBIND=1 (default 0: an FLR can itself destabilize
+  # some cards, so it is opt-in). Only when the device is unbound (reset file
+  # writable) -- it is, after step 1/4 unbind + step 2/4 clear override.
+  if [[ "${VFIO_DYNAMIC_FLR_BEFORE_REBIND:-0}" == "1" && -w "$sys/reset" ]]; then
+    jlog "$dev: reprobe step 2b/4 pre-rebind soft FLR (before)"
+    _rx9070_gated_soft_flr "$dev" "pre-rebind FLR applied (card reset to clean state before amdgpu re-grabs)" 0 0.3
+    jlog "$dev: reprobe step 2b/4 pre-rebind soft FLR (after)"
+  fi
+  # 3/4. Rebind the host driver. PREFER a DIRECT bind to the driver that was
+  # bound before vfio-pci (remembered at bind time) via
+  # /sys/bus/pci/drivers/<prev>/bind -- a different kernel code path than the
+  # generic /sys/bus/pci/drivers_probe re-probe. The generic re-probe
+  # SEGFAULTS (exit 139) on Navi 48 after vfio-pci (confirmed: --release at
+  # 21:25:21 crashed at the drivers_probe write with SIGSEGV, wedging
+  # libvirt). The direct bind avoids the PCI-core bus re-probe wrapper that
+  # faults. Fall back to drivers_probe ONLY if no prior driver is remembered
+  # or the direct bind did not land a host driver.
+  local _prev_drv="" _prev_file
+  _prev_file="$(dirname "$COOLDOWN_TS_FILE")/$dev.prev_driver"
+  [[ -f "$_prev_file" ]] && _prev_drv="$(cat "$_prev_file" 2>/dev/null || true)"
+  local _direct_ok=0
+  if [[ -n "$_prev_drv" && -w "/sys/bus/pci/drivers/$_prev_drv/bind" ]]; then
+    jlog "$dev: reprobe step 3/4 direct bind to $_prev_drv (before)"
+    echo "$dev" >"/sys/bus/pci/drivers/$_prev_drv/bind" 2>/dev/null || true
+    jlog "$dev: reprobe step 3/4 direct bind to $_prev_drv (after)"
+    sleep 0.5  # let the driver probe settle
+    local _direct_drv
+    _direct_drv="$(basename "$(readlink "$sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+    if [[ "$_direct_drv" == "$_prev_drv" ]]; then
+      _direct_ok=1
+      jlog "$dev: reprobe step 3/4 direct bind landed on $_prev_drv (no drivers_probe needed)"
+    else
+      jlog "$dev: reprobe step 3/4 direct bind to $_prev_drv did not land (got ${_direct_drv:-none}); falling back to drivers_probe"
+    fi
+  else
+    jlog "$dev: reprobe step 3/4 no remembered prev driver (${_prev_drv:-none}); using drivers_probe fallback"
+  fi
+  if (( ! _direct_ok )) && [[ -w /sys/bus/pci/drivers_probe ]]; then
+    # FALLBACK: the generic PCI-core re-probe. This is the path that
+    # segfaulted on Navi 48; kept as a last resort for cards where no prev
+    # driver was remembered (e.g. first run after an upgrade).
+    jlog "$dev: reprobe step 3/4 drivers_probe write (before) [CRASH-PRONE on Navi 48]"
     echo "$dev" >/sys/bus/pci/drivers_probe 2>/dev/null || true
     jlog "$dev: reprobe step 3/4 drivers_probe write (after)"
     sleep 0.5  # kernel re-probe is async; let amdgpu/snd probe settle
-  else
-    jlog "$dev: reprobe step 3/4 drivers_probe unavailable (no re-probe kick)"
   fi
   # 3b/4. VERIFY a host driver actually bound, with a bounded poll. The verify
   # is diagnostic + a settle gate; reprobe_to_host stays best-effort (returns 0)
@@ -8498,6 +8581,16 @@ reprobe_to_host() {
     jlog "$dev: reprobe step 3b/4 verified on $_vp_drv (poll $_vp_att/$_vp_max)"
   else
     jlog "$dev: reprobe step 3b/4 WARN no host driver bound after $_vp_max polls (last=${_vp_drv:-none}); card may have fallen off the bus"
+  fi
+  # 3c/4. amdgpu-readiness settle: if the card landed on amdgpu, do NOT return
+  # until amdgpu has FINISHED probing (DRM card node up). amdgpu's probe is
+  # async; the driver symlink appears early but the DRM card appears at the
+  # END of probe. If the next --bind-now unbinds amdgpu before the DRM card is
+  # up, the kernel can hang in D-state (observed 15:36:49 on Navi 48).
+  # _wait_amdgpu_ready polls for the DRM card with a bounded window.
+  if [[ "$_vp_drv" == "amdgpu" ]]; then
+    jlog "$dev: reprobe step 3c/4 amdgpu landed; waiting for amdgpu-readiness (DRM card up) before returning"
+    _wait_amdgpu_ready "$dev" || true
   fi
   # 4/4. d3cold_allowed + power/control. Default keeps the card pinned in D0
   # (no D3hot, no D3cold) to avoid the RX 9070 / RDNA4 reset bug on the host.
@@ -8566,6 +8659,47 @@ _bdf_to_drm_card() {
       return 0
     fi
   done
+  return 1
+}
+
+# Returns 0 if the GPU at $1 is on amdgpu AND amdgpu has FINISHED probing --
+# i.e. the DRM card node (/dev/dri/cardN) exists for this BDF. "Config space
+# readable" (_pci_dev_alive) is NOT enough: amdgpu's probe is ASYNC, and the
+# DRM card appears at the END of probe. Unbinding the card from amdgpu before
+# the DRM card is up (mid-probe) can hang the kernel in D-state (observed on
+# Navi 48 / RX 9070: the 15:36:49 --bind-now D-stated on the amdgpu->vfio-pci
+# unbind 9s after a release rebind, because amdgpu had not finished probing).
+# This is the readiness gate the release->start handoff needs.
+_amdgpu_ready() {
+  local _bdf="$1" _sys _drv
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -L "$_sys/driver" ]] || return 1
+  _drv="$(basename "$(readlink "$_sys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+  [[ "$_drv" == "amdgpu" ]] || return 1
+  _bdf_to_drm_card "$_bdf" >/dev/null 2>&1
+}
+
+# Bounded poll for amdgpu-readiness (DRM card up). $1 = BDF. Polls every 0.2s
+# up to VFIO_AMDGPU_READY_TIMEOUT seconds (default 5s = 25 ticks). Returns 0 if
+# amdgpu finished probing within the window, 1 otherwise. jlogs the outcome so
+# the journal shows how long amdgpu took (or that it never finished -- a clear
+# signal the card is stuck mid-probe). Never fatal: callers use `|| true` so a
+# timeout proceeds with the bind rather than aborting the VM start.
+_wait_amdgpu_ready() {
+  local _bdf="$1" _max="${VFIO_AMDGPU_READY_TIMEOUT:-5}"
+  [[ "$_max" =~ ^[0-9]+$ ]] || _max=5
+  (( _max < 1 )) && _max=1
+  local _att _ticks
+  _ticks=$(( _max * 5 ))  # 0.2s ticks
+  for _att in $(seq 1 "$_ticks"); do
+    if _amdgpu_ready "$_bdf"; then
+      jlog "$_bdf: amdgpu ready (DRM card up) after $((_att * 200))ms (poll $_att/$_ticks)"
+      return 0
+    fi
+    sleep 0.2
+  done
+  jlog "$_bdf: WARN amdgpu NOT ready after ${_max}s (DRM card not up); proceeding anyway"
   return 1
 }
 
@@ -8854,6 +8988,26 @@ case "$ACTION" in
           say "ERROR: $GUEST_GPU_BDF is Boot VGA; refusing --bind-now to keep host display alive. For dual-GPU: set HOST_GPU_BDF to a different GPU with boot_vga=0 and VFIO_BOOT_VGA_POLICY=AUTO. For single-GPU/headless: set VFIO_DYNAMIC_ALLOW_BOOT_VGA=1. Aborting VM start." >&2
           exit 1
         fi
+    fi
+    fi
+    # amdgpu-readiness gate: if the guest GPU is currently on amdgpu (cold
+    # start, OR shutdown->start with REBIND_HOST=1 where the release just
+    # rebind it to amdgpu), wait for amdgpu to FINISH probing (DRM card node
+    # up) BEFORE do_bind unbinds it. amdgpu's probe is async; unbinding
+    # mid-probe can hang the kernel in D-state (observed on Navi 48: the
+    # 15:36:49 --bind-now D-stated on the amdgpu->vfio-pci unbind 9s after a
+    # release rebind, because amdgpu had not finished probing). Bounded by
+    # VFIO_AMDGPU_READY_TIMEOUT (default 5s) so it cannot hit the hook
+    # deadline. No-op if the card is not on amdgpu (e.g. parked on vfio-pci
+    # with REBIND_HOST=0).
+    if [[ -L "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" ]]; then
+      # NOTE: this runs at the top level of the bind-now) case branch, NOT
+      # inside a function, so `local` cannot be used here (bash: "local: can
+      # only be used in a function"). Use a plain prefixed var instead.
+      _bn_drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+      if [[ "$_bn_drv" == "amdgpu" ]]; then
+        jlog "$GUEST_GPU_BDF: --bind-now: guest GPU on amdgpu; waiting for amdgpu-readiness (DRM card up) before bind"
+        _wait_amdgpu_ready "$GUEST_GPU_BDF" || true
       fi
     fi
     do_bind

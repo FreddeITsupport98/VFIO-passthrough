@@ -2091,6 +2091,73 @@ else
   record_failure "R12 _sync_conf_defaults is idempotent missing-only merge"
 fi
 
+# --- Functional R13: reprobe_to_host binds DIRECTLY to the remembered host
+# driver (not the generic /sys/bus/pci/drivers_probe re-probe that SEGFAULTS
+# exit 139 on Navi 48 / RX 9070 after vfio-pci). bind_one remembers the
+# pre-vfio-pci host driver (amdgpu/snd_hda_intel) to a state file; reprobe_to_host
+# reads it and binds directly via /sys/bus/pci/drivers/<prev>/bind, falling back
+# to drivers_probe ONLY if no prior driver was remembered or the direct bind
+# did not land. Confirmed crash site: 21:25:21 --release died at the
+# drivers_probe write (SIGSEGV, wedged libvirt).
+assert_contains_text \
+  "R13 bind_one remembers pre-vfio-pci host driver to state file" \
+  'remembered pre-vfio-pci host driver' \
+  "$bind_block"
+assert_contains_text \
+  "R13 bind_one persists the driver name to <state-dir>/<bdf>.prev_driver" \
+  '.prev_driver' \
+  "$bind_block"
+assert_contains_text \
+  "R13 reprobe_to_host reads the remembered prev driver" \
+  'prev_driver' \
+  "$bind_block"
+assert_contains_text \
+  "R13 reprobe_to_host prefers direct bind to the remembered driver" \
+  'direct bind to $_prev_drv' \
+  "$bind_block"
+assert_contains_text \
+  "R13 reprobe_to_host falls back to drivers_probe only when direct bind fails" \
+  'CRASH-PRONE on Navi 48' \
+  "$bind_block"
+
+# --- Functional R14: amdgpu-readiness gate + opt-in pre-rebind FLR ---
+# The amdgpu->vfio-pci handoff in --bind-now D-stated (15:36:49) because amdgpu
+# had not FINISHED probing (DRM card not up) when bind-now unbound it 9s after a
+# release rebind. "Config space readable" (_pci_dev_alive) is NOT readiness --
+# amdgpu's DRM card appears at the END of async probe. R14 adds:
+#  (a) _amdgpu_ready / _wait_amdgpu_ready helpers (DRM-card-up = probe done);
+#  (b) reprobe_to_host settles for amdgpu-readiness after the rebind (step 3c/4);
+#  (c) an opt-in pre-rebind soft FLR (VFIO_DYNAMIC_FLR_BEFORE_REBIND) at step 2b/4;
+#  (d) a bind-now amdgpu-readiness gate right before do_bind.
+assert_contains_text \
+  "R14 _amdgpu_ready helper defined (DRM-card-up = amdgpu probe done)" \
+  '_amdgpu_ready()' \
+  "$bind_block"
+assert_contains_text \
+  "R14 _wait_amdgpu_ready bounded poll defined" \
+  '_wait_amdgpu_ready()' \
+  "$bind_block"
+assert_contains_text \
+  "R14 reprobe_to_host settles for amdgpu-readiness after rebind (step 3c/4)" \
+  'reprobe step 3c/4' \
+  "$bind_block"
+assert_contains_text \
+  "R14 reprobe_to_host has opt-in pre-rebind soft FLR gate (step 2b/4)" \
+  'reprobe step 2b/4 pre-rebind soft FLR' \
+  "$bind_block"
+assert_contains_text \
+  "R14 bind-now waits for amdgpu-readiness before do_bind" \
+  'waiting for amdgpu-readiness (DRM card up) before bind' \
+  "$bind_block"
+assert_contains_file \
+  "R14 write_conf persists VFIO_DYNAMIC_FLR_BEFORE_REBIND" \
+  'VFIO_DYNAMIC_FLR_BEFORE_REBIND="0"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R14 write_conf persists VFIO_AMDGPU_READY_TIMEOUT" \
+  'VFIO_AMDGPU_READY_TIMEOUT="5"' \
+  "$VFIO_SCRIPT"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

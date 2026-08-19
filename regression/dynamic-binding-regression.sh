@@ -1031,6 +1031,83 @@ assert_contains_file \
   'worsens D3 issues' \
   "$VFIO_SCRIPT"
 
+# --- Functional Q3p2b: durable GUEST_GPU_DEVICE_ID persistence (R16 hardening) ---
+# write_conf must persist the guest GPU device id so _is_guest_rx9070_family
+# can detect Navi 48 (device 7550) DURABLY -- even when the card is dead / off
+# the bus at standalone-switcher time (sysfs + lspci return nothing then). The
+# helper must prefer the persisted conf key over the runtime fallback, and the
+# standalone switchers must backfill the key if it is missing.
+assert_contains_file \
+  "Q3p2b write_conf emits GUEST_GPU_DEVICE_ID" \
+  'GUEST_GPU_DEVICE_ID="$guest_device"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2b write_conf reads guest device id from sysfs" \
+  '"/sys/bus/pci/devices/$guest_gpu/device"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2b helper prefers GUEST_GPU_DEVICE_ID from conf" \
+  '/^GUEST_GPU_DEVICE_ID=/' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2b _ensure_guest_device_id_persisted helper defined" \
+  "_ensure_guest_device_id_persisted()" \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "Q3p2b dynamic switcher calls _ensure_guest_device_id_persisted" \
+  "_ensure_guest_device_id_persisted" \
+  "$_dyn_fn"
+assert_contains_text \
+  "Q3p2b early switcher calls _ensure_guest_device_id_persisted" \
+  "_ensure_guest_device_id_persisted" \
+  "$_early_fn3"
+# Functional: with a persisted device id, the helper detects Navi 48 even when
+# CTX[guest_vfio_ids] is empty and the BDF is absent from sysfs (card dead).
+# Save/restore globals so later assertions see the real conf.
+_rx9070_conf="${tmp_dir}/fake_rx9070.conf"
+_other_conf="${tmp_dir}/fake_other.conf"
+printf 'GUEST_GPU_BDF="0000:0e:00.0"\nGUEST_GPU_DEVICE_ID="0x7550"\n' > "$_rx9070_conf"
+printf 'GUEST_GPU_BDF="0000:06:00.0"\nGUEST_GPU_DEVICE_ID="0x743f"\n' > "$_other_conf"
+_save_conf="$CONF_FILE"
+_save_d3="${AMD_D3_OVERRIDE:-}"
+CONF_FILE="$_rx9070_conf"; AMD_D3_OVERRIDE=""
+if _is_guest_rx9070_family; then
+  printf 'PASS: Q3p2b helper detects Navi 48 from persisted GUEST_GPU_DEVICE_ID=7550\n'
+else
+  printf 'FAIL: Q3p2b helper should detect Navi 48 from persisted device id 7550\n' >&2
+  record_failure "Q3p2b helper detects Navi 48 from persisted device id"
+fi
+CONF_FILE="$_other_conf"
+if _is_guest_rx9070_family; then
+  printf 'FAIL: Q3p2b helper should NOT flag non-Navi-48 device 743f as RX 9070\n' >&2
+  record_failure "Q3p2b helper rejects non-Navi-48 persisted device id"
+else
+  printf 'PASS: Q3p2b helper rejects non-Navi-48 persisted device id (743f)\n'
+fi
+# _should_add_disable_idle_d3 decision matrix on Navi 48 (persisted id):
+CONF_FILE="$_rx9070_conf"; AMD_D3_OVERRIDE=""
+if _should_add_disable_idle_d3; then
+  printf 'FAIL: Q3p2b _should_add_disable_idle_d3 should SKIP Navi 48 by default\n' >&2
+  record_failure "Q3p2b _should_add_disable_idle_d3 skips Navi 48 by default"
+else
+  printf 'PASS: Q3p2b _should_add_disable_idle_d3 skips Navi 48 by default\n'
+fi
+AMD_D3_OVERRIDE=1
+if _should_add_disable_idle_d3; then
+  printf 'PASS: Q3p2b _should_add_disable_idle_d3 forces add on Navi 48 with --amd-disable-idle-d3\n'
+else
+  printf 'FAIL: Q3p2b _should_add_disable_idle_d3 should force add on Navi 48 with override=1\n' >&2
+  record_failure "Q3p2b _should_add_disable_idle_d3 forces add on Navi 48 with override"
+fi
+AMD_D3_OVERRIDE=0
+if _should_add_disable_idle_d3; then
+  printf 'FAIL: Q3p2b _should_add_disable_idle_d3 should SKIP with --no-amd-disable-idle-d3\n' >&2
+  record_failure "Q3p2b _should_add_disable_idle_d3 skips with --no-amd-disable-idle-d3"
+else
+  printf 'PASS: Q3p2b _should_add_disable_idle_d3 skips with --no-amd-disable-idle-d3\n'
+fi
+CONF_FILE="$_save_conf"; AMD_D3_OVERRIDE="$_save_d3"
+
 # --- Functional Q3q: _pci_dev_remove_rescan (last-resort bus recovery) ---
 # When the alive-check (Q3n) catches a dead card and the soft PCI reset does not
 # recover it, the bind script now attempts a remove+rescan bus recovery as a

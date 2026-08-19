@@ -4281,6 +4281,18 @@ write_conf() {
 
   boot_vga_host_assisted_default="$(host_assisted_boot_vga_policy_default "$host_gpu" "$guest_gpu")"
 
+  # Persist the guest GPU device id so _is_guest_rx9070_family can detect a
+  # Navi 48 (device 7550) card DURABLY -- even when the card is dead / off the
+  # bus at standalone-switcher time (sysfs/lspci return nothing then, so the
+  # runtime fallback in the helper cannot fire). Read from sysfs here (the
+  # wizard runs while the card is alive). Empty if unreadable; the helper
+  # falls back to CTX[guest_vfio_ids] / sysfs / lspci then.
+  local guest_device=""
+  if [[ -n "$guest_gpu" && -r "/sys/bus/pci/devices/$guest_gpu/device" ]]; then
+    guest_device="$(cat "/sys/bus/pci/devices/$guest_gpu/device" 2>/dev/null || true)"
+    guest_device="${guest_device#0x}"
+  fi
+
   backup_file "$CONF_FILE"
 
   write_file_atomic "$CONF_FILE" 0644 "root:root" <<EOF
@@ -4312,6 +4324,9 @@ HOST_AUDIO_NODE_NAME="$host_audio_node_name"
 GUEST_GPU_BDF="$guest_gpu"
 GUEST_AUDIO_BDFS_CSV="$guest_audio_bdfs_csv"
 GUEST_GPU_VENDOR_ID="$guest_vendor"
+# Guest GPU PCI device id (e.g. 7550 for RX 9070 / RDNA4 Navi 48). Persisted
+# at wizard time so the Navi 48 disable_idle_d3 gate works without a live card.
+GUEST_GPU_DEVICE_ID="$guest_device"
 GRAPHICS_PROTOCOL_MODE="$graphics_protocol_mode"
 VFIO_GRAPHICS_DAEMON_INTERVAL="$graphics_daemon_interval"
 # Watchdog log retention and growth controls for vfio-graphics-protocold:
@@ -13385,23 +13400,39 @@ strip_early_binding_tokens() {
 # so a non-Navi-48 card keeps the legacy add-disable_idle_d3 behavior).
 _is_guest_rx9070_family() {
   local _vid_pid _dev _bdf _sys _line
+  # 1. Prefer the persisted device id from conf (DURABLE: works even when the
+  #    card is dead / off the bus at standalone-switcher time, since it was
+  #    captured at wizard time by write_conf or backfilled by
+  #    _ensure_guest_device_id_persisted). This is the primary path.
+  if [[ -f "$CONF_FILE" ]]; then
+    _dev="$(awk -F= '/^GUEST_GPU_DEVICE_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    _dev="${_dev#0x}"
+    if [[ -n "$_dev" ]]; then
+      [[ "${_dev,,}" == "7550" ]]
+      return $?
+    fi
+  fi
+  # 2. Wizard context (set at GPU selection as "vendor:device").
   _vid_pid="${CTX[guest_vfio_ids]:-}"
   if [[ -n "$_vid_pid" ]]; then
     _dev="${_vid_pid#*:}"
     _dev="${_dev#0x}"
-  else
-    if [[ -f "$CONF_FILE" ]]; then
-      _bdf="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
-    fi
-    [[ -n "$_bdf" ]] || return 1
-    _sys="/sys/bus/pci/devices/$_bdf"
-    _dev="$(cat "$_sys/device" 2>/dev/null || true)"
+    [[ "${_dev,,}" == "7550" ]]
+    return $?
+  fi
+  # 3. Runtime sysfs/lspci fallback (card must be alive; used only when the
+  #    conf key is absent, e.g. a conf written by an older script version).
+  if [[ -f "$CONF_FILE" ]]; then
+    _bdf="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  fi
+  [[ -n "$_bdf" ]] || return 1
+  _sys="/sys/bus/pci/devices/$_bdf"
+  _dev="$(cat "$_sys/device" 2>/dev/null || true)"
+  _dev="${_dev#0x}"
+  if [[ -z "$_dev" ]]; then
+    _line="$(lspci -n -s "$_bdf" 2>/dev/null || true)"
+    _dev="$(printf '%s' "$_line" | grep -oE '[0-9a-fA-F]{4}:[0-9a-fA-F]{4}' | head -n1 | cut -d: -f2 || true)"
     _dev="${_dev#0x}"
-    if [[ -z "$_dev" ]]; then
-      _line="$(lspci -n -s "$_bdf" 2>/dev/null || true)"
-      _dev="$(printf '%s' "$_line" | grep -oE '[0-9a-fA-F]{4}:[0-9a-fA-F]{4}' | head -n1 | cut -d: -f2 || true)"
-      _dev="${_dev#0x}"
-    fi
   fi
   [[ -n "$_dev" ]] || return 1
   [[ "${_dev,,}" == "7550" ]]
@@ -13419,6 +13450,31 @@ _should_add_disable_idle_d3() {
   [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] || return 1
   [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && return 0
   ! _is_guest_rx9070_family
+}
+
+# Persist GUEST_GPU_DEVICE_ID into $CONF_FILE if it is missing, using the live
+# sysfs device id of the configured guest GPU. Called by the standalone binding
+# switchers (--install-dynamic-binding / --install-early-binding), which do NOT
+# run the full wizard / write_conf, so the Navi 48 disable_idle_d3 gate stays
+# durable across future switcher runs even when the card is later dead / off
+# the bus (the _is_guest_rx9070_family sysfs fallback cannot fire then). Best-
+# effort: no-op if the conf is missing, the BDF is absent, the card is not
+# alive, or the key is already present. Uses rewrite_conf_key (which appends if
+# the key is absent, so this only runs once per conf).
+_ensure_guest_device_id_persisted() {
+  readable_file "$CONF_FILE" || return 0
+  if grep -Eq '^GUEST_GPU_DEVICE_ID=' "$CONF_FILE" 2>/dev/null; then
+    return 0
+  fi
+  local _bdf _dev
+  _bdf="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_bdf" ]] || return 0
+  local _sys="/sys/bus/pci/devices/$_bdf"
+  [[ -r "$_sys/device" ]] || return 0
+  _dev="$(cat "$_sys/device" 2>/dev/null || true)"
+  _dev="${_dev#0x}"
+  [[ -n "$_dev" ]] || return 0
+  rewrite_conf_key "GUEST_GPU_DEVICE_ID" "$_dev"
 }
 
 # Ensure the AMD reset-bug-critical kernel params are present on a cmdline string:
@@ -13771,6 +13827,7 @@ install_dynamic_binding_from_existing_config() {
   # write_conf (it needs full wizard context), so without this step new keys
   # drift out of the live conf even after the bind script is regenerated.
   _sync_conf_defaults
+  _ensure_guest_device_id_persisted
 
   # 2. Regenerate the bind script so the latest bind/hook-runtime logic (e.g.
   #    Boot-VGA host-assisted escape, d3cold pinning, retry/jlog behavior) is
@@ -13941,6 +13998,7 @@ install_early_binding_from_existing_config() {
   # write_conf (it needs full wizard context), so without this step new keys
   # drift out of the live conf even after the bind script is regenerated.
   _sync_conf_defaults
+  _ensure_guest_device_id_persisted
 
   # 2. Regenerate the bind script so the latest bind/boot-time logic is deployed
   #    without needing a full wizard re-run.

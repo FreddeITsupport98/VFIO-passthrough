@@ -985,6 +985,52 @@ assert_contains_text \
   'Ensure the AMD reset-bug kernel params' \
   "$_early_fn3"
 
+# --- Functional Q3p2: Navi 48 (RX 9070) disable_idle_d3 gate (R16) ---
+# vfio-pci.disable_idle_d3=1 worsens D3 issues on RX 9070 / RDNA4 (Navi 48,
+# device 7550): two independent working guides (CachyOS single-GPU 9070 XT
+# gist; Proxmox uzumo months-stable recipe) report it triggers a
+# vfio_bar_restore reset loop that drops the card off the host bus mid-session.
+# The installer must SKIP it for Navi 48 by default. The bind script's D0-lock
+# (d3cold_allowed=0 + power/control=on) is the correct reset-bug defense.
+# Honors --amd-disable-idle-d3 (force add even on Navi 48) and
+# --no-amd-disable-idle-d3 (always skip).
+assert_contains_file \
+  "Q3p2 _is_guest_rx9070_family helper defined" \
+  "_is_guest_rx9070_family()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 _should_add_disable_idle_d3 helper defined" \
+  "_should_add_disable_idle_d3()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 helper gates on Navi 48 device 7550" \
+  '"7550"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 helper reads guest device id from CTX[guest_vfio_ids]" \
+  'CTX[guest_vfio_ids]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 helper honors AMD_D3_OVERRIDE=0 opt-out" \
+  '"${AMD_D3_OVERRIDE:-}" != "0"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 helper honors AMD_D3_OVERRIDE=1 force-add" \
+  '"${AMD_D3_OVERRIDE:-}" == "1"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 ensure_amd_reset_bug_params gates via the helper" \
+  'if _should_add_disable_idle_d3; then' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 wizard openSUSE spot gates via the helper" \
+  'if _should_add_disable_idle_d3; then' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3p2 helper documents the Navi 48 D3-worsen finding" \
+  'worsens D3 issues' \
+  "$VFIO_SCRIPT"
+
 # --- Functional Q3q: _pci_dev_remove_rescan (last-resort bus recovery) ---
 # When the alive-check (Q3n) catches a dead card and the soft PCI reset does not
 # recover it, the bind script now attempts a remove+rescan bus recovery as a

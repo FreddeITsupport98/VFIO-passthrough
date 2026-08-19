@@ -6945,7 +6945,11 @@ systemd_boot_add_kernel_params() {
     # (dynamic strips them, handled above/below). Honors --no-amd-* opt-outs.
     if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" && -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
       note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to /etc/kernel/cmdline (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
-      [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] && new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
+      if _should_add_disable_idle_d3; then
+        new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
+      else
+        note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there (card drops off the bus mid-session); the bind script's D0-lock (d3cold_allowed=0 + power/control=on) is the correct defense. Use --amd-disable-idle-d3 to force it."
+      fi
       [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
       new_cmdline="$(add_param_once "$new_cmdline" "pcie_aspm=off")"
     fi
@@ -7313,7 +7317,11 @@ systemd_boot_add_kernel_params() {
   # it, handled above). Honors --no-amd-* opt-outs.
   if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" && -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
     note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to this boot entry (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
-    [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] && new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
+    if _should_add_disable_idle_d3; then
+      new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
+    else
+      note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there; the bind script's D0-lock is the correct defense. Use --amd-disable-idle-d3 to force it."
+    fi
     [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
     new_opts="$(add_param_once "$new_opts" "pcie_aspm=off")"
   fi
@@ -7477,7 +7485,11 @@ grub_add_kernel_params() {
   # handled above/below). Honors --no-amd-disable-idle-d3 / --no-amd-pcie-port-pm-off.
   if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" && -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
     note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to GRUB kernel cmdline (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
-    [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] && new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
+    if _should_add_disable_idle_d3; then
+      new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
+    else
+      note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there; the bind script's D0-lock is the correct defense. Use --amd-disable-idle-d3 to force it."
+    fi
     [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new="$(add_param_once "$new" "pcie_port_pm=off")"
     new="$(add_param_once "$new" "pcie_aspm=off")"
   fi
@@ -13356,6 +13368,59 @@ strip_early_binding_tokens() {
   printf '%s' "$(trim "$cmdline")"
 }
 
+# Returns 0 (true) if the configured guest GPU is an RX 9070 / RDNA4
+# (Navi 48) card: AMD vendor (1002) + device 7550. All 9070 / 9070 XT /
+# 9070 GRE SKUs share device 7550. Used to gate OUT vfio-pci.disable_idle_d3=1,
+# which two independent working guides for this exact card (CachyOS single-GPU
+# RX 9070 XT gist; Proxmox uzumo months-stable recipe) report makes D3 issues
+# WORSE on Navi 48, not better -- it triggers a vfio_bar_restore reset-recovery
+# loop that ends with the card falling off the host PCIe bus mid-session
+# (config space all 0xff, qemu "Unknown PCI header type 127"). The correct D0
+# lock -- d3cold_allowed=0 + power/control=on -- is already applied by the bind
+# script at boot and bind time, so disable_idle_d3 is not needed on Navi 48.
+# Device id is read from CTX[guest_vfio_ids] (wizard context, set at GPU
+# selection as "vendor:device") when available, else from sysfs/lspci at
+# runtime (card is alive at install/switch time). Returns 1 (false) if the
+# device id cannot be determined (conservative: do NOT gate on unknown hw,
+# so a non-Navi-48 card keeps the legacy add-disable_idle_d3 behavior).
+_is_guest_rx9070_family() {
+  local _vid_pid _dev _bdf _sys _line
+  _vid_pid="${CTX[guest_vfio_ids]:-}"
+  if [[ -n "$_vid_pid" ]]; then
+    _dev="${_vid_pid#*:}"
+    _dev="${_dev#0x}"
+  else
+    if [[ -f "$CONF_FILE" ]]; then
+      _bdf="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    fi
+    [[ -n "$_bdf" ]] || return 1
+    _sys="/sys/bus/pci/devices/$_bdf"
+    _dev="$(cat "$_sys/device" 2>/dev/null || true)"
+    _dev="${_dev#0x}"
+    if [[ -z "$_dev" ]]; then
+      _line="$(lspci -n -s "$_bdf" 2>/dev/null || true)"
+      _dev="$(printf '%s' "$_line" | grep -oE '[0-9a-fA-F]{4}:[0-9a-fA-F]{4}' | head -n1 | cut -d: -f2 || true)"
+      _dev="${_dev#0x}"
+    fi
+  fi
+  [[ -n "$_dev" ]] || return 1
+  [[ "${_dev,,}" == "7550" ]]
+}
+
+# Returns 0 (true) if vfio-pci.disable_idle_d3=1 should be added to the kernel
+# cmdline for the current guest GPU. Decision matrix:
+#  - --no-amd-disable-idle-d3 (AMD_D3_OVERRIDE=0): always SKIP (explicit opt-out).
+#  - --amd-disable-idle-d3    (AMD_D3_OVERRIDE=1): always ADD  (explicit force,
+#    honored even on Navi 48 -- the user explicitly asked for it).
+#  - default (unset): ADD for non-Navi-48 AMD cards; SKIP for RX 9070 / RDNA4
+#    (Navi 48, device 7550) because disable_idle_d3 worsens D3 issues there
+#    (the bind script's D0-lock is the correct reset-bug defense instead).
+_should_add_disable_idle_d3() {
+  [[ "${AMD_D3_OVERRIDE:-}" != "0" ]] || return 1
+  [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && return 0
+  ! _is_guest_rx9070_family
+}
+
 # Ensure the AMD reset-bug-critical kernel params are present on a cmdline string:
 # vfio-pci.disable_idle_d3=1 and pcie_port_pm=off. These prevent the RX 9070 /
 # RDNA4 D3cold reset bug (card falls off the bus on a D3cold exit, config space
@@ -13384,14 +13449,19 @@ ensure_amd_reset_bug_params() {
     return 0
   fi
   local _before="$cmdline"
-  if [[ "${AMD_D3_OVERRIDE:-}" != "0" ]]; then
+  if _should_add_disable_idle_d3; then
     cmdline="$(add_param_once "$cmdline" "vfio-pci.disable_idle_d3=1")"
   fi
   if [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]]; then
     cmdline="$(add_param_once "$cmdline" "pcie_port_pm=off")"
   fi
   if [[ "$cmdline" != "$_before" ]]; then
-    note "AMD guest GPU: ensured vfio-pci.disable_idle_d3=1 and pcie_port_pm=off are on the kernel cmdline (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both binding modes)." >&2
+    note "AMD guest GPU: ensured pcie_port_pm=off on the kernel cmdline (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both binding modes)." >&2
+    if grep -q 'vfio-pci.disable_idle_d3=1' <<<"$cmdline"; then
+      note "  Also ensured vfio-pci.disable_idle_d3=1." >&2
+    else
+      note "  vfio-pci.disable_idle_d3=1 deliberately SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues on Navi 48 (triggers a vfio_bar_restore reset loop that drops the card off the bus mid-session); the D0-lock (d3cold_allowed=0 + power/control=on) already applied by the bind script is the correct defense. Pass --amd-disable-idle-d3 to force it anyway." >&2
+    fi
   fi
   printf '%s' "$(trim "$cmdline")"
 }
@@ -13616,6 +13686,11 @@ install_dynamic_binding_from_existing_config() {
   note "  ${C_GREEN}4b${C_RESET}. Ensure the AMD reset-bug kernel params (vfio-pci.disable_idle_d3=1,"
   note "      pcie_port_pm=off) are on the cmdline when the guest GPU is AMD"
   note "      (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both modes)"
+  note "      NOTE: vfio-pci.disable_idle_d3=1 is SKIPPED for RX 9070 / RDNA4 (Navi 48)"
+  note "      because it worsens D3 issues there (card drops off the bus mid-session);"
+  note "      pcie_port_pm=off is still added. The bind script's D0-lock"
+  note "      (d3cold_allowed=0 + power/control=on) is the correct reset-bug defense."
+  note "      Use --amd-disable-idle-d3 to force disable_idle_d3=1 anyway."
   note "  ${C_GREEN}5${C_RESET}. Sync BLS boot entries to the updated cmdline"
   note "  ${C_GREEN}6${C_RESET}. Pin Wayland compositors (KDE/KWin + wlroots: sway/hyprland/labwc) to the"
   note "     HOST GPU so binding the guest GPU does not crash the host compositor"
@@ -13822,7 +13897,8 @@ install_dynamic_binding_from_existing_config() {
     say "✔ Dynamic binding is now active (takes effect on next boot)"
   fi
   note "The guest GPU will stay on amdgpu until you start a libvirt VM that has it attached."
-  note "Keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off on the kernel cmdline for both modes."
+  note "Keep pcie_port_pm=off on the kernel cmdline for both modes."
+  note "Keep vfio-pci.disable_idle_d3=1 too -- EXCEPT on RX 9070 / RDNA4 (Navi 48), where it is skipped (it worsens D3 issues there; the bind script's D0-lock is the correct defense). Use --amd-disable-idle-d3 to force it."
 }
 
 install_early_binding_from_existing_config() {
@@ -13842,6 +13918,10 @@ install_early_binding_from_existing_config() {
   note "  4b. Ensure the AMD reset-bug kernel params (vfio-pci.disable_idle_d3=1,"
   note "      pcie_port_pm=off) are on the cmdline when the guest GPU is AMD"
   note "      (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both modes)"
+  note "      NOTE: vfio-pci.disable_idle_d3=1 is SKIPPED for RX 9070 / RDNA4 (Navi 48)"
+  note "      because it worsens D3 issues there; pcie_port_pm=off is still added."
+  note "      The bind script's D0-lock (d3cold_allowed=0 + power/control=on) is the"
+  note "      correct reset-bug defense. Use --amd-disable-idle-d3 to force it anyway."
   note "  5. Sync BLS boot entries to the updated cmdline"
   note "  6. Remove the Wayland HOST-GPU render-device pins (early binding binds the"
   note "     guest GPU at boot, before the compositor starts, so the pins are no"
@@ -18710,6 +18790,7 @@ apply_configuration() {
     say "    - more reliable for RX 9070 / RDNA4 reset bug"
     say
     note "Both modes keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off."
+    note "(RX 9070 / RDNA4 Navi 48 skips disable_idle_d3=1: it worsens D3 issues there; the bind script's D0-lock handles the reset bug.)"
     note "dynamic is the recommended default for RX 9070 / RDNA4 cards."
     local binding_default="N"
     if [[ "${guest_vendor,,}" == "1002" ]]; then

@@ -13642,6 +13642,47 @@ install_wayland_render_device_pin() {
     return 0
   fi
 
+  # LOGIN-SAFETY VALIDATION (R17b): a wrong pin (pointing at the guest GPU, or
+  # at a path that does not resolve to a usable DRM card) prevents the greeter
+  # compositor from starting -> no graphical login, only systemd journal text
+  # (observed: kwin_wayland "Failed to open drm device" -> plasmalogin-helper
+  # crashed). This was caused by a fragile cardN pin surviving a card-number
+  # swap so it pointed at the guest. The by-path form above fixes the swap case;
+  # these checks fix the "resolved to something unusable" case so a regenerated
+  # pin can NEVER break login. If ANY check fails we SKIP writing the pin (the
+  # bind-now path still refuses if the compositor is on the guest GPU, so VM
+  # start stays safe) rather than risk a non-booting desktop.
+  # 1. The resolved path must exist right now.
+  if [[ ! -e "$_host_card" ]]; then
+    note "WARN: resolved host DRM card $_host_card does not exist; skipping Wayland render-device pin to avoid breaking login."
+    note "      Re-run the installer once the host GPU ($host_gpu) is enumerated."
+    return 0
+  fi
+  # 2. It must be readable AND writable (KWin needs rw to become DRM master).
+  if [[ ! -r "$_host_card" || ! -w "$_host_card" ]]; then
+    note "WARN: resolved host DRM card $_host_card is not read/write-accessible; skipping Wayland render-device pin to avoid breaking login."
+    note "      Check the user is in the video/render group or that a logind ACL grants access."
+    return 0
+  fi
+  # 3. It must actually map back to the HOST BDF, not the guest. (Catches a
+  #    stale by-path symlink or a future regression that resolves the wrong
+  #    card -- writing a guest-pointed pin would crash the greeter.) Resolve
+  #    the symlink to the real /dev/dri/cardN, then walk that card's sysfs
+  #    device symlink to its PCI BDF and compare.
+  local _real_card _resolved_bdf
+  _real_card="$(readlink -f "$_host_card" 2>/dev/null || true)"
+  if [[ -n "$_real_card" ]]; then
+    _resolved_bdf="$(basename "$(readlink -f "/sys/class/drm/$(basename "$_real_card")/device" 2>/dev/null)" 2>/dev/null || true)"
+  fi
+  if [[ -z "$_resolved_bdf" ]]; then
+    note "WARN: could not resolve $_host_card to a PCI BDF; skipping Wayland render-device pin to avoid pointing the compositor at an unknown GPU."
+    return 0
+  fi
+  if [[ "$_resolved_bdf" != "$host_gpu" ]]; then
+    note "WARN: resolved host DRM card $_host_card maps to BDF $_resolved_bdf, not the configured HOST_GPU_BDF=$host_gpu; skipping Wayland render-device pin to avoid pointing the compositor at the wrong GPU."
+    return 0
+  fi
+
   local _env_dir
   _env_dir="$(dirname "$KWIN_RENDER_PIN_FILE")"
   if (( ! DRY_RUN )); then

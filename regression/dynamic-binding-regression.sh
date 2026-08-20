@@ -852,6 +852,35 @@ assert_contains_text \
   '_bdf_to_drm_card_stable "$HOST_GPU_BDF"' \
   "$bind_block"
 
+# --- Functional Q3m-safe: login-safety validation (R17b no-boot fix) ---
+# A wrong render-device pin (pointing at the guest GPU, or at a path that does
+# not resolve to a usable DRM card) prevents the greeter compositor from
+# starting -> no graphical login, only systemd journal text (observed:
+# kwin_wayland "Failed to open drm device" -> plasmalogin-helper crashed).
+# The installer MUST validate the resolved host card before writing the pin,
+# and SKIP the pin (not write a broken one) if the path is missing,
+# inaccessible, or maps to the wrong BDF. A skipped pin never breaks login.
+assert_contains_text \
+  "Q3m-safe installer validates resolved card exists before pinning" \
+  'if [[ ! -e "$_host_card" ]]; then' \
+  "$_inst_stable_fn"
+assert_contains_text \
+  "Q3m-safe installer validates resolved card is read/write before pinning" \
+  'if [[ ! -r "$_host_card" || ! -w "$_host_card" ]]; then' \
+  "$_inst_stable_fn"
+assert_contains_text \
+  "Q3m-safe installer validates resolved card maps to the HOST BDF" \
+  'if [[ "$_resolved_bdf" != "$host_gpu" ]]; then' \
+  "$_inst_stable_fn"
+assert_contains_text \
+  "Q3m-safe skip message mentions avoiding breaking login" \
+  'skipping Wayland render-device pin to avoid breaking login' \
+  "$_inst_stable_fn"
+assert_contains_text \
+  "Q3m-safe skip message on wrong-BDF names the wrong GPU" \
+  'pointing the compositor at the wrong GPU' \
+  "$_inst_stable_fn"
+
 # --- Functional Q3n: PCI device alive-check (header type 127 / reset-bug fix) ---
 # The RX 9070 / RDNA4 reset bug can drop the card off the bus between a VM stop
 # and the next start, leaving a vfio-pci driver symlink pointing at a dead

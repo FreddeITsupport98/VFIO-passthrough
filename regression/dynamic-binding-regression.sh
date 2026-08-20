@@ -821,6 +821,37 @@ else
   printf 'PASS: Q3m-fix guard does not reference renderD nodes\n'
 fi
 
+# --- Functional Q3m-stable: pin by stable by-path symlink (R17 cardN-swap fix) ---
+# The render-device pin must use a STABLE device path
+# (/dev/dri/by-path/pci-<BDF>-card) keyed by PCI address, NOT /dev/dri/cardN
+# (which can swap enumeration order across reboots). A pin pinned to cardN can
+# end up pointing at the GUEST GPU after a card-number swap, crashing the
+# compositor it is meant to protect. Both the installer
+# (install_wayland_render_device_pin) and the bind-now error hint must use the
+# stable _bdf_to_drm_card_stable helper (with a cardN fallback for systems
+# without by-path symlinks).
+assert_contains_file \
+  "Q3m-stable _bdf_to_drm_card_stable helper defined (main script)" \
+  "_bdf_to_drm_card_stable()" \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "Q3m-stable _bdf_to_drm_card_stable defined in generated bind script" \
+  "_bdf_to_drm_card_stable()" \
+  "$bind_block"
+assert_contains_file \
+  "Q3m-stable helper prefers by-path symlink" \
+  '/dev/dri/by-path/pci-$_bdf-card' \
+  "$VFIO_SCRIPT"
+_inst_stable_fn="$(sed -n '/^install_wayland_render_device_pin()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "Q3m-stable installer pins via _bdf_to_drm_card_stable (not fragile cardN)" \
+  '_bdf_to_drm_card_stable "$host_gpu"' \
+  "$_inst_stable_fn"
+assert_contains_text \
+  "Q3m-stable bind-now error hint uses _bdf_to_drm_card_stable" \
+  '_bdf_to_drm_card_stable "$HOST_GPU_BDF"' \
+  "$bind_block"
+
 # --- Functional Q3n: PCI device alive-check (header type 127 / reset-bug fix) ---
 # The RX 9070 / RDNA4 reset bug can drop the card off the bus between a VM stop
 # and the next start, leaving a vfio-pci driver symlink pointing at a dead

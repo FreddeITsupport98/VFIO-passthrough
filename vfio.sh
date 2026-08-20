@@ -8793,6 +8793,22 @@ _bdf_to_drm_card() {
   return 1
 }
 
+# Map a PCI BDF to a STABLE DRM card device path that survives card-number
+# swaps across reboots. Prefers /dev/dri/by-path/pci-<BDF>-card (keyed by PCI
+# address, stable); falls back to _bdf_to_drm_card (cardN) when by-path is
+# absent. Used for the bind-now error hint (a persistent recommendation).
+_bdf_to_drm_card_stable() {
+  local _bdf="$1" _cand
+  [[ -n "$_bdf" ]] || return 1
+  for _cand in "/dev/dri/by-path/pci-$_bdf-card" "/dev/dri/by-path/pci-${_bdf#0000:}-card"; do
+    if [[ -e "$_cand" ]]; then
+      printf '%s\n' "$_cand"
+      return 0
+    fi
+  done
+  _bdf_to_drm_card "$_bdf"
+}
+
 # Returns 0 if the GPU at $1 is on amdgpu AND amdgpu has FINISHED probing --
 # i.e. the DRM card node (/dev/dri/cardN) exists for this BDF. "Config space
 # readable" (_pci_dev_alive) is NOT enough: amdgpu's probe is ASYNC, and the
@@ -9099,7 +9115,7 @@ case "$ACTION" in
           if _comp="$(_wayland_compositor_uses_bdf "$GUEST_GPU_BDF")"; then
             _host_card=""
             if [[ -n "${HOST_GPU_BDF:-}" ]]; then
-              _host_card="$(_bdf_to_drm_card "$HOST_GPU_BDF" 2>/dev/null || true)"
+              _host_card="$(_bdf_to_drm_card_stable "$HOST_GPU_BDF" 2>/dev/null || true)"
             fi
             # Map the detected compositor to its render-device env var so the
             # fix message names the right knob (KWin vs wlroots-based).
@@ -13541,6 +13557,27 @@ _bdf_to_drm_card() {
   return 1
 }
 
+# Map a PCI BDF to a STABLE DRM card device path that survives card-number
+# swaps across reboots (the kernel assigns card0/card1 in enumeration order,
+# which can flip between boots). Prefers the /dev/dri/by-path/pci-<BDF>-card
+# symlink (keyed by PCI address, stable across reboots). Falls back to the
+# cardN walk (_bdf_to_drm_card) on systems without by-path symlinks. Used for
+# PERSISTENT artifacts (the Wayland render-device pin file, the bind-now error
+# hint) where a stale cardN would point at the wrong GPU after a reboot. For
+# runtime /proc/<pid>/fd comparisons use _bdf_to_drm_card (cardN) instead,
+# since open fds resolve to the cardN device node.
+_bdf_to_drm_card_stable() {
+  local _bdf="$1" _cand
+  [[ -n "$_bdf" ]] || return 1
+  for _cand in "/dev/dri/by-path/pci-$_bdf-card" "/dev/dri/by-path/pci-${_bdf#0000:}-card"; do
+    if [[ -e "$_cand" ]]; then
+      printf '%s\n' "$_cand"
+      return 0
+    fi
+  done
+  _bdf_to_drm_card "$_bdf"
+}
+
 # Apply cmdline changes to both /etc/kernel/cmdline (openSUSE/BLS) and
 # /etc/default/grub (classic GRUB) when present, then sync BLS entries.
 apply_binding_cmdline_change() {
@@ -13592,9 +13629,13 @@ install_wayland_render_device_pin() {
     return 0
   fi
 
-  # Map the host GPU to its /dev/dri/cardN.
+  # Map the host GPU to a STABLE DRM card path (/dev/dri/by-path/pci-<BDF>-card)
+  # so the pin survives card-number swaps across reboots (card0/card1 can flip
+  # enumeration order between boots; a pin pinned to cardN can end up pointing
+  # at the GUEST GPU after a swap, crashing the compositor it is meant to
+  # protect). Falls back to /dev/dri/cardN only on systems without by-path.
   local _host_card
-  _host_card="$(_bdf_to_drm_card "$host_gpu" 2>/dev/null || true)"
+  _host_card="$(_bdf_to_drm_card_stable "$host_gpu" 2>/dev/null || true)"
   if [[ -z "$_host_card" ]]; then
     note "WARN: could not map HOST_GPU_BDF=$host_gpu to a /dev/dri/cardN; skipping Wayland render-device pin."
     note "      The bind-now path will still refuse if the compositor is rendering on the guest GPU."

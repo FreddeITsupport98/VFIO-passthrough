@@ -13629,57 +13629,15 @@ install_wayland_render_device_pin() {
     return 0
   fi
 
-  # Map the host GPU to a STABLE DRM card path (/dev/dri/by-path/pci-<BDF>-card)
-  # so the pin survives card-number swaps across reboots (card0/card1 can flip
-  # enumeration order between boots; a pin pinned to cardN can end up pointing
-  # at the GUEST GPU after a swap, crashing the compositor it is meant to
-  # protect). Falls back to /dev/dri/cardN only on systems without by-path.
-  local _host_card
-  _host_card="$(_bdf_to_drm_card_stable "$host_gpu" 2>/dev/null || true)"
-  if [[ -z "$_host_card" ]]; then
-    note "WARN: could not map HOST_GPU_BDF=$host_gpu to a /dev/dri/cardN; skipping Wayland render-device pin."
+  # Install-time pre-check: the host BDF must currently map to a DRM card,
+  # so we know the BDF is valid before writing a resolver for it. The pin file
+  # itself is SELF-RESOLVING (runs at session start), so it adapts to future
+  # card0/card1 swaps and never goes stale -- this check only guards against
+  # writing a resolver for a bogus/un-enumerated BDF.
+  if ! _bdf_to_drm_card "$host_gpu" >/dev/null 2>&1; then
+    note "WARN: HOST_GPU_BDF=$host_gpu has no DRM card right now; skipping Wayland render-device pin."
+    note "      Re-run the installer once the host GPU is enumerated by amdgpu."
     note "      The bind-now path will still refuse if the compositor is rendering on the guest GPU."
-    return 0
-  fi
-
-  # LOGIN-SAFETY VALIDATION (R17b): a wrong pin (pointing at the guest GPU, or
-  # at a path that does not resolve to a usable DRM card) prevents the greeter
-  # compositor from starting -> no graphical login, only systemd journal text
-  # (observed: kwin_wayland "Failed to open drm device" -> plasmalogin-helper
-  # crashed). This was caused by a fragile cardN pin surviving a card-number
-  # swap so it pointed at the guest. The by-path form above fixes the swap case;
-  # these checks fix the "resolved to something unusable" case so a regenerated
-  # pin can NEVER break login. If ANY check fails we SKIP writing the pin (the
-  # bind-now path still refuses if the compositor is on the guest GPU, so VM
-  # start stays safe) rather than risk a non-booting desktop.
-  # 1. The resolved path must exist right now.
-  if [[ ! -e "$_host_card" ]]; then
-    note "WARN: resolved host DRM card $_host_card does not exist; skipping Wayland render-device pin to avoid breaking login."
-    note "      Re-run the installer once the host GPU ($host_gpu) is enumerated."
-    return 0
-  fi
-  # 2. It must be readable AND writable (KWin needs rw to become DRM master).
-  if [[ ! -r "$_host_card" || ! -w "$_host_card" ]]; then
-    note "WARN: resolved host DRM card $_host_card is not read/write-accessible; skipping Wayland render-device pin to avoid breaking login."
-    note "      Check the user is in the video/render group or that a logind ACL grants access."
-    return 0
-  fi
-  # 3. It must actually map back to the HOST BDF, not the guest. (Catches a
-  #    stale by-path symlink or a future regression that resolves the wrong
-  #    card -- writing a guest-pointed pin would crash the greeter.) Resolve
-  #    the symlink to the real /dev/dri/cardN, then walk that card's sysfs
-  #    device symlink to its PCI BDF and compare.
-  local _real_card _resolved_bdf
-  _real_card="$(readlink -f "$_host_card" 2>/dev/null || true)"
-  if [[ -n "$_real_card" ]]; then
-    _resolved_bdf="$(basename "$(readlink -f "/sys/class/drm/$(basename "$_real_card")/device" 2>/dev/null)" 2>/dev/null || true)"
-  fi
-  if [[ -z "$_resolved_bdf" ]]; then
-    note "WARN: could not resolve $_host_card to a PCI BDF; skipping Wayland render-device pin to avoid pointing the compositor at an unknown GPU."
-    return 0
-  fi
-  if [[ "$_resolved_bdf" != "$host_gpu" ]]; then
-    note "WARN: resolved host DRM card $_host_card maps to BDF $_resolved_bdf, not the configured HOST_GPU_BDF=$host_gpu; skipping Wayland render-device pin to avoid pointing the compositor at the wrong GPU."
     return 0
   fi
 
@@ -13689,22 +13647,48 @@ install_wayland_render_device_pin() {
     mkdir -p "$_env_dir" 2>/dev/null || true
   fi
 
+  # Self-resolving pin (R17c): instead of hardcoding /dev/dri/cardN or a
+  # by-path path (either of which can go stale after a card-number swap and
+  # point KWin at the GUEST GPU -> "Failed to open drm device" -> no graphical
+  # login), write a tiny resolver that runs at SESSION START and finds the
+  # host GPU's CURRENT DRM card. It prefers the stable by-path symlink when
+  # present and falls back to the cardN device node, so it adapts to whatever
+  # card0/card1 enumeration order this boot has. If the host card is not found
+  # at session start (e.g. amdgpu still probing), the vars stay UNSET and the
+  # compositor uses its default device -- it never points at a wrong/nonexistent
+  # device, so it can NEVER break login.
   backup_file "$KWIN_RENDER_PIN_FILE"
   write_file_atomic "$KWIN_RENDER_PIN_FILE" 0644 "root:root" <<EOF
-# Managed by $SCRIPT_NAME. Pins KDE/KWin Wayland to the HOST GPU so the
-# compositor never renders on the guest (Boot VGA) GPU. Without this, binding
-# the guest GPU to vfio-pci at VM start crashes the Wayland compositor
-# mid-frame (kwin_wayland SEGV in GLVertexBuffer::endOfFrame).
+# Managed by $SCRIPT_NAME. Self-resolving render-device pin: at session start
+# it finds the HOST GPU's current DRM card and points KWin at it, so the
+# compositor never renders on the guest (Boot VGA) GPU that gets bound to
+# vfio-pci at VM start (kwin_wayland SEGV in GLVertexBuffer::endOfFrame).
+# Self-resolving (not a hardcoded /dev/dri/cardN or by-path path) so it adapts
+# to card0/card1 enumeration-order swaps across reboots and cannot go stale.
 # Takes effect on next login / reboot. Verify with: echo \$KWIN_DRM_DEVICES
 # Remove via: sudo $SCRIPT_NAME --reset  (or sudo $SCRIPT_NAME --install-early-binding)
-export KWIN_DRM_DEVICES="$_host_card"
+_vfio_host_bdf="$host_gpu"
+for _c in /sys/class/drm/card[0-9]; do
+  [ -e "\$_c" ] || continue
+  _vfio_nm="\$(basename "\$_c")"
+  case "\$_vfio_nm" in card[0-9]-*) continue ;; esac
+  _vfio_cbdf="\$(basename "\$(readlink -f "\$_c/device" 2>/dev/null)" 2>/dev/null)"
+  if [ "\$_vfio_cbdf" = "\$_vfio_host_bdf" ]; then
+    if [ -e "/dev/dri/by-path/pci-\$_vfio_host_bdf-card" ]; then
+      export KWIN_DRM_DEVICES="/dev/dri/by-path/pci-\$_vfio_host_bdf-card"
+    else
+      export KWIN_DRM_DEVICES="/dev/dri/\$_vfio_nm"
+    fi
+    break
+  fi
+done
+unset _vfio_host_bdf _c _vfio_nm _vfio_cbdf
 EOF
-  say "Pinned KDE/KWin Wayland render device to the host GPU ($_host_card) via $KWIN_RENDER_PIN_FILE."
+  say "Installed self-resolving KWin render-device pin (host $host_gpu) via $KWIN_RENDER_PIN_FILE."
 
   # Generic login-shell drop-in for wlroots-based compositors (sway / hyprland /
-  # labwc / wlroots) AND kwin launched from a shell. Sourced by /etc/profile.d.
-  # Exports both vars so whatever compositor the user starts from a login shell
-  # renders on the host GPU.
+  # labbc / wlroots) AND kwin launched from a shell. Sourced by /etc/profile.d.
+  # Same self-resolving logic, exports both KWIN_DRM_DEVICES and WLR_DRM_DEVICES.
   local _wlr_dir
   _wlr_dir="$(dirname "$WLR_RENDER_PIN_FILE")"
   if (( ! DRY_RUN )); then
@@ -13712,19 +13696,38 @@ EOF
   fi
   backup_file "$WLR_RENDER_PIN_FILE"
   write_file_atomic "$WLR_RENDER_PIN_FILE" 0644 "root:root" <<EOF
-# Managed by $SCRIPT_NAME. Pins Wayland compositors to the HOST GPU so the
-# compositor never renders on the guest (Boot VGA) GPU. Without this, binding
-# the guest GPU to vfio-pci at VM start crashes the compositor mid-frame.
+# Managed by $SCRIPT_NAME. Self-resolving render-device pin: at session start
+# it finds the HOST GPU's current DRM card and points Wayland compositors at
+# it, so the compositor never renders on the guest (Boot VGA) GPU that gets
+# bound to vfio-pci at VM start.
 # Covers: KWin (KWIN_DRM_DEVICES) and wlroots-based compositors (WLR_DRM_DEVICES:
-# sway / hyprland / labwc / wlroots). Sourced by login shells via /etc/profile.d.
+# sway / hyprland / labbc / wlroots). Sourced by login shells via /etc/profile.d.
+# Self-resolving (not a hardcoded path) so it adapts to card0/card1 swaps and
+# cannot go stale / break login.
 # Takes effect on next login / reboot.
 # Remove via: sudo $SCRIPT_NAME --reset  (or sudo $SCRIPT_NAME --install-early-binding)
-export KWIN_DRM_DEVICES="$_host_card"
-export WLR_DRM_DEVICES="$_host_card"
+_vfio_host_bdf="$host_gpu"
+for _c in /sys/class/drm/card[0-9]; do
+  [ -e "\$_c" ] || continue
+  _vfio_nm="\$(basename "\$_c")"
+  case "\$_vfio_nm" in card[0-9]-*) continue ;; esac
+  _vfio_cbdf="\$(basename "\$(readlink -f "\$_c/device" 2>/dev/null)" 2>/dev/null)"
+  if [ "\$_vfio_cbdf" = "\$_vfio_host_bdf" ]; then
+    if [ -e "/dev/dri/by-path/pci-\$_vfio_host_bdf-card" ]; then
+      export KWIN_DRM_DEVICES="/dev/dri/by-path/pci-\$_vfio_host_bdf-card"
+      export WLR_DRM_DEVICES="/dev/dri/by-path/pci-\$_vfio_host_bdf-card"
+    else
+      export KWIN_DRM_DEVICES="/dev/dri/\$_vfio_nm"
+      export WLR_DRM_DEVICES="/dev/dri/\$_vfio_nm"
+    fi
+    break
+  fi
+done
+unset _vfio_host_bdf _c _vfio_nm _vfio_cbdf
 EOF
-  say "Pinned Wayland compositors (KWin + wlroots: sway/hyprland/labwc) to the host GPU ($_host_card) via $WLR_RENDER_PIN_FILE."
-  note "These take effect on next login (or reboot). The compositor will render on the host GPU"
-  note "instead of the guest (Boot VGA) GPU, so VM start will not crash the host desktop."
+  say "Installed self-resolving Wayland compositor pin (host $host_gpu) via $WLR_RENDER_PIN_FILE."
+  note "These take effect on next login (or reboot). The pin resolves the host GPU's current"
+  note "card at session start, so it survives card0/card1 swaps and never breaks login."
 }
 
 # Remove the render-device pins installed by install_wayland_render_device_pin.

@@ -821,65 +821,81 @@ else
   printf 'PASS: Q3m-fix guard does not reference renderD nodes\n'
 fi
 
-# --- Functional Q3m-stable: pin by stable by-path symlink (R17 cardN-swap fix) ---
-# The render-device pin must use a STABLE device path
-# (/dev/dri/by-path/pci-<BDF>-card) keyed by PCI address, NOT /dev/dri/cardN
-# (which can swap enumeration order across reboots). A pin pinned to cardN can
-# end up pointing at the GUEST GPU after a card-number swap, crashing the
-# compositor it is meant to protect. Both the installer
-# (install_wayland_render_device_pin) and the bind-now error hint must use the
-# stable _bdf_to_drm_card_stable helper (with a cardN fallback for systems
-# without by-path symlinks).
+# --- Functional Q3m-resolve: self-resolving render-device pin (R17c) ---
+# A hardcoded pin (/dev/dri/cardN OR a by-path symlink) can go stale after a
+# card-number swap and point KWin at the GUEST GPU -> "Failed to open drm
+# device" -> plasmalogin-helper crashed -> no graphical login (observed on
+# Fedora). R17c replaces the hardcoded path with a SELF-RESOLVING pin: a tiny
+# resolver that runs at SESSION START and walks /sys/class/drm to find the host
+# GPU's CURRENT card, preferring the stable by-path symlink and falling back to
+# the cardN device node. It adapts to every card0/card1 swap, so it can NEVER
+# go stale and break login. If the host card is not found at session start the
+# vars stay UNSET (compositor uses its default) -- it never points at a
+# wrong/nonexistent device.
 assert_contains_file \
-  "Q3m-stable _bdf_to_drm_card_stable helper defined (main script)" \
+  "Q3m-resolve _bdf_to_drm_card_stable helper defined (main script)" \
   "_bdf_to_drm_card_stable()" \
   "$VFIO_SCRIPT"
 assert_contains_text \
-  "Q3m-stable _bdf_to_drm_card_stable defined in generated bind script" \
+  "Q3m-resolve _bdf_to_drm_card_stable defined in generated bind script" \
   "_bdf_to_drm_card_stable()" \
   "$bind_block"
-assert_contains_file \
-  "Q3m-stable helper prefers by-path symlink" \
-  '/dev/dri/by-path/pci-$_bdf-card' \
-  "$VFIO_SCRIPT"
-_inst_stable_fn="$(sed -n '/^install_wayland_render_device_pin()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "Q3m-stable installer pins via _bdf_to_drm_card_stable (not fragile cardN)" \
-  '_bdf_to_drm_card_stable "$host_gpu"' \
-  "$_inst_stable_fn"
-assert_contains_text \
-  "Q3m-stable bind-now error hint uses _bdf_to_drm_card_stable" \
+  "Q3m-resolve bind-now error hint uses _bdf_to_drm_card_stable" \
   '_bdf_to_drm_card_stable "$HOST_GPU_BDF"' \
   "$bind_block"
-
-# --- Functional Q3m-safe: login-safety validation (R17b no-boot fix) ---
-# A wrong render-device pin (pointing at the guest GPU, or at a path that does
-# not resolve to a usable DRM card) prevents the greeter compositor from
-# starting -> no graphical login, only systemd journal text (observed:
-# kwin_wayland "Failed to open drm device" -> plasmalogin-helper crashed).
-# The installer MUST validate the resolved host card before writing the pin,
-# and SKIP the pin (not write a broken one) if the path is missing,
-# inaccessible, or maps to the wrong BDF. A skipped pin never breaks login.
+_inst_resolve_fn="$(sed -n '/^install_wayland_render_device_pin()/,/^}/p' "$VFIO_SCRIPT")"
+# Install-time pre-check: host BDF must currently map to a DRM card.
 assert_contains_text \
-  "Q3m-safe installer validates resolved card exists before pinning" \
-  'if [[ ! -e "$_host_card" ]]; then' \
-  "$_inst_stable_fn"
-assert_contains_text \
-  "Q3m-safe installer validates resolved card is read/write before pinning" \
-  'if [[ ! -r "$_host_card" || ! -w "$_host_card" ]]; then' \
-  "$_inst_stable_fn"
-assert_contains_text \
-  "Q3m-safe installer validates resolved card maps to the HOST BDF" \
-  'if [[ "$_resolved_bdf" != "$host_gpu" ]]; then' \
-  "$_inst_stable_fn"
-assert_contains_text \
-  "Q3m-safe skip message mentions avoiding breaking login" \
-  'skipping Wayland render-device pin to avoid breaking login' \
-  "$_inst_stable_fn"
-assert_contains_text \
-  "Q3m-safe skip message on wrong-BDF names the wrong GPU" \
-  'pointing the compositor at the wrong GPU' \
-  "$_inst_stable_fn"
+  "Q3m-resolve installer pre-checks host BDF has a DRM card" \
+  '_bdf_to_drm_card "$host_gpu"' \
+  "$_inst_resolve_fn"
+# The pin file bakes in the host BDF (not a device path) for the resolver.
+assert_contains_file \
+  "Q3m-resolve pin bakes in host BDF for session-start resolution" \
+  '_vfio_host_bdf="$host_gpu"' \
+  "$VFIO_SCRIPT"
+# The resolver walks /sys/class/drm to find the host card at session start.
+assert_contains_file \
+  "Q3m-resolve pin walks /sys/class/drm at session start" \
+  'for _c in /sys/class/drm/card[0-9]; do' \
+  "$VFIO_SCRIPT"
+# It prefers the stable by-path symlink when present. (The resolver's $ is
+# escaped as \$ in the unquoted heredoc source, so the patterns include the
+# backslash to match the source literally under grep -F.)
+assert_contains_file \
+  "Q3m-resolve pin prefers by-path symlink at session start" \
+  '/dev/dri/by-path/pci-\$_vfio_host_bdf-card' \
+  "$VFIO_SCRIPT"
+# It falls back to the cardN device node when by-path is absent.
+assert_contains_file \
+  "Q3m-resolve pin falls back to cardN device node" \
+  'export KWIN_DRM_DEVICES="/dev/dri/\$_vfio_nm"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3m-resolve pin exports WLR_DRM_DEVICES with the same resolver" \
+  'export WLR_DRM_DEVICES="/dev/dri/\$_vfio_nm"' \
+  "$VFIO_SCRIPT"
+# No hardcoded /dev/dri/cardN export remains in the installer heredocs (the
+# resolver replaces it). The old fragile form would be a bare export of a
+# literal cardN; assert it is gone from the installer function body.
+if grep -Fq 'export KWIN_DRM_DEVICES="/dev/dri/card' <<<"$_inst_resolve_fn"; then
+  printf 'FAIL: Q3m-resolve installer still hardcodes a /dev/dri/cardN pin (fragile)\n' >&2
+  record_failure "Q3m-resolve installer does not hardcode a cardN pin"
+else
+  printf 'PASS: Q3m-resolve installer does not hardcode a fragile cardN pin\n'
+fi
+# The resolver must NOT fall back to pointing at a wrong card if the host is not
+# found -- it must leave the vars unset (safe). Assert the loop only exports on
+# a BDF match and breaks, with no unconditional export outside the match.
+assert_contains_file \
+  "Q3m-resolve pin only exports on host-BDF match" \
+  'if [ "\$_vfio_cbdf" = "\$_vfio_host_bdf" ]; then' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3m-resolve pin cleans up its temp vars" \
+  'unset _vfio_host_bdf _c _vfio_nm _vfio_cbdf' \
+  "$VFIO_SCRIPT"
 
 # --- Functional Q3n: PCI device alive-check (header type 127 / reset-bug fix) ---
 # The RX 9070 / RDNA4 reset bug can drop the card off the bus between a VM stop

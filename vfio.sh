@@ -7844,8 +7844,16 @@ CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 # Written on --release (VM stop), read on --bind-now (VM start) to refuse a
 # too-soon restart that can drop the RX 9070 / RDNA4 off the PCI bus.
 COOLDOWN_TS_FILE="/var/lib/vfio-dynamic/last-vm-stop.ts"
+# State file tracking whether the AMD Windows driver appears to be installed in
+# the guest VM. Values: "unknown" (no successful session yet) or
+# "likely_installed" (card survived at least one full VM session -> the AMD
+# driver is initializing the GPU properly). Used by the release path to decide
+# whether to notify the user to install the AMD driver (the card dies ~25s into
+# a session without the driver because the Microsoft Basic Display Adapter
+# leaves the GPU in an undefined state that crashes the host PCIe bus).
+DRIVER_STATUS_FILE="/var/lib/vfio-dynamic/amd-driver-status"
 
-say() { printf '%s\n' "$*"; }
+say() { printf '%s\n'; "$*"; }
 
 die() {
   say "ERROR: $*" >&2
@@ -7856,6 +7864,27 @@ die() {
 # in the system journal (journalctl -t vfio-dynamic). Failures to log are silent.
 jlog() {
   command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "$*" 2>/dev/null || true
+}
+
+# Best-effort desktop notification (notify-send) to the active desktop user.
+# The bind script runs as root (via the libvirt hook), so we must find the
+# desktop user's session and send notify-send through runuser with the right
+# DBUS_SESSION_BUS_ADDRESS. Silent on failure (no desktop, no notify-send,
+# headless, etc.). Used for the AMD-driver-missing warning so the user sees a
+# popup instead of having to dig through the journal.
+_desktop_notify() {
+  local _msg="$1"
+  command -v notify-send >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  # Find the first logged-in user with a graphical session.
+  local _user _display _bus
+  for _user in $(loginctl --no-legend 2>/dev/null | awk '$4=="user"{print $3}' | sort -u); do
+    _display="$(loginctl show-session "$(loginctl --no-legend | awk -v u="$_user" '$3==u{print $1; exit}')" -p Display 2>/dev/null | cut -d= -f2)"
+    [[ -n "$_display" ]] || continue
+    _bus="unix:path=/run/user/$(id -u "$_user")/bus"
+    DBUS_SESSION_BUS_ADDRESS="$_bus" runuser -u "$_user" -- notify-send -i dialog-warning "VFIO GPU" "$_msg" 2>/dev/null || true
+    return 0
+  done
 }
 
 [[ -f "$CONF_FILE" ]] || die "Missing $CONF_FILE"
@@ -9037,6 +9066,37 @@ case "$ACTION" in
       else
         jlog "$GUEST_GPU_BDF: still dead at release time after remove+rescan; next --bind-now will report it needs a host reboot"
         say "WARN: $GUEST_GPU_BDF is still dead after remove+rescan at release time. The next VM start will report it needs a host reboot." >&2
+      fi
+      # AMD driver status notification (R22): the card died during the VM
+      # session. On RX 9070 / RDNA4 this happens when the AMD Windows driver
+      # is NOT installed -- without it, Windows uses the Microsoft Basic
+      # Display Adapter which leaves the GPU in an undefined state that
+      # crashes the host PCIe bus ~25s into the session. If the driver status
+      # is still "unknown" (no prior successful session), notify the user to
+      # install the AMD driver. If the status is "likely_installed" (a prior
+      # session survived), the driver IS installed and this death is from
+      # another cause -- do NOT suggest the driver (no false positive).
+      if _is_rx9070 "$GUEST_GPU_BDF"; then
+        _drv_status="$(cat "$DRIVER_STATUS_FILE" 2>/dev/null || echo "unknown")"
+        if [[ "$_drv_status" != "likely_installed" ]]; then
+          jlog "$GUEST_GPU_BDF: card died during VM session and AMD driver status is unknown — notifying user to install the AMD Windows driver"
+          say "WARN: The guest GPU died during the VM session. On RX 9070 / RDNA4 this is likely because the AMD Windows driver is NOT installed in the guest — the Microsoft Basic Display Adapter leaves the GPU in an undefined state that crashes the PCIe bus. Install the AMD driver (Adrenalin) inside the Windows VM to stabilize the card. The card needs a host reboot to come back on the bus." >&2
+          _desktop_notify "VFIO: The guest GPU (RX 9070) died during the VM session. Install the AMD driver inside the Windows VM to stabilize the card. Host reboot needed to bring the card back."
+        fi
+      fi
+    else
+      # Card survived the full VM session — the AMD driver is likely installed
+      # and properly initializing the GPU. Mark the status so future deaths
+      # don't falsely suggest installing the driver (no false positive).
+      if _is_rx9070 "$GUEST_GPU_BDF"; then
+        _drv_status="$(cat "$DRIVER_STATUS_FILE" 2>/dev/null || echo "unknown")"
+        if [[ "$_drv_status" != "likely_installed" ]]; then
+          mkdir -p "$(dirname "$DRIVER_STATUS_FILE")" 2>/dev/null || true
+          printf 'likely_installed\n' >"$DRIVER_STATUS_FILE" 2>/dev/null || true
+          jlog "$GUEST_GPU_BDF: card survived full VM session — marking AMD driver status as likely_installed"
+          say "Guest GPU survived the full VM session — the AMD Windows driver appears to be installed. Future card-death notifications will not suggest the driver."
+          _desktop_notify "VFIO: The guest GPU survived the full VM session — the AMD Windows driver appears to be installed. Passthrough is working."
+        fi
       fi
     fi
     # Record the VM-stop timestamp for the cooldown guard on the next --bind-now.
@@ -14197,6 +14257,32 @@ install_dynamic_binding_from_existing_config() {
   note "The guest GPU will stay on amdgpu until you start a libvirt VM that has it attached."
   note "Keep pcie_port_pm=off on the kernel cmdline for both modes."
   note "Keep vfio-pci.disable_idle_d3=1 too -- EXCEPT on RX 9070 / RDNA4 (Navi 48), where it is skipped (it worsens D3 issues there; the bind script's D0-lock is the correct defense). Use --amd-disable-idle-d3 to force it."
+  # RX 9070 / RDNA4 driver hint (R22b): the card dies ~25s into the first VM
+  # session if the AMD Windows driver is not installed (the Microsoft Basic
+  # Display Adapter leaves the GPU in an undefined state that crashes the PCIe
+  # bus). Make this clear during install so the user knows to install the
+  # driver before the first VM start. Only shown for RX 9070 / Navi 48.
+  if _is_guest_rx9070_family; then
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}${C_YELLOW}⚠ RX 9070 / RDNA4 driver requirement:${C_RESET}"
+    else
+      say "⚠ RX 9070 / RDNA4 driver requirement:"
+    fi
+    note "The guest GPU (RX 9070 / Navi 48) requires the AMD Windows driver to be installed"
+    note "inside the VM for the card to survive VM sessions. Without the driver, Windows uses"
+    note "the Microsoft Basic Display Adapter, which leaves the GPU in an undefined state that"
+    note "crashes the host PCIe bus ~25 seconds into the session."
+    note ""
+    note "First boot: the card may die during the first VM session (before the driver can be"
+    note "installed). This is expected — reboot the host, start the VM, and install the AMD"
+    note "driver (Adrenalin) from AMD's website. Once the driver is installed, the card"
+    note "stabilizes and survives full VM sessions + shutdown/restart cycles."
+    note ""
+    note "The bind script will send a desktop notification if it detects the driver is missing"
+    note "(card dies during session with no prior successful session). Once a session survives,"
+    note "the notification is suppressed (no false positives)."
+  fi
 }
 
 install_early_binding_from_existing_config() {
@@ -14228,6 +14314,20 @@ install_early_binding_from_existing_config() {
   note "     passthrough; the monitor is dynamic-binding-only)"
   note "  7b. Remove the park-keepalive monitor (dynamic-binding-only)"
   say
+  # RX 9070 / RDNA4 driver hint (R22b): same as the dynamic switcher above.
+  if _is_guest_rx9070_family; then
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}${C_YELLOW}⚠ RX 9070 / RDNA4 driver requirement:${C_RESET}"
+    else
+      say "⚠ RX 9070 / RDNA4 driver requirement:"
+    fi
+    note "The guest GPU (RX 9070 / Navi 48) requires the AMD Windows driver to be installed"
+    note "inside the VM for the card to survive VM sessions. Without the driver, the card"
+    note "dies ~25s into the session (Microsoft Basic Display Adapter crashes the PCIe bus)."
+    note "Install the AMD driver (Adrenalin) inside the Windows VM to stabilize the card."
+    note "The bind script will notify you if it detects the driver is missing."
+    say
+  fi
 
   # 1. Flip the conf key.
   rewrite_conf_key "VFIO_BINDING_MODE" "early"

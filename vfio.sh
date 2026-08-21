@@ -10966,7 +10966,7 @@ install_hypervisor_hiding() {
     fi
     # Check VM state — can only define shut-off VMs.
     local _state
-    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping hypervisor hiding. Shut it off and re-run to update it."
       _skipped_running=1
@@ -11127,7 +11127,7 @@ install_stealth_vm_tuning() {
       continue
     fi
     # Only define shut-off VMs.
-    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping stealth/perf tuning. Shut it off and re-run."
       _skipped_running=1
@@ -11476,7 +11476,7 @@ reset_stealth_vm_tuning() {
     if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
       continue
     fi
-    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping revert. Shut it off and re-run."
       _skipped_running=1
@@ -12643,7 +12643,7 @@ install_vbios_romfile() {
     if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
       continue
     fi
-    _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping vBIOS ROM injection. Shut it off and re-run to update it."
       _skipped_running=1
@@ -12770,9 +12770,9 @@ remove_vbios_romfile() {
           /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
         ')"
         grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null || continue
-        _state="$(virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
-        if [[ "$_state" != "shut off" ]]; then
-          note "WARN: VM '$_dom' is '$_state' (not shut off); leaving its vBIOS ROM pin in place. Shut it off and re-run --reset / --install-early-binding to remove it."
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); leaving its vBIOS ROM pin in place. Shut it off and re-run --reset / --install-early-binding to remove it."
           continue
         fi
         _tmp="$(mktemp)"

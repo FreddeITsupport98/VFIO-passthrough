@@ -209,6 +209,39 @@ assert_contains_file \
   'rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "0"' \
   "$VFIO_SCRIPT"
 
+# --- Static wiring: install saves a per-VM XML backup; remove restores it ---
+# install_live_attach removes the GPU hostdev from each VM's persistent XML so
+# the VM boots on a virtual display; it MUST save a full pre-live-attach backup
+# (with the GPU) per VM so the revert path can re-attach the GPU automatically
+# instead of leaving the VM permanently GPU-less.
+assert_contains_text \
+  "R23 install_live_attach saves per-VM pre-live-attach XML backup" \
+  'live-attach-backup-$_dom.xml' \
+  "$_la_fn"
+assert_contains_text \
+  "R23 install_live_attach writes backup atomically (write_file_atomic)" \
+  'write_file_atomic "$_backup_xml"' \
+  "$_la_fn"
+# remove_live_attach must restore each VM's XML from the backup BEFORE deleting
+# it (only shut-off VMs; virsh define requires it), then clean up the backups.
+_rm_la_fn="$(sed -n '/^remove_live_attach()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R23 remove_live_attach restores VM XML from pre-live-attach backup" \
+  'virsh -c qemu:///system define "$_backup_xml"' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R23 remove_live_attach validates backup before restore" \
+  'virt-xml-validate "$_backup_xml"' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R23 remove_live_attach only restores shut-off VMs" \
+  '[[ "$_state" != "shut off" ]]' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R23 remove_live_attach removes per-VM backup files (glob)" \
+  'live-attach-backup-*.xml' \
+  "$_rm_la_fn"
+
 # --- Static wiring: reset + early-binding call remove_live_attach ---
 _reset_fn="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \

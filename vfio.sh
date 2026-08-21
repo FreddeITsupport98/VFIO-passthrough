@@ -1557,7 +1557,7 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   'virsh attach-device' (live mode). This sidesteps the parked-restart card death
                   on RX 9070 / RDNA4. Requires --install-dynamic-binding to be run first,
                   and the AMD Windows driver MUST be installed in the guest VM.
-                  To revert: sudo vfio.sh --install-dynamic-binding
+                  To revert: sudo vfio.sh --install-dynamic-binding (restores the GPU to the VM XML from the per-VM backup)
   --install-stealth-vm-tuning
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
@@ -9785,8 +9785,10 @@ install_live_attach() {
   note "Without the driver, the card dies ~25s into the session regardless of method."
   note ""
   note "The VM XML will be modified to REMOVE the GPU hostdev (so libvirt starts"
-  note "without it). A backup of the original XML is saved. To revert, run:"
-  note "  sudo $SCRIPT_NAME --install-dynamic-binding  (restores normal binding)"
+  note "without it). A full backup of the original XML (with the GPU) is saved per VM."
+  note "To revert, run:"
+  note "  sudo $SCRIPT_NAME --install-dynamic-binding"
+  note "  (restores normal binding AND re-attaches the GPU to the VM XML from the backup)"
   say
 
   local _delay_default="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
@@ -9846,6 +9848,17 @@ install_live_attach() {
     _tmp_gpu="$(mktemp)"
     _tmp_audio="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp_vm"
+
+    # Save a full pre-live-attach XML backup (the VM XML WITH the GPU still
+    # attached) so remove_live_attach can restore the GPU hostdev on revert.
+    # One backup per VM; saved before python3 strips the hostdev below.
+    # Atomic (write_file_atomic: temp file + install/rename) so a power loss or
+    # full disk mid-write cannot leave a truncated backup on disk — the backup
+    # either appears complete or not at all (remove_live_attach still validates
+    # it before defining, as a second line of defense).
+    local _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
+    printf '%s\n' "$_xml" | write_file_atomic "$_backup_xml" 0644 "root:root"
+    say "  Saved pre-live-attach VM XML backup (with GPU): $_backup_xml"
 
     python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || true
 import sys, xml.etree.ElementTree as ET
@@ -9965,13 +9978,46 @@ PYEOF
   fi
   note "The VM will start WITHOUT the GPU. After ${_delay_default}s, the GPU will be"
   note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
-  note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding)"
+  note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU from the per-VM backup)"
 }
 
 # Remove the live-attach workflow (called by --install-dynamic-binding to restore
 # normal binding, and by --reset).
 remove_live_attach() {
   local _removed=0
+
+  # Restore the GPU hostdev to each VM's XML from the pre-live-attach backup
+  # BEFORE deleting the backup + VM list. install_live_attach removed the GPU
+  # hostdev from each VM's persistent XML so the VM boots on a virtual display;
+  # this re-defines the VM from the saved backup (with the GPU re-attached),
+  # undoing that modification so --install-dynamic-binding / --reset leave the
+  # VM with its GPU back. Only restores shut-off VMs (virsh define requires it);
+  # a running VM is skipped with a note so the user can shut it off and re-run.
+  # Best-effort: missing backup / failed validation / no virsh are skipped so
+  # cleanup still completes.
+  if [[ -f "$LIVE_ATTACH_VM_LIST" ]] && have_cmd virsh; then
+    local _dom _backup_xml _state
+    while IFS= read -r _dom; do
+      [[ -n "$_dom" ]] || continue
+      _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
+      [[ -f "$_backup_xml" ]] || continue
+      _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+      if [[ "$_state" != "shut off" ]]; then
+        note "WARN: VM '$_dom' is '$_state' (not shut off); skipping XML restore. Shut it off and re-run to restore the GPU hostdev."
+        continue
+      fi
+      if virt-xml-validate "$_backup_xml" 2>/dev/null; then
+        if (( ! DRY_RUN )) && virsh -c qemu:///system define "$_backup_xml" 2>/dev/null; then
+          say "Restored GPU hostdev to VM '$_dom' from pre-live-attach backup."
+          _removed=1
+        fi
+      else
+        note "WARN: pre-live-attach backup for '$_dom' failed validation; skipping XML restore (backup left in place)."
+      fi
+    done < "$LIVE_ATTACH_VM_LIST"
+  fi
+
+  # Remove the managed artifacts.
   if [[ -f "$LIVE_ATTACH_HELPER" ]]; then
     run rm -f "$LIVE_ATTACH_HELPER" 2>/dev/null || true
     _removed=1
@@ -9988,12 +10034,19 @@ remove_live_attach() {
     run rm -f "$LIVE_ATTACH_VM_LIST" 2>/dev/null || true
     _removed=1
   fi
+  # Remove per-VM pre-live-attach XML backups (glob: one backup per VM).
+  local _bxml
+  for _bxml in /var/lib/vfio-dynamic/live-attach-backup-*.xml; do
+    [[ -f "$_bxml" ]] || continue
+    run rm -f "$_bxml" 2>/dev/null || true
+    _removed=1
+  done
   # Flip the conf key back to 0.
   if readable_file "$CONF_FILE" && grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
     rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "0"
     _removed=1
   fi
-  (( _removed )) && note "Removed live-attach workflow. Re-run --install-dynamic-binding to restore the GPU hostdev to the VM XML."
+  (( _removed )) && note "Removed live-attach workflow (VM XML restored from pre-live-attach backups where the VM was shut off)."
 }
 # guest reboot lifecycle events and does a soft function-level reset on the
 # guest GPU to clear the display wedge. On RX 9070 / RDNA4 with on_reboot=restart

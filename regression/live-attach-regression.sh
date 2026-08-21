@@ -180,9 +180,23 @@ assert_contains_file \
   "R23 install_live_attach flips VFIO_DYNAMIC_LIVE_ATTACH=1" \
   'rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "1"' \
   "$VFIO_SCRIPT"
+# install_live_attach must reinstall the libvirt hook (deploys the live-attach
+# branch + recreates the /etc/libvirt/hooks/qemu entry point) AND regenerate the
+# bind script (the helper calls --bind-now). Without the hook reinstall, a hook
+# written by an older vfio.sh would lack the live-attach branch, and a missing
+# qemu entry would mean libvirt never invokes the hook at all.
+_la_fn="$(sed -n '/^install_live_attach()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R23 install_live_attach calls install_libvirt_hook (deploys live-attach hook)" \
+  'install_libvirt_hook' \
+  "$_la_fn"
+assert_contains_text \
+  "R23 install_live_attach calls install_bind_script (helper uses --bind-now)" \
+  'install_bind_script' \
+  "$_la_fn"
 assert_contains_file \
-  "R23 install_live_attach regenerates the bind script (deploys updated hook)" \
-  'Regenerated $BIND_SCRIPT (updated hook with live-attach support)' \
+  "R23 install_live_attach regenerates the bind script" \
+  'Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)' \
   "$VFIO_SCRIPT"
 
 # --- Static wiring: remove_live_attach cleans up + flips conf back ---

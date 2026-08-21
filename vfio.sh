@@ -9943,9 +9943,19 @@ PYEOF
   rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "1"
   say "Set VFIO_DYNAMIC_LIVE_ATTACH=1 in $CONF_FILE"
 
-  # Regenerate the bind script (deploys the updated hook with live-attach logic).
+  # Reinstall the libvirt hook so the live-attach branch (gates on
+  # VFIO_DYNAMIC_LIVE_ATTACH=1, checks the live-attach VM list, launches the
+  # helper in the background) is deployed AND the /etc/libvirt/hooks/qemu entry
+  # point exists. Without this, a hook written by an older vfio.sh (pre-R23)
+  # would lack the live-attach branch, and a missing qemu entry would mean
+  # libvirt never invokes the hook at all — so VM start would never launch the
+  # helper and the GPU would never hot-attach.
+  install_libvirt_hook
+
+  # Regenerate the bind script: the live-attach helper calls --bind-now, so
+  # deploy the latest bind logic (alive-check, D0-lock, recovery, etc.).
   install_bind_script
-  say "Regenerated $BIND_SCRIPT (updated hook with live-attach support)"
+  say "Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)"
 
   say
   if (( ENABLE_COLOR )); then

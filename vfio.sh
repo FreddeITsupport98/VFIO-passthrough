@@ -17091,6 +17091,92 @@ verify_vbios_candidates() {
   fi
 }
 
+# Print an ASCII-art GPU card showing the role (GUEST/HOST), live card name,
+# BDF, boot_vga, and current driver — color-coded so `--verify` output is easy
+# to scan at a glance. The GUEST card (passed to the VM) and the HOST card
+# (your display) are drawn side by side as little cards with a fan motif.
+# $1 = BDF, $2 = role ("GUEST" | "HOST"), $3 = binding_mode (for guest dynamic note)
+_print_gpu_card_visual() {
+  local _bdf="$1" _role="$2" _mode="${3:-early}"
+  [[ -n "$_bdf" ]] || return 0
+  local _drv _name _bv _status _status_color _role_color _border_color _pad
+  _drv="$(bdf_driver_name "$_bdf")"
+  _bv="$(pci_boot_vga_flag "$_bdf")"
+  # Card name from lspci (best-effort). lspci prints e.g.
+  #   "Navi 48 [Radeon RX 9070/9070 XT/9070 GRE]"
+  # where the bracket holds the marketing name (more useful than the codename).
+  # Strip the PCI-ID bracket and rev, then prefer the marketing bracket content.
+  _name=""
+  if have_cmd lspci; then
+    _name="$(lspci -s "$_bdf" 2>/dev/null | sed 's/^[^]]*] *//' | sed -E 's/ \[[0-9a-f]{4}:[0-9a-f]{4}\].*$//; s/ \(rev [^)]+\)$//')"
+    _name="$(trim "$_name")"
+    # If there is a [...Radeon/NVIDIA/Intel...] marketing bracket, keep only it.
+    _name="$(printf '%s' "$_name" | sed -E 's/^[^[]*\[([^]]+)\]$/\1/')"
+  fi
+  [[ -n "$_name" ]] || _name="<unknown GPU>"
+
+  # Role + status coloring.
+  _role_color="$C_CYAN"
+  _border_color="$C_CYAN"
+  case "$_role" in
+    GUEST)
+      if [[ "$_drv" == "vfio-pci" ]]; then
+        _status="vfio-pci ✓ (parked)"
+        _status_color="$C_GREEN"
+        [[ "$_mode" != "DYNAMIC" ]] && _status="vfio-pci ✓"
+      elif [[ "$_mode" == "DYNAMIC" && "$_drv" == "amdgpu" ]]; then
+        _status="amdgpu ✓ (dynamic)"
+        _status_color="$C_GREEN"
+      elif [[ "$_mode" == "DYNAMIC" ]]; then
+        _status="${_drv} ? (dynamic)"
+        _status_color="$C_YELLOW"
+      else
+        _status="${_drv} ✖ (want vfio-pci)"
+        _status_color="$C_RED"
+      fi
+      ;;
+    HOST)
+      if [[ "$_drv" == "vfio-pci" ]]; then
+        _status="vfio-pci ✖ (stolen!)"
+        _status_color="$C_RED"
+      else
+        _status="${_drv} ✓ (display)"
+        _status_color="$C_GREEN"
+      fi
+      _role_color="$C_BLUE"
+      _border_color="$C_BLUE"
+      ;;
+  esac
+
+  # boot_vga annotation on the BDF line.
+  local _bvnote=""
+  [[ "$_bv" == "1" ]] && _bvnote="  (Boot VGA)"
+
+  # Fixed-width text area (36 cols) so the right border aligns. Truncate
+  # over-long names to keep the box tidy in a monospace terminal.
+  _pad() { local _s="$1" _w=36; printf '%s' "$_s"; local _l=${#_s}; (( _l < _w )) && printf '%*s' $((_w - _l)) "" || true; }
+  # Truncate to 36 chars (character count; box-drawing is single-width).
+  _trunc() { local _s="$1" _w=36; (( ${#_s} > _w )) && printf '%s' "${_s:0:_w}" || printf '%s' "$_s"; }
+  local _name_t _bdf_t _status_t
+  _name_t="$(_trunc "$_name")"
+  _bdf_t="$(_trunc "${_bdf}${_bvnote}")"
+  _status_t="$(_trunc "[ ${_role} • ${_status} ]")"
+
+  if (( ENABLE_COLOR )); then
+    say "${_border_color}   ┌──────────────────────────────────────────────┐${C_RESET}"
+    say "${_border_color}   │${C_RESET}  ╭───╮   ${C_BOLD}$(_pad "$_name_t")${C_RESET}${_border_color}│${C_RESET}"
+    say "${_border_color}   │${C_RESET}  │ ◎ │   $(_pad "$_bdf_t")${_border_color}│${C_RESET}"
+    say "${_border_color}   │${C_RESET}  ╰───╯   ${_status_color}${C_BOLD}$(_pad "$_status_t")${C_RESET}${_border_color}│${C_RESET}"
+    say "${_border_color}   └──────────────────────────────────────────────┘${C_RESET}"
+  else
+    say "   ┌──────────────────────────────────────────────┐"
+    say "   │  ╭───╮   $(_pad "$_name_t")│"
+    say "   │  │ ◎ │   $(_pad "$_bdf_t")│"
+    say "   │  ╰───╯   $(_pad "$_status_t")│"
+    say "   └──────────────────────────────────────────────┘"
+  fi
+}
+
 verify_setup() {
   hdr "VERIFY VFIO SETUP"
   VFIO_BRIEF_REPORT=1 detect_existing_vfio_report
@@ -17111,6 +17197,16 @@ verify_setup() {
   say "  Guest audio: ${GUEST_AUDIO_BDFS_CSV:-<none>}"
   say "  Host audio:  ${HOST_AUDIO_BDFS_CSV:-<none>}"
   say "  Binding mode: ${VFIO_BINDING_MODE:-early}"
+
+  # Visual ASCII card layout: GUEST (passed to VM) and HOST (your display),
+  # with live card name, BDF, boot_vga, and current driver — color-coded.
+  if [[ -n "${GUEST_GPU_BDF:-}" ]]; then
+    say
+    _print_gpu_card_visual "$GUEST_GPU_BDF" GUEST "${VFIO_BINDING_MODE:-early}"
+  fi
+  if [[ -n "${HOST_GPU_BDF:-}" ]]; then
+    _print_gpu_card_visual "$HOST_GPU_BDF" HOST "${VFIO_BINDING_MODE:-early}"
+  fi
 
   # Basic sanity
   if [[ -z "${GUEST_GPU_BDF:-}" ]]; then

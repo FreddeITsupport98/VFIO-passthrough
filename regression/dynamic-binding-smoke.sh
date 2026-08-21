@@ -2450,6 +2450,38 @@ if grep -Fq 'verify_vbios_candidates()' "$VFIO_SCRIPT" \
 else
   bad "Q3z verify_vbios_candidates() is missing, not wired into --verify, or lacks the scan/summary"
 fi
+
+# --- Smoke Q3m-visual: ASCII GPU card visual in --verify (R18) ---
+# --verify must print a color-coded ASCII-art card for the GUEST and HOST GPUs
+# showing the live card name, BDF, boot_vga, and current driver, so the operator
+# gets an at-a-glance visual of which GPU is passed through vs. the display.
+# The role+status line is built at runtime as "[ ${_role} • ${_status} ]", so
+# assert the bullet format string + the GUEST/HOST case branches (the literals
+# GUEST/HOST appear in the case, and the bullet • appears in the format string).
+if grep -Fq '_print_gpu_card_visual()' "$VFIO_SCRIPT" \
+  && echo "$_verify_fn" | grep -Fq '_print_gpu_card_visual "$GUEST_GPU_BDF" GUEST' \
+  && echo "$_verify_fn" | grep -Fq '_print_gpu_card_visual "$HOST_GPU_BDF" HOST' \
+  && grep -Fq '│ ◎ │' "$VFIO_SCRIPT" \
+  && grep -Fq '╭───╮' "$VFIO_SCRIPT" \
+  && grep -Fq '${_role} • ${_status}' "$VFIO_SCRIPT" \
+  && grep -Fq 'GUEST)' "$VFIO_SCRIPT" \
+  && grep -Fq 'HOST)' "$VFIO_SCRIPT"; then
+  ok "Q3m-visual --verify prints a color-coded ASCII GPU card for GUEST + HOST (name/BDF/boot_vga/driver)"
+else
+  bad "Q3m-visual --verify is missing the ASCII GPU card visual or the GUEST/HOST wiring"
+fi
+# The visual must color-code the status: green for correctly bound, red for
+# mis-bound (guest not on vfio-pci in early mode, or host stolen by vfio-pci),
+# yellow for dynamic unexpected driver. Assert the status-color branches exist.
+if grep -Fq 'vfio-pci ✓' "$VFIO_SCRIPT" \
+  && grep -Fq 'want vfio-pci' "$VFIO_SCRIPT" \
+  && grep -Fq 'stolen!' "$VFIO_SCRIPT" \
+  && grep -Fq 'C_GREEN' "$VFIO_SCRIPT" \
+  && grep -Fq 'C_RED' "$VFIO_SCRIPT"; then
+  ok "Q3m-visual GPU card visual color-codes binding status (green ok / red mis-bound / yellow dynamic)"
+else
+  bad "Q3m-visual GPU card visual is missing the color-coded status branches"
+fi
 # Static: the live-ROM byte-comparison helpers must be defined and wired into
 # verify_vbios_candidates() so --verify flags a dump with the RIGHT PCI ID but
 # WRONG content (the exact tuf-gaming.rom trap: matched 1002:7550 in the header

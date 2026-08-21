@@ -9197,6 +9197,123 @@ EOF
   run systemctl daemon-reload
   run systemctl enable vfio-bind-selected-gpu.service
 }
+# Install a targeted SELinux policy module allowing virtqemud_t to execute
+# the libvirt qemu hook and write the PCI sysfs entries the bind script touches
+# (driver_override, rescan, unbind, bind, d3cold_allowed, power/control, reset,
+# remove). On SELinux-enforcing distros (Fedora/RHEL) the default policy does
+# NOT grant virtqemud_t execute_no_trans on virt_hook_t nor sysfs_t write
+# access, so EVERY VM start/stop floods the audit log with thousands of AVC
+# denials (observed: 9000+ denials per session on Fedora). This module is
+# minimal and scoped to vfio only -- it does NOT use the firehose audit2allow
+# output (which sweeps up unrelated service domains). Auto-detected: no-op on
+# non-SELinux systems or when the policy tools (checkmodule/semodule) are
+# missing. Idempotent: re-installing replaces the module in place.
+install_selinux_virtqemud_policy() {
+  # Only relevant when SELinux is enabled.
+  if ! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled 2>/dev/null; then
+    return 0
+  fi
+  local _mode
+  _mode="$(getenforce 2>/dev/null || echo "")"
+  if [[ "$_mode" != "Enforcing" && "$_mode" != "Permissive" ]]; then
+    note "SELinux mode is '$_mode'; skipping virtqemud policy module."
+    return 0
+  fi
+  # Need the policy build/install tools.
+  if ! have_cmd checkmodule || ! have_cmd semodule_package || ! have_cmd semodule; then
+    note "SELinux is enabled ($_mode) but checkmodule/semodule_package/semodule are not all installed;"
+    note "skipping the virtqemud policy module. Install policycoreutils-python-utils / selinux-tools to get it."
+    if have_cmd dnf; then
+      note "  Fedora/RHEL: sudo dnf install policycoreutils-python-utils checkpolicy"
+    elif have_cmd zypper; then
+      note "  openSUSE: sudo zypper in selinux-tools checkpolicy"
+    elif have_cmd apt-get; then
+      note "  Debian/Ubuntu: sudo apt-get install policycoreutils-python-utils checkpolicy"
+    fi
+    return 0
+  fi
+  # Confirm virtqemud_t exists in the loaded policy (it does on Fedora/modular
+  # libvirt; on classic libvirtd-only systems the type may be libvirtd_t and
+  # this module is not needed / would not compile). Skip silently if absent.
+  if command -v seinfo >/dev/null 2>&1; then
+    if ! seinfo -t virtqemud_t 2>/dev/null | grep -q virtqemud_t; then
+      note "SELinux virtqemud_t type not present in the loaded policy (classic libvirtd?); skipping virtqemud policy module."
+      return 0
+    fi
+  fi
+
+  say
+  hdr "SELinux: install virtqemud VFIO hook policy (Fedora/RHEL)"
+  note "SELinux is $_mode. Installing a targeted policy module so virtqemud can execute"
+  note "the libvirt qemu hook and write the PCI sysfs entries the bind script uses,"
+  note "instead of flooding the audit log with AVC denials on every VM start/stop."
+
+  local _tmp _te _mod _pp
+  _tmp="$(mktemp -d)"
+  _te="$_tmp/vfio_virtqemud.te"
+  _mod="$_tmp/vfio_virtqemud.mod"
+  _pp="$_tmp/vfio_virtqemud.pp"
+
+  write_file_atomic "$_te" 0644 "root:root" <<'EOF'
+module vfio_virtqemud 1.0;
+
+require {
+    type virtqemud_t;
+    type virt_hook_t;
+    type sysfs_t;
+    type kmod_exec_t;
+    type modules_dep_t;
+    class file { execute execute_no_trans map create write };
+    class dir { add_name write };
+}
+
+# Allow virtqemud to execute the libvirt qemu hook script
+# (/etc/libvirt/hooks/qemu is labeled virt_hook_t; the default policy does not
+# grant virtqemud_t execute_no_trans on it, so every VM start/stop floods the
+# audit log with denied execute_no_trans denials).
+allow virtqemud_t virt_hook_t:file { execute execute_no_trans };
+
+# Allow the hook (running as virtqemud_t) to exec modprobe (kmod)
+# so the bind script can modprobe vfio vfio-pci vfio_iommu_type1.
+allow virtqemud_t kmod_exec_t:file { execute execute_no_trans map };
+
+# Allow modprobe to mmap modules.dep.
+allow virtqemud_t modules_dep_t:file map;
+
+# Allow the bind script (invoked by the hook as virtqemud_t) to write sysfs
+# entries: driver_override, rescan, unbind, bind, d3cold_allowed,
+# power/control, reset, remove. Without this, every PCI bind/unbind sysfs
+# write floods the audit log with denied add_name/create denials.
+allow virtqemud_t sysfs_t:dir { add_name write };
+allow virtqemud_t sysfs_t:file { create write };
+EOF
+
+  if ! run checkmodule -M -m -o "$_mod" "$_te" 2>/dev/null; then
+    note "WARN: checkmodule failed to compile the virtqemud policy .te; skipping SELinux module."
+    rm -rf "$_tmp" 2>/dev/null || true
+    return 0
+  fi
+  if ! run semodule_package -m "$_mod" -o "$_pp" 2>/dev/null; then
+    note "WARN: semodule_package failed to package the virtqemud policy; skipping SELinux module."
+    rm -rf "$_tmp" 2>/dev/null || true
+    return 0
+  fi
+  if ! run semodule -i "$_pp" 2>/dev/null; then
+    note "WARN: semodule -i failed to install the virtqemud policy; skipping SELinux module."
+    rm -rf "$_tmp" 2>/dev/null || true
+    return 0
+  fi
+  rm -rf "$_tmp" 2>/dev/null || true
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Installed SELinux policy module: vfio_virtqemud (virtqemud_t can exec the qemu hook + write PCI sysfs)"
+  else
+    say "  ✔ Installed SELinux policy module: vfio_virtqemud"
+  fi
+  note "  Verify: sudo semodule -l | grep vfio_virtqemud"
+  note "  If virtqemud_t was put in permissive mode to work around the denials, you can"
+  note "  now return it to enforcing: sudo semanage permissive -d virtqemud_t"
+}
+
 install_libvirt_hook() {
   # Installs a generic libvirt qemu hook for dynamic GPU binding.
   # No hardcoded VM/domain names: the hook reads the VM XML from stdin and only
@@ -9394,6 +9511,12 @@ EOF
     say "  ✔ Installed libvirt hook script: $LIBVIRT_HOOK_SCRIPT"
   fi
   note "Dynamic binding switches the guest GPU to vfio-pci only when a VM that has it attached is started."
+
+  # SELinux: on Fedora/RHEL (SELinux Enforcing), virtqemud_t cannot execute the
+  # qemu hook nor write the PCI sysfs entries the bind script uses, so every VM
+  # start/stop floods the audit log with AVC denials. Install a targeted policy
+  # module to allow exactly that. Auto-detected; no-op on non-SELinux systems.
+  install_selinux_virtqemud_policy
 }
 
 # Install the reboot-FLR monitor: a systemd service that watches libvirt for

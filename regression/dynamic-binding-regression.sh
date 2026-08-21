@@ -149,6 +149,63 @@ assert_contains_file \
   "exec /usr/local/sbin/vfio-libvirt-hook.sh" \
   "$VFIO_SCRIPT"
 
+# --- Static wiring: SELinux auto-detect + virtqemud policy (R19) ---
+# On SELinux-enforcing distros (Fedora/RHEL), virtqemud_t cannot execute the
+# qemu hook nor write the PCI sysfs entries the bind script uses, so every VM
+# start/stop floods the audit log with AVC denials. install_libvirt_hook must
+# auto-detect SELinux and install a targeted policy module (vfio_virtqemud)
+# granting exactly those permissions. No-op on non-SELinux systems.
+assert_contains_file \
+  "Q3sel install_selinux_virtqemud_policy helper defined" \
+  "install_selinux_virtqemud_policy()" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel helper gates on selinuxenabled" \
+  "selinuxenabled" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel helper reads getenforce" \
+  "getenforce" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel helper requires checkmodule + semodule_package + semodule" \
+  "have_cmd checkmodule" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel helper checks virtqemud_t exists via seinfo" \
+  "seinfo -t virtqemud_t" \
+  "$VFIO_SCRIPT"
+# The targeted .te content: only virtqemud_t + virt_hook_t + sysfs_t + kmod
+# (NOT the firehose audit2allow output that sweeps up unrelated services).
+assert_contains_file \
+  "Q3sel policy module targets virtqemud_t -> virt_hook_t execute" \
+  "allow virtqemud_t virt_hook_t:file { execute execute_no_trans }" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel policy module targets virtqemud_t -> sysfs_t write" \
+  "allow virtqemud_t sysfs_t:file { create write }" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel policy module targets virtqemud_t -> kmod_exec_t execute" \
+  "allow virtqemud_t kmod_exec_t:file { execute execute_no_trans map }" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel policy module compiles via checkmodule" \
+  "checkmodule -M -m -o" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "Q3sel policy module installs via semodule -i" \
+  "semodule -i" \
+  "$VFIO_SCRIPT"
+# install_libvirt_hook must call the SELinux policy installer. (Use a
+# whole-file grep instead of sed extraction: the function body contains
+# heredocs whose generated bash has ^} lines that would stop a sed range
+# early, so the extracted block would miss the call at the end.)
+assert_contains_file \
+  "Q3sel install_libvirt_hook calls install_selinux_virtqemud_policy" \
+  "install_selinux_virtqemud_policy" \
+  "$VFIO_SCRIPT"
+
 # --- Static wiring: generated hook VM-XML detection + phase handling ---
 hook_block="$(sed -n '/write_file_atomic "$LIBVIRT_HOOK_SCRIPT" 0755 "root:root" <<.EOF./,/^EOF$/p' "$VFIO_SCRIPT")"
 assert_contains_text \

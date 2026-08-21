@@ -2124,9 +2124,24 @@ assert_contains_text \
   "R6 bind_one writes reset (via _rx9070_gated_soft_flr)" \
   'echo 1 >"$_sys/reset"' \
   "$bind_block"
+# R20: VFIO_DYNAMIC_PCI_RESET default is now auto-detected (1 for RX 9070 /
+# Navi 48 device 7550, 0 for other cards) instead of a hardcoded 0. Assert
+# the variable form in the heredoc + the auto-detect logic.
 assert_contains_file \
-  "R6 write_conf persists VFIO_DYNAMIC_PCI_RESET" \
-  'VFIO_DYNAMIC_PCI_RESET="0"' \
+  "R6 write_conf persists VFIO_DYNAMIC_PCI_RESET (variable form)" \
+  'VFIO_DYNAMIC_PCI_RESET="$pci_reset_default"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R20 write_conf auto-detects pci_reset_default for Navi 48" \
+  'pci_reset_default="1"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R20 write_conf gates pci_reset_default on device 7550" \
+  '"${guest_device,,}" == "7550"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R20 _sync_conf_defaults reads GUEST_GPU_DEVICE_ID for PCI_RESET default" \
+  'GUEST_GPU_DEVICE_ID=' \
   "$VFIO_SCRIPT"
 
 # --- Functional R7: journal logging of the bind sequence (jlog helper) ---

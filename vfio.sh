@@ -4194,7 +4194,6 @@ _sync_conf_defaults() {
     [VFIO_GRAPHICS_AUTO_X11_PINNING]="1"
     [VFIO_DYNAMIC_REBIND_HOST]="0"
     [VFIO_DYNAMIC_ALLOW_BOOT_VGA]="0"
-    [VFIO_DYNAMIC_PCI_RESET]="0"
     [VFIO_DYNAMIC_SOFT_FLR_ON_BIND]="0"
     [VFIO_DYNAMIC_COOLDOWN_SECONDS]="10"
     [VFIO_RESTORE_D3COLD_ON_RELEASE]="0"
@@ -4211,6 +4210,18 @@ _sync_conf_defaults() {
     [VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX]="300"
     [VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY]="1"
   )
+  # VFIO_DYNAMIC_PCI_RESET is card-specific (not a fixed 0/1): default 1 for
+  # RX 9070 / RDNA4 (Navi 48, device 7550) where the pre-bind FLR is needed to
+  # survive VM shutdown, 0 for all other cards. Read the persisted device id
+  # from the existing conf so the switcher syncs the right default without
+  # needing the full wizard context.
+  local _sync_dev_id
+  _sync_dev_id="$(awk -F= '/^GUEST_GPU_DEVICE_ID=/{v=$2; gsub(/"/,"",v); gsub(/^0x/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -n "$_sync_dev_id" && "${_sync_dev_id,,}" == "7550" ]]; then
+    _defs[VFIO_DYNAMIC_PCI_RESET]="1"
+  else
+    _defs[VFIO_DYNAMIC_PCI_RESET]="0"
+  fi
   local _added=0 _k _val _tmp
   _tmp="$(mktemp)"
   # Copy the existing conf verbatim into the temp, then append any missing
@@ -4291,6 +4302,21 @@ write_conf() {
   if [[ -n "$guest_gpu" && -r "/sys/bus/pci/devices/$guest_gpu/device" ]]; then
     guest_device="$(cat "/sys/bus/pci/devices/$guest_gpu/device" 2>/dev/null || true)"
     guest_device="${guest_device#0x}"
+  fi
+
+  # RX 9070 / RDNA4 (Navi 48, device 7550) needs a pre-bind function-level
+  # reset on the cold-start path (amdgpu -> vfio-pci): without it the card
+  # carries amdgpu's residual state into qemu and dies on the detach reset at
+  # VM shutdown (observed on Fedora: card survives attach but goes zombie on
+  # release). With the FLR (Gen1 downtrain + reset + adaptive link restore)
+  # the card enters qemu in a clean state and survives the full session
+  # (confirmed on openSUSE where this was default=1). Other cards do NOT need
+  # it and a reset on a healthy non-Navi-48 card is unnecessary / potentially
+  # harmful, so the default is card-specific: 1 for Navi 48, 0 for everything
+  # else. The operator can still override via the conf key.
+  local pci_reset_default="0"
+  if [[ -n "$guest_device" && "${guest_device,,}" == "7550" ]]; then
+    pci_reset_default="1"
   fi
 
   backup_file "$CONF_FILE"
@@ -4384,18 +4410,19 @@ VFIO_DYNAMIC_REBIND_HOST="0"
 # the VM and do not need the host display while the VM runs.
 VFIO_DYNAMIC_ALLOW_BOOT_VGA="0"
 # Dynamic-mode optional PCI function-level reset before bind (advanced):
-# - 0 (default): do NOT reset the device before binding. A reset on a healthy
+# - 0: do NOT reset the device before binding. A reset on a healthy non-Navi-48
 #   card is unnecessary, and on a mid-reset card it can worsen the state.
 # - 1: after unbind and before the vfio-pci bind, attempt writing 1 to
 #   /sys/bus/pci/devices/<BDF>/reset (only if the sysfs reset file is writable).
-#   This can clear residual amdgpu state on RX 9070 / RDNA4 that otherwise makes
-#   the first vfio-pci bind fail with "Unknown PCI header type 127". Enable only
-#   if you repeatedly hit bind failures after amdgpu teardown.
-# WHY this value: 0 avoids a needless reset on a healthy card and a harmful reset
-# on a card that is already mid-reset. Set 1 only if you repeatedly see bind
-# failures with "header type 127" after amdgpu teardown and a plain retry does not
-# recover it.
-VFIO_DYNAMIC_PCI_RESET="0"
+#   On RX 9070 / RDNA4 (Navi 48) this clears residual amdgpu state so the card
+#   enters qemu in a clean state and survives the detach reset at VM shutdown
+#   (without it the card goes zombie on release — observed on Fedora where this
+#   was default=0). The reset is gated to the RX 9070 family via the Gen1
+#   downtrain + adaptive link restore, so it retrains reliably.
+# WHY this value: auto-detected at wizard time — 1 for RX 9070 / RDNA4 (Navi 48,
+# device 7550) where it is needed to survive VM shutdown; 0 for all other cards
+# where it is unnecessary and potentially harmful. Override here if needed.
+VFIO_DYNAMIC_PCI_RESET="$pci_reset_default"
 # Dynamic-mode soft FLR on the alive-parked bind path (advanced):
 # - 0 (default): when --bind-now finds the guest GPU already on vfio-pci AND alive
 #   (the normal shutdown->start case), do NOT do a soft function-level reset +

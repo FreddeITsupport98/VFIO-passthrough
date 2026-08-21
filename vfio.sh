@@ -109,13 +109,28 @@ PARK_KEEPALIVE_UDEV_RULE="/etc/udev/rules.d/99-vfio-park-keepalive.rules"
 # location, and pins it via <rom file='...'/> in each shut-off guest-GPU VM's
 # hostdev. Removed by --install-early-binding and by --reset.
 VBIOS_RUNTIME_DIR="/var/lib/libvirt/vbios"
+# Live-attach (hotplug GPU) support: an optional binding method where the VM
+# starts WITHOUT the GPU (Windows boots on a virtual display), and after a
+# configurable delay the GPU is bound to vfio-pci and hot-attached to the
+# running VM via `virsh attach-device --live`. This sidesteps qemu's
+# attach-time bus reset on a parked (previously-used) card — the reset bug
+# that kills the RX 9070 / RDNA4 on the second VM start. With live-attach,
+# the GPU is hot-added to a running Windows that has already loaded the AMD
+# driver, so the card is properly initialized before qemu's attach reset
+# fires. The VM XML is modified to REMOVE the PCI GPU hostdevs (so libvirt
+# starts without the GPU); the GPU device XML is saved separately and
+# hot-attached by the live-attach helper after the delay.
+LIVE_ATTACH_HELPER="/usr/local/sbin/vfio-live-attach.sh"
+LIVE_ATTACH_GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
+LIVE_ATTACH_AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
+LIVE_ATTACH_VM_LIST="/var/lib/vfio-dynamic/live-attach-vms"
 
 DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -716,6 +731,7 @@ complete -c $cmd -l vbios -d 'Dynamic-install: inject matching vBIOS ROM dump (s
 complete -c $cmd -l no-vbios -d 'Dynamic-install: skip vBIOS injection + remove existing script-installed pin'
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
+complete -c $cmd -l install-live-attach -d 'Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
 complete -c $cmd -l reset-stealth-vm-tuning -d 'Revert stealth/perf VM tuning from backup XML'
 complete -c $cmd -l verify -d 'Validate existing setup'
@@ -757,7 +773,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -813,6 +829,7 @@ _vfio_sh_complete() {
     '--no-vbios[Dynamic-install: skip vBIOS injection + remove existing script-installed pin]' \\
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
+    '--install-live-attach[Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
     '--reset-stealth-vm-tuning[Revert stealth/perf VM tuning from backup XML]' \\
     '--verify[Validate existing setup]' \\
@@ -1533,6 +1550,14 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    script-installed vBIOS pin so VMs use the live ROM read (or
                    your manual XML config). Use this if you already have a vBIOS
                    configured in your VM XML manually.
+  --install-live-attach
+                  Set up the live-attach (hotplug GPU) workflow: the VM starts WITHOUT the
+                  GPU, Windows boots on a virtual display, and after a configurable delay the
+                  GPU is bound to vfio-pci and hot-attached to the running VM via
+                  'virsh attach-device' (live mode). This sidesteps the parked-restart card death
+                  on RX 9070 / RDNA4. Requires --install-dynamic-binding to be run first,
+                  and the AMD Windows driver MUST be installed in the guest VM.
+                  To revert: sudo vfio.sh --install-dynamic-binding
   --install-stealth-vm-tuning
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
@@ -1765,6 +1790,9 @@ parse_args() {
         ;;
       --install-stealth-vm-tuning)
         MODE="install-stealth-vm-tuning"
+        ;;
+      --install-live-attach)
+        MODE="install-live-attach"
         ;;
       --reset-stealth-vm-tuning)
         MODE="reset-stealth-vm-tuning"
@@ -4209,6 +4237,8 @@ _sync_conf_defaults() {
     [VFIO_DYNAMIC_PARK_KEEPALIVE_MAX_FAILS]="5"
     [VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX]="300"
     [VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY]="1"
+    [VFIO_DYNAMIC_LIVE_ATTACH]="0"
+    [VFIO_DYNAMIC_LIVE_ATTACH_DELAY]="30"
   )
   # VFIO_DYNAMIC_PCI_RESET is card-specific (not a fixed 0/1): default 1 for
   # RX 9070 / RDNA4 (Navi 48, device 7550) where the pre-bind FLR is needed to
@@ -4600,6 +4630,29 @@ VFIO_DYNAMIC_PARK_KEEPALIVE_BACKOFF_MAX="300"
 # failures is reached (silently no-ops if notify-send / a desktop session is
 # unavailable). 0 = never notify (recovery attempts + logging still happen).
 VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY="1"
+# Live-attach (hotplug GPU) mode (advanced, opt-in, read by the libvirt hook):
+# - 0 (default): the GPU is bound to vfio-pci BEFORE the VM starts (standard
+#   dynamic binding). qemu attaches the GPU at boot, which triggers the attach-
+#   time bus reset that kills the RX 9070 / RDNA4 on the second (parked) start.
+# - 1: the VM starts WITHOUT the GPU (Windows boots on a virtual display), and
+#   after VFIO_DYNAMIC_LIVE_ATTACH_DELAY seconds the GPU is bound to vfio-pci
+#   and hot-attached to the running VM via 'virsh attach-device --live'. This
+#   sidesteps the parked-restart death: the GPU is hot-added to a running
+#   Windows that has already loaded the AMD driver, so the card is properly
+#   initialized before qemu's attach reset fires.
+# WHY this value: 0 is the safe default (standard dynamic binding). Set 1 ONLY
+# if the card dies on the second (parked) VM start and the AMD Windows driver
+# is already installed (the driver must be installed first, otherwise the card
+# dies during the first session regardless). Use 'sudo vfio.sh --install-live-
+# attach' to set up the live-attach workflow (modifies the VM XML, creates the
+# GPU device XML, installs the helper script).
+VFIO_DYNAMIC_LIVE_ATTACH="0"
+# Delay in seconds after VM start before hot-attaching the GPU. Must be long
+# enough for Windows to fully boot and load the AMD driver (default 30s).
+# If the card still dies with 30s, increase to 60-90s (Windows may need longer
+# to load the driver on the first few boots). If Windows boots fast and the
+# driver loads quickly, decrease to 15-20s for a faster display handoff.
+VFIO_DYNAMIC_LIVE_ATTACH_DELAY="30"
 EOF
 }
 
@@ -9547,7 +9600,36 @@ case "$PHASE" in
     # A non-zero exit from --bind-now is INTENTIONAL and will abort the VM start
     # cleanly (libvirt treats a non-zero qemu hook exit as a fatal error), so a
     # broken/mid-reset device does not get attached to the VM.
-    if vm_uses_guest_gpu; then
+    #
+    # LIVE-ATTACH MODE (VFIO_DYNAMIC_LIVE_ATTACH=1): the VM XML has the GPU
+    # hostdev REMOVED (by --install-live-attach), so vm_uses_guest_gpu will NOT
+    # find it. Instead, check if this domain is in the live-attach VM list. If
+    # so, do NOT bind the GPU now — launch the live-attach helper in the
+    # background, which sleeps VFIO_DYNAMIC_LIVE_ATTACH_DELAY seconds, then
+    # binds the GPU to vfio-pci and hot-attaches it to the running VM via
+    # `virsh attach-device --live`. This sidesteps the parked-restart death.
+    if [[ "${VFIO_DYNAMIC_LIVE_ATTACH:-0}" == "1" ]] && [[ -f "/var/lib/vfio-dynamic/live-attach-vms" ]]; then
+      if grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms 2>/dev/null; then
+        _la_delay="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
+        say "vfio-libvirt-hook: VM '$DOMAIN' is in live-attach list; launching background helper (delay=${_la_delay}s)."
+        hook_log "action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s"
+        # Launch the helper in the background. It handles the bind + attach.
+        /usr/local/sbin/vfio-live-attach.sh "$DOMAIN" "$_la_delay" &
+        : # let libvirt proceed — VM starts without the GPU.
+      elif vm_uses_guest_gpu; then
+        say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
+        hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
+        if _bind_now; then
+          hook_log "action=bind-now-done rc=0"
+        else
+          _rc=$?
+          hook_log "action=bind-now-failed rc=$_rc"
+          exit "$_rc"
+        fi
+      else
+        hook_log "action=skip-not-attached"
+      fi
+    elif vm_uses_guest_gpu; then
       say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
       hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
       # Run under `if` so set -e does not kill the hook before we can log the
@@ -9606,7 +9688,303 @@ EOF
   install_selinux_virtqemud_policy
 }
 
-# Install the reboot-FLR monitor: a systemd service that watches libvirt for
+# Install the live-attach helper script: a background script launched by the
+# libvirt hook on VM prepare (when VFIO_DYNAMIC_LIVE_ATTACH=1). It sleeps for a
+# configurable delay (so Windows boots and loads the AMD driver), then binds
+# the GPU to vfio-pci (via the bind script --bind-now) and hot-attaches it to
+# the running VM via `virsh attach-device --live`.
+install_live_attach_helper() {
+  backup_file "$LIVE_ATTACH_HELPER"
+  write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<'HELPEREOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Managed by vfio.sh — live-attach helper for hotplug GPU binding.
+# Launched in the background by the libvirt qemu hook on VM prepare when
+# VFIO_DYNAMIC_LIVE_ATTACH=1. Sleeps for the configured delay (so Windows
+# boots and the AMD driver loads), then binds the GPU to vfio-pci and
+# hot-attaches it to the running VM.
+# Usage: vfio-live-attach.sh <domain> <delay_seconds>
+# Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --install-early-binding)
+
+DOMAIN="${1:-}"
+DELAY="${2:-30}"
+CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
+GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
+AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
+
+jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*" 2>/dev/null || true; }
+
+[[ -n "$DOMAIN" ]] || { jlog "live-attach: missing domain argument"; exit 1; }
+[[ -f "$CONF_FILE" ]] || { jlog "live-attach: missing $CONF_FILE"; exit 0; }
+# shellcheck disable=SC1090
+. "$CONF_FILE"
+[[ -x "$BIND_SCRIPT" ]] || { jlog "live-attach: $BIND_SCRIPT missing"; exit 0; }
+
+jlog "live-attach: waiting ${DELAY}s before binding GPU for domain '$DOMAIN'"
+sleep "$DELAY"
+
+# Step 1: bind the GPU to vfio-pci (same as the normal prepare hook does).
+jlog "live-attach: binding GPU $GUEST_GPU_BDF to vfio-pci"
+if ! "$BIND_SCRIPT" --bind-now 2>&1; then
+  jlog "live-attach: FAILED to bind GPU — aborting attach"
+  exit 1
+fi
+jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
+
+# Step 2: hot-attach the GPU to the running VM.
+if [[ -f "$GPU_XML" ]]; then
+  jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live"
+  if virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
+    jlog "live-attach: GPU attached successfully to '$DOMAIN'"
+  else
+    jlog "live-attach: FAILED to attach GPU to '$DOMAIN'"
+    exit 1
+  fi
+fi
+
+# Step 3: hot-attach the audio function (if configured and XML exists).
+if [[ -f "$AUDIO_XML" ]]; then
+  jlog "live-attach: attaching audio to domain '$DOMAIN'"
+  virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
+    jlog "live-attach: WARN audio attach failed (non-fatal)"
+fi
+
+jlog "live-attach: complete for domain '$DOMAIN'"
+HELPEREOF
+  say "Installed live-attach helper: $LIVE_ATTACH_HELPER"
+}
+
+# Install the live-attach (hotplug GPU) workflow:
+# 1. Extract the GPU + audio hostdev blocks from each shut-off guest-GPU VM's
+#    XML into standalone device XML files.
+# 2. Remove the GPU + audio hostdev blocks from the VM's persistent XML (so
+#    libvirt starts the VM WITHOUT the GPU).
+# 3. Write the VM name(s) to the live-attach VM list.
+# 4. Install the live-attach helper script.
+# 5. Flip VFIO_DYNAMIC_LIVE_ATTACH=1 in the conf.
+# 6. Regenerate the bind script (deploys the updated hook with live-attach logic).
+# Prerequisites: dynamic binding must already be installed (conf + hook exist).
+# The AMD Windows driver MUST be installed first (the card dies without it).
+install_live_attach() {
+  readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run the full installer or --install-dynamic-binding first."
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+  [[ -n "${GUEST_GPU_BDF:-}" ]] || die "No GUEST_GPU_BDF in $CONF_FILE."
+  have_cmd virsh || die "virsh not available."
+  have_cmd python3 || die "python3 not available (needed to extract hostdev XML)."
+
+  say
+  hdr "Live-attach (hotplug GPU) setup"
+  note "This sets up the live-attach workflow: the VM starts WITHOUT the GPU, Windows"
+  note "boots on a virtual display, and after a delay the GPU is hot-attached to the"
+  note "running VM. This sidesteps the parked-restart card death on RX 9070 / RDNA4."
+  note ""
+  note "PREREQUISITE: the AMD Windows driver MUST already be installed inside the VM."
+  note "Without the driver, the card dies ~25s into the session regardless of method."
+  note ""
+  note "The VM XML will be modified to REMOVE the GPU hostdev (so libvirt starts"
+  note "without it). A backup of the original XML is saved. To revert, run:"
+  note "  sudo $SCRIPT_NAME --install-dynamic-binding  (restores normal binding)"
+  say
+
+  local _delay_default="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
+  note "Default attach delay: ${_delay_default}s (time for Windows to boot + load the AMD driver)."
+  note "Increase if Windows boots slowly; decrease if it boots fast."
+  say
+
+  local _la_dir="/var/lib/vfio-dynamic"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$_la_dir"
+  fi
+
+  # Find shut-off VMs with the guest GPU and set up live-attach for each.
+  local _dom _xml _bdfs _state _found=0
+  local _gpu_bdf="$GUEST_GPU_BDF"
+  local _audio_csv="${GUEST_AUDIO_BDFS_CSV:-}"
+
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    # Parse PCI hostdev BDFs (same awk parser as the hook).
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_gpu_bdf" <<<"$_bdfs" 2>/dev/null; then
+      continue
+    fi
+    # Check VM state — can only define shut-off VMs.
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
+      continue
+    fi
+    _found=1
+    say "Setting up live-attach for VM '$_dom'..."
+
+    # Use python to extract the GPU + audio hostdev blocks into standalone XML
+    # and remove them from the VM XML.
+    local _tmp_vm _tmp_gpu _tmp_audio
+    _tmp_vm="$(mktemp)"
+    _tmp_gpu="$(mktemp)"
+    _tmp_audio="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp_vm"
+
+    python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || true
+import sys, xml.etree.ElementTree as ET
+vm_path, gpu_path, audio_path, gpu_bdf, audio_csv = sys.argv[1:6]
+tree = ET.parse(vm_path); root = tree.getroot()
+device_type = root.tag.replace('domain', 'devices')
+devices = root.find('devices')
+if devices is None: sys.exit(1)
+# Parse the GPU BDF into domain/bus/slot/function hex components.
+parts = gpu_bdf.split(':')
+gpu_dom = parts[0]; gpu_bus = parts[1]; gpu_slot_fn = parts[2]
+gpu_slot, gpu_func = gpu_slot_fn.split('.')
+# Parse audio BDFs (comma-separated).
+audio_bdfs = []
+for a in audio_csv.split(','):
+    a = a.strip()
+    if not a: continue
+    p = a.split(':')
+    if len(p) == 3:
+        sf = p[2].split('.')
+        audio_bdfs.append((p[0], p[1], sf[0], sf[1] if len(sf) > 1 else '0'))
+gpu_hostdev = None
+audio_hostdevs = []
+for hd in list(devices.findall('hostdev')):
+    if hd.get('type') != 'pci': continue
+    src = hd.find('source')
+    if src is None: continue
+    addr = src.find('address')
+    if addr is None: continue
+    ad = addr.get('domain', ''); ab = addr.get('bus', ''); asl = addr.get('slot', ''); af = addr.get('function', '')
+    # Normalize to 4-digit domain, 2-digit bus/slot.
+    ad = ad.lstrip('0x').zfill(4) if ad else ''
+    ab = ab.lstrip('0x').zfill(2) if ab else ''
+    asl = asl.lstrip('0x').zfill(2) if asl else ''
+    bdf = f"{ad}:{ab}:{asl}.{af.lstrip('0x')}"
+    if bdf.lower() == gpu_bdf.lower():
+        gpu_hostdev = hd
+    elif any(bdf.lower() == f"{d}:{b}:{s}.{f}".lower() for d,b,s,f in audio_bdfs):
+        audio_hostdevs.append(hd)
+# Write the GPU device XML.
+if gpu_hostdev is not None:
+    gpu_el = ET.Element('devices')
+    gpu_el.append(gpu_hostdev)
+    ET.ElementTree(gpu_el).write(gpu_path)
+    devices.remove(gpu_hostdev)
+# Write the audio device XML (all audio hostdevs in one file).
+if audio_hostdevs:
+    audio_el = ET.Element('devices')
+    for ah in audio_hostdevs:
+        audio_el.append(ah)
+    ET.ElementTree(audio_el).write(audio_path)
+    for ah in audio_hostdevs:
+        devices.remove(ah)
+tree.write(vm_path)
+PYEOF
+
+    # Save the device XMLs to the runtime location.
+    if [[ -s "$_tmp_gpu" ]]; then
+      cp -f "$_tmp_gpu" "$LIVE_ATTACH_GPU_XML" 2>/dev/null || true
+      say "  Saved GPU device XML: $LIVE_ATTACH_GPU_XML"
+    fi
+    if [[ -s "$_tmp_audio" ]]; then
+      cp -f "$_tmp_audio" "$LIVE_ATTACH_AUDIO_XML" 2>/dev/null || true
+      say "  Saved audio device XML: $LIVE_ATTACH_AUDIO_XML"
+    fi
+
+    # Validate and redefine the VM without the GPU.
+    if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
+      if (( ! DRY_RUN )); then
+        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null
+      fi
+      say "  Redefined VM '$_dom' WITHOUT the GPU hostdev (backup in XML dump)"
+    else
+      note "WARN: XML validation failed for '$_dom'; skipping VM XML modification."
+    fi
+
+    # Add the VM to the live-attach list.
+    if (( ! DRY_RUN )); then
+      grep -Fixq "$_dom" "$LIVE_ATTACH_VM_LIST" 2>/dev/null || printf '%s\n' "$_dom" >>"$LIVE_ATTACH_VM_LIST"
+    fi
+    say "  Added '$_dom' to live-attach VM list"
+
+    rm -f "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" 2>/dev/null || true
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+
+  if (( ! _found )); then
+    note "No shut-off VMs with the guest GPU found. Ensure the VM is shut off and has the GPU in its XML, then re-run."
+    return 1
+  fi
+
+  # Install the helper script.
+  install_live_attach_helper
+
+  # Flip the conf key.
+  rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "1"
+  say "Set VFIO_DYNAMIC_LIVE_ATTACH=1 in $CONF_FILE"
+
+  # Regenerate the bind script (deploys the updated hook with live-attach logic).
+  install_bind_script
+  say "Regenerated $BIND_SCRIPT (updated hook with live-attach support)"
+
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_GREEN}${C_BOLD}✔ Live-attach is now active${C_RESET}"
+  else
+    say "✔ Live-attach is now active"
+  fi
+  note "The VM will start WITHOUT the GPU. After ${_delay_default}s, the GPU will be"
+  note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
+  note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding)"
+}
+
+# Remove the live-attach workflow (called by --install-dynamic-binding to restore
+# normal binding, and by --reset).
+remove_live_attach() {
+  local _removed=0
+  if [[ -f "$LIVE_ATTACH_HELPER" ]]; then
+    run rm -f "$LIVE_ATTACH_HELPER" 2>/dev/null || true
+    _removed=1
+  fi
+  if [[ -f "$LIVE_ATTACH_GPU_XML" ]]; then
+    run rm -f "$LIVE_ATTACH_GPU_XML" 2>/dev/null || true
+    _removed=1
+  fi
+  if [[ -f "$LIVE_ATTACH_AUDIO_XML" ]]; then
+    run rm -f "$LIVE_ATTACH_AUDIO_XML" 2>/dev/null || true
+    _removed=1
+  fi
+  if [[ -f "$LIVE_ATTACH_VM_LIST" ]]; then
+    run rm -f "$LIVE_ATTACH_VM_LIST" 2>/dev/null || true
+    _removed=1
+  fi
+  # Flip the conf key back to 0.
+  if readable_file "$CONF_FILE" && grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+    rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "0"
+    _removed=1
+  fi
+  (( _removed )) && note "Removed live-attach workflow. Re-run --install-dynamic-binding to restore the GPU hostdev to the VM XML."
+}
 # guest reboot lifecycle events and does a soft function-level reset on the
 # guest GPU to clear the display wedge. On RX 9070 / RDNA4 with on_reboot=restart
 # (warm reboot), the card survives (qemu never releases the vfio device, link
@@ -14379,6 +14757,9 @@ install_early_binding_from_existing_config() {
   # 3c3. Remove the vBIOS ROM auto-injection (dynamic-binding-only).
   remove_vbios_romfile
 
+  # 3c4. Remove the live-attach (hotplug GPU) workflow (dynamic-binding-only).
+  remove_live_attach
+
   # 4. Re-add early-binding tokens to the kernel cmdline.
   local guest_ids
   guest_ids="$(build_vfio_pci_ids_from_conf)"
@@ -18445,6 +18826,9 @@ reset_vfio_all() {
   # Remove the vBIOS ROM auto-injection (VM-XML <rom> pins + runtime dir).
   # Must run BEFORE $CONF_FILE is deleted below (it reads GUEST_GPU_BDF from it).
   remove_vbios_romfile
+  # Remove the live-attach (hotplug GPU) workflow artifacts. Must run before
+  # $CONF_FILE is deleted (it reads VFIO_DYNAMIC_LIVE_ATTACH from it).
+  remove_live_attach
 
   # Libvirt hook cleanup: restore pre-existing user-managed qemu hook or remove our managed entry.
   if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
@@ -18476,6 +18860,7 @@ reset_vfio_all() {
            "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" \
            "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" "$PARK_KEEPALIVE_CHECK_UNIT" \
            "$PARK_KEEPALIVE_RESUME_HOOK" "$PARK_KEEPALIVE_UDEV_RULE" "$PARK_KEEPALIVE_STATE_FILE" \
+           "$LIVE_ATTACH_HELPER" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" "$LIVE_ATTACH_VM_LIST" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook
@@ -19950,6 +20335,22 @@ main() {
       fi
     fi
     reset_stealth_vm_tuning
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-live-attach" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run --install-dynamic-binding first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; live-attach needs libvirt to modify VM XML."
+      if ! prompt_yn "Continue anyway?" N "Live-attach"; then
+        die "Aborted by user"
+      fi
+    fi
+    install_live_attach
     exit 0
   fi
 

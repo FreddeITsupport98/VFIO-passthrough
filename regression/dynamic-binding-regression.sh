@@ -821,17 +821,22 @@ else
   printf 'PASS: Q3m-fix guard does not reference renderD nodes\n'
 fi
 
-# --- Functional Q3m-resolve: self-resolving render-device pin (R17c) ---
+# --- Functional Q3m-resolve: self-resolving render-device pin (R17c/R17d) ---
 # A hardcoded pin (/dev/dri/cardN OR a by-path symlink) can go stale after a
 # card-number swap and point KWin at the GUEST GPU -> "Failed to open drm
 # device" -> plasmalogin-helper crashed -> no graphical login (observed on
-# Fedora). R17c replaces the hardcoded path with a SELF-RESOLVING pin: a tiny
-# resolver that runs at SESSION START and walks /sys/class/drm to find the host
-# GPU's CURRENT card, preferring the stable by-path symlink and falling back to
-# the cardN device node. It adapts to every card0/card1 swap, so it can NEVER
-# go stale and break login. If the host card is not found at session start the
-# vars stay UNSET (compositor uses its default) -- it never points at a
-# wrong/nonexistent device.
+# Fedora). R17c replaced the hardcoded path with a SELF-RESOLVING pin that
+# walks /sys/class/drm at session start to find the host GPU's current card by
+# PCI BDF. R17d corrected a critical bug: the resolver MUST export the
+# colon-free /dev/dri/cardN path, NOT the /dev/dri/by-path/pci-<BDF>-card
+# symlink, because KWIN_DRM_DEVICES and WLR_DRM_DEVICES use ':' as a device-
+# list separator -- a by-path path like /dev/dri/by-path/pci-0000:06:00.0-card
+# gets split into three bogus fragments ("pci-0000", "06", "00.0-card") ->
+# "No suitable DRM devices have been found" -> no graphical login. The BDF walk
+# makes it swap-safe (re-resolves every session); exporting cardN keeps the env
+# var colon-free. If the host card is not found at session start the vars stay
+# UNSET (compositor uses its default) -- it never points at a wrong/nonexistent
+# device, so it can NEVER break login.
 assert_contains_file \
   "Q3m-resolve _bdf_to_drm_card_stable helper defined (main script)" \
   "_bdf_to_drm_card_stable()" \
@@ -860,34 +865,38 @@ assert_contains_file \
   "Q3m-resolve pin walks /sys/class/drm at session start" \
   'for _c in /sys/class/drm/card[0-9]; do' \
   "$VFIO_SCRIPT"
-# It prefers the stable by-path symlink when present. (The resolver's $ is
-# escaped as \$ in the unquoted heredoc source, so the patterns include the
-# backslash to match the source literally under grep -F.)
+# CRITICAL (R17d): the resolver must export the COLON-FREE /dev/dri/cardN path,
+# NOT the by-path symlink (KWIN/WLR_DRM_DEVICES use ':' as a device-list
+# separator -> a by-path path with colons in the BDF gets split into bogus
+# fragments and breaks the greeter). The resolver's $ is escaped as \$ in the
+# unquoted heredoc source, so the patterns include the backslash to match the
+# source literally under grep -F.
 assert_contains_file \
-  "Q3m-resolve pin prefers by-path symlink at session start" \
-  '/dev/dri/by-path/pci-\$_vfio_host_bdf-card' \
-  "$VFIO_SCRIPT"
-# It falls back to the cardN device node when by-path is absent.
-assert_contains_file \
-  "Q3m-resolve pin falls back to cardN device node" \
+  "Q3m-resolve pin exports colon-free /dev/dri/cardN (not by-path)" \
   'export KWIN_DRM_DEVICES="/dev/dri/\$_vfio_nm"' \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "Q3m-resolve pin exports WLR_DRM_DEVICES with the same resolver" \
+  "Q3m-resolve pin exports WLR_DRM_DEVICES colon-free cardN" \
   'export WLR_DRM_DEVICES="/dev/dri/\$_vfio_nm"' \
   "$VFIO_SCRIPT"
-# No hardcoded /dev/dri/cardN export remains in the installer heredocs (the
-# resolver replaces it). The old fragile form would be a bare export of a
-# literal cardN; assert it is gone from the installer function body.
-if grep -Fq 'export KWIN_DRM_DEVICES="/dev/dri/card' <<<"$_inst_resolve_fn"; then
-  printf 'FAIL: Q3m-resolve installer still hardcodes a /dev/dri/cardN pin (fragile)\n' >&2
-  record_failure "Q3m-resolve installer does not hardcode a cardN pin"
+# The by-path symlink must NOT appear in any exported KWIN/WLR_DRM_DEVICES value
+# (it contains colons -> splits into bogus fragments -> breaks login).
+if grep -Fq 'KWIN_DRM_DEVICES="/dev/dri/by-path' "$VFIO_SCRIPT" || grep -Fq 'WLR_DRM_DEVICES="/dev/dri/by-path' "$VFIO_SCRIPT"; then
+  printf 'FAIL: Q3m-resolve pin exports a by-path path in KWIN/WLR_DRM_DEVICES (colon separator breaks login)\n' >&2
+  record_failure "Q3m-resolve pin does not export by-path in KWIN/WLR_DRM_DEVICES"
 else
-  printf 'PASS: Q3m-resolve installer does not hardcode a fragile cardN pin\n'
+  printf 'PASS: Q3m-resolve pin does not export by-path in KWIN/WLR_DRM_DEVICES (colon-safe)\n'
 fi
-# The resolver must NOT fall back to pointing at a wrong card if the host is not
-# found -- it must leave the vars unset (safe). Assert the loop only exports on
-# a BDF match and breaks, with no unconditional export outside the match.
+# No hardcoded literal /dev/dri/cardN export remains in the installer function
+# body (the resolver replaces it; the only export is the resolver's \$_vfio_nm).
+if grep -Fq 'export KWIN_DRM_DEVICES="/dev/dri/card' <<<"$_inst_resolve_fn"; then
+  printf 'FAIL: Q3m-resolve installer still hardcodes a literal /dev/dri/cardN pin (fragile)\n' >&2
+  record_failure "Q3m-resolve installer does not hardcode a literal cardN pin"
+else
+  printf 'PASS: Q3m-resolve installer does not hardcode a literal cardN pin\n'
+fi
+# The resolver must NOT export when the host BDF is not found -- it must leave
+# the vars unset (safe). Assert the loop only exports on a BDF match and breaks.
 assert_contains_file \
   "Q3m-resolve pin only exports on host-BDF match" \
   'if [ "\$_vfio_cbdf" = "\$_vfio_host_bdf" ]; then' \

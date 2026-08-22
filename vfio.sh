@@ -10118,6 +10118,34 @@ PYEOF
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
 
   if (( ! _found )); then
+    # Idempotency: a re-run on an ALREADY-active live-attach setup (e.g. the
+    # user accepted the R25 dynamic-install prompt, or re-ran
+    # --install-live-attach) finds no shut-off VM with the GPU hostdev because a
+    # PRIOR install already stripped it from the VM XML(s) and saved the device
+    # XML. That is a SUCCESS, not a failure — print the same green confirmation
+    # banner the first install prints (so the operator sees the active set
+    # instead of a confusing "No shut-off VMs found" error) and return 0.
+    # Detected by ALL FOUR together: the conf key is already 1, the helper is
+    # installed, the live-attach VM list is non-empty, and the GPU device XML
+    # exists (a prior successful install leaves exactly this state). If only
+    # some are present (a partial/half-installed state), fall through to the
+    # original actionable error so the operator fixes it.
+    if [[ -f "$LIVE_ATTACH_HELPER" && -s "$LIVE_ATTACH_VM_LIST" && -s "$LIVE_ATTACH_GPU_XML" ]] && \
+       grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+      local _la_vms _la_count
+      _la_vms="$(tr '\n' ' ' <"$LIVE_ATTACH_VM_LIST" 2>/dev/null | sed 's/ *$//')"
+      _la_count="$(grep -cve '^[[:space:]]*$' "$LIVE_ATTACH_VM_LIST" 2>/dev/null || echo 0)"
+      say
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}${C_BOLD}✔ Live-attach is already active${C_RESET} for '$_la_vms' ($_la_count VM(s))"
+      else
+        say "✔ Live-attach is already active for '$_la_vms' ($_la_count VM(s))"
+      fi
+      note "The VM(s) will start WITHOUT the GPU. After ${_delay_default}s the GPU is"
+      note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
+      note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU from the per-VM backup)"
+      return 0
+    fi
     note "No shut-off VMs with the guest GPU found. Ensure the VM is shut off and has the GPU in its XML, then re-run."
     return 1
   fi

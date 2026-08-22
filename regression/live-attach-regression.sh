@@ -449,6 +449,46 @@ assert_contains_file \
   "'--install-live-attach[" \
   "$VFIO_SCRIPT"
 
+# --- R26: install_live_attach is idempotent on an already-active setup ---
+# A re-run of --install-live-attach (or accepting the R25 dynamic-install prompt)
+# when live-attach is ALREADY active finds no shut-off VM with the GPU hostdev
+# because a prior install already stripped it from the VM XML(s) and saved the
+# device XML. Without idempotency that prints a confusing "No shut-off VMs found"
+# error and returns 1 even though live-attach is healthy. R26 detects the
+# already-active state (conf=1 + helper installed + non-empty VM list + GPU
+# device XML -- all four = a prior successful install) and prints the same green
+# "Live-attach is already active" banner the first install prints, returning 0 so
+# callers see success. A partial/half-installed state still falls through to the
+# original actionable error.
+assert_contains_text \
+  "R26 install_live_attach prints already-active confirmation banner" \
+  'Live-attach is already active' \
+  "$_la_fn"
+assert_contains_text \
+  "R26 idempotency gates on the helper being installed" \
+  '-f "$LIVE_ATTACH_HELPER"' \
+  "$_la_fn"
+assert_contains_text \
+  "R26 idempotency gates on a non-empty live-attach VM list" \
+  '-s "$LIVE_ATTACH_VM_LIST"' \
+  "$_la_fn"
+assert_contains_text \
+  "R26 idempotency gates on the GPU device XML existing" \
+  '-s "$LIVE_ATTACH_GPU_XML"' \
+  "$_la_fn"
+assert_contains_text \
+  "R26 idempotency gates on VFIO_DYNAMIC_LIVE_ATTACH=1 in conf" \
+  'VFIO_DYNAMIC_LIVE_ATTACH="1"' \
+  "$_la_fn"
+assert_contains_text \
+  "R26 idempotency returns 0 so callers see success" \
+  'return 0' \
+  "$_la_fn"
+assert_contains_text \
+  "R26 keeps the actionable fallback for a partial/half-installed state" \
+  'No shut-off VMs with the guest GPU found' \
+  "$_la_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

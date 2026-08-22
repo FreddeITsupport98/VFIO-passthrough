@@ -10278,16 +10278,36 @@ install_virtio_win_guest_agent() {
     say "Found virtio-win ISO: $_iso"
   else
     note "virtio-win ISO not found at $VIRTIO_WIN_ISO_PATH."
-    if have_cmd dnf; then
-      if prompt_yn "Install the virtio-win package via dnf now (provides the driver ISO)?" Y "virtio-win package"; then
-        run dnf -y install virtio-win || note "dnf install virtio-win failed; will try the download fallback."
+    # Distro-aware package resolution. The virtio-win package (which drops
+    # the driver ISO at $VIRTIO_WIN_ISO_PATH) ships ONLY on Fedora/RHEL-
+    # family (dnf) and openSUSE (zypper). Debian/Ubuntu (apt) and Arch/
+    # CachyOS (pacman) have NO official virtio-win package, so those skip
+    # straight to the ISO download fallback (below) with an explanation.
+    if is_fedora_like || have_cmd dnf; then
+      note "Detected Fedora/RHEL-family (dnf)."
+      if prompt_yn "Install the virtio-win package via dnf now (drops the driver ISO at $VIRTIO_WIN_ISO_PATH)?" Y "virtio-win package"; then
+        run dnf -y install virtio-win || note "dnf install virtio-win failed; will try the download fallback. You can also grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL"
         [[ -f "$VIRTIO_WIN_ISO_PATH" ]] && _iso="$VIRTIO_WIN_ISO_PATH"
       fi
-    elif have_cmd zypper; then
-      if prompt_yn "Install the virtio-win package via zypper now (provides the driver ISO)?" Y "virtio-win package"; then
-        run zypper --non-interactive in virtio-win || note "zypper install virtio-win failed; will try the download fallback."
+    elif is_opensuse_like || have_cmd zypper; then
+      note "Detected openSUSE-family (zypper)."
+      if prompt_yn "Install the virtio-win package via zypper now (drops the driver ISO at $VIRTIO_WIN_ISO_PATH)?" Y "virtio-win package"; then
+        run zypper --non-interactive in virtio-win || note "zypper install virtio-win failed; will try the download fallback. You can also grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL"
         [[ -f "$VIRTIO_WIN_ISO_PATH" ]] && _iso="$VIRTIO_WIN_ISO_PATH"
       fi
+    elif have_cmd apt-get; then
+      note "Detected Debian/Ubuntu-family (apt): there is NO official virtio-win package"
+      note "in apt repositories, so the ISO will be downloaded from fedorapeople.org instead."
+      note "To pick a specific version instead of the stable build: $VIRTIO_WIN_ARCHIVE_URL"
+      note "(download it, drop it at $VIRTIO_WIN_FALLBACK_ISO, then re-run.)"
+    elif have_cmd pacman; then
+      note "Detected Arch-family e.g. Arch/CachyOS (pacman): there is NO official virtio-win"
+      note "package in the pacman repos (it is only in the AUR), so the ISO will be downloaded"
+      note "from fedorapeople.org instead. To pick a specific version: $VIRTIO_WIN_ARCHIVE_URL"
+      note "(download it, drop it at $VIRTIO_WIN_FALLBACK_ISO, then re-run.)"
+    else
+      note "No recognized package manager with a virtio-win package detected."
+      note "The ISO will be downloaded from fedorapeople.org instead."
     fi
     if [[ -z "$_iso" ]]; then
       local _dl=""

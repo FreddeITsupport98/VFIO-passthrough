@@ -718,6 +718,38 @@ assert_contains_text \
   'VIRTIO_WIN_ARCHIVE_URL' \
   "$_r28_sw_fn"
 
+# --- R28b: distro-aware virtio-win ISO resolution ---
+# install_virtio_win_guest_agent must detect the distro and use the right package
+# manager, naming the distro in the message. virtio-win ships as a package only on
+# Fedora/RHEL-family (dnf) and openSUSE (zypper); apt/pacman have no official
+# package -> skip to the download fallback with an explanation. On package-install
+# failure the archive link must be shown so the operator can grab a specific ISO.
+_vw_fn="$(sed -n '/^install_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R28b detects Fedora/RHEL-family via is_fedora_like (dnf)" \
+  'is_fedora_like || have_cmd dnf' \
+  "$_vw_fn"
+assert_contains_text \
+  "R28b detects openSUSE-family via is_opensuse_like (zypper)" \
+  'is_opensuse_like || have_cmd zypper' \
+  "$_vw_fn"
+assert_contains_text \
+  "R28b apt branch explains no official virtio-win package" \
+  'NO official virtio-win package' \
+  "$_vw_fn"
+assert_contains_text \
+  "R28b pacman branch explains no official virtio-win package" \
+  'NO official virtio-win' \
+  "$_vw_fn"
+assert_contains_text \
+  "R28b dnf-failure note points to the ISO archive link" \
+  'grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL' \
+  "$_vw_fn"
+assert_contains_text \
+  "R28b zypper-failure note points to the ISO archive link" \
+  'zypper install virtio-win failed' \
+  "$_vw_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

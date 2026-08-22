@@ -4239,6 +4239,7 @@ _sync_conf_defaults() {
     [VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY]="1"
     [VFIO_DYNAMIC_LIVE_ATTACH]="0"
     [VFIO_DYNAMIC_LIVE_ATTACH_DELAY]="30"
+    [VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT]="60"
   )
   # VFIO_DYNAMIC_PCI_RESET is card-specific (not a fixed 0/1): default 1 for
   # RX 9070 / RDNA4 (Navi 48, device 7550) where the pre-bind FLR is needed to
@@ -4660,6 +4661,15 @@ VFIO_DYNAMIC_LIVE_ATTACH="0"
 # guest-agent channel; install the virtio-win guest agent inside Windows (via
 # the virtio-win guest-tools ISO) to enable the smart early-bind path.
 VFIO_DYNAMIC_LIVE_ATTACH_DELAY="30"
+# Timeout in seconds for the 'virsh attach-device --live' call (read by the
+# live-attach helper). The RX 9070 / RDNA4 vfio attach reset + Gen5 link retrain
+# can take >30s, so the default is 60 (a 30s timeout fired on a still-progressing
+# attach — the card was alive afterward, so it was slow, not dead). On timeout
+# the helper logs and exits non-zero so libvirt is never blocked indefinitely.
+# If it still times out at 60s the attach reset is genuinely stuck (not just
+# slow) and live-attach won't work for the card — revert with
+# --install-dynamic-binding. Floor is 10s.
+VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT="60"
 EOF
 }
 
@@ -9738,17 +9748,23 @@ jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*"
 # behavior as before. install_live_attach auto-injects the guest-agent channel,
 # but the virtio-win guest agent must still be installed inside Windows (via the
 # virtio-win guest-tools ISO) for guest-ping to respond.
+# IMPORTANT: use WALL-CLOCK elapsed time (date +%s), not a loop counter — each
+# iteration takes up to 8s (5s virsh timeout + 3s sleep), so a counter that
+# increments by 3 made a 30s ceiling take ~80s real time (observed in the journal:
+# 22:02:34 -> 22:03:54). Wall-clock makes DELAY mean what it says.
 jlog "live-attach: waiting for Windows readiness (guest-ping, up to ${DELAY}s) for domain '$DOMAIN'"
 _ready=0
-_elapsed=0
-while (( _elapsed < 10#$DELAY )); do
+_start="$(date +%s)"
+while :; do
+  _now="$(date +%s)"
+  _elapsed=$((_now - _start))
+  (( _elapsed < 10#$DELAY )) || break
   if timeout 5 virsh -c qemu:///system qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
     _ready=1
     jlog "live-attach: guest agent responded after ${_elapsed}s — Windows is up, binding GPU"
     break
   fi
   sleep 3
-  _elapsed=$((_elapsed + 3))
 done
 if (( ! _ready )); then
   jlog "live-attach: guest agent did not respond within ${DELAY}s — proceeding with bind (install the virtio-win guest agent inside Windows for a faster handoff)"
@@ -9772,17 +9788,27 @@ jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
 # Use [[ -s ]] (non-empty), not [[ -f ]] — an empty/stale XML file makes virsh
 # attach-device hang on empty input and block libvirt's VM lock (observed: a
 # stuck attach-device held the lock for minutes so every other virsh call,
-# including VM start, queued behind it). Wrap in `timeout 30` so a hung attach
-# (guest PCI address conflict, vfio reset hang, etc.) can NEVER block libvirt
-# indefinitely: on timeout we log and exit non-zero instead of holding the lock.
+# including VM start, queued behind it). Wrap in `timeout` (default 60s, tunable
+# via VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT) so a hung attach (guest PCI address
+# conflict, vfio reset hang, etc.) can NEVER block libvirt indefinitely: on
+# timeout we log and exit non-zero instead of holding the lock. 60s (not 30s)
+# because the RX 9070's vfio attach reset + Gen5 link retrain can take >30s — a
+# 30s timeout fired on a still-progressing attach (the card was alive afterward,
+# so the attach was slow, not dead). If it still times out at 60s the attach
+# reset is genuinely stuck (not just slow) and live-attach won't work for this
+# card — revert with --install-dynamic-binding.
+_la_timeout="${VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT:-60}"
+if ! [[ "$_la_timeout" =~ ^[0-9]+$ ]] || (( 10#$_la_timeout < 10 )); then
+  _la_timeout=60
+fi
 if [[ -s "$GPU_XML" ]]; then
-  jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live"
-  if timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
+  jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live (timeout ${_la_timeout}s)"
+  if timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
     jlog "live-attach: GPU attached successfully to '$DOMAIN'"
   else
     _rc=$?
     if (( _rc == 124 )); then
-      jlog "live-attach: FAILED to attach GPU — virsh attach-device timed out after 30s (guest PCI address conflict or vfio reset hang); aborting to avoid blocking libvirt"
+      jlog "live-attach: FAILED to attach GPU — virsh attach-device timed out after ${_la_timeout}s (vfio reset hang or guest PCI conflict). If this repeats, the RX 9070 attach reset is genuinely stuck; revert with --install-dynamic-binding."
     else
       jlog "live-attach: FAILED to attach GPU to '$DOMAIN' (rc=$_rc)"
     fi
@@ -9796,7 +9822,7 @@ fi
 # Step 3: hot-attach the audio function (if configured and XML is non-empty).
 if [[ -s "$AUDIO_XML" ]]; then
   jlog "live-attach: attaching audio to domain '$DOMAIN'"
-  timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
+  timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
     jlog "live-attach: WARN audio attach failed or timed out (non-fatal)"
 fi
 

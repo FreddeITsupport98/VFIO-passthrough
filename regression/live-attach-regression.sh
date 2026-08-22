@@ -158,17 +158,35 @@ assert_contains_text \
   "R23 helper falls back to fixed delay when agent is absent" \
   'guest agent did not respond within' \
   "$helper_block"
-# Anti-hang: the helper MUST wrap virsh attach-device in `timeout` so a hung
-# attach (guest PCI address conflict, vfio reset hang) can NEVER block libvirt's
-# VM lock indefinitely (observed: a stuck attach-device held the lock for
-# minutes so every other virsh call, including VM start, queued behind it).
+# The guest-ping loop MUST use WALL-CLOCK elapsed time (date +%s), not a counter
+# that increments by 3 — each iteration takes up to 8s (5s virsh timeout + 3s
+# sleep), so a counter made a 30s ceiling take ~80s real time (observed in the
+# journal: 22:02:34 -> 22:03:54). Wall-clock makes DELAY mean what it says.
+assert_contains_text \
+  "R23 helper guest-ping loop uses wall-clock time (date +%s)" \
+  '_start="$(date +%s)"' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper guest-ping loop computes elapsed from wall clock" \
+  '_elapsed=$((_now - _start))' \
+  "$helper_block"
+# Anti-hang: the helper MUST wrap virsh attach-device in `timeout` (tunable via
+# VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT, default 60) so a hung attach (guest PCI
+# address conflict, vfio reset hang) can NEVER block libvirt's VM lock
+# indefinitely (observed: a stuck attach-device held the lock for minutes so
+# every other virsh call, including VM start, queued behind it). 60s not 30s
+# because the RX 9070 attach reset + Gen5 retrain can take >30s.
+assert_contains_text \
+  "R23 helper uses tunable attach timeout (VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT)" \
+  '_la_timeout="${VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT:-60}"' \
+  "$helper_block"
 assert_contains_text \
   "R23 helper times out the GPU attach-device (anti-hang)" \
-  'timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live' \
+  'timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live' \
   "$helper_block"
 assert_contains_text \
   "R23 helper times out the audio attach-device (anti-hang)" \
-  'timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live' \
+  'timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live' \
   "$helper_block"
 # The helper MUST use [[ -s ]] (non-empty), not [[ -f ]] (exists), for the GPU
 # and audio XML — an empty/stale file makes virsh attach-device hang on empty
@@ -183,7 +201,7 @@ assert_contains_text \
   "$helper_block"
 assert_contains_text \
   "R23 helper logs a timeout-specific failure message (rc 124)" \
-  'virsh attach-device timed out after 30s' \
+  'virsh attach-device timed out after ${_la_timeout}s' \
   "$helper_block"
 if grep -Fq 'if [[ -f "$GPU_XML" ]]; then' <<<"$helper_block"; then
   printf 'FAIL: R23 helper still uses -f for GPU_XML (empty file would hang libvirt)\n' >&2
@@ -191,6 +209,11 @@ if grep -Fq 'if [[ -f "$GPU_XML" ]]; then' <<<"$helper_block"; then
 else
   printf 'PASS: R23 helper does not use -f for GPU_XML\n'
 fi
+# write_conf must persist the tunable timeout default.
+assert_contains_file \
+  "R23 write_conf emits VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT default (60)" \
+  'VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT="60"' \
+  "$VFIO_SCRIPT"
 assert_contains_text \
   "R23 helper binds the GPU via the bind script --bind-now" \
   '"$BIND_SCRIPT" --bind-now' \

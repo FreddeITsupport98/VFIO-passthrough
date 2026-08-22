@@ -143,8 +143,20 @@ assert_contains_text \
   '#!/usr/bin/env bash' \
   "$helper_block"
 assert_contains_text \
-  "R23 helper sleeps the configured delay before binding" \
-  'sleep "$DELAY"' \
+  "R23 helper polls guest-ping for Windows readiness (smart detection)" \
+  'qemu-agent-command "$DOMAIN"' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper uses guest-ping as the readiness probe" \
+  '{"execute":"guest-ping"}' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper binds immediately when the guest agent responds" \
+  'guest agent responded after ${_elapsed}s' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper falls back to fixed delay when agent is absent" \
+  'guest agent did not respond within' \
   "$helper_block"
 assert_contains_text \
   "R23 helper binds the GPU via the bind script --bind-now" \
@@ -214,6 +226,22 @@ if grep -Fq "lstrip('0x')" "$VFIO_SCRIPT"; then
 else
   printf 'PASS: R23 python extractor does not use lstrip(0x0)\n'
 fi
+# install_live_attach must auto-inject the qemu guest-agent channel (virtio-serial
+# + unix channel) into the VM XML so the live-attach helper has a transport for
+# guest-ping (smart Windows-readiness detection). Without it the helper can
+# only fall back to the blind fixed delay. Idempotent: skipped if already present.
+assert_contains_file \
+  "R23 python injector adds guest-agent channel target" \
+  "'org.qemu.guest_agent.0'" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R23 python injector adds virtio-serial controller" \
+  "'virtio-serial'" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R23 python injector is idempotent (checks existing channel first)" \
+  '_has_ga = any' \
+  "$VFIO_SCRIPT"
 assert_contains_file \
   "R23 install_live_attach appends VM to live-attach list" \
   'printf '\''%s\n'\'' "$_dom" >>"$LIVE_ATTACH_VM_LIST"' \

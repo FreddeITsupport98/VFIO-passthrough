@@ -4647,11 +4647,18 @@ VFIO_DYNAMIC_PARK_KEEPALIVE_NOTIFY="1"
 # attach' to set up the live-attach workflow (modifies the VM XML, creates the
 # GPU device XML, installs the helper script).
 VFIO_DYNAMIC_LIVE_ATTACH="0"
-# Delay in seconds after VM start before hot-attaching the GPU. Must be long
-# enough for Windows to fully boot and load the AMD driver (default 30s).
-# If the card still dies with 30s, increase to 60-90s (Windows may need longer
-# to load the driver on the first few boots). If Windows boots fast and the
-# driver loads quickly, decrease to 15-20s for a faster display handoff.
+# Max seconds to wait after VM start before binding + hot-attaching the GPU
+# (read by the live-attach helper). SMART: the helper polls the qemu guest
+# agent (guest-ping) every 3s and binds the MOMENT Windows userspace responds —
+# so with the virtio-win guest agent installed, the GPU hot-attaches as soon as
+# Windows is actually up (often ~15s), not after a blind fixed wait. This value
+# is the CEILING: if the agent responds earlier, bind happens earlier; if the
+# agent is not installed in Windows (or no channel), the helper waits this full
+# value then binds (the old fixed-delay behavior). Default 30s. If the card
+# still dies with 30s, increase to 60-90s (Windows may need longer to load the
+# AMD driver on the first few boots). install_live_attach auto-injects the
+# guest-agent channel; install the virtio-win guest agent inside Windows (via
+# the virtio-win guest-tools ISO) to enable the smart early-bind path.
 VFIO_DYNAMIC_LIVE_ATTACH_DELAY="30"
 EOF
 }
@@ -9722,8 +9729,30 @@ jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*"
 . "$CONF_FILE"
 [[ -x "$BIND_SCRIPT" ]] || { jlog "live-attach: $BIND_SCRIPT missing"; exit 0; }
 
-jlog "live-attach: waiting ${DELAY}s before binding GPU for domain '$DOMAIN'"
-sleep "$DELAY"
+# Wait for Windows userspace to be ready before binding + hot-attaching the GPU.
+# Smart path: poll the qemu guest agent (guest-ping) — when it responds, Windows
+# userspace is up and the AMD driver has loaded, so bind + attach IMMEDIATELY
+# instead of waiting the full fixed delay (often ~15s vs the full 30s). Fallback:
+# if the agent never responds within DELAY seconds (agent not installed in
+# Windows yet, or no channel), bind + attach after the full delay — same
+# behavior as before. install_live_attach auto-injects the guest-agent channel,
+# but the virtio-win guest agent must still be installed inside Windows (via the
+# virtio-win guest-tools ISO) for guest-ping to respond.
+jlog "live-attach: waiting for Windows readiness (guest-ping, up to ${DELAY}s) for domain '$DOMAIN'"
+_ready=0
+_elapsed=0
+while (( _elapsed < 10#$DELAY )); do
+  if timeout 5 virsh -c qemu:///system qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+    _ready=1
+    jlog "live-attach: guest agent responded after ${_elapsed}s — Windows is up, binding GPU"
+    break
+  fi
+  sleep 3
+  _elapsed=$((_elapsed + 3))
+done
+if (( ! _ready )); then
+  jlog "live-attach: guest agent did not respond within ${DELAY}s — proceeding with bind (install the virtio-win guest agent inside Windows for a faster handoff)"
+fi
 
 # Step 1: bind the GPU to vfio-pci (same as the normal prepare hook does).
 # Capture the full output so a failure surfaces the REAL cause in the journal
@@ -9786,6 +9815,11 @@ install_live_attach() {
   note "This sets up the live-attach workflow: the VM starts WITHOUT the GPU, Windows"
   note "boots on a virtual display, and after a delay the GPU is hot-attached to the"
   note "running VM. This sidesteps the parked-restart card death on RX 9070 / RDNA4."
+  note ""
+  note "The VM XML is also auto-injected with a qemu guest-agent channel, and the"
+  note "helper polls guest-ping so the GPU hot-attaches the MOMENT Windows is up"
+  note "(not after a blind fixed wait). For the smart early-bind path, install the"
+  note "virtio-win guest agent inside Windows (via the virtio-win guest-tools ISO)."
   note ""
   note "PREREQUISITE: the AMD Windows driver MUST already be installed inside the VM."
   note "Without the driver, the card dies ~25s into the session regardless of method."
@@ -9924,6 +9958,23 @@ if audio_hostdevs:
     ET.ElementTree(audio_el).write(audio_path)
     for ah in audio_hostdevs:
         devices.remove(ah)
+# Auto-inject the qemu guest-agent channel (virtio-serial + unix channel) so the
+# live-attach helper can poll guest-ping to detect when Windows userspace is
+# actually up, instead of a blind fixed delay. Idempotent: skipped if a
+# guest-agent channel already exists. The virtio-win guest agent must still be
+# installed inside Windows (via the virtio-win guest-tools ISO) for guest-ping
+# to respond; until then the helper falls back to the fixed delay.
+_has_ga = any(
+    (ch.find('target') is not None and ch.find('target').get('name') == 'org.qemu.guest_agent.0')
+    for ch in devices.findall('channel')
+)
+if not _has_ga:
+    if not any(c.get('type') == 'virtio-serial' for c in devices.findall('controller')):
+        _vs = ET.Element('controller', {'type': 'virtio-serial', 'index': '0'})
+        devices.append(_vs)
+    _ch = ET.Element('channel', {'type': 'unix'})
+    ET.SubElement(_ch, 'target', {'type': 'virtio', 'name': 'org.qemu.guest_agent.0'})
+    devices.append(_ch)
 tree.write(vm_path)
 PYEOF
 

@@ -15003,6 +15003,52 @@ install_dynamic_binding_from_existing_config() {
     note "(card dies during session with no prior successful session). Once a session survives,"
     note "the notification is suppressed (no false positives)."
   fi
+
+  # 3e. Live-attach (hotplug GPU) — RECOMMENDED for RX 9070 / RDNA4. The card
+  #     can still die on the first VM start / a parked restart (especially
+  #     before the AMD Windows driver is installed); live-attach sidesteps that
+  #     by starting the VM WITHOUT the GPU and hot-attaching it to the RUNNING
+  #     VM once Windows is up. Complementary to the automatic SBR Phase-2
+  #     force-kill recovery (R24): R24 re-enumerates a force-killed card, while
+  #     live-attach avoids the cold-attach-at-boot death in the first place.
+  #     Opt-in (default N). PREREQUISITE: the AMD Windows driver MUST be
+  #     installed in the guest before the hot-attach will survive.
+  if _is_guest_rx9070_family; then
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}${C_YELLOW}RECOMMENDED for RX 9070 / RDNA4:${C_RESET} live-attach (hotplug GPU) workflow"
+    else
+      say "RECOMMENDED for RX 9070 / RDNA4: live-attach (hotplug GPU) workflow"
+    fi
+    note "The RX 9070 / RDNA4 can still die on the first VM start or a parked restart (the card"
+    note "drops off the PCI bus on the D3cold exit before the AMD driver can stabilize it). The"
+    note "live-attach (hotplug GPU) workflow sidesteps this: the VM starts WITHOUT the GPU"
+    note "(Windows boots on a virtual display), and after a short delay the GPU is bound to"
+    note "vfio-pci and hot-attached to the RUNNING VM once Windows is up — handed to a"
+    note "driver-ready guest instead of cold-attached at boot. This is complementary to the"
+    note "automatic SBR Phase-2 recovery that re-enumerates a force-killed card (virsh destroy"
+    note "/ BSOD) via Secondary Bus Reset."
+    note ""
+    note "PREREQUISITE: the AMD Windows driver MUST already be installed inside the VM, or the"
+    note "card dies ~25s after the hot-attach regardless. Setting this up removes the GPU hostdev"
+    note "from the VM XML (a full backup is saved per VM); revert with --install-dynamic-binding."
+    if prompt_yn "Set up the live-attach (hotplug GPU) workflow for RX 9070 / RDNA4 now?" N "Live-attach (hotplug GPU)"; then
+      # `||` so a soft-fail (no shut-off VM with the guest GPU -> install_live_attach
+      # returns 1) does NOT trip `set -e` and abort the wizard. Hard prerequisites
+      # (missing conf / virsh / python3) call die, which is fatal by design and
+      # already satisfied by the wizard above.
+      install_live_attach || {
+        note "Live-attach setup did not complete (no shut-off VM with the guest GPU was found,"
+        note "or a prerequisite was missing). Shut off the VM and re-run:"
+        note "  sudo $SCRIPT_NAME --install-live-attach"
+      }
+    else
+      note "Skipping live-attach setup for now."
+      note "Once the AMD Windows driver is installed and a VM session survives, enable it with:"
+      note "  sudo $SCRIPT_NAME --install-live-attach"
+      note "Reversible at any time with: sudo $SCRIPT_NAME --install-dynamic-binding"
+    fi
+  fi
 }
 
 install_early_binding_from_existing_config() {

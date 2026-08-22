@@ -2520,6 +2520,53 @@ assert_contains_text \
   'recovered after SBR+rescan (alive)' \
   "$bind_block"
 
+# --- Functional R25: surface the live-attach (hotplug GPU) workflow as an
+# RDNA4-gated opt-in at the very end of the dynamic install. Live-attach was
+# previously standalone-only (--install-live-attach): the VM starts WITHOUT the
+# GPU, Windows boots on a virtual display, then the GPU is bound to vfio-pci and
+# hot-attached to the running VM once Windows is up — sidestepping the RX 9070
+# / RDNA4 first-bind / parked-restart death (the card drops off the PCI bus on
+# the D3cold exit before the AMD driver stabilizes it). R25 recommends it to the
+# RDNA4 users who need it most, right after the driver-requirement warning,
+# gated on _is_guest_rx9070_family, default N. Complementary to the R24 SBR
+# Phase-2 force-kill recovery (R24 re-enumerates a force-killed card; live-attach
+# avoids the cold-attach-at-boot death in the first place).
+_dync_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -z "$_dync_fn" ]]; then
+  printf 'FAIL: R25 could not extract install_dynamic_binding_from_existing_config body\n' >&2
+  record_failure "R25 extract dynamic install function"
+else
+  printf 'PASS: R25 extracted install_dynamic_binding_from_existing_config body\n'
+fi
+assert_contains_text \
+  "R25 dynamic install gates live-attach offer on RX 9070 family" \
+  '_is_guest_rx9070_family' \
+  "$_dync_fn"
+assert_contains_text \
+  "R25 dynamic install flags live-attach as RECOMMENDED for RDNA4" \
+  'RECOMMENDED for RX 9070 / RDNA4' \
+  "$_dync_fn"
+assert_contains_text \
+  "R25 dynamic install prompts to set up live-attach now" \
+  'Set up the live-attach (hotplug GPU) workflow for RX 9070 / RDNA4 now?' \
+  "$_dync_fn"
+assert_contains_text \
+  "R25 dynamic install calls install_live_attach on YES (set -e safe via ||)" \
+  'install_live_attach || {' \
+  "$_dync_fn"
+assert_contains_text \
+  "R25 dynamic install prints --install-live-attach command on NO / soft-fail" \
+  'sudo $SCRIPT_NAME --install-live-attach' \
+  "$_dync_fn"
+assert_contains_text \
+  "R25 dynamic install notes the AMD driver prerequisite" \
+  'AMD Windows driver MUST already be installed' \
+  "$_dync_fn"
+assert_contains_text \
+  "R25 dynamic install notes live-attach is complementary to SBR Phase-2" \
+  'complementary to the' \
+  "$_dync_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

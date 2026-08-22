@@ -9630,8 +9630,22 @@ case "$PHASE" in
         _la_delay="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
         say "vfio-libvirt-hook: VM '$DOMAIN' is in live-attach list; launching background helper (delay=${_la_delay}s)."
         hook_log "action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s"
-        # Launch the helper in the background. It handles the bind + attach.
-        /usr/local/sbin/vfio-live-attach.sh "$DOMAIN" "$_la_delay" &
+        # Launch the helper FULLY DETACHED so it does NOT hold this hook's
+        # stdout/stderr pipe open. libvirt waits for the hook's stdout/stderr
+        # pipe to reach EOF before it starts qemu; a plain `&` child inherits
+        # those fds, keeping the pipe open, so libvirt blocks until the helper
+        # exits (~60-90s) — and the helper's `virsh attach-device --live` blocks
+        # waiting for the VM to be running. That is a DEADLOCK: the VM cannot
+        # start until the helper exits, but the helper cannot attach until the
+        # VM is running (observed: vnet0 only came up 92s after VM start, the
+        # instant the helper timed out and closed the pipe). setsid puts the
+        # helper in its own session (survives hook exit, no SIGHUP),
+        # </dev/null breaks stdin, >>log 2>&1 moves stdout/stderr OFF the
+        # libvirt pipe so the pipe closes immediately and qemu starts at once.
+        # The helper then polls guest-ping against the now-running VM, binds,
+        # and hot-attaches.
+        setsid /usr/local/sbin/vfio-live-attach.sh "$DOMAIN" "$_la_delay" \
+          </dev/null >>/var/log/vfio-live-attach.log 2>&1 &
         : # let libvirt proceed — VM starts without the GPU.
       elif vm_uses_guest_gpu; then
         say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."

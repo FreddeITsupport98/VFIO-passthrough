@@ -127,10 +127,28 @@ assert_contains_text \
   "R23 hook checks the live-attach VM list file" \
   'grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms' \
   "$hook_block"
+# CRITICAL anti-deadlock: the hook MUST launch the helper FULLY DETACHED
+# (setsid + </dev/null + >>log 2>&1) so the helper does NOT hold the hook's
+# stdout/stderr pipe open. libvirt waits for that pipe to reach EOF before
+# starting qemu; a plain `&` child inherits the fds, keeping the pipe open, so
+# libvirt blocks until the helper exits — and the helper's attach-device --live
+# blocks waiting for the VM to be running. DEADLOCK (observed: VM started 92s
+# late, the instant the helper timed out). setsid + fd redirects close the pipe
+# immediately so qemu starts at once.
 assert_contains_text \
-  "R23 hook launches the live-attach helper in the background" \
-  'vfio-live-attach.sh "$DOMAIN" "$_la_delay" &' \
+  "R23 hook detaches helper with setsid (anti-deadlock)" \
+  'setsid /usr/local/sbin/vfio-live-attach.sh' \
   "$hook_block"
+assert_contains_text \
+  "R23 hook redirects helper stdin off the libvirt pipe" \
+  '</dev/null >>/var/log/vfio-live-attach.log 2>&1 &' \
+  "$hook_block"
+if grep -Fq 'vfio-live-attach.sh "$DOMAIN" "$_la_delay" &' <<<"$hook_block"; then
+  printf 'FAIL: R23 hook still launches helper with a bare & (deadlock: holds libvirt pipe open)\n' >&2
+  record_failure "R23 hook does not launch helper with a bare &"
+else
+  printf 'PASS: R23 hook does not launch helper with a bare &\n'
+fi
 assert_contains_text \
   "R23 hook logs the live-attach launch" \
   'action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s' \

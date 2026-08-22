@@ -312,6 +312,20 @@ assert_contains_file \
   "R23 python extractor calls _strip_guest_addr on the GPU hostdev" \
   '_strip_guest_addr(gpu_hostdev)' \
   "$VFIO_SCRIPT"
+# virsh attach-device wants a BARE <hostdev> element as the XML root, NOT
+# wrapped in <devices>. A <devices> root makes attach-device reject it with
+# "unsupported configuration: unknown device type 'devices'" (observed: instant
+# rc=1 failure). The python extractor MUST write the hostdev directly.
+assert_contains_file \
+  "R23 python writes bare GPU hostdev (no <devices> wrapper)" \
+  'ET.ElementTree(gpu_hostdev).write(gpu_path)' \
+  "$VFIO_SCRIPT"
+if grep -Fq "gpu_el = ET.Element('devices')" "$VFIO_SCRIPT"; then
+  printf 'FAIL: R23 python still wraps GPU XML in <devices> (virsh attach-device rejects it)\n' >&2
+  record_failure "R23 python does not wrap GPU XML in <devices>"
+else
+  printf 'PASS: R23 python does not wrap GPU XML in <devices>\n'
+fi
 # The install MUST fail loudly when the GPU device XML extraction produces an
 # empty file instead of silently shipping a broken live-attach with nothing to
 # hot-attach (the helper would then hang or abort at VM start time).

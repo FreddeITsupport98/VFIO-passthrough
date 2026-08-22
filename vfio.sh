@@ -10008,21 +10008,22 @@ for hd in list(devices.findall('hostdev')):
         gpu_hostdev = hd
     elif any(bdf.lower() == f"{d}:{b}:{s}.{f}".lower() for d,b,s,f in audio_bdfs):
         audio_hostdevs.append(hd)
-# Write the GPU device XML.
+# Write the GPU device XML. virsh attach-device wants a BARE <hostdev>
+# element, NOT wrapped in <devices> — a <devices> root makes attach-device
+# reject it with "unsupported configuration: unknown device type 'devices'"
+# (observed: instant rc=1 failure). Write the hostdev directly as the root.
 if gpu_hostdev is not None:
     _strip_guest_addr(gpu_hostdev)
-    gpu_el = ET.Element('devices')
-    gpu_el.append(gpu_hostdev)
-    ET.ElementTree(gpu_el).write(gpu_path)
+    ET.ElementTree(gpu_hostdev).write(gpu_path)
     devices.remove(gpu_hostdev)
-# Write the audio device XML (all audio hostdevs in one file).
+# Write the audio device XML (a bare <hostdev> — same rationale). attach-device
+# takes one device element per call; write the first audio hostdev (the common
+# case is a single audio function). If there are extras they are still removed
+# from the VM XML below so libvirt does not attach them at boot.
 if audio_hostdevs:
     for ah in audio_hostdevs:
         _strip_guest_addr(ah)
-    audio_el = ET.Element('devices')
-    for ah in audio_hostdevs:
-        audio_el.append(ah)
-    ET.ElementTree(audio_el).write(audio_path)
+    ET.ElementTree(audio_hostdevs[0]).write(audio_path)
     for ah in audio_hostdevs:
         devices.remove(ah)
 # Auto-inject the qemu guest-agent channel (virtio-serial + unix channel) so the

@@ -158,6 +158,39 @@ assert_contains_text \
   "R23 helper falls back to fixed delay when agent is absent" \
   'guest agent did not respond within' \
   "$helper_block"
+# Anti-hang: the helper MUST wrap virsh attach-device in `timeout` so a hung
+# attach (guest PCI address conflict, vfio reset hang) can NEVER block libvirt's
+# VM lock indefinitely (observed: a stuck attach-device held the lock for
+# minutes so every other virsh call, including VM start, queued behind it).
+assert_contains_text \
+  "R23 helper times out the GPU attach-device (anti-hang)" \
+  'timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper times out the audio attach-device (anti-hang)" \
+  'timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live' \
+  "$helper_block"
+# The helper MUST use [[ -s ]] (non-empty), not [[ -f ]] (exists), for the GPU
+# and audio XML — an empty/stale file makes virsh attach-device hang on empty
+# input and block libvirt.
+assert_contains_text \
+  "R23 helper guards GPU attach with -s (non-empty) not -f" \
+  'if [[ -s "$GPU_XML" ]]; then' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper guards audio attach with -s (non-empty) not -f" \
+  'if [[ -s "$AUDIO_XML" ]]; then' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper logs a timeout-specific failure message (rc 124)" \
+  'virsh attach-device timed out after 30s' \
+  "$helper_block"
+if grep -Fq 'if [[ -f "$GPU_XML" ]]; then' <<<"$helper_block"; then
+  printf 'FAIL: R23 helper still uses -f for GPU_XML (empty file would hang libvirt)\n' >&2
+  record_failure "R23 helper does not use -f for GPU_XML"
+else
+  printf 'PASS: R23 helper does not use -f for GPU_XML\n'
+fi
 assert_contains_text \
   "R23 helper binds the GPU via the bind script --bind-now" \
   '"$BIND_SCRIPT" --bind-now' \
@@ -226,6 +259,25 @@ if grep -Fq "lstrip('0x')" "$VFIO_SCRIPT"; then
 else
   printf 'PASS: R23 python extractor does not use lstrip(0x0)\n'
 fi
+# The python extractor MUST strip the fixed GUEST PCI address (<address type='pci'>
+# directly under the hostdev) so libvirt auto-assigns a free guest address on
+# hot-attach — a fixed guest address can collide with an existing device in the
+# running VM and make virsh attach-device hang (the libvirt-lock-hang root cause).
+assert_contains_file \
+  "R23 python extractor strips fixed guest PCI address" \
+  'def _strip_guest_addr(hd):' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R23 python extractor calls _strip_guest_addr on the GPU hostdev" \
+  '_strip_guest_addr(gpu_hostdev)' \
+  "$VFIO_SCRIPT"
+# The install MUST fail loudly when the GPU device XML extraction produces an
+# empty file instead of silently shipping a broken live-attach with nothing to
+# hot-attach (the helper would then hang or abort at VM start time).
+assert_contains_file \
+  "R23 install_live_attach fails loudly on empty GPU extraction" \
+  'GPU device XML extraction failed' \
+  "$VFIO_SCRIPT"
 # install_live_attach must auto-inject the qemu guest-agent channel (virtio-serial
 # + unix channel) into the VM XML so the live-attach helper has a transport for
 # guest-ping (smart Windows-readiness detection). Without it the helper can

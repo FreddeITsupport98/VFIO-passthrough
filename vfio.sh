@@ -9769,21 +9769,35 @@ fi
 jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
 
 # Step 2: hot-attach the GPU to the running VM.
-if [[ -f "$GPU_XML" ]]; then
+# Use [[ -s ]] (non-empty), not [[ -f ]] — an empty/stale XML file makes virsh
+# attach-device hang on empty input and block libvirt's VM lock (observed: a
+# stuck attach-device held the lock for minutes so every other virsh call,
+# including VM start, queued behind it). Wrap in `timeout 30` so a hung attach
+# (guest PCI address conflict, vfio reset hang, etc.) can NEVER block libvirt
+# indefinitely: on timeout we log and exit non-zero instead of holding the lock.
+if [[ -s "$GPU_XML" ]]; then
   jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live"
-  if virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
+  if timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
     jlog "live-attach: GPU attached successfully to '$DOMAIN'"
   else
-    jlog "live-attach: FAILED to attach GPU to '$DOMAIN'"
+    _rc=$?
+    if (( _rc == 124 )); then
+      jlog "live-attach: FAILED to attach GPU — virsh attach-device timed out after 30s (guest PCI address conflict or vfio reset hang); aborting to avoid blocking libvirt"
+    else
+      jlog "live-attach: FAILED to attach GPU to '$DOMAIN' (rc=$_rc)"
+    fi
     exit 1
   fi
+else
+  jlog "live-attach: FAILED — $GPU_XML missing or empty; the GPU device XML was not saved at install time. Re-run 'sudo vfio.sh --install-live-attach' with the VM shut off."
+  exit 1
 fi
 
-# Step 3: hot-attach the audio function (if configured and XML exists).
-if [[ -f "$AUDIO_XML" ]]; then
+# Step 3: hot-attach the audio function (if configured and XML is non-empty).
+if [[ -s "$AUDIO_XML" ]]; then
   jlog "live-attach: attaching audio to domain '$DOMAIN'"
-  virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
-    jlog "live-attach: WARN audio attach failed (non-fatal)"
+  timeout 30 virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
+    jlog "live-attach: WARN audio attach failed or timed out (non-fatal)"
 fi
 
 jlog "live-attach: complete for domain '$DOMAIN'"
@@ -9908,6 +9922,16 @@ import sys, xml.etree.ElementTree as ET
 # it at boot anyway, defeating live-attach entirely).
 def _strip0x(v):
     return v[2:] if v.startswith('0x') else v
+# Strip the fixed GUEST PCI address (<address type='pci'> directly under the
+# hostdev, NOT the <address> inside <source> which carries the host BDF and has
+# no type= attribute) so libvirt AUTO-assigns a free guest address on hot-
+# attach. A fixed guest address can collide with an existing device in the
+# running VM and make virsh attach-device hang (observed: attach-device held
+# libvirt's VM lock for minutes on a colliding guest address).
+def _strip_guest_addr(hd):
+    for a in list(hd.findall('address')):
+        if a.get('type') == 'pci':
+            hd.remove(a)
 vm_path, gpu_path, audio_path, gpu_bdf, audio_csv = sys.argv[1:6]
 tree = ET.parse(vm_path); root = tree.getroot()
 device_type = root.tag.replace('domain', 'devices')
@@ -9946,12 +9970,15 @@ for hd in list(devices.findall('hostdev')):
         audio_hostdevs.append(hd)
 # Write the GPU device XML.
 if gpu_hostdev is not None:
+    _strip_guest_addr(gpu_hostdev)
     gpu_el = ET.Element('devices')
     gpu_el.append(gpu_hostdev)
     ET.ElementTree(gpu_el).write(gpu_path)
     devices.remove(gpu_hostdev)
 # Write the audio device XML (all audio hostdevs in one file).
 if audio_hostdevs:
+    for ah in audio_hostdevs:
+        _strip_guest_addr(ah)
     audio_el = ET.Element('devices')
     for ah in audio_hostdevs:
         audio_el.append(ah)
@@ -9977,6 +10004,18 @@ if not _has_ga:
     devices.append(_ch)
 tree.write(vm_path)
 PYEOF
+
+    # Fail loudly if the GPU was NOT extracted: the awk gate above matched the
+    # GPU BDF in the VM XML, so python3 should have written a non-empty GPU
+    # device XML. An empty file means the extractor silently failed (e.g. a
+    # BDF normalization bug) and the helper would have nothing to hot-attach —
+    # better to abort the install here than ship a broken live-attach.
+    if [[ ! -s "$_tmp_gpu" ]]; then
+      note "ERROR: python3 failed to extract the GPU hostdev for '$_dom' (device XML is empty)."
+      note "       The VM XML has the GPU BDF but the extractor wrote nothing. Re-run --install-live-attach."
+      rm -f "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" 2>/dev/null || true
+      die "GPU device XML extraction failed for '$_dom' — aborting live-attach install."
+    fi
 
     # Save the device XMLs to the runtime location.
     if [[ -s "$_tmp_gpu" ]]; then

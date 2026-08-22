@@ -158,6 +158,33 @@ assert_contains_text \
   "R23 helper hot-attaches the audio function via virsh attach-device --live" \
   'attach-device "$DOMAIN" "$AUDIO_XML" --live' \
   "$helper_block"
+# The helper MUST capture and log the bind script's full output on failure so a
+# bind-script bug surfaces in the journal instead of being swallowed (a swallowed
+# stderr left us blind to the say() semicolon bug for an entire session — the
+# helper reported "FAILED to bind GPU" with no cause).
+assert_contains_text \
+  "R23 helper captures bind output in _bind_out" \
+  '_bind_out="$' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper logs each bind output line on failure" \
+  'jlog "live-attach: bind: $_line"' \
+  "$helper_block"
+# The generated bind script's say() must use a SPACE (printf '%s\n' "$*"), not
+# a semicolon (printf '%s\n'; "$*"). The semicolon form executes the message as
+# a command (exit 127) and set -e kills the script before the bind — which made
+# --bind-now abort every live-attach attempt with a swallowed error.
+bind_block="$(sed -n '/write_file_atomic "$BIND_SCRIPT" 0755 "root:root" <<.EOF./,/^EOF$/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R23 bind script say() uses space (correct form)" \
+  "printf '%s\\n' \"\$*\"" \
+  "$bind_block"
+if grep -Fq "printf '%s\\n'; \"\$*\"" <<<"$bind_block"; then
+  printf 'FAIL: R23 bind script say() uses semicolon (executes messages as commands)\n' >&2
+  record_failure "R23 bind script say() does not use semicolon form"
+else
+  printf 'PASS: R23 bind script say() does not use semicolon form\n'
+fi
 
 # --- Static wiring: install_live_attach extracts hostdevs + flips conf + regenerates ---
 assert_contains_file \
@@ -172,6 +199,21 @@ assert_contains_file \
   "R23 install_live_attach validates VM XML before redefine" \
   'virt-xml-validate "$_tmp_vm"' \
   "$VFIO_SCRIPT"
+# The python3 hostdev extractor must use _strip0x (strips only the '0x' prefix),
+# NOT lstrip('0x') (strips ALL leading 0/x chars — function='0x0' becomes '',
+# the BDF becomes '0000:0e:00.' and the GPU never matches, so it is never
+# extracted from the VM XML and qemu attaches it at boot anyway, defeating
+# live-attach entirely).
+assert_contains_file \
+  "R23 python extractor uses _strip0x helper" \
+  'def _strip0x(v):' \
+  "$VFIO_SCRIPT"
+if grep -Fq "lstrip('0x')" "$VFIO_SCRIPT"; then
+  printf 'FAIL: R23 python extractor still uses lstrip(0x0) (strips all 0/x chars, breaks function=0x0 match)\n' >&2
+  record_failure "R23 python extractor does not use lstrip(0x0)"
+else
+  printf 'PASS: R23 python extractor does not use lstrip(0x0)\n'
+fi
 assert_contains_file \
   "R23 install_live_attach appends VM to live-attach list" \
   'printf '\''%s\n'\'' "$_dom" >>"$LIVE_ATTACH_VM_LIST"' \

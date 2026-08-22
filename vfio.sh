@@ -7906,7 +7906,7 @@ COOLDOWN_TS_FILE="/var/lib/vfio-dynamic/last-vm-stop.ts"
 # leaves the GPU in an undefined state that crashes the host PCIe bus).
 DRIVER_STATUS_FILE="/var/lib/vfio-dynamic/amd-driver-status"
 
-say() { printf '%s\n'; "$*"; }
+say() { printf '%s\n' "$*"; }
 
 die() {
   say "ERROR: $*" >&2
@@ -9726,9 +9726,15 @@ jlog "live-attach: waiting ${DELAY}s before binding GPU for domain '$DOMAIN'"
 sleep "$DELAY"
 
 # Step 1: bind the GPU to vfio-pci (same as the normal prepare hook does).
+# Capture the full output so a failure surfaces the REAL cause in the journal
+# (a swallowed stderr left us blind to a bind-script bug for an entire session).
 jlog "live-attach: binding GPU $GUEST_GPU_BDF to vfio-pci"
-if ! "$BIND_SCRIPT" --bind-now 2>&1; then
-  jlog "live-attach: FAILED to bind GPU — aborting attach"
+if ! _bind_out="$("$BIND_SCRIPT" --bind-now 2>&1)"; then
+  _rc=$?
+  jlog "live-attach: FAILED to bind GPU (rc=$_rc) — aborting attach"
+  printf '%s\n' "$_bind_out" | while IFS= read -r _line; do
+    [[ -n "$_line" ]] && jlog "live-attach: bind: $_line"
+  done
   exit 1
 fi
 jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
@@ -9862,6 +9868,12 @@ install_live_attach() {
 
     python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || true
 import sys, xml.etree.ElementTree as ET
+# Strip a leading 0x prefix. Do NOT use the str.lstrip form with 0x — that
+# strips ALL leading 0/x chars, so function 0x0 becomes empty and the BDF match
+# silently fails (the GPU is never extracted from the VM XML and qemu attaches
+# it at boot anyway, defeating live-attach entirely).
+def _strip0x(v):
+    return v[2:] if v.startswith('0x') else v
 vm_path, gpu_path, audio_path, gpu_bdf, audio_csv = sys.argv[1:6]
 tree = ET.parse(vm_path); root = tree.getroot()
 device_type = root.tag.replace('domain', 'devices')
@@ -9890,10 +9902,10 @@ for hd in list(devices.findall('hostdev')):
     if addr is None: continue
     ad = addr.get('domain', ''); ab = addr.get('bus', ''); asl = addr.get('slot', ''); af = addr.get('function', '')
     # Normalize to 4-digit domain, 2-digit bus/slot.
-    ad = ad.lstrip('0x').zfill(4) if ad else ''
-    ab = ab.lstrip('0x').zfill(2) if ab else ''
-    asl = asl.lstrip('0x').zfill(2) if asl else ''
-    bdf = f"{ad}:{ab}:{asl}.{af.lstrip('0x')}"
+    ad = _strip0x(ad).zfill(4) if ad else ''
+    ab = _strip0x(ab).zfill(2) if ab else ''
+    asl = _strip0x(asl).zfill(2) if asl else ''
+    bdf = f"{ad}:{ab}:{asl}.{_strip0x(af)}"
     if bdf.lower() == gpu_bdf.lower():
         gpu_hostdev = hd
     elif any(bdf.lower() == f"{d}:{b}:{s}.{f}".lower() for d,b,s,f in audio_bdfs):

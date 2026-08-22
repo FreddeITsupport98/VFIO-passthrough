@@ -2490,6 +2490,36 @@ else
   record_failure "R15 _sync_conf_defaults merges SBR key"
 fi
 
+# --- Functional R24: SBR Phase-2 escalation in _pci_dev_remove_rescan (force-
+# kill survival). A force-kill VM (virsh destroy / BSOD) drops the RX 9070 /
+# RDNA4 off the PCI bus via the vfio-pci release bus reset, and the lighter
+# Phase-1 remove+rescan often fails to bring it back (confirmed live on Navi
+# 48). R15 added the OPT-IN pre-rebind SBR; R24 graduates the post-failure
+# RECOVERY to also escalate: _pci_dev_remove_rescan now calls
+# _secondary_bus_reset (RST# on the upstream port) + a rescan when Phase 1 did
+# not recover the card, so a force-killed card is parked on vfio-pci and
+# reusable by the next live-attach (hotswap) WITHOUT a host reboot. Runs at
+# --release time (shared by live-attach AND standard dynamic binding) and from
+# the park-keepalive monitor, so force-kill survival works both ways.
+# Unconditional: the card is already dead when Phase 2 runs, so there is no
+# healthy card to harm.
+assert_contains_text \
+  "R24 _pci_dev_remove_rescan escalates to _secondary_bus_reset" \
+  '_secondary_bus_reset "$_bdf"' \
+  "$bind_block"
+assert_contains_text \
+  "R24 _pci_dev_remove_rescan logs the SBR escalation" \
+  'escalating to Secondary Bus Reset' \
+  "$bind_block"
+assert_contains_text \
+  "R24 _pci_dev_remove_rescan triggers a rescan after SBR" \
+  'PCI bus rescan triggered after SBR' \
+  "$bind_block"
+assert_contains_text \
+  "R24 _pci_dev_remove_rescan logs recovery after SBR+rescan" \
+  'recovered after SBR+rescan (alive)' \
+  "$bind_block"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

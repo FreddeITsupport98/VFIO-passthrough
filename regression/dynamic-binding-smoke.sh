@@ -2737,6 +2737,64 @@ else
   bad "Q3z could not extract the live-ROM fallback block to LIVE-test"
 fi
 
+# --- Smoke R24: SBR Phase-2 escalation in the recovery functions (force-kill
+# survival). A force-kill VM (virsh destroy / BSOD) drops the RX 9070 / RDNA4
+# off the PCI bus; the lighter Phase-1 remove+rescan often fails (confirmed
+# live on Navi 48). The recovery functions now escalate to _secondary_bus_reset
+# (RST# on the upstream port) + rescan so the force-killed card is parked on
+# vfio-pci and reusable by the next live-attach, without a host reboot. Works
+# for both live-attach and standard dynamic binding (shared release path +
+# keepalive). _bind_rr / _pk_rr / _pk_rso were extracted in Q3y above.
+
+# Bind script: _pci_dev_remove_rescan escalates to SBR (Phase 2).
+if echo "$_bind_rr" | grep -Fq '_secondary_bus_reset "$_bdf"'; then
+  ok "R24 bind script _pci_dev_remove_rescan escalates to _secondary_bus_reset (Phase 2)"
+else
+  bad "R24 bind script _pci_dev_remove_rescan missing SBR Phase-2 escalation"
+fi
+if echo "$_bind_rr" | grep -Fq 'escalating to Secondary Bus Reset'; then
+  ok "R24 bind script _pci_dev_remove_rescan logs the SBR escalation"
+else
+  bad "R24 bind script _pci_dev_remove_rescan missing SBR escalation log"
+fi
+if echo "$_bind_rr" | grep -Fq 'recovered after SBR+rescan (alive)'; then
+  ok "R24 bind script _pci_dev_remove_rescan logs recovery after SBR+rescan"
+else
+  bad "R24 bind script _pci_dev_remove_rescan missing SBR recovery log"
+fi
+
+# Park-keepalive: _pci_dev_remove_rescan escalates to SBR (Phase 2).
+if echo "$_pk_rr" | grep -Fq '_secondary_bus_reset "$_bdf"'; then
+  ok "R24 park-keepalive _pci_dev_remove_rescan escalates to _secondary_bus_reset (Phase 2)"
+else
+  bad "R24 park-keepalive _pci_dev_remove_rescan missing SBR Phase-2 escalation"
+fi
+if echo "$_pk_rr" | grep -Fq 'escalating to Secondary Bus Reset'; then
+  ok "R24 park-keepalive _pci_dev_remove_rescan logs the SBR escalation"
+else
+  bad "R24 park-keepalive _pci_dev_remove_rescan missing SBR escalation log"
+fi
+
+# Park-keepalive: _pci_bus_rescan_only (fully-off-bus) escalates to SBR when
+# plain rescan fails.
+if echo "$_pk_rso" | grep -Fq '_secondary_bus_reset "$_bdf"'; then
+  ok "R24 park-keepalive _pci_bus_rescan_only escalates to _secondary_bus_reset"
+else
+  bad "R24 park-keepalive _pci_bus_rescan_only missing SBR escalation"
+fi
+
+# Park-keepalive: the _secondary_bus_reset helper is duplicated (standalone
+# generated script, not sourced) and pulses RST# via Bridge Control 0x3E bit 6
+# (same technique as the bind script's copy).
+if grep -Fq '_secondary_bus_reset()' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '3E.w' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '0x0040' "$tmp/gen_park_keepalive.sh" \
+  && grep -Fq '0xFFBF' "$tmp/gen_park_keepalive.sh"; then
+  ok "R24 park-keepalive duplicates _secondary_bus_reset (BridgeCtl 0x3E bit6 RST# pulse, 0x0040/0xFFBF)"
+else
+  bad "R24 park-keepalive missing the duplicated _secondary_bus_reset helper or its RST# pulse"
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d):\n' "${#_fails_arr[@]}" >&2
   printf '  - %s\n' "${_fails_arr[@]}" >&2

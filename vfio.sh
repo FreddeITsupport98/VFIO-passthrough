@@ -8417,6 +8417,15 @@ _secondary_bus_reset() {
 # and adaptive link restore already proven for the guest-reboot FLR path (see
 # _pre_reset_gen1_downtrain), since a plain `rescan` has no mechanism of its own
 # to force the PCIe link to retrain if it is already down when the card zombies.
+# Two-phase graduated recovery: Phase 1 is the lighter remove+rescan; if that
+# fails (device never reappeared OR reappeared as a config-space-unreadable
+# zombie), Phase 2 escalates to a Secondary Bus Reset of the upstream PCIe
+# switch port (see _secondary_bus_reset) -- RST# hot-resets the GPU and forces a
+# full link retrain, the proven recovery for an RX 9070 / RDNA4 dropped off the
+# bus by a force-kill VM (virsh destroy / BSOD). The card is already dead when
+# Phase 2 runs, so there is no healthy card to harm. Runs at --release time
+# (shared by live-attach and standard dynamic binding) and from the
+# park-keepalive monitor, so force-kill survival works both ways.
 # Returns 0 if the device is alive and on vfio-pci after recovery, 1 otherwise.
 _pci_dev_remove_rescan() {
   local _bdf="$1" _sys _rx9070=0
@@ -8429,35 +8438,56 @@ _pci_dev_remove_rescan() {
     _rx9070=1
     _pre_reset_gen1_downtrain "$_bdf"
   fi
-  # 1. Remove the device from the bus (forces the kernel to drop it).
+  # Phase 1 (light): remove the device from the bus, then rescan to re-enumerate.
   if [[ -w "$_sys/remove" ]]; then
     echo 1 >"$_sys/remove" 2>/dev/null || true
     jlog "$_bdf: removed from PCI bus"
     sleep 1
   fi
-  # 2. Rescan the whole PCI bus to re-enumerate dropped devices.
   echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
   jlog "$_bdf: PCI bus rescan triggered"
   sleep 1
-  # 3. Check if the device came back at the same BDF. After remove, the sysfs
-  #    path is gone; after rescan it may or may not reappear.
-  [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after rescan"; return 1; }
-  # 3b. RX 9070 family: adaptively restore the link speed now that the device
-  #     is back in sysfs, before touching driver binding.
-  if (( _rx9070 )); then
-    _post_reset_restore_link "$_bdf"
+  if [[ -d "$_sys" ]]; then
+    # RX 9070 family: adaptively restore the link speed now that the device is
+    # back in sysfs, before touching driver binding.
+    if (( _rx9070 )); then
+      _post_reset_restore_link "$_bdf"
+    fi
+    echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+    echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+    sleep 0.3
+    if _pci_dev_alive "$_bdf"; then
+      jlog "$_bdf: recovered after remove+rescan (alive)"
+      return 0
+    fi
   fi
-  # 4. Set driver_override so amdgpu does not grab the rescanned device first,
-  #    then bind to vfio-pci.
+  # Phase 2 (heavy): the lighter remove+rescan did not recover the device
+  # (never reappeared, or reappeared as a config-space-unreadable zombie).
+  # Escalate to a Secondary Bus Reset of the upstream PCIe switch port -- RST#
+  # hot-resets the GPU (and its audio sibling) and forces a full PCIe link
+  # retrain, the proven recovery for an RX 9070 / RDNA4 that dropped off the
+  # bus on a force-kill VM (virsh destroy / BSOD) where plain remove+rescan
+  # fails. The card is already dead here so there is no healthy card to harm;
+  # _secondary_bus_reset resolves the upstream port via the pci_bus fallback
+  # even when the GPU's own sysfs entry is gone. After SBR, rescan to
+  # re-enumerate then bind vfio-pci. This runs at --release time (zombie
+  # detected immediately after a force-kill VM stop) and benefits BOTH
+  # live-attach and standard dynamic binding (the release path is shared).
+  jlog "$_bdf: did not reappear after rescan (or reappeared dead); escalating to Secondary Bus Reset (RST# on upstream port)"
+  say "WARN: $_bdf remove+rescan failed; escalating to Secondary Bus Reset (heavier bus reset) to recover the force-killed card." >&2
+  _secondary_bus_reset "$_bdf" || true
+  echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+  jlog "$_bdf: PCI bus rescan triggered after SBR"
+  sleep 1
+  [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after SBR+rescan; needs host reboot"; return 1; }
   echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
   echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
   sleep 0.3
-  # 5. Verify it is alive now.
   if _pci_dev_alive "$_bdf"; then
-    jlog "$_bdf: recovered after remove+rescan (alive)"
+    jlog "$_bdf: recovered after SBR+rescan (alive)"
     return 0
   fi
-  jlog "$_bdf: still dead after remove+rescan"
+  jlog "$_bdf: still dead after SBR+rescan; needs host reboot"
   return 1
 }
 
@@ -11083,11 +11113,74 @@ _post_reset_restore_link() {
   return 0
 }
 
+# Secondary Bus Reset (SBR) of the upstream PCIe switch port for $1 (the GPU).
+# Pulses RST# on the upstream port's secondary bus (setpci Bridge Control
+# register at offset 0x3E, bit 6 = 0x0040), hot-resetting the GPU AND every
+# other device behind the same upstream port (e.g. the GPU's audio sibling).
+# A HEAVIER reset than a plain remove+rescan: it resets more of the card's
+# internal state (PSP/MC) and forces a full PCIe link retrain, which is what
+# recovers an RX 9070 / RDNA4 that dropped off the bus on a force-kill VM
+# (virsh destroy / BSOD) where the lighter remove+rescan fails.
+#
+# Wraps the SAME pre-reset Gen1 downtrain + post-reset adaptive link restore
+# already proven for the park-keepalive remove+rescan / rescan-only paths (see
+# _pre_reset_gen1_downtrain / _post_reset_restore_link): an SBR drops the PCIe
+# link and it must retrain reliably (Gen1 first, then adapt back up). The
+# upstream port is NOT itself reset by the SBR, so its LnkCtl2 Gen1 target set
+# by _pre_reset_gen1_downtrain persists across the RST# pulse and the link
+# retrains at Gen1 after de-assert. Resolves the upstream port via
+# _gpu_upstream_port's pci_bus/<domain:bus> fallback, so this works even when
+# the GPU's own sysfs entry is missing (the exact force-kill zombie state).
+# Best-effort: returns 0 even if a setpci step fails (the caller proceeds to
+# the rescan + bind; a failed SBR is no worse than no SBR).
+# Duplicated from the bind script (each generated helper script is standalone).
+_secondary_bus_reset() {
+  local _bdf="$1" _upstream _brctl _brctl_set _brctl_clr
+  [[ -n "$_bdf" ]] || return 1
+  _upstream="$(_gpu_upstream_port "$_bdf" 2>/dev/null || true)"
+  if [[ -z "$_upstream" ]]; then
+    jlog "$_bdf: SBR skipped (could not find upstream port)"
+    return 1
+  fi
+  if ! command -v setpci >/dev/null 2>&1; then
+    jlog "$_bdf: SBR skipped (setpci not installed)"
+    return 1
+  fi
+  # Pre-reset Gen1 downtrain (stashes detected cap/cur/width globals for the
+  # matching _post_reset_restore_link call below).
+  _pre_reset_gen1_downtrain "$_bdf"
+  # Read the upstream port's Bridge Control register (offset 0x3E, 16-bit).
+  _brctl="$(_setpci_word "$_upstream" 3E.w 2>/dev/null || true)"
+  if [[ -z "$_brctl" ]]; then
+    jlog "$_bdf: SBR aborted (could not read Bridge Control from $_upstream)"
+    return 1
+  fi
+  # Assert Secondary Bus Reset (bit 6 = 0x0040): pulses RST# on the secondary
+  # bus, hot-resetting the GPU and every device behind the same upstream port.
+  _brctl_set="$(printf '%04x' $(( 0x$_brctl | 0x0040 )) )"
+  setpci -s "$_upstream" 3E.w="$_brctl_set" 2>/dev/null || true
+  jlog "$_bdf: SBR assert on $_upstream (BridgeCtl 0x$_brctl -> 0x$_brctl_set, bit6 RST# set)"
+  # Hold reset: PCIe TPerst must be asserted >= 2ms; give a generous margin.
+  sleep 0.05
+  # De-assert SBR (clear bit 6 via AND ~0x0040 = 0xFFBF) so the link retrains.
+  _brctl_clr="$(printf '%04x' $(( 0x$_brctl & 0xFFBF )) )"
+  setpci -s "$_upstream" 3E.w="$_brctl_clr" 2>/dev/null || true
+  jlog "$_bdf: SBR de-assert on $_upstream (BridgeCtl -> 0x$_brctl_clr, RST# cleared); link retraining"
+  # Post-reset adaptive link restore (bounded descent back to detected cap).
+  _post_reset_restore_link "$_bdf"
+  jlog "$_bdf: SBR complete (upstream $_upstream reset, link restored)"
+  return 0
+}
+
 # Same last-resort recovery as the bind script's _pci_dev_remove_rescan. RX
 # 9070 family: wrapped with the SAME pre/post Gen1-downtrain and adaptive link
 # restore proven for the guest-reboot FLR path, since a plain `rescan` has no
 # mechanism of its own to force the PCIe link to retrain if it is already
-# down when the card zombies.
+# down when the card zombies. Two-phase graduated recovery (kept in sync with
+# the bind script's copy): Phase 1 is the lighter remove+rescan; if that fails
+# Phase 2 escalates to _secondary_bus_reset (RST# on the upstream port), the
+# proven recovery for an RX 9070 / RDNA4 dropped off the bus by a force-kill VM
+# (virsh destroy / BSOD). The card is already dead when Phase 2 runs.
 _pci_dev_remove_rescan() {
   local _bdf="$1" _sys _rx9070=0
   [[ -n "$_bdf" ]] || return 1
@@ -11098,24 +11191,48 @@ _pci_dev_remove_rescan() {
     _rx9070=1
     _pre_reset_gen1_downtrain "$_bdf"
   fi
+  # Phase 1 (light): remove the device + rescan the bus to re-enumerate it.
   if [[ -w "$_sys/remove" ]]; then
     echo 1 >"$_sys/remove" 2>/dev/null || true
     sleep 1
   fi
   echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
   sleep 1
-  [[ -d "$_sys" ]] || { jlog "$_bdf: did not reappear after rescan"; return 1; }
-  if (( _rx9070 )); then
-    _post_reset_restore_link "$_bdf"
+  if [[ -d "$_sys" ]]; then
+    if (( _rx9070 )); then
+      _post_reset_restore_link "$_bdf"
+    fi
+    echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+    echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+    sleep 0.3
+    if _pci_dev_alive "$_bdf"; then
+      jlog "$_bdf: park-keepalive recovered device after remove+rescan (alive)"
+      return 0
+    fi
   fi
+  # Phase 2 (heavy): the lighter remove+rescan did not recover the device
+  # (either it never reappeared, or it reappeared as a zombie with unreadable
+  # config space). Escalate to a Secondary Bus Reset of the upstream PCIe
+  # switch port -- RST# hot-resets the GPU (and its audio sibling) and forces a
+  # full link retrain, the proven recovery for an RX 9070 / RDNA4 dropped off
+  # the bus by a force-kill VM (virsh destroy / BSOD). The card is already dead
+  # here, so there is no healthy card to harm; _secondary_bus_reset resolves the
+  # upstream port via the pci_bus fallback even when the GPU's own sysfs entry
+  # is gone. After SBR, rescan to re-enumerate then bind vfio-pci.
+  jlog "$_bdf: park-keepalive did not reappear after rescan (or reappeared dead); escalating to Secondary Bus Reset"
+  _secondary_bus_reset "$_bdf" || true
+  echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+  jlog "$_bdf: park-keepalive PCI bus rescan triggered after SBR"
+  sleep 1
+  [[ -d "$_sys" ]] || { jlog "$_bdf: park-keepalive did not reappear after SBR+rescan; needs host reboot"; return 1; }
   echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
   echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
   sleep 0.3
   if _pci_dev_alive "$_bdf"; then
-    jlog "$_bdf: park-keepalive recovered device after remove+rescan (alive)"
+    jlog "$_bdf: park-keepalive recovered device after SBR+rescan (alive)"
     return 0
   fi
-  jlog "$_bdf: park-keepalive remove+rescan did not recover device"
+  jlog "$_bdf: park-keepalive still dead after SBR+rescan; needs host reboot"
   return 1
 }
 
@@ -11145,16 +11262,35 @@ _pci_bus_rescan_only() {
   _pre_reset_gen1_downtrain "$_bdf"
   echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
   sleep 1
-  [[ -d "$_sys" ]] || { jlog "$_bdf: still did not reappear after rescan"; return 1; }
-  _post_reset_restore_link "$_bdf"
+  if [[ -d "$_sys" ]]; then
+    _post_reset_restore_link "$_bdf"
+    echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
+    echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+    sleep 0.3
+    if _pci_dev_alive "$_bdf"; then
+      jlog "$_bdf: park-keepalive recovered device after rescan (alive)"
+      return 0
+    fi
+  fi
+  # Escalation: plain rescan did not bring the device back. SBR the upstream
+  # port (RST# pulse) to force a full hot-reset + link retrain of everything
+  # behind the port, then rescan to re-enumerate. Proven heavier recovery for
+  # the RX 9070 / RDNA4 force-kill zombie where plain rescan fails (the device
+  # is already fully off the bus here, so there is no healthy card to harm).
+  jlog "$_bdf: park-keepalive did not reappear after plain rescan; escalating to Secondary Bus Reset"
+  _secondary_bus_reset "$_bdf" || true
+  echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+  jlog "$_bdf: park-keepalive PCI bus rescan triggered after SBR"
+  sleep 1
+  [[ -d "$_sys" ]] || { jlog "$_bdf: park-keepalive still did not reappear after SBR+rescan; needs host reboot"; return 1; }
   echo vfio-pci >"$_sys/driver_override" 2>/dev/null || true
   echo "$_bdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
   sleep 0.3
   if _pci_dev_alive "$_bdf"; then
-    jlog "$_bdf: park-keepalive recovered device after rescan (alive)"
+    jlog "$_bdf: park-keepalive recovered device after SBR+rescan (alive)"
     return 0
   fi
-  jlog "$_bdf: reappeared after rescan but is not alive/bound correctly"
+  jlog "$_bdf: park-keepalive reappeared after SBR+rescan but is not alive/bound correctly; needs host reboot"
   return 1
 }
 

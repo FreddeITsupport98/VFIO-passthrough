@@ -124,13 +124,24 @@ LIVE_ATTACH_HELPER="/usr/local/sbin/vfio-live-attach.sh"
 LIVE_ATTACH_GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
 LIVE_ATTACH_AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
 LIVE_ATTACH_VM_LIST="/var/lib/vfio-dynamic/live-attach-vms"
+# virtio-win guest-agent support (smart live-attach handoff). The live-attach
+# helper polls the qemu guest agent (guest-ping) so the GPU hot-attaches the
+# MOMENT Windows is up instead of after a blind fixed delay; that needs the
+# virtio-win guest agent installed INSIDE Windows. These constants let
+# --install-virtio-win-guest-agent resolve the driver ISO: the distro package
+# (dnf/zypper) drops it at VIRTIO_WIN_ISO_PATH; on distros without the package
+# the stable ISO is downloaded to VIRTIO_WIN_FALLBACK_ISO from VIRTIO_WIN_STABLE_URL.
+# The helper's fixed-delay FALLBACK still works until the agent is installed.
+VIRTIO_WIN_ISO_PATH="/usr/share/virtio-win/virtio-win.iso"
+VIRTIO_WIN_FALLBACK_ISO="/var/lib/vfio-dynamic/virtio-win.iso"
+VIRTIO_WIN_STABLE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 
 DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -732,6 +743,7 @@ complete -c $cmd -l no-vbios -d 'Dynamic-install: skip vBIOS injection + remove 
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-live-attach -d 'Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay'
+complete -c $cmd -l install-virtio-win-guest-agent -d 'Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
 complete -c $cmd -l reset-stealth-vm-tuning -d 'Revert stealth/perf VM tuning from backup XML'
 complete -c $cmd -l verify -d 'Validate existing setup'
@@ -773,7 +785,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -830,6 +842,7 @@ _vfio_sh_complete() {
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-live-attach[Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay]' \\
+    '--install-virtio-win-guest-agent[Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
     '--reset-stealth-vm-tuning[Revert stealth/perf VM tuning from backup XML]' \\
     '--verify[Validate existing setup]' \\
@@ -1453,7 +1466,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1558,6 +1571,14 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   on RX 9070 / RDNA4. Requires --install-dynamic-binding to be run first,
                   and the AMD Windows driver MUST be installed in the guest VM.
                   To revert: sudo vfio.sh --install-dynamic-binding (restores the GPU to the VM XML from the per-VM backup)
+  --install-virtio-win-guest-agent
+                  Attach the virtio-win driver ISO to each guest-GPU VM as a CD-ROM (idempotent) so
+                  you can run virtio-win-guest-tools.exe inside Windows to install the QEMU guest
+                  agent + virtio drivers. With the agent installed, the live-attach helper hot-
+                  attaches the GPU the MOMENT Windows is up (guest-ping) instead of after the blind
+                  fixed delay. Resolves the ISO via the distro virtio-win package (dnf/zypper) or
+                  downloads the stable ISO from fedorapeople.org. Requires --install-live-attach to
+                  be run first. The fixed-delay FALLBACK still works until the agent is installed.
   --install-stealth-vm-tuning
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
@@ -1793,6 +1814,9 @@ parse_args() {
         ;;
       --install-live-attach)
         MODE="install-live-attach"
+        ;;
+      --install-virtio-win-guest-agent)
+        MODE="install-virtio-win-guest-agent"
         ;;
       --reset-stealth-vm-tuning)
         MODE="reset-stealth-vm-tuning"
@@ -9777,6 +9801,27 @@ AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
 
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*" 2>/dev/null || true; }
 
+# Best-effort desktop notification (never fatal). This helper runs as root under
+# the libvirt hook (setsid-detached), so to reach the desktop user it broadcasts
+# to every active session under /run/user/<uid> via runuser + notify-send, the
+# same pattern the park-keepalive monitor uses. Used to tell the operator the
+# GPU hot-plug is ready to use (or failed) without watching the journal.
+_notify_desktop() {
+  local _title="$1" _body="$2" _urg="${3:-normal}" _rt _uid _user
+  command -v notify-send >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  for _rt in /run/user/*; do
+    [[ -d "$_rt" ]] || continue
+    _uid="$(basename "$_rt")"
+    [[ "$_uid" =~ ^[0-9]+$ ]] || continue
+    _user="$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)"
+    [[ -n "$_user" ]] || continue
+    runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$_rt/bus" \
+      notify-send -u "$_urg" "$_title" "$_body" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
 [[ -n "$DOMAIN" ]] || { jlog "live-attach: missing domain argument"; exit 1; }
 [[ -f "$CONF_FILE" ]] || { jlog "live-attach: missing $CONF_FILE"; exit 0; }
 # shellcheck disable=SC1090
@@ -9824,6 +9869,7 @@ if ! _bind_out="$("$BIND_SCRIPT" --bind-now 2>&1)"; then
   printf '%s\n' "$_bind_out" | while IFS= read -r _line; do
     [[ -n "$_line" ]] && jlog "live-attach: bind: $_line"
   done
+  _notify_desktop "GPU hot-plug failed" "Failed to bind the GPU to vfio-pci for VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach" critical
   exit 1
 fi
 jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
@@ -9849,6 +9895,7 @@ if [[ -s "$GPU_XML" ]]; then
   jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live (timeout ${_la_timeout}s)"
   if timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
     jlog "live-attach: GPU attached successfully to '$DOMAIN'"
+    _notify_desktop "GPU hot-plug ready" "The GPU has been hot-attached to VM '$DOMAIN' — ready to use." normal
   else
     _rc=$?
     if (( _rc == 124 )); then
@@ -9856,10 +9903,12 @@ if [[ -s "$GPU_XML" ]]; then
     else
       jlog "live-attach: FAILED to attach GPU to '$DOMAIN' (rc=$_rc)"
     fi
+    _notify_desktop "GPU hot-plug failed" "Failed to hot-attach the GPU to VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach" critical
     exit 1
   fi
 else
   jlog "live-attach: FAILED — $GPU_XML missing or empty; the GPU device XML was not saved at install time. Re-run 'sudo vfio.sh --install-live-attach' with the VM shut off."
+  _notify_desktop "GPU hot-plug failed" "The GPU device XML is missing for VM '$DOMAIN'. Re-run: sudo vfio.sh --install-live-attach (VM shut off)" critical
   exit 1
 fi
 
@@ -10180,6 +10229,224 @@ PYEOF
   note "The VM will start WITHOUT the GPU. After ${_delay_default}s, the GPU will be"
   note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
   note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU from the per-VM backup)"
+}
+
+# Install the virtio-win guest-agent support so the live-attach helper's smart
+# guest-ping detection works: with the QEMU guest agent installed INSIDE Windows,
+# the helper hot-attaches the GPU the MOMENT Windows userspace is up (often ~15s
+# vs the full VFIO_DYNAMIC_LIVE_ATTACH_DELAY fixed delay) instead of waiting the
+# blind fixed delay. install_live_attach already auto-injects the qemu
+# guest-agent <channel> into the VM XML; this standalone mode goes one step
+# further: it installs the virtio-win package (ships the driver ISO at
+# /usr/share/virtio-win/virtio-win.iso) OR downloads the stable ISO, then
+# attaches that ISO to each guest-GPU VM as a SATA CD-ROM (idempotent), so the
+# operator can run virtio-win-guest-tools.exe inside Windows to install the
+# agent + all virtio drivers. Until the agent is actually installed inside
+# Windows, the helper's fixed-delay FALLBACK still works (proceeds after
+# VFIO_DYNAMIC_LIVE_ATTACH_DELAY seconds), so this is a pure enhancement —
+# nothing breaks if the agent is not installed.
+install_virtio_win_guest_agent() {
+  readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run --install-dynamic-binding first."
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+  [[ -n "${GUEST_GPU_BDF:-}" ]] || die "No GUEST_GPU_BDF in $CONF_FILE."
+  have_cmd virsh || die "virsh not available."
+  have_cmd python3 || die "python3 not available (needed to attach the ISO to the VM XML)."
+
+  say
+  hdr "virtio-win guest agent setup (smart live-attach handoff)"
+  note "The live-attach helper polls the qemu guest agent (guest-ping) so the GPU hot-"
+  note "attaches the MOMENT Windows is up instead of after a blind fixed delay. For that,"
+  note "the virtio-win guest agent must be installed INSIDE Windows. This helper:"
+  note "  1. installs the virtio-win package (or downloads the stable driver ISO), and"
+  note "  2. attaches that ISO to each guest-GPU VM as a CD-ROM (idempotent),"
+  note "so you can run virtio-win-guest-tools.exe inside Windows to install the agent."
+  note ""
+  note "Until the agent is installed in Windows, the helper's fixed-delay FALLBACK still"
+  note "works (proceeds after ${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}s), so nothing breaks."
+  say
+
+  # 1. Resolve the virtio-win ISO (prefer the distro package; fall back to a download).
+  local _iso=""
+  if [[ -f "$VIRTIO_WIN_ISO_PATH" ]]; then
+    _iso="$VIRTIO_WIN_ISO_PATH"
+    say "Found virtio-win ISO: $_iso"
+  else
+    note "virtio-win ISO not found at $VIRTIO_WIN_ISO_PATH."
+    if have_cmd dnf; then
+      if prompt_yn "Install the virtio-win package via dnf now (provides the driver ISO)?" Y "virtio-win package"; then
+        run dnf -y install virtio-win || note "dnf install virtio-win failed; will try the download fallback."
+        [[ -f "$VIRTIO_WIN_ISO_PATH" ]] && _iso="$VIRTIO_WIN_ISO_PATH"
+      fi
+    elif have_cmd zypper; then
+      if prompt_yn "Install the virtio-win package via zypper now (provides the driver ISO)?" Y "virtio-win package"; then
+        run zypper --non-interactive in virtio-win || note "zypper install virtio-win failed; will try the download fallback."
+        [[ -f "$VIRTIO_WIN_ISO_PATH" ]] && _iso="$VIRTIO_WIN_ISO_PATH"
+      fi
+    fi
+    if [[ -z "$_iso" ]]; then
+      local _dl=""
+      if have_cmd wget; then _dl=wget; elif have_cmd curl; then _dl=curl; fi
+      if [[ -n "$_dl" ]]; then
+        note "Downloading the stable virtio-win ISO from fedorapeople.org to $VIRTIO_WIN_FALLBACK_ISO ..."
+        if (( ! DRY_RUN )); then mkdir -p "$(dirname "$VIRTIO_WIN_FALLBACK_ISO")"; fi
+        if [[ "$_dl" == wget ]]; then
+          run wget -qO "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL" || true
+        else
+          run curl -fsSL -o "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL" || true
+        fi
+        if [[ -s "$VIRTIO_WIN_FALLBACK_ISO" ]]; then
+          _iso="$VIRTIO_WIN_FALLBACK_ISO"
+          say "Downloaded virtio-win ISO: $_iso"
+        fi
+      fi
+    fi
+    if [[ -z "$_iso" ]]; then
+      note "Could not obtain the virtio-win ISO automatically. Get it manually, then re-run:"
+      note "  Fedora/RHEL: sudo dnf install virtio-win"
+      note "  openSUSE:    sudo zypper in virtio-win"
+      note "  Any distro:  wget -O $VIRTIO_WIN_FALLBACK_ISO $VIRTIO_WIN_STABLE_URL"
+      return 1
+    fi
+  fi
+
+  # 2. Attach the ISO as a SATA CD-ROM to each guest-GPU VM (idempotent, shut-off
+  #    only). A VM qualifies if it has the GPU BDF in its XML OR it is in the
+  #    live-attach VM list (live-attach strips the GPU hostdev, so the BDF grep
+  #    alone would miss an already-live-attach-configured VM). Uses python3 +
+  #    ElementTree (same approach as install_live_attach) so it works without
+  #    virt-xml and auto-assigns a free vdX target. Idempotent: skips a VM that
+  #    already has this ISO attached as a cdrom (python exit 3).
+  local _dom _xml _bdfs _state _found=0 _updated=0 _skipped_already=0 _skipped_running=0
+  local _gpu_bdf="$GUEST_GPU_BDF"
+  local _la_list="/var/lib/vfio-dynamic/live-attach-vms"
+  say
+  note "Attaching the ISO as a CD-ROM to each shut-off guest-GPU VM (idempotent)..."
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    local _is_guest=0
+    if grep -Fixq "$_gpu_bdf" <<<"$_bdfs" 2>/dev/null; then
+      _is_guest=1
+    elif [[ -f "$_la_list" ]] && grep -Fixq "$_dom" "$_la_list" 2>/dev/null; then
+      _is_guest=1
+    fi
+    (( _is_guest )) || continue
+    _found=1
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
+      _skipped_running=1
+      continue
+    fi
+    local _tmp_vm _py_status=0
+    _tmp_vm="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp_vm"
+    python3 - "$_tmp_vm" "$_iso" <<'PYEOF' || _py_status=$?
+import sys, string, xml.etree.ElementTree as ET
+vm_path, iso_path = sys.argv[1], sys.argv[2]
+tree = ET.parse(vm_path); root = tree.getroot()
+devices = root.find('devices')
+if devices is None: sys.exit(1)
+# Idempotent: skip if a cdrom already uses this ISO as its source file.
+for d in devices.findall('disk'):
+    if d.get('device') == 'cdrom':
+        src = d.find('source')
+        if src is not None and src.get('file') == iso_path:
+            sys.exit(3)
+# Find a free vdX target (vda..vdz).
+used = set()
+for d in devices.findall('disk'):
+    tgt = d.find('target')
+    if tgt is not None and (tgt.get('dev','') or '').startswith('vd'):
+        used.add(tgt.get('dev'))
+_dev = None
+for c in string.ascii_lowercase:
+    cand = 'vd' + c
+    if cand not in used:
+        _dev = cand
+        break
+if _dev is None: sys.exit(4)
+disk = ET.Element('disk', {'type': 'file', 'device': 'cdrom'})
+ET.SubElement(disk, 'driver', {'name': 'qemu', 'type': 'raw'})
+ET.SubElement(disk, 'source', {'file': iso_path})
+ET.SubElement(disk, 'target', {'dev': _dev, 'bus': 'sata'})
+ET.SubElement(disk, 'readonly')
+devices.append(disk)
+tree.write(vm_path)
+sys.exit(0)
+PYEOF
+    if (( _py_status == 3 )); then
+      say "VM '$_dom' already has the virtio-win ISO attached as a CD-ROM; skipping (idempotent)."
+      _skipped_already=1
+      rm -f "$_tmp_vm" 2>/dev/null || true
+      continue
+    elif (( _py_status == 4 )); then
+      note "WARN: no free vdX CD-ROM target for '$_dom' (all vda..vdz used); skipping."
+      rm -f "$_tmp_vm" 2>/dev/null || true
+      continue
+    elif (( _py_status != 0 )); then
+      note "WARN: virtio-win ISO attach XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      rm -f "$_tmp_vm" 2>/dev/null || true
+      continue
+    fi
+    if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
+      if (( ! DRY_RUN )); then
+        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null
+      fi
+      say "Attached virtio-win ISO to VM '$_dom' as a SATA CD-ROM."
+      _updated=1
+    else
+      note "WARN: virt-xml-validate failed for '$_dom'; skipping ISO attach."
+    fi
+    rm -f "$_tmp_vm" 2>/dev/null || true
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+
+  if (( ! _found )); then
+    note "No guest-GPU VMs found. Ensure a VM has the guest GPU attached (or is in the"
+    note "live-attach VM list) and re-run."
+    return 1
+  fi
+
+  say
+  if (( _updated )); then
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}${C_BOLD}✔ virtio-win ISO attached to guest-GPU VM(s)${C_RESET}"
+    else
+      say "✔ virtio-win ISO attached to guest-GPU VM(s)"
+    fi
+  elif (( _skipped_already )); then
+    say "virtio-win ISO was already attached to all guest-GPU VM(s); nothing to do."
+  fi
+  say
+  hdr "Next: install the agent INSIDE Windows"
+  note "Start the VM, open the virtio-win CD in File Explorer, and run:"
+  note "  virtio-win-guest-tools.exe   (or virtio-win-gt-x64.msi for a 64-bit silent install)"
+  note "This installs the QEMU guest agent + all virtio drivers. Reboot the VM afterward."
+  note ""
+  note "Once the agent is running in Windows, the live-attach helper's guest-ping poll"
+  note "responds and the GPU hot-attaches the MOMENT Windows is up (often ~15s vs the"
+  note "full ${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}s fixed delay). Until then, the fixed-"
+  note "delay FALLBACK still works, so nothing breaks."
 }
 
 # Remove the live-attach workflow (called by --install-dynamic-binding to restore
@@ -20767,6 +21034,22 @@ main() {
       fi
     fi
     install_live_attach
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-virtio-win-guest-agent" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run --install-dynamic-binding first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; virtio-win guest-agent setup needs libvirt to attach the ISO to VM XML."
+      if ! prompt_yn "Continue anyway?" N "virtio-win guest agent"; then
+        die "Aborted by user"
+      fi
+    fi
+    install_virtio_win_guest_agent
     exit 0
   fi
 

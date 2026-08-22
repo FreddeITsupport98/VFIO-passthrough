@@ -1112,9 +1112,9 @@ r2="$(SYSROOT="$qfake" RESCAN_FILE="$qfake/rescan" bash "$tmp/smoke_release_zomb
 if echo "$r2" | grep -Fq 'HEALTHY_SKIP' && echo "$r2" | grep -Fq 'RECOVERY_ATTEMPTED=0'; then ok "Q3r release path skips recovery for healthy card"; else bad "Q3r healthy-card case failed (got: $r2)"; fi
 # Case 3 (static): generated bind script has the release-path zombie gate
 _release_block="$(sed -n '/^  release)/,/^  bind-now)/p' "$tmp/gen_bind.sh")"
-if echo "$_release_block" | grep -Fq 'if ! _pci_dev_alive "$GUEST_GPU_BDF"; then' \
-  && echo "$_release_block" | grep -Fq 'zombie detected at release time' \
-  && echo "$_release_block" | grep -Fq '_pci_dev_remove_rescan "$GUEST_GPU_BDF"'; then
+if grep -Fq -- 'if ! _pci_dev_alive "$GUEST_GPU_BDF"; then' <<<"$_release_block" \
+  && grep -Fq -- 'zombie detected at release time' <<<"$_release_block" \
+  && grep -Fq -- '_pci_dev_remove_rescan "$GUEST_GPU_BDF"' <<<"$_release_block"; then
   ok "Q3r generated bind script has release-path zombie gate + recovery"
 else
   bad "Q3r generated bind script missing release-path zombie gate"
@@ -1369,37 +1369,37 @@ r2="$(SYSROOT="$qfake4" bash "$tmp/smoke_q3t_gate.sh" 2>&1 || true)"
 if echo "$r2" | grep -Fq 'IS_RX9070=NO'; then ok "Q3t non-RX 9070 (NVIDIA) -> gate skips"; else bad "Q3t non-RX 9070 case failed (got: $r2)"; fi
 # Case 3 (static): vfio.sh defines gate + downtrain + adaptive restore + all new helpers.
 _reboot_block="$(sed -n '/write_file_atomic "$REBOOT_FLR_SCRIPT" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
-if echo "$_reboot_block" | grep -Fq '_is_rx9070()' \
-  && echo "$_reboot_block" | grep -Fq '_gpu_upstream_port()' \
-  && echo "$_reboot_block" | grep -Fq '_pre_flr_gen1_downtrain()' \
-  && echo "$_reboot_block" | grep -Fq '_post_flr_restore_target()' \
-  && echo "$_reboot_block" | grep -Fq '_speed_to_gen()' \
-  && echo "$_reboot_block" | grep -Fq '_port_speed_gen()' \
-  && echo "$_reboot_block" | grep -Fq '_setpci_word()' \
-  && echo "$_reboot_block" | grep -Fq '_port_link_width()' \
-  && echo "$_reboot_block" | grep -Fq '_gpu_alive()' \
-  && echo "$_reboot_block" | grep -Fq '_rx9070_sku_name()' \
-  && echo "$_reboot_block" | grep -Fq 'max_link_speed' \
-  && echo "$_reboot_block" | grep -Fq 'current_link_speed' \
-  && echo "$_reboot_block" | grep -Fq 'current_link_width' \
-  && echo "$_reboot_block" | grep -Fq 'VFIO_REBOOT_FLR_MAX_GEN' \
-  && echo "$_reboot_block" | grep -Fq 'for (( _g = _target; _g >= 1; _g-- ))' \
-  && echo "$_reboot_block" | grep -Fq 'descending to Gen' \
-  && echo "$_reboot_block" | grep -Fq '88.w' \
-  && echo "$_reboot_block" | grep -Fq '6A.w' \
-  && echo "$_reboot_block" | grep -Fq '0x2000' \
-  && echo "$_reboot_block" | grep -Fq '7550'; then
+if grep -Fq -- '_is_rx9070()' <<<"$_reboot_block" \
+  && grep -Fq -- '_gpu_upstream_port()' <<<"$_reboot_block" \
+  && grep -Fq -- '_pre_flr_gen1_downtrain()' <<<"$_reboot_block" \
+  && grep -Fq -- '_post_flr_restore_target()' <<<"$_reboot_block" \
+  && grep -Fq -- '_speed_to_gen()' <<<"$_reboot_block" \
+  && grep -Fq -- '_port_speed_gen()' <<<"$_reboot_block" \
+  && grep -Fq -- '_setpci_word()' <<<"$_reboot_block" \
+  && grep -Fq -- '_port_link_width()' <<<"$_reboot_block" \
+  && grep -Fq -- '_gpu_alive()' <<<"$_reboot_block" \
+  && grep -Fq -- '_rx9070_sku_name()' <<<"$_reboot_block" \
+  && grep -Fq -- 'max_link_speed' <<<"$_reboot_block" \
+  && grep -Fq -- 'current_link_speed' <<<"$_reboot_block" \
+  && grep -Fq -- 'current_link_width' <<<"$_reboot_block" \
+  && grep -Fq -- 'VFIO_REBOOT_FLR_MAX_GEN' <<<"$_reboot_block" \
+  && grep -Fq -- 'for (( _g = _target; _g >= 1; _g-- ))' <<<"$_reboot_block" \
+  && grep -Fq -- 'descending to Gen' <<<"$_reboot_block" \
+  && grep -Fq -- '88.w' <<<"$_reboot_block" \
+  && grep -Fq -- '6A.w' <<<"$_reboot_block" \
+  && grep -Fq -- '0x2000' <<<"$_reboot_block" \
+  && grep -Fq -- '7550' <<<"$_reboot_block"; then
   ok "Q3t vfio.sh defines gate + downtrain + adaptive restore + helpers (sku/setpci_word/width/alive) + MAX_GEN + bounded descent"
 else
   bad "Q3t vfio.sh missing gate/downtrain/adaptive-restore/helper definitions"
 fi
 # Case 4 (static): old Gen5-only restore name AND one-step retry loop must be gone.
-if echo "$_reboot_block" | grep -Fq '_post_flr_restore_gen5'; then
+if grep -Fq -- '_post_flr_restore_gen5' <<<"$_reboot_block"; then
   bad "Q3t old _post_flr_restore_gen5 name still present in vfio.sh"
 else
   ok "Q3t old Gen5-only restore name removed from vfio.sh"
 fi
-if echo "$_reboot_block" | grep -Fq 'for _try in 1 2'; then
+if grep -Fq -- 'for _try in 1 2' <<<"$_reboot_block"; then
   bad "Q3t old one-step retry loop still present in vfio.sh"
 else
   ok "Q3t old one-step retry loop removed from vfio.sh"
@@ -1412,9 +1412,9 @@ else
 fi
 # Case 6 (static): installer warns when setpci is missing + names the pciutils command.
 _inst_flr_fn="$(sed -n '/^install_reboot_flr_monitor()/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_inst_flr_fn" | grep -Fq 'have_cmd setpci' \
-  && echo "$_inst_flr_fn" | grep -Fq 'zypper in pciutils' \
-  && echo "$_inst_flr_fn" | grep -Fq 'adaptive PCIe link restore will be SKIPPED'; then
+if grep -Fq -- 'have_cmd setpci' <<<"$_inst_flr_fn" \
+  && grep -Fq -- 'zypper in pciutils' <<<"$_inst_flr_fn" \
+  && grep -Fq -- 'adaptive PCIe link restore will be SKIPPED' <<<"$_inst_flr_fn"; then
   ok "Q3t installer warns on missing setpci + names openSUSE pciutils command"
 else
   bad "Q3t installer missing setpci/pciutils notice"
@@ -1905,8 +1905,8 @@ fi
 # Case 7 (static): the post-resume systemd-sleep hook only acts on "post" and
 # invokes the park-keepalive script with --once.
 _resume_block="$(sed -n '/write_file_atomic "$PARK_KEEPALIVE_RESUME_HOOK" 0755/,/^EOF$/p' "$VFIO_SCRIPT")"
-if echo "$_resume_block" | grep -Fq 'case "\${1:-}" in' \
-  && echo "$_resume_block" | grep -Fq '  post)' \
+if grep -Fq -- 'case "\${1:-}" in' <<<"$_resume_block" \
+  && grep -Fq -- '  post)' <<<"$_resume_block" \
   && echo "$_resume_block" | grep -Fq -- '--once'; then
   ok "Q3w post-resume hook acts only on 'post' and invokes the script with --once"
 else
@@ -1916,8 +1916,8 @@ fi
 # Case 8 (static): the udev rule documents the remove-uevent caveat and wires
 # the guest BDF to the one-shot check unit via SYSTEMD_WANTS (best-effort).
 _udev_block="$(sed -n '/write_file_atomic "$PARK_KEEPALIVE_UDEV_RULE" 0644/,/^EOF$/p' "$VFIO_SCRIPT")"
-if echo "$_udev_block" | grep -Fq 'does NOT emit a PCI "remove"' \
-  && echo "$_udev_block" | grep -Fq 'ENV{SYSTEMD_WANTS}+="vfio-gpu-park-keepalive-check.service"'; then
+if grep -Fq -- 'does NOT emit a PCI "remove"' <<<"$_udev_block" \
+  && grep -Fq -- 'ENV{SYSTEMD_WANTS}+="vfio-gpu-park-keepalive-check.service"' <<<"$_udev_block"; then
   ok "Q3w udev rule documents the remove-uevent caveat and wires SYSTEMD_WANTS to the check unit"
 else
   bad "Q3w udev rule missing caveat comment or SYSTEMD_WANTS wiring"
@@ -1927,9 +1927,9 @@ fi
 # same script with --once (no [Install]/WantedBy — it is only ever
 # triggered on-demand by the udev rule above, never enabled at boot).
 _check_unit_block="$(sed -n '/write_file_atomic "$PARK_KEEPALIVE_CHECK_UNIT" 0644/,/^EOF$/p' "$VFIO_SCRIPT")"
-if echo "$_check_unit_block" | grep -Fq 'Type=oneshot' \
-  && echo "$_check_unit_block" | grep -Fq 'ExecStart=$PARK_KEEPALIVE_SCRIPT --once' \
-  && ! echo "$_check_unit_block" | grep -Fq '[Install]'; then
+if grep -Fq -- 'Type=oneshot' <<<"$_check_unit_block" \
+  && grep -Fq -- 'ExecStart=$PARK_KEEPALIVE_SCRIPT --once' <<<"$_check_unit_block" \
+  && ! grep -Fq -- '[Install]' <<<"$_check_unit_block"; then
   ok "Q3w one-shot check unit runs the script --once and is not self-enabling"
 else
   bad "Q3w one-shot check unit definition wrong or unexpectedly self-enabling"
@@ -1993,19 +1993,19 @@ fi
 _q3x_wizard="$(sed -n '/^apply_configuration()/,/^main() {/p' "$VFIO_SCRIPT")"
 _q3x_switcher="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
 _q3x_fn="$(sed -n '/^install_stealth_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_q3x_wizard" | grep -Fq 'DISCLAIMER' \
-  && echo "$_q3x_wizard" | grep -Fq 'defeat or bypass anti-cheat'; then
+if grep -Fq -- 'DISCLAIMER' <<<"$_q3x_wizard" \
+  && grep -Fq -- 'defeat or bypass anti-cheat' <<<"$_q3x_wizard"; then
   ok "Q3x full wizard shows anti-cheat disclaimer before the stealth-tuning prompt"
 else
   bad "Q3x full wizard missing anti-cheat disclaimer before stealth-tuning prompt"
 fi
-if echo "$_q3x_switcher" | grep -Fq 'DISCLAIMER' \
-  && echo "$_q3x_switcher" | grep -Fq 'defeat or bypass anti-cheat'; then
+if grep -Fq -- 'DISCLAIMER' <<<"$_q3x_switcher" \
+  && grep -Fq -- 'defeat or bypass anti-cheat' <<<"$_q3x_switcher"; then
   ok "Q3x --install-dynamic-binding switcher shows anti-cheat disclaimer before the prompt"
 else
   bad "Q3x switcher missing anti-cheat disclaimer before stealth-tuning prompt"
 fi
-if echo "$_q3x_fn" | grep -Fq 'DISCLAIMER' && echo "$_q3x_fn" | grep -Fq 'anti-tamper'; then
+if grep -Fq -- 'DISCLAIMER' <<<"$_q3x_fn" && grep -Fq -- 'anti-tamper' <<<"$_q3x_fn"; then
   ok "Q3x install_stealth_vm_tuning() itself prints the disclaimer regardless of entry path"
 else
   bad "Q3x install_stealth_vm_tuning() missing its own disclaimer"
@@ -2046,9 +2046,9 @@ done
 # recovery and by bind_one's own remove+rescan fallbacks) must call both
 # halves of the wrap, gated on _is_rx9070.
 _bind_rr="$(sed -n '/^_pci_dev_remove_rescan()/,/^}/p' "$tmp/gen_bind.sh")"
-if echo "$_bind_rr" | grep -Fq '_is_rx9070 "$_bdf"' \
-  && echo "$_bind_rr" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
-  && echo "$_bind_rr" | grep -Fq '_post_reset_restore_link "$_bdf"'; then
+if grep -Fq -- '_is_rx9070 "$_bdf"' <<<"$_bind_rr" \
+  && grep -Fq -- '_pre_reset_gen1_downtrain "$_bdf"' <<<"$_bind_rr" \
+  && grep -Fq -- '_post_reset_restore_link "$_bdf"' <<<"$_bind_rr"; then
   ok "Q3y bind script _pci_dev_remove_rescan wraps remove+rescan with gated downtrain/restore"
 else
   bad "Q3y bind script _pci_dev_remove_rescan missing gated downtrain/restore wrap"
@@ -2058,9 +2058,9 @@ fi
 # downtrain + adaptive restore (gated on _is_rx9070), so the three call sites
 # inherit the wrap by calling it instead of open-coding it.
 _bind_flr_fn="$(sed -n '/^_rx9070_gated_soft_flr()/,/^}/p' "$tmp/gen_bind.sh")"
-if echo "$_bind_flr_fn" | grep -Fq '_is_rx9070 "$_bdf"' \
-  && echo "$_bind_flr_fn" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
-  && echo "$_bind_flr_fn" | grep -Fq '_post_reset_restore_link "$_bdf"'; then
+if grep -Fq -- '_is_rx9070 "$_bdf"' <<<"$_bind_flr_fn" \
+  && grep -Fq -- '_pre_reset_gen1_downtrain "$_bdf"' <<<"$_bind_flr_fn" \
+  && grep -Fq -- '_post_reset_restore_link "$_bdf"' <<<"$_bind_flr_fn"; then
   ok "Q3y bind script _rx9070_gated_soft_flr wraps the reset with gated downtrain/restore"
 else
   bad "Q3y bind script _rx9070_gated_soft_flr missing gated downtrain/restore wrap"
@@ -2068,7 +2068,7 @@ fi
 # bind_one() must call _rx9070_gated_soft_flr at ALL THREE reset sites (alive
 # soft-FLR + dead-card recovery + opt-in pre-bind reset) rather than open-coding.
 _bind_one_fn="$(sed -n '/^bind_one()/,/^}/p' "$tmp/gen_bind.sh")"
-if echo "$_bind_one_fn" | grep -Fq 'config space unreadable' \
+if grep -Fq -- 'config space unreadable' <<<"$_bind_one_fn" \
   && echo "$_bind_one_fn" | grep -Fc '_rx9070_gated_soft_flr "$dev"' | grep -Fxq 3; then
   ok "Q3y bind_one calls _rx9070_gated_soft_flr at ALL THREE reset sites (alive soft-FLR + dead-card recovery + opt-in pre-bind reset)"
 else
@@ -2078,9 +2078,9 @@ fi
 # Park-keepalive script: _pci_dev_remove_rescan (zombie-while-parked recovery)
 # must be gated on _is_rx9070, same as the bind script's copy.
 _pk_rr="$(sed -n '/^_pci_dev_remove_rescan()/,/^}/p' "$tmp/gen_park_keepalive.sh")"
-if echo "$_pk_rr" | grep -Fq '_is_rx9070 "$_bdf"' \
-  && echo "$_pk_rr" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
-  && echo "$_pk_rr" | grep -Fq '_post_reset_restore_link "$_bdf"'; then
+if grep -Fq -- '_is_rx9070 "$_bdf"' <<<"$_pk_rr" \
+  && grep -Fq -- '_pre_reset_gen1_downtrain "$_bdf"' <<<"$_pk_rr" \
+  && grep -Fq -- '_post_reset_restore_link "$_bdf"' <<<"$_pk_rr"; then
   ok "Q3y park-keepalive _pci_dev_remove_rescan wraps remove+rescan with gated downtrain/restore"
 else
   bad "Q3y park-keepalive _pci_dev_remove_rescan missing gated downtrain/restore wrap"
@@ -2091,9 +2091,9 @@ fi
 # unreadable once it is gone from sysfs), so it must call the downtrain/
 # restore helpers UNCONDITIONALLY instead.
 _pk_rso="$(sed -n '/^_pci_bus_rescan_only()/,/^}/p' "$tmp/gen_park_keepalive.sh")"
-if echo "$_pk_rso" | grep -Fq '_pre_reset_gen1_downtrain "$_bdf"' \
-  && echo "$_pk_rso" | grep -Fq '_post_reset_restore_link "$_bdf"' \
-  && ! echo "$_pk_rso" | grep -Fq '_is_rx9070'; then
+if grep -Fq -- '_pre_reset_gen1_downtrain "$_bdf"' <<<"$_pk_rso" \
+  && grep -Fq -- '_post_reset_restore_link "$_bdf"' <<<"$_pk_rso" \
+  && ! grep -Fq -- '_is_rx9070' <<<"$_pk_rso"; then
   ok "Q3y park-keepalive _pci_bus_rescan_only calls downtrain/restore unconditionally (no config-space read possible)"
 else
   bad "Q3y park-keepalive _pci_bus_rescan_only missing unconditional downtrain/restore wrap"
@@ -2146,7 +2146,7 @@ fi
 # install_park_keepalive_monitor's existing call sites, so it runs
 # automatically without the user having to manually edit VM XML.
 _switcher_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_switcher_fn" | grep -Fq 'install_vbios_romfile'; then
+if grep -Fq -- 'install_vbios_romfile' <<<"$_switcher_fn"; then
   ok "Q3z install_dynamic_binding_from_existing_config() calls install_vbios_romfile"
 else
   bad "Q3z install_dynamic_binding_from_existing_config() missing install_vbios_romfile call"
@@ -2156,8 +2156,8 @@ fi
 # sites inside if/elif/else branches), so check both functions reference it
 # rather than asserting an exact grep count.
 _wizard_fn="$(sed -n '/^apply_configuration()/,/^main() {/p' "$VFIO_SCRIPT")"
-if echo "$_switcher_fn" | grep -Fq 'install_vbios_romfile' \
-  && echo "$_wizard_fn" | grep -Fq 'install_vbios_romfile'; then
+if grep -Fq -- 'install_vbios_romfile' <<<"$_switcher_fn" \
+  && grep -Fq -- 'install_vbios_romfile' <<<"$_wizard_fn"; then
   ok "Q3z install_vbios_romfile is wired into both install paths (switcher + full wizard)"
 else
   bad "Q3z install_vbios_romfile is not wired into both install paths (switcher + full wizard)"
@@ -2167,13 +2167,13 @@ fi
 # --install-early-binding switcher and --reset), per the "always update the
 # uninstaller" rule, matching remove_park_keepalive_monitor's call sites.
 _early_fn="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_early_fn" | grep -Fq 'remove_vbios_romfile'; then
+if grep -Fq -- 'remove_vbios_romfile' <<<"$_early_fn"; then
   ok "Q3z install_early_binding_from_existing_config() calls remove_vbios_romfile"
 else
   bad "Q3z install_early_binding_from_existing_config() missing remove_vbios_romfile call"
 fi
 _reset_fn="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_reset_fn" | grep -Fq 'remove_vbios_romfile'; then
+if grep -Fq -- 'remove_vbios_romfile' <<<"$_reset_fn"; then
   ok "Q3z reset_vfio_all() calls remove_vbios_romfile"
 else
   bad "Q3z reset_vfio_all() missing remove_vbios_romfile call"
@@ -2376,7 +2376,7 @@ fi
 _resolv_fn="$(sed -n '/^_vbios_techpowerup_resolve_detail() {/,/^}/p' "$VFIO_SCRIPT")"
 if echo "$_resolv_fn" | grep -Fq -- '--max-time 6' \
   && echo "$_resolv_fn" | grep -Fq -- '-T 6' \
-  && echo "$_resolv_fn" | grep -Fq '|| true' \
+  && grep -Fq -- '|| true' <<<"$_resolv_fn" \
   && ! echo "$_resolv_fn" | grep -Eq 'strings[^|]*\| *grep'; then
   ok "Q3z resolver guards the fetch with a 6s timeout + capture-then-grep (pipefail-safe)"
 fi
@@ -2443,7 +2443,7 @@ fi
 # the operator has dropped multiple candidates in. Read-only; informational.
 _verify_fn="$(sed -n '/^verify_setup() {/,/^}/p' "$VFIO_SCRIPT")"
 if grep -Fq 'verify_vbios_candidates()' "$VFIO_SCRIPT" \
-  && echo "$_verify_fn" | grep -Fq 'verify_vbios_candidates || true' \
+  && grep -Fq -- 'verify_vbios_candidates || true' <<<"$_verify_fn" \
   && grep -Fq 'vBIOS candidate scan (VBIOS/ folder)' "$VFIO_SCRIPT" \
   && grep -Fq 'vBIOS SUMMARY:' "$VFIO_SCRIPT"; then
   ok "Q3z verify_vbios_candidates() is defined + wired into --verify with a scan + summary"
@@ -2459,8 +2459,8 @@ fi
 # assert the bullet format string + the GUEST/HOST case branches (the literals
 # GUEST/HOST appear in the case, and the bullet • appears in the format string).
 if grep -Fq '_print_gpu_card_visual()' "$VFIO_SCRIPT" \
-  && echo "$_verify_fn" | grep -Fq '_print_gpu_card_visual "$GUEST_GPU_BDF" GUEST' \
-  && echo "$_verify_fn" | grep -Fq '_print_gpu_card_visual "$HOST_GPU_BDF" HOST' \
+  && grep -Fq -- '_print_gpu_card_visual "$GUEST_GPU_BDF" GUEST' <<<"$_verify_fn" \
+  && grep -Fq -- '_print_gpu_card_visual "$HOST_GPU_BDF" HOST' <<<"$_verify_fn" \
   && grep -Fq '│ ◎ │' "$VFIO_SCRIPT" \
   && grep -Fq '╭───╮' "$VFIO_SCRIPT" \
   && grep -Fq '${_role} • ${_status}' "$VFIO_SCRIPT" \
@@ -2506,7 +2506,7 @@ fi
 # sites (direct match + byte-swap-repaired match) so every MATCHED candidate
 # gets a byte verdict — not just defined-but-unused.
 _verify_cand_fn="$(sed -n '/^verify_vbios_candidates() {/,/^}/p' "$VFIO_SCRIPT")"
-if echo "$_verify_cand_fn" | grep -Fq '_vbios_dump_live_rom "$_guest_gpu"' \
+if grep -Fq -- '_vbios_dump_live_rom "$_guest_gpu"' <<<"$_verify_cand_fn" \
   && echo "$_verify_cand_fn" | grep -Fc '_vbios_print_live_rom_verdict' | grep -Fxq 2; then
   ok "Q3z verify_vbios_candidates dumps the live ROM + calls the byte-verdict at BOTH match sites (direct + repaired)"
 else
@@ -2543,7 +2543,7 @@ if [[ -n "$_cmp_fn" ]]; then
   } > "$vfake4/cmp_test.sh"
   _cmp_out="$(bash "$vfake4/cmp_test.sh" 2>/dev/null || true)"
   _exact_ok=0; _differ_ok=0; _padded_ok=0
-  echo "$_cmp_out" | grep -Fq 'EXACT byte match' && echo "$_cmp_out" | grep -A0 'EXACT byte match' | head -1 >/dev/null
+  grep -Fq -- 'EXACT byte match' <<<"$_cmp_out" && echo "$_cmp_out" | grep -A0 'EXACT byte match' | head -1 >/dev/null
   _exact_line="$(printf '%s\n' "$_cmp_out" | grep -F 'EXACT byte match' | head -1)"
   _differ_line="$(printf '%s\n' "$_cmp_out" | grep -F 'BYTES DIFFER' | head -1)"
   _padded_line="$(printf '%s\n' "$_cmp_out" | grep -F 'PADDED byte match' | head -1)"
@@ -2747,29 +2747,29 @@ fi
 # keepalive). _bind_rr / _pk_rr / _pk_rso were extracted in Q3y above.
 
 # Bind script: _pci_dev_remove_rescan escalates to SBR (Phase 2).
-if echo "$_bind_rr" | grep -Fq '_secondary_bus_reset "$_bdf"'; then
+if grep -Fq -- '_secondary_bus_reset "$_bdf"' <<<"$_bind_rr"; then
   ok "R24 bind script _pci_dev_remove_rescan escalates to _secondary_bus_reset (Phase 2)"
 else
   bad "R24 bind script _pci_dev_remove_rescan missing SBR Phase-2 escalation"
 fi
-if echo "$_bind_rr" | grep -Fq 'escalating to Secondary Bus Reset'; then
+if grep -Fq -- 'escalating to Secondary Bus Reset' <<<"$_bind_rr"; then
   ok "R24 bind script _pci_dev_remove_rescan logs the SBR escalation"
 else
   bad "R24 bind script _pci_dev_remove_rescan missing SBR escalation log"
 fi
-if echo "$_bind_rr" | grep -Fq 'recovered after SBR+rescan (alive)'; then
+if grep -Fq -- 'recovered after SBR+rescan (alive)' <<<"$_bind_rr"; then
   ok "R24 bind script _pci_dev_remove_rescan logs recovery after SBR+rescan"
 else
   bad "R24 bind script _pci_dev_remove_rescan missing SBR recovery log"
 fi
 
 # Park-keepalive: _pci_dev_remove_rescan escalates to SBR (Phase 2).
-if echo "$_pk_rr" | grep -Fq '_secondary_bus_reset "$_bdf"'; then
+if grep -Fq -- '_secondary_bus_reset "$_bdf"' <<<"$_pk_rr"; then
   ok "R24 park-keepalive _pci_dev_remove_rescan escalates to _secondary_bus_reset (Phase 2)"
 else
   bad "R24 park-keepalive _pci_dev_remove_rescan missing SBR Phase-2 escalation"
 fi
-if echo "$_pk_rr" | grep -Fq 'escalating to Secondary Bus Reset'; then
+if grep -Fq -- 'escalating to Secondary Bus Reset' <<<"$_pk_rr"; then
   ok "R24 park-keepalive _pci_dev_remove_rescan logs the SBR escalation"
 else
   bad "R24 park-keepalive _pci_dev_remove_rescan missing SBR escalation log"
@@ -2777,7 +2777,7 @@ fi
 
 # Park-keepalive: _pci_bus_rescan_only (fully-off-bus) escalates to SBR when
 # plain rescan fails.
-if echo "$_pk_rso" | grep -Fq '_secondary_bus_reset "$_bdf"'; then
+if grep -Fq -- '_secondary_bus_reset "$_bdf"' <<<"$_pk_rso"; then
   ok "R24 park-keepalive _pci_bus_rescan_only escalates to _secondary_bus_reset"
 else
   bad "R24 park-keepalive _pci_bus_rescan_only missing SBR escalation"
@@ -2793,6 +2793,141 @@ if grep -Fq '_secondary_bus_reset()' "$tmp/gen_park_keepalive.sh" \
   ok "R24 park-keepalive duplicates _secondary_bus_reset (BridgeCtl 0x3E bit6 RST# pulse, 0x0040/0xFFBF)"
 else
   bad "R24 park-keepalive missing the duplicated _secondary_bus_reset helper or its RST# pulse"
+fi
+
+# --- Smoke R27: virtio-win guest-agent ISO attach (idempotent SATA cdrom) + helper notify + CLI ---
+# install_virtio_win_guest_agent attaches the virtio-win ISO to each shut-off
+# guest-GPU VM as a SATA CD-ROM via a python3+ElementTree heredoc. LIVE-test that
+# heredoc against a fake VM XML + fake ISO: (a) first run adds a SATA cdrom on a
+# free vdX target (exit 0), (b) second run is idempotent (exit 3), (c) no free
+# vdX target -> exit 4. Then static-check the generated helper notify + CLI wiring.
+
+if grep -Fq 'install_virtio_win_guest_agent()' "$VFIO_SCRIPT"; then
+  ok "R27 install_virtio_win_guest_agent function defined"
+else
+  bad "R27 install_virtio_win_guest_agent function missing"
+fi
+
+# Extract the python CD-ROM-attach heredoc body from install_virtio_win_guest_agent.
+_vw_fn="$(sed -n '/^install_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
+_vw_py="$(printf '%s\n' "$_vw_fn" | awk 'f{if(/^PYEOF$/){f=0;next}print} /<<.PYEOF./{f=1}')"
+
+if [[ -n "$_vw_py" ]]; then
+  ok "R27 extracted the python CD-ROM-attach heredoc"
+else
+  bad "R27 could not extract the python CD-ROM-attach heredoc"
+fi
+
+if [[ -n "$_vw_py" ]]; then
+  vfake27="$tmp/r27fake"
+  mkdir -p "$vfake27"
+  _iso27="$vfake27/virtio-win.iso"
+  printf 'fake-iso' > "$_iso27"
+  _vm27="$vfake27/win11.xml"
+  cat > "$_vm27" <<'XEOF'
+<domain type='kvm'>
+  <name>win11</name>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/x.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>
+XEOF
+  printf '%s\n' "$_vw_py" > "$vfake27/attach_iso.py"
+
+  # (a) First run: exit 0, adds a SATA cdrom on vdb with the ISO + readonly.
+  py_rc=0
+  python3 "$vfake27/attach_iso.py" "$_vm27" "$_iso27" || py_rc=$?
+  if (( py_rc == 0 )); then
+    ok "R27 python attach first run exits 0"
+  else
+    bad "R27 python attach first run did not exit 0 (got $py_rc)"
+  fi
+  if grep -Fq 'device="cdrom"' "$_vm27" \
+    && grep -Fq 'dev="vdb"' "$_vm27" \
+    && grep -Fq 'bus="sata"' "$_vm27" \
+    && grep -Fq 'virtio-win.iso' "$_vm27" \
+    && grep -Fq 'readonly' "$_vm27"; then
+    ok "R27 python attach first run added a SATA cdrom (vdb) with the ISO + readonly"
+  else
+    bad "R27 python attach first run did not add the expected SATA cdrom"
+  fi
+
+  # (b) Second run on the same XML: idempotent -> exit 3.
+  py_rc2=0
+  python3 "$vfake27/attach_iso.py" "$_vm27" "$_iso27" || py_rc2=$?
+  if (( py_rc2 == 3 )); then
+    ok "R27 python attach second run is idempotent (exit 3, ISO already attached)"
+  else
+    bad "R27 python attach second run did not exit 3 (got $py_rc2)"
+  fi
+
+  # (c) No free vdX target (vda..vdz all used) -> exit 4.
+  _vm27b="$vfake27/win11-full.xml"
+  {
+    echo "<domain type='kvm'><name>win11</name><devices>"
+    for c in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+      echo "<disk type='file' device='disk'><target dev='vd$c' bus='virtio'/></disk>"
+    done
+    echo "</devices></domain>"
+  } > "$_vm27b"
+  py_rc3=0
+  python3 "$vfake27/attach_iso.py" "$_vm27b" "$_iso27" || py_rc3=$?
+  if (( py_rc3 == 4 )); then
+    ok "R27 python attach exits 4 when no free vdX target (vda..vdz all used)"
+  else
+    bad "R27 python attach did not exit 4 on no-free-target (got $py_rc3)"
+  fi
+fi
+
+# Generated live-attach helper: syntax + hot-plug-ready desktop notify.
+sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT" | sed '1d;$d' > "$tmp/gen_helper.sh"
+if bash -n "$tmp/gen_helper.sh"; then
+  ok "R27 generated live-attach helper syntax"
+else
+  bad "R27 generated live-attach helper syntax"
+fi
+if grep -Fq '_notify_desktop()' "$tmp/gen_helper.sh" \
+  && grep -Fq 'notify-send' "$tmp/gen_helper.sh" \
+  && grep -Fq 'runuser' "$tmp/gen_helper.sh" \
+  && grep -Fq 'GPU hot-plug ready' "$tmp/gen_helper.sh" \
+  && grep -Fq 'hot-attached to VM' "$tmp/gen_helper.sh" \
+  && grep -Fq 'GPU hot-plug failed' "$tmp/gen_helper.sh"; then
+  ok "R27 generated helper wires the hot-plug-ready/failed desktop notify"
+else
+  bad "R27 generated helper missing the desktop notify wiring"
+fi
+if grep -Fq 'ready to use." normal' "$tmp/gen_helper.sh" \
+  && grep -Fq ' critical' "$tmp/gen_helper.sh"; then
+  ok "R27 helper notify uses normal urgency on success, critical on failure"
+else
+  bad "R27 helper notify urgency mismatch (success=normal, failure=critical)"
+fi
+
+# --install-virtio-win-guest-agent CLI mode + dispatch + completions + usage.
+if grep -Fq -- '--install-virtio-win-guest-agent)' "$VFIO_SCRIPT" \
+  && grep -Fq 'MODE="install-virtio-win-guest-agent"' "$VFIO_SCRIPT" \
+  && grep -Fq '[[ "$MODE" == "install-virtio-win-guest-agent" ]]' "$VFIO_SCRIPT" \
+  && grep -Fq 'install-virtio-win-guest-agent | completion printers' "$VFIO_SCRIPT"; then
+  ok "R27 CLI parse_args + dispatch + MODE comment"
+else
+  bad "R27 CLI parse_args/dispatch/MODE-comment wiring missing"
+fi
+if grep -Fq 'complete -c $cmd -l install-virtio-win-guest-agent' "$VFIO_SCRIPT" \
+  && grep -Fq "'--install-virtio-win-guest-agent[" "$VFIO_SCRIPT" \
+  && grep -Fq -- '--install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning' "$VFIO_SCRIPT"; then
+  ok "R27 fish/bash/zsh completions cover --install-virtio-win-guest-agent"
+else
+  bad "R27 completions missing --install-virtio-win-guest-agent"
+fi
+if grep -Fq 'Attach the virtio-win driver ISO to each guest-GPU VM' "$VFIO_SCRIPT" \
+  && grep -Fq '[--install-live-attach] [--install-virtio-win-guest-agent]' "$VFIO_SCRIPT"; then
+  ok "R27 usage help + one-liner cover --install-virtio-win-guest-agent"
+else
+  bad "R27 usage help/one-liner missing --install-virtio-win-guest-agent"
 fi
 
 if (( fail != 0 )); then

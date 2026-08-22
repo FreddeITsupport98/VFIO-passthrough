@@ -442,8 +442,11 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R23 bash completion opts include --install-live-attach" \
-  '--install-early-binding --install-live-attach --install-stealth-vm-tuning' \
+  '--install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
+# R27 inserted --install-virtio-win-guest-agent between --install-live-attach and
+# --install-stealth-vm-tuning in the bash opts string, so the ordered pattern above
+# now includes that token (additive update; the R27 assertion below also covers it).
 assert_contains_file \
   "R23 zsh completion includes --install-live-attach" \
   "'--install-live-attach[" \
@@ -488,6 +491,173 @@ assert_contains_text \
   "R26 keeps the actionable fallback for a partial/half-installed state" \
   'No shut-off VMs with the guest GPU found' \
   "$_la_fn"
+
+# --- R27: virtio-win guest-agent installer + hotplug-ready desktop notification ---
+# --install-virtio-win-guest-agent resolves the virtio-win driver ISO (distro package
+# or stable download) and attaches it as a SATA CD-ROM to each guest-GPU VM (idempotent)
+# so the operator can run virtio-win-guest-tools.exe inside Windows to install the QEMU
+# guest agent. With the agent installed, the live-attach helper's guest-ping poll hot-
+# attaches the GPU the MOMENT Windows is up instead of after the blind fixed delay; the
+# fixed-delay FALLBACK still works until the agent is installed. The live-attach helper
+# also fires a desktop notification (notify-send via runuser to each /run/user/<uid>)
+# when the GPU hot-plug is ready to use, and on bind/attach/missing-XML failures.
+
+# Constants for the virtio-win ISO resolution.
+assert_contains_file \
+  "R27 VIRTIO_WIN_ISO_PATH constant defined" \
+  'VIRTIO_WIN_ISO_PATH="/usr/share/virtio-win/virtio-win.iso"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 VIRTIO_WIN_FALLBACK_ISO constant defined" \
+  'VIRTIO_WIN_FALLBACK_ISO="/var/lib/vfio-dynamic/virtio-win.iso"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 VIRTIO_WIN_STABLE_URL constant defined" \
+  'VIRTIO_WIN_STABLE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"' \
+  "$VFIO_SCRIPT"
+
+# install_virtio_win_guest_agent function defined + body wiring.
+assert_contains_file \
+  "R27 install_virtio_win_guest_agent function defined" \
+  'install_virtio_win_guest_agent()' \
+  "$VFIO_SCRIPT"
+_vw_fn="$(sed -n '/^install_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent requires python3" \
+  'have_cmd python3 || die "python3 not available (needed to attach the ISO to the VM XML)."' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent prefers the distro ISO path" \
+  '-f "$VIRTIO_WIN_ISO_PATH"' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent dnf-installs virtio-win as fallback" \
+  'dnf -y install virtio-win' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent zypper-installs virtio-win as fallback" \
+  'zypper --non-interactive in virtio-win' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent wget-downloads the stable ISO" \
+  'wget -qO "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL"' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent curl-downloads the stable ISO" \
+  'curl -fsSL -o "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL"' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent attaches a cdrom disk" \
+  "'device': 'cdrom'" \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent attaches via SATA bus" \
+  "'bus': 'sata'" \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent idempotent (python exit 3 on already-attached ISO)" \
+  'sys.exit(3)' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent exits 4 when no free vdX target" \
+  'sys.exit(4)' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent finds a free vdX target" \
+  'string.ascii_lowercase' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent validates VM XML before redefine" \
+  'virt-xml-validate "$_tmp_vm"' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent only attaches shut-off VMs" \
+  '[[ "$_state" != "shut off" ]]' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent qualifies VM by guest GPU BDF" \
+  'grep -Fixq "$_gpu_bdf"' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent qualifies VM by live-attach VM list" \
+  'grep -Fixq "$_dom" "$_la_list"' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent prints the Windows guest-tools instructions" \
+  'virtio-win-guest-tools.exe' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent prints the silent-install MSI alternative" \
+  'virtio-win-gt-x64.msi' \
+  "$_vw_fn"
+assert_contains_text \
+  "R27 install_virtio_win_guest_agent notes the fixed-delay FALLBACK still works" \
+  'FALLBACK still works' \
+  "$_vw_fn"
+
+# --install-virtio-win-guest-agent CLI mode + dispatch + completions + usage.
+assert_contains_file \
+  "R27 parse_args handles --install-virtio-win-guest-agent" \
+  '--install-virtio-win-guest-agent)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 parse_args sets MODE=install-virtio-win-guest-agent" \
+  'MODE="install-virtio-win-guest-agent"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 main dispatch wires install-virtio-win-guest-agent" \
+  '[[ "$MODE" == "install-virtio-win-guest-agent" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 MODE comment lists install-virtio-win-guest-agent" \
+  'install-virtio-win-guest-agent | completion printers' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 usage help documents --install-virtio-win-guest-agent" \
+  'Attach the virtio-win driver ISO to each guest-GPU VM' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 usage one-liner includes --install-virtio-win-guest-agent" \
+  '[--install-live-attach] [--install-virtio-win-guest-agent]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 fish completion includes --install-virtio-win-guest-agent" \
+  'complete -c $cmd -l install-virtio-win-guest-agent' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 bash completion opts include --install-virtio-win-guest-agent" \
+  '--install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R27 zsh completion includes --install-virtio-win-guest-agent" \
+  "'--install-virtio-win-guest-agent[" \
+  "$VFIO_SCRIPT"
+
+# Hotplug-ready desktop notification in the live-attach helper heredoc.
+assert_contains_text \
+  "R27 helper defines _notify_desktop" \
+  '_notify_desktop()' \
+  "$helper_block"
+assert_contains_text \
+  "R27 helper notify uses notify-send" \
+  'notify-send' \
+  "$helper_block"
+assert_contains_text \
+  "R27 helper notify reaches user sessions via runuser" \
+  'runuser' \
+  "$helper_block"
+assert_contains_text \
+  "R27 helper notifies GPU hot-plug ready on success" \
+  'GPU hot-plug ready' \
+  "$helper_block"
+assert_contains_text \
+  "R27 helper success notification body mentions hot-attach to VM" \
+  'hot-attached to VM' \
+  "$helper_block"
+assert_contains_text \
+  "R27 helper notifies GPU hot-plug failed on failure" \
+  'GPU hot-plug failed' \
+  "$helper_block"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

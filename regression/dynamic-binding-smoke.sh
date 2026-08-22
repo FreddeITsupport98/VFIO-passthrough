@@ -2930,6 +2930,144 @@ else
   bad "R27 usage help/one-liner missing --install-virtio-win-guest-agent"
 fi
 
+# --- Smoke R28: virtio-win ISO CD-ROM detach (uninstaller) + archive link ---
+# remove_virtio_win_guest_agent detaches only a cdrom whose source file is one of
+# the two script-managed ISO paths. LIVE-test the detach python heredoc against a
+# fake VM XML: (a) script ISO cdrom -> removed exit 0; (b) a DIFFERENT ISO cdrom ->
+# preserved exit 3; (c) no cdrom -> exit 3. Plus static wiring + archive link checks.
+
+if grep -Fq 'remove_virtio_win_guest_agent()' "$VFIO_SCRIPT"; then
+  ok "R28 remove_virtio_win_guest_agent function defined"
+else
+  bad "R28 remove_virtio_win_guest_agent function missing"
+fi
+
+# remove_live_attach must call remove_virtio_win_guest_agent (here-string grep;
+# SIGPIPE-safe under `set -o pipefail`).
+_r28_rla_fn="$(sed -n '/^remove_live_attach()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq 'remove_virtio_win_guest_agent' <<<"$_r28_rla_fn"; then
+  ok "R28 remove_live_attach calls remove_virtio_win_guest_agent"
+else
+  bad "R28 remove_live_attach does not call remove_virtio_win_guest_agent"
+fi
+
+_vw_rm_fn="$(sed -n '/^remove_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
+# The detach must never delete the distro ISO (owned by the package manager).
+if printf '%s\n' "$_vw_rm_fn" | grep -Fq 'rm -f "$VIRTIO_WIN_ISO_PATH"'; then
+  bad "R28 detach deletes the distro ISO (package-manager-owned)"
+else
+  ok "R28 detach never deletes the distro ISO"
+fi
+# The detach must remove the downloaded fallback ISO (ours).
+if grep -Fq 'rm -f "$VIRTIO_WIN_FALLBACK_ISO"' <<<"$_vw_rm_fn"; then
+  ok "R28 detach removes the downloaded fallback ISO"
+else
+  bad "R28 detach does not remove the downloaded fallback ISO"
+fi
+
+_vw_rm_py="$(printf '%s\n' "$_vw_rm_fn" | awk 'f{if(/^DETACHEOF$/){f=0;next}print} /<<.DETACHEOF./{f=1}')"
+if [[ -n "$_vw_rm_py" ]]; then
+  ok "R28 extracted the python detach heredoc"
+else
+  bad "R28 could not extract the python detach heredoc"
+fi
+
+if [[ -n "$_vw_rm_py" ]]; then
+  vfake28="$tmp/r28fake"
+  mkdir -p "$vfake28"
+  printf '%s\n' "$_vw_rm_py" > "$vfake28/detach_iso.py"
+  _iso_distro="/usr/share/virtio-win/virtio-win.iso"
+  _iso_fb="/var/lib/vfio-dynamic/virtio-win.iso"
+
+  # (a) VM with a cdrom sourcing the fallback ISO -> removed, exit 0.
+  _vm_a="$vfake28/win-a.xml"
+  cat > "$_vm_a" <<'XEOF'
+<domain type='kvm'>
+  <name>win-a</name>
+  <devices>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/vfio-dynamic/virtio-win.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+  </devices>
+</domain>
+XEOF
+  pya=0
+  python3 "$vfake28/detach_iso.py" "$_vm_a" "$_iso_distro" "$_iso_fb" || pya=$?
+  if (( pya == 0 )) && ! grep -Fq 'virtio-win.iso' "$_vm_a"; then
+    ok "R28 detach removes the script fallback-ISO cdrom (exit 0, cdrom gone)"
+  else
+    bad "R28 detach did not remove the script fallback-ISO cdrom (rc=$pya)"
+  fi
+
+  # (b) VM with a cdrom sourcing a DIFFERENT ISO -> preserved, exit 3.
+  _vm_b="$vfake28/win-b.xml"
+  cat > "$_vm_b" <<'XEOF'
+<domain type='kvm'>
+  <name>win-b</name>
+  <devices>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/iso/ubuntu-24.04.iso'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+  </devices>
+</domain>
+XEOF
+  pyb=0
+  python3 "$vfake28/detach_iso.py" "$_vm_b" "$_iso_distro" "$_iso_fb" || pyb=$?
+  if (( pyb == 3 )) && grep -Fq 'ubuntu-24.04.iso' "$_vm_b"; then
+    ok "R28 detach preserves a non-script ISO cdrom (exit 3, cdrom intact)"
+  else
+    bad "R28 detach touched a non-script ISO cdrom (rc=$pyb)"
+  fi
+
+  # (c) VM with no cdrom -> exit 3.
+  _vm_c="$vfake28/win-c.xml"
+  cat > "$_vm_c" <<'XEOF'
+<domain type='kvm'>
+  <name>win-c</name>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/x.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+  </devices>
+</domain>
+XEOF
+  pyc=0
+  python3 "$vfake28/detach_iso.py" "$_vm_c" "$_iso_distro" "$_iso_fb" || pyc=$?
+  if (( pyc == 3 )); then
+    ok "R28 detach is idempotent when no script cdrom is attached (exit 3)"
+  else
+    bad "R28 detach did not exit 3 with no cdrom (rc=$pyc)"
+  fi
+fi
+
+# Archive link + R25 dynamic-setup rec.
+if grep -Fq 'VIRTIO_WIN_ARCHIVE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/?C=M;O=A"' "$VFIO_SCRIPT"; then
+  ok "R28 VIRTIO_WIN_ARCHIVE_URL constant defined"
+else
+  bad "R28 VIRTIO_WIN_ARCHIVE_URL constant missing"
+fi
+if grep -Fq 'All released ISOs (pick a specific version): $VIRTIO_WIN_ARCHIVE_URL' "$VFIO_SCRIPT" \
+  && grep -Fq 'Driver ISO archive (all released versions, if you need a specific one):' "$VFIO_SCRIPT"; then
+  ok "R28 archive link printed in install_virtio_win_guest_agent output"
+else
+  bad "R28 archive link missing from install_virtio_win_guest_agent output"
+fi
+_r28_sw_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+if grep -Fq -- '--install-virtio-win-guest-agent' <<<"$_r28_sw_fn" \
+  && grep -Fq 'VIRTIO_WIN_ARCHIVE_URL' <<<"$_r28_sw_fn"; then
+  ok "R28 dynamic-setup rec shows --install-virtio-win-guest-agent + archive URL"
+else
+  bad "R28 dynamic-setup rec missing the virtio-win hint / archive URL"
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d):\n' "${#_fails_arr[@]}" >&2
   printf '  - %s\n' "${_fails_arr[@]}" >&2

@@ -135,6 +135,11 @@ LIVE_ATTACH_VM_LIST="/var/lib/vfio-dynamic/live-attach-vms"
 VIRTIO_WIN_ISO_PATH="/usr/share/virtio-win/virtio-win.iso"
 VIRTIO_WIN_FALLBACK_ISO="/var/lib/vfio-dynamic/virtio-win.iso"
 VIRTIO_WIN_STABLE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+# Archive of EVERY released virtio-win ISO (directory listing sorted by
+# modification date). Surfaced during dynamic-binding setup and in
+# --install-virtio-win-guest-agent output so the operator can pick a specific
+# version instead of only the stable ISO.
+VIRTIO_WIN_ARCHIVE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/?C=M;O=A"
 
 DEBUG=0
 DRY_RUN=0
@@ -10306,6 +10311,7 @@ install_virtio_win_guest_agent() {
       note "  Fedora/RHEL: sudo dnf install virtio-win"
       note "  openSUSE:    sudo zypper in virtio-win"
       note "  Any distro:  wget -O $VIRTIO_WIN_FALLBACK_ISO $VIRTIO_WIN_STABLE_URL"
+      note "  All released ISOs (pick a specific version): $VIRTIO_WIN_ARCHIVE_URL"
       return 1
     fi
   fi
@@ -10442,11 +10448,108 @@ PYEOF
   note "Start the VM, open the virtio-win CD in File Explorer, and run:"
   note "  virtio-win-guest-tools.exe   (or virtio-win-gt-x64.msi for a 64-bit silent install)"
   note "This installs the QEMU guest agent + all virtio drivers. Reboot the VM afterward."
+  note "Driver ISO archive (all released versions, if you need a specific one):"
+  note "  $VIRTIO_WIN_ARCHIVE_URL"
   note ""
   note "Once the agent is running in Windows, the live-attach helper's guest-ping poll"
   note "responds and the GPU hot-attaches the MOMENT Windows is up (often ~15s vs the"
   note "full ${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}s fixed delay). Until then, the fixed-"
   note "delay FALLBACK still works, so nothing breaks."
+}
+
+# Remove the virtio-win guest-agent ISO CD-ROM that install_virtio_win_guest_agent
+# attached to each guest-GPU VM, plus the downloaded fallback ISO. Called by
+# remove_live_attach (so --reset and --install-early-binding both clean it up).
+# SAFETY — "how it knows the correct CD": only removes a <disk> whose
+# device='cdrom' AND whose <source file=> is EXACTLY one of the two paths this
+# script manages (VIRTIO_WIN_ISO_PATH or VIRTIO_WIN_FALLBACK_ISO). A real
+# optical-drive passthrough or a different ISO the user attached has a different
+# source file, so it is never touched. install_virtio_win_guest_agent only ever
+# attached to guest-GPU VMs, so a cdrom sourcing one of these paths is, by
+# construction, one we attached (no separate BDF match needed). The distro ISO
+# at VIRTIO_WIN_ISO_PATH is owned by the package manager (dnf/zypper) and is
+# NEVER deleted; only the downloaded fallback ISO at VIRTIO_WIN_FALLBACK_ISO is
+# removed. Idempotent (no-op if the ISO is not attached). Shut-off VMs only
+# (virsh define requires it); a running VM is noted + skipped. Best-effort:
+# never aborts cleanup.
+remove_virtio_win_guest_agent() {
+  if ! readable_file "$CONF_FILE"; then
+    return 0
+  fi
+  if ! have_cmd virsh || ! have_cmd python3; then
+    return 0
+  fi
+  local _dom _xml _state _found=0 _removed=0
+  say
+  note "Detaching the script-attached virtio-win ISO CD-ROM from each shut-off VM (idempotent)..."
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    # Quick skip: only consider VMs whose XML references one of our managed ISO
+    # paths. The python step below further requires device='cdrom' + an exact
+    # source-file match, so a real optical drive or a different ISO is never touched.
+    if ! grep -Fq "$VIRTIO_WIN_ISO_PATH" <<<"$_xml" 2>/dev/null \
+      && ! grep -Fq "$VIRTIO_WIN_FALLBACK_ISO" <<<"$_xml" 2>/dev/null; then
+      continue
+    fi
+    _found=1
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); leaving the virtio-win ISO CD-ROM in place. Shut it off and re-run --reset / --install-early-binding to remove it."
+      continue
+    fi
+    local _tmp_vm _py_status=0
+    _tmp_vm="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp_vm"
+    python3 - "$_tmp_vm" "$VIRTIO_WIN_ISO_PATH" "$VIRTIO_WIN_FALLBACK_ISO" <<'DETACHEOF' || _py_status=$?
+import sys, xml.etree.ElementTree as ET
+vm_path = sys.argv[1]
+iso_paths = set(sys.argv[2:])  # only the script-managed ISO paths
+tree = ET.parse(vm_path); root = tree.getroot()
+devices = root.find('devices')
+if devices is None: sys.exit(1)
+removed = 0
+for d in list(devices.findall('disk')):
+    if d.get('device') == 'cdrom':
+        src = d.find('source')
+        if src is not None and src.get('file') in iso_paths:
+            devices.remove(d)
+            removed += 1
+if removed == 0:
+    sys.exit(3)  # not attached as a script cdrom (idempotent no-op)
+tree.write(vm_path)
+sys.exit(0)
+DETACHEOF
+    if (( _py_status == 3 )); then
+      # Not attached as a script cdrom (the path hit was not a matching cdrom).
+      rm -f "$_tmp_vm" 2>/dev/null || true
+      continue
+    elif (( _py_status != 0 )); then
+      note "WARN: virtio-win ISO detach XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      rm -f "$_tmp_vm" 2>/dev/null || true
+      continue
+    fi
+    if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
+      if (( ! DRY_RUN )); then
+        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null
+      fi
+      say "Detached virtio-win ISO CD-ROM from VM '$_dom'."
+      _removed=1
+    else
+      note "WARN: virt-xml-validate failed for '$_dom' after ISO detach; skipping redefine."
+    fi
+    rm -f "$_tmp_vm" 2>/dev/null || true
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+
+  # Remove the downloaded fallback ISO (ours). NEVER touch the distro ISO at
+  # VIRTIO_WIN_ISO_PATH — that is owned by the package manager (dnf/zypper).
+  if [[ -f "$VIRTIO_WIN_FALLBACK_ISO" ]]; then
+    run rm -f "$VIRTIO_WIN_FALLBACK_ISO" 2>/dev/null || true
+    _removed=1
+  fi
+  (( _removed )) && note "Removed virtio-win guest-agent ISO CD-ROM(s) + the downloaded fallback ISO."
+  (( ! _found )) && note "No VM with the script-attached virtio-win ISO found; nothing to detach."
 }
 
 # Remove the live-attach workflow (called by --install-dynamic-binding to restore
@@ -10484,6 +10587,12 @@ remove_live_attach() {
       fi
     done < "$LIVE_ATTACH_VM_LIST"
   fi
+
+  # Remove the virtio-win guest-agent ISO CD-ROM that install_virtio_win_guest_agent
+  # attached to each guest-GPU VM (and the downloaded fallback ISO). Best-effort:
+  # never aborts cleanup. Only removes a cdrom whose source is one of the two
+  # script-managed ISO paths — never a real optical drive or a different ISO.
+  remove_virtio_win_guest_agent
 
   # Remove the managed artifacts.
   if [[ -f "$LIVE_ATTACH_HELPER" ]]; then
@@ -15343,6 +15452,12 @@ install_dynamic_binding_from_existing_config() {
       note "  sudo $SCRIPT_NAME --install-live-attach"
       note "Reversible at any time with: sudo $SCRIPT_NAME --install-dynamic-binding"
     fi
+    note ""
+    note "Smart handoff (optional): install the virtio-win guest agent INSIDE Windows so the"
+    note "live-attach helper hot-attaches the GPU the MOMENT Windows is up (guest-ping) instead"
+    note "of after a blind fixed delay. Attach the driver ISO to your guest-GPU VM(s) with:"
+    note "  sudo $SCRIPT_NAME --install-virtio-win-guest-agent"
+    note "Driver ISO archive (all released versions): $VIRTIO_WIN_ARCHIVE_URL"
   fi
 }
 

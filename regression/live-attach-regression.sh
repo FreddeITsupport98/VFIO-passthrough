@@ -659,6 +659,65 @@ assert_contains_text \
   'GPU hot-plug failed' \
   "$helper_block"
 
+# --- R28: virtio-win guest-agent uninstaller (ISO CD-ROM detach) + archive link ---
+# remove_virtio_win_guest_agent detaches the script-attached virtio-win ISO CD-ROM
+# from each shut-off VM and removes the downloaded fallback ISO. Wired into
+# remove_live_attach so --reset and --install-early-binding both clean it. SAFETY:
+# only removes a cdrom whose source file is one of the two script-managed ISO paths
+# (never a real ODD / different ISO); the distro ISO is never deleted.
+assert_contains_file \
+  "R28 remove_virtio_win_guest_agent function defined" \
+  'remove_virtio_win_guest_agent()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R28 remove_live_attach calls remove_virtio_win_guest_agent" \
+  'remove_virtio_win_guest_agent' \
+  "$_rm_la_fn"
+_vw_rm_fn="$(sed -n '/^remove_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R28 detach matches device=cdrom" \
+  "d.get('device') == 'cdrom'" \
+  "$_vw_rm_fn"
+assert_contains_text \
+  "R28 detach matches only the script-managed ISO source paths" \
+  "src.get('file') in iso_paths" \
+  "$_vw_rm_fn"
+assert_contains_text \
+  "R28 detach is idempotent (exit 3 when not attached)" \
+  'sys.exit(3)' \
+  "$_vw_rm_fn"
+assert_contains_text \
+  "R28 detach removes the downloaded fallback ISO" \
+  'rm -f "$VIRTIO_WIN_FALLBACK_ISO"' \
+  "$_vw_rm_fn"
+if printf '%s\n' "$_vw_rm_fn" | grep -Fq 'rm -f "$VIRTIO_WIN_ISO_PATH"'; then
+  printf 'FAIL: R28 detach deletes the distro ISO (owned by the package manager)\n' >&2
+  record_failure "R28 detach does not delete the distro ISO"
+else
+  printf 'PASS: R28 detach never deletes the distro ISO\n'
+fi
+assert_contains_file \
+  "R28 VIRTIO_WIN_ARCHIVE_URL constant defined" \
+  'VIRTIO_WIN_ARCHIVE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/?C=M;O=A"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R28 archive link in manual-fallback note" \
+  'All released ISOs (pick a specific version): $VIRTIO_WIN_ARCHIVE_URL' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R28 archive link in next-steps block" \
+  'Driver ISO archive (all released versions, if you need a specific one):' \
+  "$VFIO_SCRIPT"
+_r28_sw_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R28 dynamic-setup rec mentions --install-virtio-win-guest-agent" \
+  '--install-virtio-win-guest-agent' \
+  "$_r28_sw_fn"
+assert_contains_text \
+  "R28 dynamic-setup rec shows the archive URL" \
+  'VIRTIO_WIN_ARCHIVE_URL' \
+  "$_r28_sw_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

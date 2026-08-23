@@ -27,6 +27,41 @@
 - [Install / switch commands](#install--switch-commands)
 - [GPU binding mode (early vs dynamic) — CLI reference](#gpu-binding-mode-early-vs-dynamic)
 - [Unreleased / changelog](#unreleased)
+- [Live-attach (hotplug GPU) workflow — the recommended RDNA4 path](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path)
+- [virtio-win guest-agent installer (smart handoff)](#virtio-win-guest-agent-installer-smart-handoff)
+- [SBR Phase-2 force-kill recovery (R24)](#sbr-phase-2-force-kill-recovery-r24)
+- [Park-keepalive monitor](#park-keepalive-monitor)
+- [Idempotency + the stale-helper fix (R26/R31)](#idempotency--the-stale-helper-fix-r26r31)
+- [Table of Contents](#table-of-contents)
+
+## Table of Contents
+
+- [What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning](#whats-new--rx-9070--rdna4-dynamic-binding--wayland-render-device-pinning)
+- [Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card)
+- [Live-attach (hotplug GPU) workflow — the recommended RDNA4 path](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path)
+- [virtio-win guest-agent installer (smart handoff)](#virtio-win-guest-agent-installer-smart-handoff)
+- [SBR Phase-2 force-kill recovery (R24)](#sbr-phase-2-force-kill-recovery-r24)
+- [Park-keepalive monitor](#park-keepalive-monitor)
+- [Idempotency + the stale-helper fix (R26/R31)](#idempotency--the-stale-helper-fix-r26r31)
+- [Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)](#stealthperf-vm-tuning-smbios--cpu--nic--disk-serials--iothreads)
+- [Why this matters for newer AMD cards](#why-this-matters-for-newer-amd-cards)
+- [The two-mode choice (early vs dynamic)](#the-two-mode-choice-early-vs-dynamic)
+- [How the host desktop stays alive (3 defenses)](#how-the-host-desktop-stays-alive-3-defenses)
+- [Decision diagram (bind-now guard)](#decision-diagram-bind-now-guard)
+- [Full VM-start flow diagram](#full-vm-start-flow-diagram)
+- [Install / switch commands](#install--switch-commands)
+- [GPU binding mode (early vs dynamic) — CLI reference](#gpu-binding-mode-early-vs-dynamic)
+- [High-level design](#high-level-design)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Command-line modes](#command-line-modes)
+- [Interactive wizard (default mode)](#interactive-wizard-default-mode)
+- [Verification and troubleshooting](#verification-and-troubleshooting)
+- [Safety model](#safety-model)
+- [Known limitations](#known-limitations)
+- [FAQ](#faq)
+- [Contributing / customizing](#contributing--customizing)
+- [Unreleased / changelog](#unreleased)
 
 > **Status:** This script is a highly defensive, feature‑rich VFIO helper that has been hardened for modern Fedora/RHEL/Arch‑style setups, AMD reset quirks, and boot‑VGA framebuffer conflicts. It is designed as a _host configuration wizard_, **not** a VM manager.
 
@@ -46,6 +81,8 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 ## What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning
 
 vfio 6.0 adds reliable passthrough for **RDNA4 / RX 9070** and other cards that hit the `Unknown PCI header type 127` reset bug, plus automatic Wayland render-device pinning so your host desktop no longer crashes when the VM starts. No BIOS visit required on a dual-GPU setup. **The practical headline: an RX 9070 passed through to a Windows guest now survives a soft reboot AND a hard kill of the VM** — reboot from the Start menu and the guest comes back to a live display with no host reboot, and `virsh destroy` / force-poweroff / a BSOD no longer drops the card into the `Unknown PCI header type 127` zombie state. See [Keeping the RX 9070 alive](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card) below.
+
+vfio 7.0 adds the **live-attach (hotplug GPU) workflow** as the recommended RDNA4 path: the VM starts WITHOUT the GPU (Windows boots on a virtual display), and after a short delay the GPU is bound to `vfio-pci` and hot-attached to the RUNNING VM — sidestepping the cold-attach-at-boot death entirely. A **virtio-win guest-agent installer** (`--install-virtio-win-guest-agent`) attaches the driver ISO so the helper's `guest-ping` poll hot-attaches the GPU the MOMENT Windows is up (~15s vs the blind 30s), and a **hotplug-ready desktop notification** pops when the GPU is ready to use. A **SBR Phase-2 force-kill recovery** (R24) re-enumerates a force-killed card (`virsh destroy` / BSOD) via Secondary Bus Reset so it's reusable without a host reboot, and a **park-keepalive monitor** proactively recovers a card that dies while parked between sessions. See [Live-attach (hotplug GPU) workflow](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path) below.
 
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
@@ -144,6 +181,92 @@ flowchart TD
 ```
 
 These three mitigations run automatically once `--install-dynamic-binding` is in place — no per-reboot manual steps. Follow them live with `journalctl -t vfio-reboot-flr -f` (reboot-FLR monitor) and `journalctl -t vfio-dynamic -f` (bind/release + zombie recovery).
+
+## Live-attach (hotplug GPU) workflow — the recommended RDNA4 path
+
+The hardest remaining RX 9070 / RDNA4 problem is **not** the first bind — it is the **cold-attach-at-boot death**: on the first VM start (or a parked restart), qemu's attach-time bus reset kills the card before the AMD Windows driver can stabilize it. The live-attach (hotplug GPU) workflow sidesteps this entirely: the VM starts WITHOUT the GPU (Windows boots on a virtual display), and after a short delay the GPU is bound to `vfio-pci` and hot-attached to the RUNNING VM via `virsh attach-device --live` — handed to a driver-ready guest instead of cold-attached at boot. This is the recommended path for RX 9070 / RDNA4.
+
+### The one-command dynamic-install chain (RDNA4)
+
+A single `--install-dynamic-binding` run walks the whole RDNA4 chain in one prompted sequence:
+
+1. **Dynamic binding** — `amdgpu` loads first, a libvirt qemu hook switches the guest GPU to `vfio-pci` only when a VM that has it attached is started.
+2. **Live-attach (opt-in, default N)** — strips the GPU hostdev from the VM XML (a full backup is saved per VM), installs the live-attach helper + hook + bind script.
+3. **virtio-win ISO attach (opt-in, default N, gated on live-attach)** — attaches the virtio-win driver ISO as a SATA CD-ROM to each guest-GPU VM so you can install the QEMU guest agent inside Windows.
+
+```fish path=null start=null
+sudo ./vfio.sh --install-dynamic-binding
+```
+
+The full live-attach flow on VM start:
+
+```mermaid
+flowchart TD
+    HOST(["Host boot / cold boot"]) --> AMG["Card on amdgpu"]
+    AMG --> VMSTART(["virsh start win11"])
+    VMSTART --> HOOK["Libvirt qemu hook — prepare phase"]
+    HOOK --> HELPER["Live-attach helper launches<br/>setsid-detached, anti-deadlock"]
+    HELPER --> WAIT{"Windows up?"}
+    WAIT -->|Agent installed| GPING["guest-ping responds (~15s)"]
+    WAIT -->|No agent| FDELAY["Fixed-delay fallback (30s)"]
+    GPING --> BIND["Bind GPU to vfio-pci<br/>Gen1-downtrain + FLR + Gen5-restore<br/>D0-lock"]
+    FDELAY --> BIND
+    BIND -->|bind fails| NBFAIL["Notify: GPU hot-plug failed (critical)"]
+    NBFAIL --> ENDFAIL(["Abort — check journalctl"])
+    BIND -->|bind ok| ATTACH["virsh attach-device --live (timeout 60s)"]
+    ATTACH -->|success| READY["Notify: GPU hot-plug ready (normal)"]
+    ATTACH -->|fail / timeout| NAFAIL["Notify: GPU hot-plug failed (critical)"]
+    NAFAIL --> ENDFAIL
+    READY --> SESSION(["Windows session on the GPU"])
+    SESSION --> SHUT{"VM stop event"}
+    SHUT -->|Clean shutdown| PARK["Card stays parked on vfio-pci<br/>D0-lock, REBIND_HOST=0"]
+    SHUT -->|"Force-kill / virsh destroy / BSOD"| DEAD["Card drops off PCI bus"]
+    PARK --> KEEP["Park-keepalive monitor watches"]
+    DEAD --> SBR["R24 SBR Phase-2<br/>escalate to Secondary Bus Reset<br/>then rescan"]
+    SBR --> PARK2["Card re-enumerated, parked on vfio-pci"]
+    PARK2 --> REUSE(["Reusable by next VM start<br/>NO host reboot"])
+    KEEP --> REUSE
+    REUSE --> VMSTART
+```
+
+### The live-attach helper
+
+The generated helper (`/usr/local/sbin/vfio-live-attach.sh`, launched by the libvirt hook on VM `prepare`) does three things:
+
+- **Smart handoff via `guest-ping`**: polls the QEMU guest agent (`virsh qemu-agent-command ... guest-ping`) so the GPU hot-attaches the MOMENT Windows userspace is up — often ~15s instead of the full 30s blind fixed delay. The QEMU guest-agent `<channel>` is auto-injected into the VM XML by `install_live_attach`. **Fixed-delay fallback**: if the agent is not installed in Windows yet (or no channel), the helper proceeds after `VFIO_DYNAMIC_LIVE_ATTACH_DELAY` (default 30s) — nothing breaks until the agent is installed.
+- **Hotplug-ready desktop notification**: fires `notify-send` (broadcast to every `/run/user/<uid>` via `runuser`, same pattern as the park-keepalive monitor) on attach success (*"GPU hot-plug ready — ready to use"*, normal urgency) and on bind/attach/missing-XML failures (*"GPU hot-plug failed"*, critical urgency). You see the GPU is ready without watching the journal.
+- **Anti-deadlock**: launched `setsid`-detached with `</dev/null >>log 2>&1 &` so the helper does NOT hold the libvirt hook's stdout/stderr pipe open (a bare `&` child would make libvirt wait for EOF and block qemu start until the helper timed out — observed 92s-late VM start).
+
+### virtio-win guest-agent installer (smart handoff)
+
+`--install-virtio-win-guest-agent` resolves the virtio-win driver ISO and attaches it as a **SATA CD-ROM** to each shut-off guest-GPU VM (idempotent — skips a VM that already has it; auto-assigns a free `sdX` target; `virt-xml-validate` + `virsh define`). Then you run `virtio-win-guest-tools.exe` inside Windows to install the agent + all virtio drivers.
+
+**Distro-aware ISO resolution** (R28b/R30):
+- **Fedora/RHEL-family (dnf)**: `virtio-win` is NOT in the default repos — the script adds the fedorapeople virtio-win repo first (`curl`/`wget` the `.repo` to `/etc/yum.repos.d/virtio-win.repo`), then `dnf install virtio-win` → ISO lands at `/usr/share/virtio-win/virtio-win.iso`.
+- **openSUSE (zypper)**: tries `zypper in virtio-win`; on failure points to the direct RPM download.
+- **Debian/Ubuntu (apt) / Arch/CachyOS (pacman)**: no official virtio-win package → prints the links so you download the ISO yourself to `/var/lib/vfio-dynamic/virtio-win.iso` and re-runs. **No 270MB ISO auto-download** — link-only.
+- A user-provided ISO at `/var/lib/vfio-dynamic/virtio-win.iso` is picked up automatically.
+
+Driver ISO archive (all released versions): `https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/?C=M;O=A`
+
+### SBR Phase-2 force-kill recovery (R24)
+
+A force-killed VM (`virsh destroy` / force-poweroff / BSOD) drops the RX 9070 off the PCI bus. The lighter Phase-1 `remove+rescan` recovery often **fails** on Navi 48. The bind script and the park-keepalive monitor now **escalate to a Secondary Bus Reset** (`_secondary_bus_reset` — RST# pulse on the upstream port via BridgeCtl `0x3E` bit 6) + rescan, so the force-killed card is re-enumerated, parked back on `vfio-pci`, and reusable by the next live-attach — **without a host reboot**. Works for both live-attach and standard dynamic binding (shared release path + keepalive). LIVE-verified: the card survived `virsh destroy`, stayed parked on `vfio-pci`, and the VM restarted on the same card without a host reboot.
+
+### Park-keepalive monitor
+
+A systemd service (dynamic binding only, installed automatically) that periodically checks whether the guest GPU parked on `vfio-pci` between VM sessions is still alive, and proactively runs the same `remove+rescan` → SBR Phase-2 recovery if it has died — the PROACTIVE complement to the reactive release-time zombie recovery. It catches a card that dies while parked BETWEEN VM stop/start events, not just at the moment of VM stop. Disable via `VFIO_DYNAMIC_PARK_KEEPALIVE=0` in `$CONF_FILE`. Includes a systemd-sleep resume hook (S3/S4 sleep is a common D3cold trigger) and a backoff streak with a one-time notify threshold.
+
+### Idempotency + the stale-helper fix (R26/R31)
+
+- **R26**: a re-run of `--install-live-attach` (or accepting the dynamic-install prompt) when live-attach is already active detects the already-active state and prints the green *"✔ Live-attach is already active"* banner + returns 0, instead of a confusing *"No shut-off VMs found"* error.
+- **R31**: the already-active path now **regenerates the helper + hook + bind-script before returning**. Without this, a re-run that hit the idempotency path shipped a stale helper on disk (pre-R27, no `_notify_desktop`) and the hotplug-ready desktop notification never fired even though the attach succeeded. A re-run now deploys helper code updates instead of shipping a stale helper.
+
+### Revert / uninstall
+
+- `sudo ./vfio.sh --install-dynamic-binding` — restores normal binding + re-attaches the GPU from the per-VM backup + detaches the virtio-win ISO CD-ROM (the uninstaller only removes a cdrom whose source is one of the two script-managed ISO paths — a real optical drive or a different ISO is never touched).
+- `sudo ./vfio.sh --reset` — full cleanup (removes live-attach, the ISO CD-ROM, vBIOS pins, monitors, hook, conf).
+
 
 ### Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)
 
@@ -280,6 +403,18 @@ sudo ./vfio.sh --install-dynamic-binding
 # Switch back to early binding (also removes the render-device pin):
 sudo ./vfio.sh --install-early-binding
 
+# Live-attach (hotplug GPU) workflow — RECOMMENDED for RX 9070 / RDNA4.
+#   The VM starts WITHOUT the GPU; after a delay the GPU is hot-attached
+#   to the running VM. Requires --install-dynamic-binding first, and the
+#   AMD Windows driver MUST be installed in the guest.
+sudo ./vfio.sh --install-live-attach
+
+# virtio-win guest-agent installer (smart handoff) — attaches the virtio-win
+#   driver ISO to each guest-GPU VM as a SATA CD-ROM so you can run
+#   virtio-win-guest-tools.exe inside Windows to install the QEMU guest agent.
+#   On Fedora, adds the fedorapeople virtio-win repo first, then dnf install.
+sudo ./vfio.sh --install-virtio-win-guest-agent
+
 # Full cleanup / undo everything:
 sudo ./vfio.sh --reset
 ```
@@ -355,6 +490,23 @@ Rapid VM stop/start cycles (stopping the VM and starting it again within a few s
 - Confirmed `--reset` and rollback now remove/restore the libvirt qemu hook (restoring any pre-existing user-managed hook from `.bak` backup).
 - Added AMD GPU stability kernel parameters `vfio-pci.disable_idle_d3=1` and `pcie_port_pm=off` to the AMD-gated stability blocks in all 3 bootloader paths, with new override flags `--amd-disable-idle-d3`/`--no-amd-disable-idle-d3` and `--amd-pcie-port-pm-off`/`--no-amd-pcie-port-pm-off` (extending the 4-flag AMD override pattern); both are removed by `--reset` and documented in manual instructions for unsupported bootloaders.
 - Added `regression/dynamic-binding-regression.sh` with static wiring + functional assertions (VM-XML detection, dynamic cmdline stripping, unbind/bind flow, post-bind verification, failure propagation) ending with a FAIL SUMMARY block, and extended `regression/custom-kernel-params-regression.sh` with 28 assertions for the new AMD stability params.
+- **R32**: fixed the virtio-win ISO CD-ROM attach target naming — the python now picks a free `sdX` target (sda, sdb, sdc…) for the SATA bus cdrom, not `vdX` (virtio-blk naming, which made libvirt reject the define with a colliding drive address). Also guarded the `virsh define` with `|| _define_rc=$?` so a define failure is REPORTED instead of silently aborting the script on `set -e`. LIVE-verified: the CD-ROM now attaches to win11 (`sdc`, SATA, no collision).
+- **R31**: fixed the missing hotplug notification — the R26 "already active" idempotency path used to return 0 BEFORE regenerating the live-attach helper, so a re-run on an already-active setup shipped a stale helper on disk (pre-R27, no `_notify_desktop`) and the desktop notification never fired even though the attach succeeded. The already-active path now regenerates the helper + hook + bind-script before returning.
+- **R30**: on Fedora/RHEL-family, `virtio-win` is NOT in the default repos — the script now adds the fedorapeople virtio-win repo first (`curl`/`wget` the `.repo`), then `dnf install virtio-win`. Removed the 270MB ISO auto-download; the script now only prints the links (stable ISO URL + archive URL + RPM URL) so the operator downloads the ISO themselves. New constants `VIRTIO_WIN_REPO_URL`, `VIRTIO_WIN_RPM_URL`.
+- **R29**: wired the virtio-win ISO attach into the `--install-dynamic-binding` RDNA4 flow as an opt-in prompt (default N, gated on live-attach being active) with a DISCLAIMER (host-side ISO attach only; agent install is manual inside Windows; VM must be shut off; fixed-delay fallback still works).
+- **R28b**: made `--install-virtio-win-guest-agent` distro-aware (`is_fedora_like` / `is_opensuse_like` / apt / pacman) instead of just probing for the binary, naming the distro in the message.
+- **R28**: added `remove_virtio_win_guest_agent()` — detaches the script-attached virtio-win ISO CD-ROM from each shut-off VM (only removes a cdrom whose source is one of the two script-managed ISO paths — never a real optical drive or a different ISO) and removes the downloaded fallback ISO (never the distro ISO, which is package-manager-owned). Wired into `remove_live_attach` so `--reset` and `--install-early-binding` clean it. Added `VIRTIO_WIN_ARCHIVE_URL` (every released ISO, by date) printed in the agent output + the dynamic-setup recommendation.
+- **R27**: added `--install-virtio-win-guest-agent` — resolves the virtio-win driver ISO and attaches it as a SATA CD-ROM to each shut-off guest-GPU VM (idempotent, free `vdX`→`sdX` target, `virt-xml-validate` + `virsh define`). Added a hotplug-ready desktop notification to the live-attach helper (`notify-send` via `runuser` to each `/run/user/<uid>`) on attach success (normal urgency) + on bind/attach/missing-XML failures (critical). Full CLI wiring (MODE comment, parse_args, usage, fish/bash/zsh completions, main dispatch).
+- **R26**: `install_live_attach` idempotency — a re-run on an already-active setup detects the already-active state (conf=1 + helper + VM list + GPU device XML) and prints the green *"✔ Live-attach is already active"* banner + returns 0, instead of a confusing *"No shut-off VMs found"* error.
+- **R25**: added an RDNA4 live-attach recommendation prompt (opt-in, default N) at the end of `--install-dynamic-binding` that calls `install_live_attach` set-e-safe via `||`.
+- **R24**: SBR Phase-2 force-kill recovery — a force-killed VM (`virsh destroy` / BSOD) drops the RX 9070 off the PCI bus; the lighter Phase-1 `remove+rescan` recovery often fails on Navi 48. The bind script and the park-keepalive monitor now escalate to a Secondary Bus Reset (`_secondary_bus_reset` — RST# pulse on the upstream port via BridgeCtl `0x3E` bit 6) + rescan, so the force-killed card is re-enumerated and reusable without a host reboot. The `_secondary_bus_reset` helper is duplicated into both generated scripts (standalone, not sourced). LIVE-verified.
+
+- **R23**: live-attach (hotplug GPU) support — an optional binding method where the VM starts WITHOUT the GPU and the GPU is hot-attached to the running VM after a delay via `virsh attach-device --live`. New constants (`LIVE_ATTACH_HELPER`, `LIVE_ATTACH_GPU_XML`, `LIVE_ATTACH_AUDIO_XML`, `LIVE_ATTACH_VM_LIST`), `install_live_attach` / `install_live_attach_helper` / `remove_live_attach`, the libvirt hook's live-attach branch (setsid-detached, anti-deadlock), `--install-live-attach` CLI mode + dispatch + completions + usage. The helper auto-injects a qemu guest-agent `<channel>` into the VM XML for the smart `guest-ping` handoff, with a fixed-delay fallback.
+
+- **Q3w**: park-keepalive monitor — a systemd service (dynamic binding only, instant on) that periodically checks whether the guest GPU parked on `vfio-pci` between VM sessions is still alive and proactively recovers it if it died. Extensions: a state file (persists the failure streak across restarts), a systemd-sleep resume hook, a one-shot check unit + udev rule, and conf keys for max-fails/backoff-max/notify.
+- **Q3y**: PCIe Gen1-downtrain + adaptive-restore wrapping on every RX 9070 family PCIe link-retrain/reset path (bind, release, park-keepalive, reboot-FLR), gated on `_is_guest_rx9070_family`. Helpers `_pre_reset_gen1_downtrain`, `_post_reset_restore_link`, `_gpu_upstream_port` (with a `pci_bus/<domain:bus>` fallback for a missing device entry), `_rx9070_gated_soft_flr`. `bind_one` calls the gated soft-FLR at all three reset sites. `VFIO_REBOOT_FLR_MAX_GEN` doc broadened to cover every RX 9070 recovery path.
+- **Q3z**: vBIOS ROM auto-injection — `install_vbios_romfile` auto-detects a matching `*.rom` dump in a `VBIOS/` folder next to the script (matched by the ROM's own embedded PCI Vendor:Device ID), copies it to `VBIOS_RUNTIME_DIR`, pins it via `<rom file='...'/>`. Two-tier matcher (`_vbios_rom_matches_gpu`), techpowerup deep-link resolver + byte-swap auto-repair, `verify_vbios_candidates` in `--verify`. Removed by `--install-early-binding` and `--reset`.
+
 
 ---
 
@@ -484,7 +636,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
 
 ### Common flags

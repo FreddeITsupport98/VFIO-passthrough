@@ -140,6 +140,13 @@ VIRTIO_WIN_STABLE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-do
 # --install-virtio-win-guest-agent output so the operator can pick a specific
 # version instead of only the stable ISO.
 VIRTIO_WIN_ARCHIVE_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/archive-virtio/?C=M;O=A"
+# The fedorapeople virtio-win repo file. On Fedora/RHEL-family, virtio-win is NOT
+# in the default repos, so --install-virtio-win-guest-agent adds this repo to
+# /etc/yum.repos.d/virtio-win.repo before `dnf install virtio-win` (the proven fix).
+VIRTIO_WIN_REPO_URL="https://fedorapeople.org/groups/virt/virtio-win/virtio-win.repo"
+# Stable virtio-win RPM (for the openSUSE manual-install fallback when zypper has no
+# matching repo): download it and `sudo rpm -iv virtio-win.noarch.rpm`.
+VIRTIO_WIN_RPM_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm"
 
 DEBUG=0
 DRY_RUN=0
@@ -10243,8 +10250,11 @@ PYEOF
 # blind fixed delay. install_live_attach already auto-injects the qemu
 # guest-agent <channel> into the VM XML; this standalone mode goes one step
 # further: it installs the virtio-win package (ships the driver ISO at
-# /usr/share/virtio-win/virtio-win.iso) OR downloads the stable ISO, then
-# attaches that ISO to each guest-GPU VM as a SATA CD-ROM (idempotent), so the
+# /usr/share/virtio-win/virtio-win.iso) — adding the fedorapeople repo on Fedora
+# first since virtio-win is not in the default repos — OR points the operator to
+# the stable ISO to download themselves (this script does NOT auto-download the
+# 270MB ISO), then attaches that ISO to each guest-GPU VM as a SATA CD-ROM
+# (idempotent), so the
 # operator can run virtio-win-guest-tools.exe inside Windows to install the
 # agent + all virtio drivers. Until the agent is actually installed inside
 # Windows, the helper's fixed-delay FALLBACK still works (proceeds after
@@ -10263,7 +10273,8 @@ install_virtio_win_guest_agent() {
   note "The live-attach helper polls the qemu guest agent (guest-ping) so the GPU hot-"
   note "attaches the MOMENT Windows is up instead of after a blind fixed delay. For that,"
   note "the virtio-win guest agent must be installed INSIDE Windows. This helper:"
-  note "  1. installs the virtio-win package (or downloads the stable driver ISO), and"
+  note "  1. installs the virtio-win package (adding the fedorapeople repo on Fedora"
+  note "     first), or points you to the stable driver ISO to download yourself, and"
   note "  2. attaches that ISO to each guest-GPU VM as a CD-ROM (idempotent),"
   note "so you can run virtio-win-guest-tools.exe inside Windows to install the agent."
   note ""
@@ -10271,67 +10282,71 @@ install_virtio_win_guest_agent() {
   note "works (proceeds after ${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}s), so nothing breaks."
   say
 
-  # 1. Resolve the virtio-win ISO (prefer the distro package; fall back to a download).
+  # 1. Resolve the virtio-win ISO. Prefer the distro package (adding the fedorapeople
+  #    repo on Fedora first, since virtio-win is NOT in the default Fedora repos); if
+  #    no package is available, point the operator to the links so THEY download the
+  #    ISO themselves to $VIRTIO_WIN_FALLBACK_ISO (this script does NOT auto-download
+  #    the 270MB ISO). A user-provided ISO at $VIRTIO_WIN_FALLBACK_ISO is picked up.
   local _iso=""
   if [[ -f "$VIRTIO_WIN_ISO_PATH" ]]; then
     _iso="$VIRTIO_WIN_ISO_PATH"
     say "Found virtio-win ISO: $_iso"
+  elif [[ -s "$VIRTIO_WIN_FALLBACK_ISO" ]]; then
+    # The operator downloaded the ISO themselves to the fallback path.
+    _iso="$VIRTIO_WIN_FALLBACK_ISO"
+    say "Found virtio-win ISO (user-provided): $_iso"
   else
-    note "virtio-win ISO not found at $VIRTIO_WIN_ISO_PATH."
+    note "virtio-win ISO not found at $VIRTIO_WIN_ISO_PATH (or $VIRTIO_WIN_FALLBACK_ISO)."
     # Distro-aware package resolution. The virtio-win package (which drops
     # the driver ISO at $VIRTIO_WIN_ISO_PATH) ships ONLY on Fedora/RHEL-
-    # family (dnf) and openSUSE (zypper). Debian/Ubuntu (apt) and Arch/
-    # CachyOS (pacman) have NO official virtio-win package, so those skip
-    # straight to the ISO download fallback (below) with an explanation.
+    # family (dnf) and openSUSE (zypper), and even there it is NOT in the
+    # default repos — the fedorapeople virtio-win repo must be added first.
+    # Debian/Ubuntu (apt) and Arch/CachyOS (pacman) have NO official virtio-win
+    # package at all, so those skip straight to the link-only fallback (the
+    # operator downloads the ISO themselves).
     if is_fedora_like || have_cmd dnf; then
       note "Detected Fedora/RHEL-family (dnf)."
-      if prompt_yn "Install the virtio-win package via dnf now (drops the driver ISO at $VIRTIO_WIN_ISO_PATH)?" Y "virtio-win package"; then
-        run dnf -y install virtio-win || note "dnf install virtio-win failed; will try the download fallback. You can also grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL"
+      note "NOTE: virtio-win is NOT in the default Fedora repos. The fedorapeople"
+      note "virtio-win repo must be added first (this is the official method)."
+      if prompt_yn "Add the virtio-win repo (fedorapeople) and install virtio-win via dnf now (drops the driver ISO at $VIRTIO_WIN_ISO_PATH)?" Y "virtio-win package"; then
+        # Add the repo first (the proven fix): curl/wget the .repo file.
+        if have_cmd curl; then
+          run curl -fsSL -o /etc/yum.repos.d/virtio-win.repo "$VIRTIO_WIN_REPO_URL" || note "Adding the virtio-win repo failed; will point you to the manual links below."
+        elif have_cmd wget; then
+          run wget -qO /etc/yum.repos.d/virtio-win.repo "$VIRTIO_WIN_REPO_URL" || note "Adding the virtio-win repo failed; will point you to the manual links below."
+        fi
+        run dnf -y install virtio-win || note "dnf install virtio-win failed. You can also grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL"
         [[ -f "$VIRTIO_WIN_ISO_PATH" ]] && _iso="$VIRTIO_WIN_ISO_PATH"
       fi
     elif is_opensuse_like || have_cmd zypper; then
       note "Detected openSUSE-family (zypper)."
-      if prompt_yn "Install the virtio-win package via zypper now (drops the driver ISO at $VIRTIO_WIN_ISO_PATH)?" Y "virtio-win package"; then
-        run zypper --non-interactive in virtio-win || note "zypper install virtio-win failed; will try the download fallback. You can also grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL"
+      note "NOTE: virtio-win is NOT in the default openSUSE repos."
+      if prompt_yn "Try zypper install virtio-win now (if it fails, download the RPM and install it manually)?" Y "virtio-win package"; then
+        run zypper --non-interactive in virtio-win || note "zypper install virtio-win failed. Download the RPM directly and install it: sudo rpm -iv virtio-win.noarch.rpm (from $VIRTIO_WIN_RPM_URL), or grab a specific ISO version from: $VIRTIO_WIN_ARCHIVE_URL"
         [[ -f "$VIRTIO_WIN_ISO_PATH" ]] && _iso="$VIRTIO_WIN_ISO_PATH"
       fi
     elif have_cmd apt-get; then
       note "Detected Debian/Ubuntu-family (apt): there is NO official virtio-win package"
-      note "in apt repositories, so the ISO will be downloaded from fedorapeople.org instead."
-      note "To pick a specific version instead of the stable build: $VIRTIO_WIN_ARCHIVE_URL"
-      note "(download it, drop it at $VIRTIO_WIN_FALLBACK_ISO, then re-run.)"
+      note "in apt repositories. Download the ISO yourself from fedorapeople.org."
+      note "  Stable ISO:  wget -O $VIRTIO_WIN_FALLBACK_ISO $VIRTIO_WIN_STABLE_URL"
+      note "  All released ISOs (pick a specific version): $VIRTIO_WIN_ARCHIVE_URL"
+      note "(drop it at $VIRTIO_WIN_FALLBACK_ISO, then re-run.)"
     elif have_cmd pacman; then
       note "Detected Arch-family e.g. Arch/CachyOS (pacman): there is NO official virtio-win"
-      note "package in the pacman repos (it is only in the AUR), so the ISO will be downloaded"
-      note "from fedorapeople.org instead. To pick a specific version: $VIRTIO_WIN_ARCHIVE_URL"
-      note "(download it, drop it at $VIRTIO_WIN_FALLBACK_ISO, then re-run.)"
+      note "package in the pacman repos (it is only in the AUR). Download the ISO yourself"
+      note "from fedorapeople.org."
+      note "  Stable ISO:  wget -O $VIRTIO_WIN_FALLBACK_ISO $VIRTIO_WIN_STABLE_URL"
+      note "  All released ISOs (pick a specific version): $VIRTIO_WIN_ARCHIVE_URL"
+      note "(drop it at $VIRTIO_WIN_FALLBACK_ISO, then re-run.)"
     else
       note "No recognized package manager with a virtio-win package detected."
-      note "The ISO will be downloaded from fedorapeople.org instead."
+      note "Download the ISO yourself from fedorapeople.org."
     fi
     if [[ -z "$_iso" ]]; then
-      local _dl=""
-      if have_cmd wget; then _dl=wget; elif have_cmd curl; then _dl=curl; fi
-      if [[ -n "$_dl" ]]; then
-        note "Downloading the stable virtio-win ISO from fedorapeople.org to $VIRTIO_WIN_FALLBACK_ISO ..."
-        if (( ! DRY_RUN )); then mkdir -p "$(dirname "$VIRTIO_WIN_FALLBACK_ISO")"; fi
-        if [[ "$_dl" == wget ]]; then
-          run wget -qO "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL" || true
-        else
-          run curl -fsSL -o "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL" || true
-        fi
-        if [[ -s "$VIRTIO_WIN_FALLBACK_ISO" ]]; then
-          _iso="$VIRTIO_WIN_FALLBACK_ISO"
-          say "Downloaded virtio-win ISO: $_iso"
-        fi
-      fi
-    fi
-    if [[ -z "$_iso" ]]; then
-      note "Could not obtain the virtio-win ISO automatically. Get it manually, then re-run:"
-      note "  Fedora/RHEL: sudo dnf install virtio-win"
-      note "  openSUSE:    sudo zypper in virtio-win"
-      note "  Any distro:  wget -O $VIRTIO_WIN_FALLBACK_ISO $VIRTIO_WIN_STABLE_URL"
+      note "Could not obtain the virtio-win ISO via a package. Download it yourself, then re-run:"
+      note "  Stable ISO:  wget -O $VIRTIO_WIN_FALLBACK_ISO $VIRTIO_WIN_STABLE_URL"
       note "  All released ISOs (pick a specific version): $VIRTIO_WIN_ARCHIVE_URL"
+      note "  Fedora/RHEL RPM (install the package manually): sudo rpm -iv virtio-win.noarch.rpm from $VIRTIO_WIN_RPM_URL"
       return 1
     fi
   fi

@@ -538,14 +538,43 @@ assert_contains_text \
   "R27 install_virtio_win_guest_agent zypper-installs virtio-win as fallback" \
   'zypper --non-interactive in virtio-win' \
   "$_vw_fn"
+# R30: on Fedora, virtio-win is NOT in the default repos — the script adds the
+# fedorapeople repo first, then `dnf install virtio-win` (the proven fix).
 assert_contains_text \
-  "R27 install_virtio_win_guest_agent wget-downloads the stable ISO" \
-  'wget -qO "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL"' \
+  "R30 adds the virtio-win repo on Fedora before dnf install" \
+  'curl -fsSL -o /etc/yum.repos.d/virtio-win.repo "$VIRTIO_WIN_REPO_URL"' \
   "$_vw_fn"
 assert_contains_text \
-  "R27 install_virtio_win_guest_agent curl-downloads the stable ISO" \
-  'curl -fsSL -o "$VIRTIO_WIN_FALLBACK_ISO" "$VIRTIO_WIN_STABLE_URL"' \
+  "R30 picks up a user-provided ISO at the fallback path" \
+  'Found virtio-win ISO (user-provided)' \
   "$_vw_fn"
+assert_contains_text \
+  "R30 points the operator to download the ISO themselves (no auto-download)" \
+  'Download it yourself' \
+  "$_vw_fn"
+# R30: the 270MB ISO auto-download was REMOVED. Negative assertion: neither
+# wget nor curl may download the ISO to VIRTIO_WIN_FALLBACK_ISO anymore.
+if printf '%s\n' "$_vw_fn" | grep -Fq 'wget -qO "$VIRTIO_WIN_FALLBACK_ISO"'; then
+  printf 'FAIL: R30 still auto-downloads the ISO via wget\n' >&2
+  record_failure "R30 does not auto-download the ISO via wget"
+else
+  printf 'PASS: R30 does not auto-download the ISO via wget\n'
+fi
+if printf '%s\n' "$_vw_fn" | grep -Fq 'curl -fsSL -o "$VIRTIO_WIN_FALLBACK_ISO"'; then
+  printf 'FAIL: R30 still auto-downloads the ISO via curl\n' >&2
+  record_failure "R30 does not auto-download the ISO via curl"
+else
+  printf 'PASS: R30 does not auto-download the ISO via curl\n'
+fi
+# R30 new constants.
+assert_contains_file \
+  "R30 VIRTIO_WIN_REPO_URL constant defined" \
+  'VIRTIO_WIN_REPO_URL="https://fedorapeople.org/groups/virt/virtio-win/virtio-win.repo"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R30 VIRTIO_WIN_RPM_URL constant defined" \
+  'VIRTIO_WIN_RPM_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm"' \
+  "$VFIO_SCRIPT"
 assert_contains_text \
   "R27 install_virtio_win_guest_agent attaches a cdrom disk" \
   "'device': 'cdrom'" \

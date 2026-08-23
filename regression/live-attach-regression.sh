@@ -750,6 +750,34 @@ assert_contains_text \
   'zypper install virtio-win failed' \
   "$_vw_fn"
 
+# --- R29: dynamic-binding RDNA4 rec wires the virtio-win ISO attach (opt-in + disclaimer) ---
+# install_dynamic_binding_from_existing_config must actually CALL install_virtio_win_guest_agent
+# as an opt-in (set-e-safe via `||`), not just print the flag string. It must be gated on
+# live-attach being active (the guest agent only helps the live-attach helper's guest-ping),
+# and include a DISCLAIMER that the ISO attach is host-side only (agent install is manual
+# inside Windows).
+_r29_sw_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R29 dynamic-setup rec calls install_virtio_win_guest_agent (opt-in, set-e-safe)" \
+  'install_virtio_win_guest_agent || {' \
+  "$_r29_sw_fn"
+assert_contains_text \
+  "R29 dynamic-setup rec gates the ISO attach on live-attach being active" \
+  'VFIO_DYNAMIC_LIVE_ATTACH="1"' \
+  "$_r29_sw_fn"
+assert_contains_text \
+  "R29 dynamic-setup rec includes the disclaimer (host-side ISO attach only)" \
+  'does NOT install the agent into Windows' \
+  "$_r29_sw_fn"
+assert_contains_text \
+  "R29 dynamic-setup rec notes the VM must be shut off for the attach" \
+  'VM MUST be shut off for the attach' \
+  "$_r29_sw_fn"
+assert_contains_text \
+  "R29 dynamic-setup rec notes the fixed-delay fallback still works" \
+  'delay fallback still works' \
+  "$_r29_sw_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

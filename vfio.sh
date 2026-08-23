@@ -15473,11 +15473,37 @@ install_dynamic_binding_from_existing_config() {
       note "Reversible at any time with: sudo $SCRIPT_NAME --install-dynamic-binding"
     fi
     note ""
-    note "Smart handoff (optional): install the virtio-win guest agent INSIDE Windows so the"
-    note "live-attach helper hot-attaches the GPU the MOMENT Windows is up (guest-ping) instead"
-    note "of after a blind fixed delay. Attach the driver ISO to your guest-GPU VM(s) with:"
-    note "  sudo $SCRIPT_NAME --install-virtio-win-guest-agent"
-    note "Driver ISO archive (all released versions): $VIRTIO_WIN_ARCHIVE_URL"
+    note "Smart handoff (optional): with the virtio-win guest agent installed INSIDE Windows,"
+    note "the live-attach helper hot-attaches the GPU the MOMENT Windows is up (guest-ping)"
+    note "instead of after a blind fixed delay (often ~15s vs the full 30s)."
+    note ""
+    # Only offer the ISO attach when live-attach is active (the guest agent only helps the
+    # live-attach helper's guest-ping poll). If live-attach is not set up, keep a text hint.
+    if [[ -f "$CONF_FILE" ]] && grep -q '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+      note "DISCLAIMER: this attaches the virtio-win driver ISO to your shut-off guest-GPU"
+      note "VM(s) as a CD-ROM (host-side). It does NOT install the agent into Windows — that"
+      note "step is manual: after the ISO is attached, start the VM, open the virtio-win CD in"
+      note "File Explorer, and run virtio-win-guest-tools.exe. Until you do that, the fixed-"
+      note "delay fallback still works, so nothing breaks. The VM MUST be shut off for the attach."
+      note "Driver ISO archive (all released versions): $VIRTIO_WIN_ARCHIVE_URL"
+      if prompt_yn "Attach the virtio-win driver ISO to your shut-off guest-GPU VM(s) now?" N "virtio-win guest agent"; then
+        # `||` so a soft-fail (no shut-off guest-GPU VM / ISO could not be obtained) does NOT
+        # trip `set -e` and abort the wizard. Hard prerequisites (missing conf / virsh /
+        # python3) call die, which is fatal by design.
+        install_virtio_win_guest_agent || {
+          note "virtio-win ISO attach did not complete (no shut-off guest-GPU VM found, or the"
+          note "ISO could not be obtained). Shut off the VM and re-run:"
+          note "  sudo $SCRIPT_NAME --install-virtio-win-guest-agent"
+        }
+      else
+        note "Skipping the virtio-win ISO attach for now. You can do it later with:"
+        note "  sudo $SCRIPT_NAME --install-virtio-win-guest-agent"
+      fi
+    else
+      note "This only helps once live-attach is set up. After enabling live-attach, attach the"
+      note "driver ISO with: sudo $SCRIPT_NAME --install-virtio-win-guest-agent"
+      note "Driver ISO archive (all released versions): $VIRTIO_WIN_ARCHIVE_URL"
+    fi
   fi
 }
 

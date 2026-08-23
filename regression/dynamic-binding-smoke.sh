@@ -2838,20 +2838,22 @@ if [[ -n "$_vw_py" ]]; then
 XEOF
   printf '%s\n' "$_vw_py" > "$vfake27/attach_iso.py"
 
-  # (a) First run: exit 0, adds a SATA cdrom on vdb with the ISO + readonly.
-  py_rc=0
-  python3 "$vfake27/attach_iso.py" "$_vm27" "$_iso27" || py_rc=$?
-  if (( py_rc == 0 )); then
+  # (a) First run: exit 0, adds a SATA cdrom on sda with the ISO + readonly.
+  # R32: the python picks a free sdX target (sda here, since the existing disk is vda virtio),
+  # not vdX — vdX is virtio-blk naming and causes a libvirt address collision on SATA.
+  pya=0
+  python3 "$vfake27/attach_iso.py" "$_vm27" "$_iso27" || pya=$?
+  if (( pya == 0 )); then
     ok "R27 python attach first run exits 0"
   else
-    bad "R27 python attach first run did not exit 0 (got $py_rc)"
+    bad "R27 python attach first run did not exit 0 (got $pya)"
   fi
   if grep -Fq 'device="cdrom"' "$_vm27" \
-    && grep -Fq 'dev="vdb"' "$_vm27" \
+    && grep -Fq 'dev="sda"' "$_vm27" \
     && grep -Fq 'bus="sata"' "$_vm27" \
     && grep -Fq 'virtio-win.iso' "$_vm27" \
     && grep -Fq 'readonly' "$_vm27"; then
-    ok "R27 python attach first run added a SATA cdrom (vdb) with the ISO + readonly"
+    ok "R27 python attach first run added a SATA cdrom (sda) with the ISO + readonly"
   else
     bad "R27 python attach first run did not add the expected SATA cdrom"
   fi
@@ -2865,19 +2867,21 @@ XEOF
     bad "R27 python attach second run did not exit 3 (got $py_rc2)"
   fi
 
-  # (c) No free vdX target (vda..vdz all used) -> exit 4.
+  # (c) No free sdX target (sda..sdz all used) -> exit 4.
+  # R32: the python picks a free sdX target for the SATA cdrom, so fill sd* (not vd*)
+  # to exhaust the sdX namespace and trigger exit 4.
   _vm27b="$vfake27/win11-full.xml"
   {
     echo "<domain type='kvm'><name>win11</name><devices>"
     for c in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
-      echo "<disk type='file' device='disk'><target dev='vd$c' bus='virtio'/></disk>"
+      echo "<disk type='file' device='disk'><target dev='sd$c' bus='sata'/></disk>"
     done
     echo "</devices></domain>"
   } > "$_vm27b"
   py_rc3=0
   python3 "$vfake27/attach_iso.py" "$_vm27b" "$_iso27" || py_rc3=$?
   if (( py_rc3 == 4 )); then
-    ok "R27 python attach exits 4 when no free vdX target (vda..vdz all used)"
+    ok "R27 python attach exits 4 when no free sdX target (sda..sdz all used)"
   else
     bad "R27 python attach did not exit 4 on no-free-target (got $py_rc3)"
   fi

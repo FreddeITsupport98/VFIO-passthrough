@@ -10427,15 +10427,18 @@ for d in devices.findall('disk'):
         src = d.find('source')
         if src is not None and src.get('file') == iso_path:
             sys.exit(3)
-# Find a free vdX target (vda..vdz).
+# Find a free sdX target (sda..sdz) for the SATA bus cdrom. The existing
+# disks may use sd* (SATA) or vd* (virtio); only sd* is valid for bus='sata'.
+# Using a vd* name on a SATA bus makes libvirt assign a colliding drive address
+# and reject the define ('duplicated address for disk ... sda').
 used = set()
 for d in devices.findall('disk'):
     tgt = d.find('target')
-    if tgt is not None and (tgt.get('dev','') or '').startswith('vd'):
+    if tgt is not None and (tgt.get('dev','') or '').startswith('sd'):
         used.add(tgt.get('dev'))
 _dev = None
 for c in string.ascii_lowercase:
-    cand = 'vd' + c
+    cand = 'sd' + c
     if cand not in used:
         _dev = cand
         break
@@ -10464,11 +10467,16 @@ PYEOF
       continue
     fi
     if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
+      local _define_rc=0
       if (( ! DRY_RUN )); then
-        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null
+        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null || _define_rc=$?
       fi
-      say "Attached virtio-win ISO to VM '$_dom' as a SATA CD-ROM."
-      _updated=1
+      if (( _define_rc != 0 )); then
+        note "ERROR: virsh define failed for '$_dom' (exit $_define_rc) — the ISO CD-ROM was NOT attached. Re-run --install-virtio-win-guest-agent."
+      else
+        say "Attached virtio-win ISO to VM '$_dom' as a SATA CD-ROM."
+        _updated=1
+      fi
     else
       note "WARN: virt-xml-validate failed for '$_dom'; skipping ISO attach."
     fi

@@ -830,6 +830,30 @@ assert_contains_text \
   'install_bind_script' \
   "$_r26_block"
 
+# --- R32: SATA cdrom target naming (sdX, not vdX) + guarded virsh define ---
+# BUG: the attach python picked a free vdX target (vda) for a SATA bus cdrom, but vdX is
+# virtio-blk naming — SATA bus requires sdX (sda, sdb, sdc...). Libvirt rejected the
+# define: 'duplicated address for disk with target name sda' (auto-assigned a colliding
+# SATA drive address to the invalid vda-on-SATA disk). The script then died on `set -e`
+# before printing 'Attached', so the operator saw no error and no cdrom. R32 fixes it:
+# the python now finds a free sdX target (sdc after the existing sda/sdb).
+assert_contains_text \
+  "R32 attach python uses sdX target naming for the SATA cdrom" \
+  "cand = 'sd' + c" \
+  "$_vw_fn"
+# Negative: the vdX target naming must be gone from the attach python.
+if printf '%s\n' "$_vw_fn" | grep -Fq "cand = 'vd' + c"; then
+  printf 'FAIL: R32 attach python still uses vdX target naming (causes libvirt address collision)\n' >&2
+  record_failure "R32 attach python does not use vdX target for SATA cdrom"
+else
+  printf 'PASS: R32 attach python does not use vdX target for SATA cdrom\n'
+fi
+# The virsh define must be guarded so a failure is reported, not silently aborted by set -e.
+assert_contains_text \
+  "R32 attach guards the virsh define (reports failure instead of aborting)" \
+  'virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null || _define_rc=$?' \
+  "$_vw_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

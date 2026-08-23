@@ -807,6 +807,29 @@ assert_contains_text \
   'delay fallback still works' \
   "$_r29_sw_fn"
 
+# --- R31: R26 idempotency path must regenerate the helper/hook/bind-script ---
+# BUG: the R26 'already active' early-return used to return 0 BEFORE
+# install_live_attach_helper, so a re-run on an already-active setup never
+# regenerated the helper on disk -> the helper stayed stale (pre-R27, no
+# _notify_desktop) and the hotplug-ready desktop notification never fired even
+# though the attach succeeded (observed live: journal showed 'GPU attached
+# successfully' but no notification popped). R31 fixes it: the already-active
+# path now regenerates the helper + hook + bind-script before returning.
+# Extract the R26 'already active' block and assert it deploys the helper.
+_r26_block="$(sed -n '/Live-attach is already active/,/return 0/p' <<<"$_la_fn")"
+assert_contains_text \
+  "R31 R26 already-active path regenerates the live-attach helper" \
+  'install_live_attach_helper' \
+  "$_r26_block"
+assert_contains_text \
+  "R31 R26 already-active path reinstalls the libvirt hook" \
+  'install_libvirt_hook' \
+  "$_r26_block"
+assert_contains_text \
+  "R31 R26 already-active path regenerates the bind script" \
+  'install_bind_script' \
+  "$_r26_block"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

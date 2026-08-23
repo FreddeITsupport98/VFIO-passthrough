@@ -10205,6 +10205,19 @@ PYEOF
       note "The VM(s) will start WITHOUT the GPU. After ${_delay_default}s the GPU is"
       note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
       note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU from the per-VM backup)"
+      # Still deploy the latest helper/hook/bind-script code even on a re-run of an
+      # already-active setup. The VM-XML surgery above was correctly skipped (the
+      # GPU hostdev was already stripped by the prior install), but these three
+      # are idempotent overwrites of generated scripts — safe to always run, and
+      # the ONLY way the operator gets helper code updates (e.g. the R27 hotplug-
+      # ready desktop notification) on a re-run instead of a stale helper on disk.
+      # Without this, a re-run that hit the idempotency path shipped an outdated
+      # helper (observed: pre-R27 helper with no _notify_desktop, so the GPU
+      # attached successfully but no desktop notification ever popped).
+      install_live_attach_helper
+      install_libvirt_hook
+      install_bind_script
+      say "Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)"
       return 0
     fi
     note "No shut-off VMs with the guest GPU found. Ensure the VM is shut off and has the GPU in its XML, then re-run."

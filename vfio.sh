@@ -18613,6 +18613,9 @@ verify_vbios_candidates() {
 _print_gpu_card_visual() {
   local _bdf="$1" _role="$2" _mode="${3:-early}"
   [[ -n "$_bdf" ]] || return 0
+  # Normalize to uppercase so the DYNAMIC comparisons below are case-insensitive
+  # (the conf stores lowercase "dynamic", but the wizard/CTX path uses DYNAMIC).
+  _mode="${_mode^^}"
   local _drv _name _bv _status _status_color _role_color _border_color _pad
   _drv="$(bdf_driver_name "$_bdf")"
   _bv="$(pci_boot_vga_flag "$_bdf")"
@@ -18699,6 +18702,14 @@ verify_setup() {
   # shellcheck disable=SC1090
   . "$CONF_FILE"
 
+  # Normalize the binding mode to uppercase so the DYNAMIC comparisons below
+  # work regardless of how the conf stored it (rewrite_conf_key writes lowercase
+  # "dynamic"/"early", but the wizard/CTX path uses uppercase DYNAMIC).
+  # Without this, --verify FAILS a dynamic setup because "dynamic" != "DYNAMIC".
+  VFIO_BINDING_MODE="${VFIO_BINDING_MODE:-early}"
+  VFIO_BINDING_MODE="${VFIO_BINDING_MODE^^}"
+  case "$VFIO_BINDING_MODE" in EARLY|DYNAMIC) ;; *) VFIO_BINDING_MODE="EARLY" ;; esac
+
   local ok=1
 
   say
@@ -18736,9 +18747,13 @@ verify_setup() {
     if [[ "$guest_drv" != "vfio-pci" ]]; then
       if [[ "${VFIO_BINDING_MODE:-early}" == "DYNAMIC" ]]; then
         if (( ENABLE_COLOR )); then
-          say "${C_GREEN}✔ OK${C_RESET}: Guest GPU $GUEST_GPU_BDF on host driver '$guest_drv' (dynamic binding — hook switches at VM start)"
+          local _la_note=""
+          if grep -q '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+            _la_note=" + live-attach (hotswap: VM starts without GPU, helper hot-attaches at VM start)"
+          fi
+          say "${C_GREEN}✔ OK${C_RESET}: Guest GPU $GUEST_GPU_BDF on host driver '$guest_drv' (dynamic binding — hook switches at VM start)$_la_note"
         else
-          say "OK: Guest GPU $GUEST_GPU_BDF on host driver '$guest_drv' (dynamic binding — hook switches at VM start)"
+          say "OK: Guest GPU $GUEST_GPU_BDF on host driver '$guest_drv' (dynamic binding — hook switches at VM start)$_la_note"
         fi
       else
         if (( ENABLE_COLOR )); then
@@ -18884,6 +18899,60 @@ verify_setup() {
         say "FAIL: Libvirt qemu hook entry missing: $LIBVIRT_HOOK_ENTRY"
       fi
       ok=0
+    fi
+  fi
+
+  # Live-attach (hotswap) artifact check: when VFIO_DYNAMIC_LIVE_ATTACH=1, the
+  # live-attach helper + VM list + GPU device XML must be present. The card is
+  # EXPECTED on amdgpu when no VM is running (the VM XML was stripped so the VM
+  # boots on a virtual display; the helper hot-attaches the GPU at VM start).
+  if [[ "$VFIO_BINDING_MODE" == "DYNAMIC" ]] && grep -q '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_CYAN}Live-attach (hotswap) check:${C_RESET}"
+    else
+      say "Live-attach (hotswap) check:"
+    fi
+    if [[ -x "$LIVE_ATTACH_HELPER" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: Live-attach helper present: $LIVE_ATTACH_HELPER"
+      else
+        say "OK: Live-attach helper present: $LIVE_ATTACH_HELPER"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_RED}✖ FAIL${C_RESET}: Live-attach helper missing: $LIVE_ATTACH_HELPER"
+      else
+        say "FAIL: Live-attach helper missing: $LIVE_ATTACH_HELPER"
+      fi
+      ok=0
+    fi
+    if [[ -s "$LIVE_ATTACH_VM_LIST" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: Live-attach VM list present: $LIVE_ATTACH_VM_LIST ($(grep -cve '^[[:space:]]*$' "$LIVE_ATTACH_VM_LIST" 2>/dev/null || echo 0) VM(s))"
+      else
+        say "OK: Live-attach VM list present: $LIVE_ATTACH_VM_LIST"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_RED}✖ FAIL${C_RESET}: Live-attach VM list missing or empty: $LIVE_ATTACH_VM_LIST"
+      else
+        say "FAIL: Live-attach VM list missing or empty: $LIVE_ATTACH_VM_LIST"
+      fi
+      ok=0
+    fi
+    if [[ -s "$LIVE_ATTACH_GPU_XML" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: Live-attach GPU device XML present: $LIVE_ATTACH_GPU_XML"
+      else
+        say "OK: Live-attach GPU device XML present: $LIVE_ATTACH_GPU_XML"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_YELLOW}WARN${C_RESET}: Live-attach GPU device XML missing: $LIVE_ATTACH_GPU_XML (re-run --install-live-attach with the VM shut off)"
+      else
+        say "WARN: Live-attach GPU device XML missing: $LIVE_ATTACH_GPU_XML"
+      fi
     fi
   fi
 

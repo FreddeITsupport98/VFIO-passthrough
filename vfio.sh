@@ -265,7 +265,7 @@ normalize_display_manager_name() {
   raw="${raw%.service}"
   raw="${raw,,}"
   case "$raw" in
-    lightdm|sddm|lxdm|xdm) printf '%s\n' "$raw"; return 0 ;;
+    lightdm|sddm|lxdm|xdm|plasmalogin) printf '%s\n' "$raw"; return 0 ;;
     gdm|gdm3) printf '%s\n' "gdm"; return 0 ;;
   esac
   return 1
@@ -289,6 +289,7 @@ detect_display_manager() {
       *gdm*) echo "gdm"; return 0;;
       *lxdm*) echo "lxdm"; return 0;;
       *xdm*) echo "xdm"; return 0;;
+      *plasmalogin*) echo "plasmalogin"; return 0;;
     esac
   fi
 
@@ -310,6 +311,7 @@ detect_display_manager() {
     if systemctl list-unit-files 2>/dev/null | grep -Eq '^gdm(3)?\.service'; then echo "gdm"; return 0; fi
     if systemctl list-unit-files 2>/dev/null | grep -q '^lxdm\.service'; then echo "lxdm"; return 0; fi
     if systemctl list-unit-files 2>/dev/null | grep -q '^xdm\.service'; then echo "xdm"; return 0; fi
+    if systemctl list-unit-files 2>/dev/null | grep -q '^plasmalogin\.service'; then echo "plasmalogin"; return 0; fi
   fi
 
   if have_cmd lightdm || [[ -d /etc/lightdm ]]; then echo "lightdm"; return 0; fi
@@ -317,6 +319,7 @@ detect_display_manager() {
   if have_cmd gdm || have_cmd gdm3 || [[ -d /etc/gdm || -d /etc/gdm3 ]]; then echo "gdm"; return 0; fi
   if have_cmd lxdm || [[ -d /etc/lxdm ]]; then echo "lxdm"; return 0; fi
   if have_cmd xdm || [[ -f /etc/X11/xdm/xdm-config ]]; then echo "xdm"; return 0; fi
+  if have_cmd plasmalogin || [[ -f /usr/lib/systemd/system/plasmalogin.service ]]; then echo "plasmalogin"; return 0; fi
 
   echo "none"
   return 1
@@ -338,7 +341,7 @@ display_manager_dependency_status() {
         echo "NOT_WORK"
       fi
       ;;
-    sddm|gdm|lxdm|xdm)
+    sddm|gdm|lxdm|xdm|plasmalogin)
       echo "WORKS"
       ;;
     none|"")
@@ -1399,7 +1402,7 @@ display_manager_dependency_preflight() {
     lightdm)
       lightdm_accountsservice_preflight
       ;;
-    sddm|gdm|lxdm|xdm)
+    sddm|gdm|lxdm|xdm|plasmalogin)
       say
       hdr "Display manager dependency preflight"
       note "Detected ${dm}; no LightDM-specific AccountsService fallback is required."
@@ -19338,7 +19341,7 @@ install_prelogin_x11_host_gpu_pinning_failsafe() {
       ;;
     AUTO)
       case "$dm" in
-        lightdm|sddm|lxdm|xdm)
+        lightdm|sddm|lxdm|xdm|plasmalogin)
           should_pin=1
           ;;
       esac

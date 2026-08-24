@@ -9939,6 +9939,11 @@ jlog "live-attach: binding GPU $GUEST_GPU_BDF to vfio-pci"
 # Capture the bind script real exit code BEFORE the negation, so the FAILED
 # message reports the actual exit code (not the negated status, which is
 # always 0 inside this branch — the old "rc=0" was meaningless).
+# IMPORTANT: pre-initialize _bind_rc=0. On a SUCCESSFUL bind the `||` branch
+# never runs, so _bind_rc would be unset — and with `set -u` the `(( ))` on
+# the next line then kills the helper SILENTLY before it ever reaches the
+# attach step (the swap never initiates). Pre-setting it to 0 fixes that.
+_bind_rc=0
 _bind_out="$("$BIND_SCRIPT" --bind-now 2>&1)" || _bind_rc=$?
 if (( _bind_rc != 0 )); then
   _rc="$_bind_rc"

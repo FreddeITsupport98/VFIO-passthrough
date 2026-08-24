@@ -9878,8 +9878,12 @@ fi
 # Capture the full output so a failure surfaces the REAL cause in the journal
 # (a swallowed stderr left us blind to a bind-script bug for an entire session).
 jlog "live-attach: binding GPU $GUEST_GPU_BDF to vfio-pci"
-if ! _bind_out="$("$BIND_SCRIPT" --bind-now 2>&1)"; then
-  _rc=$?
+# Capture the bind script real exit code BEFORE the negation, so the FAILED
+# message reports the actual exit code (not the negated status, which is
+# always 0 inside this branch — the old "rc=0" was meaningless).
+_bind_out="$("$BIND_SCRIPT" --bind-now 2>&1)" || _bind_rc=$?
+if (( _bind_rc != 0 )); then
+  _rc="$_bind_rc"
   jlog "live-attach: FAILED to bind GPU (rc=$_rc) — aborting attach"
   printf '%s\n' "$_bind_out" | while IFS= read -r _line; do
     [[ -n "$_line" ]] && jlog "live-attach: bind: $_line"

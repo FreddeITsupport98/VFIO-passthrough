@@ -442,11 +442,15 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R23 bash completion opts include --install-live-attach" \
-  '--install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning' \
+  '--install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 # R27 inserted --install-virtio-win-guest-agent between --install-live-attach and
 # --install-stealth-vm-tuning in the bash opts string, so the ordered pattern above
 # now includes that token (additive update; the R27 assertion below also covers it).
+# R33 inserted --menu between --install-virtio-win-guest-agent and --install-stealth-
+# vm-tuning, so both ordered bash-opts patterns above now include the --menu token too.
+# R34 inserted --install-self --uninstall-self between --menu and --install-stealth-vm-
+# tuning, so the ordered bash-opts patterns above now include those two tokens too.
 assert_contains_file \
   "R23 zsh completion includes --install-live-attach" \
   "'--install-live-attach[" \
@@ -639,7 +643,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 MODE comment lists install-virtio-win-guest-agent" \
-  'install-virtio-win-guest-agent | completion printers' \
+  'install-virtio-win-guest-agent | menu | install-self | uninstall-self | completion printers' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 usage help documents --install-virtio-win-guest-agent" \
@@ -655,12 +659,246 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 bash completion opts include --install-virtio-win-guest-agent" \
-  '--install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning' \
+  '--install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 zsh completion includes --install-virtio-win-guest-agent" \
   "'--install-virtio-win-guest-agent[" \
   "$VFIO_SCRIPT"
+
+# --- R33: interactive --menu installer mode (pick an action from a TUI menu) ---
+# --menu launches vfio_menu(): a whiptail TUI (select_from_list) + plain-text
+# fallback that loops back after each action, so the operator can configure /
+# switch binding / live-attach / virtio-win / stealth / verify / detect / reset
+# without running the whole wizard or remembering individual flags. The dispatch
+# requires root + writable-root in main() (preserves --menu across the sudo
+# re-exec that require_root performs); read-only actions run inside the menu.
+assert_contains_file \
+  "R33 vfio_menu function defined" \
+  'vfio_menu()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 parse_args handles --menu" \
+  '--menu)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 parse_args sets MODE=menu" \
+  'MODE="menu"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 MODE comment lists menu" \
+  'menu | install-self | uninstall-self | completion printers' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 main dispatch wires menu" \
+  '[[ "$MODE" == "menu" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 usage help documents --menu" \
+  'Interactive menu' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 usage one-liner includes --menu" \
+  '[--install-virtio-win-guest-agent] [--menu]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 fish completion includes --menu" \
+  'complete -c $cmd -l menu' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 bash completion opts include --menu" \
+  '--install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R33 zsh completion includes --menu" \
+  "'--menu[" \
+  "$VFIO_SCRIPT"
+_menu_fn="$(sed -n '/^vfio_menu()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R33 vfio_menu loops back after each action" \
+  'Returning to menu' \
+  "$_menu_fn"
+assert_contains_text \
+  "R33 vfio_menu offers a full-configure (wizard) option" \
+  'apply_configuration' \
+  "$_menu_fn"
+assert_contains_text \
+  "R33 vfio_menu dispatches dynamic binding" \
+  'install_dynamic_binding_from_existing_config' \
+  "$_menu_fn"
+assert_contains_text \
+  "R33 vfio_menu dispatches live-attach" \
+  'install_live_attach' \
+  "$_menu_fn"
+assert_contains_text \
+  "R33 vfio_menu dispatches verify (read-only)" \
+  'verify_setup' \
+  "$_menu_fn"
+assert_contains_text \
+  "R33 vfio_menu dispatches reset" \
+  'reset_vfio_all' \
+  "$_menu_fn"
+assert_contains_text \
+  "R33 vfio_menu has an Exit option" \
+  'Exiting vfio.sh menu.' \
+  "$_menu_fn"
+
+# --- R34: self-install (--install-self/--uninstall-self) + config pickup ---
+# --install-self copies this script to /usr/local/sbin/vfio.sh (on PATH) and
+# drops the fish/bash/zsh completions into their vendor auto-load dirs (no
+# 'source' needed). --uninstall-self removes both (separate from --reset).
+# maybe_pickup_leftover_conf: when $CONF_FILE is missing but a .bak.* exists,
+# offer to restore the SAME config + re-apply binding instead of re-running the
+# wizard. Called from preflight_existing_config_gate (wizard + --menu option 0).
+assert_contains_file \
+  "R34 SELF_INSTALL_BIN constant defined" \
+  'SELF_INSTALL_BIN="/usr/local/sbin/vfio.sh"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 FISH_COMPLETION_DIR constant defined" \
+  'FISH_COMPLETION_DIR="/usr/share/fish/vendor_completions.d"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 BASH_COMPLETION_DIR constant defined" \
+  'BASH_COMPLETION_DIR="/usr/share/bash-completion/completions"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 ZSH_COMPLETION_DIR constant defined" \
+  'ZSH_COMPLETION_DIR="/usr/share/zsh/site-functions"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 install_self function defined" \
+  'install_self()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 uninstall_self function defined" \
+  'uninstall_self()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 maybe_pickup_leftover_conf function defined" \
+  'maybe_pickup_leftover_conf()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 parse_args handles --install-self" \
+  '--install-self)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 parse_args sets MODE=install-self" \
+  'MODE="install-self"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 parse_args handles --uninstall-self" \
+  '--uninstall-self)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 parse_args sets MODE=uninstall-self" \
+  'MODE="uninstall-self"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 MODE comment lists install-self | uninstall-self" \
+  'menu | install-self | uninstall-self | completion printers' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 main dispatch wires install-self" \
+  '[[ "$MODE" == "install-self" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 main dispatch wires uninstall-self" \
+  '[[ "$MODE" == "uninstall-self" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 usage help documents --install-self" \
+  'Install this script to /usr/local/sbin/vfio.sh' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 usage one-liner includes --install-self/--uninstall-self" \
+  '[--install-self] [--uninstall-self]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 fish completion includes --install-self" \
+  'complete -c $cmd -l install-self' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 fish completion includes --uninstall-self" \
+  'complete -c $cmd -l uninstall-self' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 bash completion opts include --install-self --uninstall-self" \
+  '--menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R34 zsh completion includes --install-self" \
+  "'--install-self[" \
+  "$VFIO_SCRIPT"
+_self_fn="$(sed -n '/^install_self()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R34 install_self copies to SELF_INSTALL_BIN" \
+  'cp -a "$src" "$SELF_INSTALL_BIN"' \
+  "$_self_fn"
+assert_contains_text \
+  "R34 install_self chmods 0755" \
+  'chmod 0755 "$SELF_INSTALL_BIN"' \
+  "$_self_fn"
+assert_contains_text \
+  "R34 install_self has a same-file guard" \
+  '-ef "$SELF_INSTALL_BIN"' \
+  "$_self_fn"
+assert_contains_text \
+  "R34 install_self installs fish completion" \
+  'print_fish_completion >"$_fc"' \
+  "$_self_fn"
+assert_contains_text \
+  "R34 install_self installs bash completion" \
+  'print_bash_completion >"$_fc"' \
+  "$_self_fn"
+assert_contains_text \
+  "R34 install_self installs zsh completion" \
+  'print_zsh_completion >"$_fc"' \
+  "$_self_fn"
+_unself_fn="$(sed -n '/^uninstall_self()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R34 uninstall_self removes the installed script" \
+  'rm -f "$SELF_INSTALL_BIN"' \
+  "$_unself_fn"
+assert_contains_text \
+  "R34 uninstall_self prompts before removing" \
+  'prompt_yn "Uninstall the self-installed vfio.sh + completions now?"' \
+  "$_unself_fn"
+_pickup_fn="$(sed -n '/^maybe_pickup_leftover_conf()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R34 pickup globs newest conf backup" \
+  '"${CONF_FILE}".bak.*' \
+  "$_pickup_fn"
+assert_contains_text \
+  "R34 pickup reads guest GPU from backup without sourcing" \
+  '/^GUEST_GPU_BDF=/' \
+  "$_pickup_fn"
+assert_contains_text \
+  "R34 pickup restores the backup to CONF_FILE" \
+  'cp -a "$_bak" "$CONF_FILE"' \
+  "$_pickup_fn"
+assert_contains_text \
+  "R34 pickup re-applies dynamic binding" \
+  'install_dynamic_binding_from_existing_config' \
+  "$_pickup_fn"
+assert_contains_text \
+  "R34 pickup re-applies early binding" \
+  'install_early_binding_from_existing_config' \
+  "$_pickup_fn"
+assert_contains_text \
+  "R34 pickup prompts (default Y) to restore" \
+  'instead of re-running the wizard?" Y "Config pickup"' \
+  "$_pickup_fn"
+_preflight_fn="$(sed -n '/^preflight_existing_config_gate()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R34 preflight calls maybe_pickup_leftover_conf" \
+  'maybe_pickup_leftover_conf' \
+  "$_preflight_fn"
+_reset_fn2="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R34 reset hints at --uninstall-self" \
+  '--uninstall-self' \
+  "$_reset_fn2"
 
 # Hotplug-ready desktop notification in the live-attach helper heredoc.
 assert_contains_text \

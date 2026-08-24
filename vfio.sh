@@ -147,13 +147,22 @@ VIRTIO_WIN_REPO_URL="https://fedorapeople.org/groups/virt/virtio-win/virtio-win.
 # Stable virtio-win RPM (for the openSUSE manual-install fallback when zypper has no
 # matching repo): download it and `sudo rpm -iv virtio-win.noarch.rpm`.
 VIRTIO_WIN_RPM_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm"
+# Self-install: --install-self copies this script to a stable PATH location
+# (/usr/local/sbin, consistent with the other vfio-* helpers) AND drops the
+# shell completions into the vendor auto-load directories so they load with no
+# 'source' step. --uninstall-self removes both (separate from --reset, which
+# stays scoped to VFIO config). The repo copy is never touched.
+SELF_INSTALL_BIN="/usr/local/sbin/vfio.sh"
+FISH_COMPLETION_DIR="/usr/share/fish/vendor_completions.d"
+BASH_COMPLETION_DIR="/usr/share/bash-completion/completions"
+ZSH_COMPLETION_DIR="/usr/share/zsh/site-functions"
 
 DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | menu | install-self | uninstall-self | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -759,6 +768,9 @@ complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-live-attach -d 'Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay'
 complete -c $cmd -l install-virtio-win-guest-agent -d 'Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)'
+complete -c $cmd -l menu -d 'Interactive menu — pick what to do without running the whole wizard'
+complete -c $cmd -l install-self -d 'Install this script to /usr/local/sbin + shell completions (auto-load)'
+complete -c $cmd -l uninstall-self -d 'Remove the self-installed vfio.sh + completion files'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
 complete -c $cmd -l reset-stealth-vm-tuning -d 'Revert stealth/perf VM tuning from backup XML'
 complete -c $cmd -l verify -d 'Validate existing setup'
@@ -800,7 +812,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -858,6 +870,9 @@ _vfio_sh_complete() {
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-live-attach[Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay]' \\
     '--install-virtio-win-guest-agent[Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)]' \\
+    '--menu[Interactive menu — pick what to do without running the whole wizard]' \\
+    '--install-self[Install this script to /usr/local/sbin + shell completions (auto-load)]' \\
+    '--uninstall-self[Remove the self-installed vfio.sh + completion files]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
     '--reset-stealth-vm-tuning[Revert stealth/perf VM tuning from backup XML]' \\
     '--verify[Validate existing setup]' \\
@@ -1469,7 +1484,17 @@ prompt_yn() {
     else
       printf '%s [y/N] ' "$q" >"$out"
     fi
-    read -r ans <"$in" || return 1
+    if ! read -r ans <"$in" 2>/dev/null; then
+      # /dev/tty open/read failed (setsid, sudo without an allocated tty, CI):
+      # fall back to stdin/stderr so piped or redirected input still works.
+      if [[ "$in" == "/dev/tty" ]]; then
+        in="/dev/stdin"
+        out="/dev/stderr"
+        read -r ans <"$in" || return 1
+      else
+        return 1
+      fi
+    fi
     ans="${ans:-$def}"
     case "$ans" in
       y|Y) return 0;;
@@ -1481,7 +1506,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
@@ -1594,6 +1619,23 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   fixed delay. Resolves the ISO via the distro virtio-win package (dnf/zypper) or
                   downloads the stable ISO from fedorapeople.org. Requires --install-live-attach to
                   be run first. The fixed-delay FALLBACK still works until the agent is installed.
+  --menu
+                  Interactive menu — pick what to do without running the whole wizard or
+                  remembering individual flags. Options: full configure, switch dynamic/early
+                  binding, set up live-attach/hotswap, attach virtio-win guest-agent ISO,
+                  apply/revert stealth/perf VM tuning, verify, detect/health-check, reset,
+                  exit. Loops back after each action so you can do multiple things in one
+                  session. Requires root (most actions write to /etc).
+  --install-self
+                  Install this script to /usr/local/sbin/vfio.sh (so it is on PATH) AND drop the
+                  fish/bash/zsh completions into their vendor auto-load directories (so they load
+                  with no 'source' step). Idempotent: re-run anytime to update the installed copy
+                  + completions to the latest version. The repo copy is never touched. Requires
+                  root. Separate from --reset (VFIO config) and --uninstall-self.
+  --uninstall-self
+                  Remove the self-installed /usr/local/sbin/vfio.sh + the 3 completion files
+                  (our names only). Idempotent. Does NOT remove the VFIO config (use --reset for
+                  that) or your repo copy. Requires root.
   --install-stealth-vm-tuning
                    Re-apply/refresh stealth/perf VM XML tuning on detected guest-GPU VMs without
                    re-running the full wizard. Requires an existing $CONF_FILE and libvirt.
@@ -1832,6 +1874,15 @@ parse_args() {
         ;;
       --install-virtio-win-guest-agent)
         MODE="install-virtio-win-guest-agent"
+        ;;
+      --menu)
+        MODE="menu"
+        ;;
+      --install-self)
+        MODE="install-self"
+        ;;
+      --uninstall-self)
+        MODE="uninstall-self"
         ;;
       --reset-stealth-vm-tuning)
         MODE="reset-stealth-vm-tuning"
@@ -20046,6 +20097,7 @@ reset_vfio_all() {
   say
   say "Reset complete. Reboot recommended."
   note "If any devices are currently bound to vfio-pci, a reboot is the cleanest way to restore host drivers."
+  note "This removed VFIO config only. To also remove the self-installed vfio.sh + shell completions, run: sudo $SCRIPT_NAME --uninstall-self"
 
   # Snapshot-aware hint for openSUSE/Btrfs users: each snapshot has its own
   # /etc/kernel/cmdline. If you later roll back to an older snapshot that
@@ -20130,6 +20182,11 @@ preflight_existing_config_gate() {
       note "Continuing with existing config. (You can run: sudo bash vfio.sh --reset)"
     fi
   fi
+
+  # No live config here. If a prior run left a conf backup (e.g. after --reset
+  # removed the live conf, or a fresh repo clone onto a host that had VFIO
+  # before), offer to restore the SAME config instead of re-running the wizard.
+  maybe_pickup_leftover_conf
 }
 
 detect_system() {
@@ -21073,6 +21130,384 @@ apply_configuration() {
   say "  4) In your VM manager, passthrough the guest GPU and any selected guest audio PCI functions."
 }
 
+# Self-install: copy this script to /usr/local/sbin/vfio.sh (on PATH) and drop
+# the fish/bash/zsh completions into their vendor auto-load directories so they
+# load with no 'source' step. Idempotent: re-run to update the installed copy +
+# completions. Root + writable-root are enforced by the main() --install-self /
+# --uninstall-self dispatch (preserves the flag across the sudo re-exec). The
+# repo copy is never touched.
+install_self() {
+  hdr "Install vfio.sh to a stable PATH location"
+
+  # Resolve the source script we are installing. $0 may be a relative path
+  # (./vfio.sh) or an absolute one; canonicalize it. Refuse if it is not a
+  # regular readable file (e.g. piped via curl|bash has no file to copy).
+  local src
+  src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  if [[ ! -f "$src" || ! -r "$src" ]]; then
+    die "Cannot self-install: '$0' is not a regular readable file (self-install needs the script file on disk, not a pipe)."
+  fi
+
+  note "Source: $(_link "$src")"
+  note "Target: $(_link "$SELF_INSTALL_BIN")"
+
+  if (( DRY_RUN )); then
+    note "DRY-RUN: would copy $src -> $SELF_INSTALL_BIN (0755) and install 3 completion files"
+    return 0
+  fi
+
+  # Same-file guard: running the already-installed copy re-installs idempotently
+  # (refresh completions only) instead of cp-erroring "same file".
+  if [[ "$src" -ef "$SELF_INSTALL_BIN" ]]; then
+    note "Source is already the installed copy; refreshing completions only."
+  else
+    run mkdir -p "$(dirname "$SELF_INSTALL_BIN")"
+    if [[ -f "$SELF_INSTALL_BIN" ]]; then
+      backup_file "$SELF_INSTALL_BIN"
+    fi
+    run cp -a "$src" "$SELF_INSTALL_BIN"
+    run chmod 0755 "$SELF_INSTALL_BIN"
+    say "Installed: $(_link "$SELF_INSTALL_BIN")"
+  fi
+
+  # Install the 3 shell completions into the vendor auto-load directories so
+  # they load with no 'source' step. Idempotent: overwrite = update.
+  local _fc
+  run mkdir -p "$FISH_COMPLETION_DIR"
+  _fc="${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish"
+  print_fish_completion >"$_fc"
+  say "Installed fish completion: $(_link "$_fc")"
+
+  run mkdir -p "$BASH_COMPLETION_DIR"
+  _fc="${BASH_COMPLETION_DIR}/${SCRIPT_NAME}"
+  print_bash_completion >"$_fc"
+  say "Installed bash completion: $(_link "$_fc")"
+
+  run mkdir -p "$ZSH_COMPLETION_DIR"
+  _fc="${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}"
+  print_zsh_completion >"$_fc"
+  say "Installed zsh completion: $(_link "$_fc")"
+
+  say
+  say "Done. Next steps:"
+  say "  - vfio.sh is now on PATH via /usr/local/sbin (open a new shell or 'hash -r' / 'rehash')."
+  say "  - Fish/bash/zsh completions auto-load from the vendor dirs (no 'source' needed)."
+  say "  - Re-run anytime to update the installed copy + completions to the latest version."
+}
+
+# Uninstaller for the self-installed script + completions (separate from --reset,
+# which stays scoped to VFIO config). Removes only our 4 files (by name); never
+# touches the repo copy or the VFIO config.
+uninstall_self() {
+  hdr "Uninstall the self-installed vfio.sh"
+
+  local _found=0
+  if [[ -f "$SELF_INSTALL_BIN" ]] \
+    || [[ -f "${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish" ]] \
+    || [[ -f "${BASH_COMPLETION_DIR}/${SCRIPT_NAME}" ]] \
+    || [[ -f "${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}" ]]; then
+    _found=1
+  fi
+
+  if (( ! _found )); then
+    note "No self-installed vfio.sh or completion files found; nothing to uninstall."
+    note "(This does NOT touch the VFIO config — use --reset for that.)"
+    return 0
+  fi
+
+  note "This removes:"
+  note "  - $SELF_INSTALL_BIN"
+  note "  - ${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish"
+  note "  - ${BASH_COMPLETION_DIR}/${SCRIPT_NAME}"
+  note "  - ${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}"
+  note "It does NOT remove the VFIO config (use --reset) or your repo copy."
+
+  if ! prompt_yn "Uninstall the self-installed vfio.sh + completions now?" N "Uninstall self"; then
+    note "Uninstall cancelled."
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    note "DRY-RUN: would remove $SELF_INSTALL_BIN + 3 completion files"
+    return 0
+  fi
+
+  run rm -f "$SELF_INSTALL_BIN" \
+    "${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish" \
+    "${BASH_COMPLETION_DIR}/${SCRIPT_NAME}" \
+    "${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}"
+  say "Removed self-installed vfio.sh + completion files."
+  say
+  note "If vfio.sh was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
+  note "The VFIO config ($CONF_FILE) is untouched — use --reset to remove it."
+}
+
+# Config pickup: when the install wizard (or --menu option 0) starts and the
+# live $CONF_FILE is missing but a prior run left a $CONF_FILE.bak.<ts> backup
+# on disk (e.g. after --reset removed the live conf, or a fresh repo clone onto
+# a host that had VFIO before), offer to restore the SAME config (guest/host GPU
+# BDFs + binding mode) and re-apply the binding instead of re-running the whole
+# wizard. Self-gates: no-op unless MODE=install, $CONF_FILE missing, and a .bak
+# exists. Called from preflight_existing_config_gate. On a successful restore it
+# exits 0 so the wizard is skipped (the config is already re-applied).
+maybe_pickup_leftover_conf() {
+  [[ "${MODE:-install}" == "install" ]] || return 0
+  readable_file "$CONF_FILE" && return 0
+
+  # Newest backup first (mtime comparison). Globs sort lexically by default;
+  # the .bak.<RUN_TS> timestamps are YYYYmmdd-HHMMSS so lexical ~= time order,
+  # but prefer an explicit mtime comparison for robustness.
+  local _bak="" _f
+  for _f in "${CONF_FILE}".bak.*; do
+    [[ -f "$_f" ]] || continue
+    if [[ -z "$_bak" || "$_f" -nt "$_bak" ]]; then
+      _bak="$_f"
+    fi
+  done
+  [[ -n "$_bak" ]] || return 0
+
+  # One-line summary of what the backup contains (read without sourcing, same
+  # awk pattern used elsewhere in this script to read a quoted KEY="value" line).
+  local _gg _hg _bm _ts
+  _gg="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_bak" 2>/dev/null || true)"
+  _hg="$(awk -F= '/^HOST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_bak" 2>/dev/null || true)"
+  _bm="$(awk -F= '/^VFIO_BINDING_MODE=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_bak" 2>/dev/null || true)"
+  [[ -n "$_bm" ]] || _bm="early"
+  _ts="${_bak##*.bak.}"
+
+  say
+  hdr "Backed-up VFIO config found"
+  note "A previous $SCRIPT_NAME run left a config backup, but $CONF_FILE is missing."
+  note "Backup: $(_link "$_bak") (from $_ts)"
+  note "  Guest GPU:    ${_gg:-<missing>}"
+  note "  Host GPU:     ${_hg:-<missing>}"
+  note "  Binding mode: $_bm"
+
+  if ! prompt_yn "Restore this config (pick up the same GPU selection) instead of re-running the wizard?" Y "Config pickup"; then
+    note "Skipping pickup; continuing to the guided wizard."
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    note "DRY-RUN: would restore $_bak -> $CONF_FILE and re-apply $_bm binding"
+    return 0
+  fi
+
+  run cp -a "$_bak" "$CONF_FILE"
+  run chmod 0644 "$CONF_FILE"
+  say "Restored config: $(_link "$CONF_FILE")"
+
+  # Re-apply the binding so the bind script/hook/cmdline match the restored
+  # config (the switchers regenerate the bind script + sync cmdline without
+  # re-running the full wizard). Both already exist and check $CONF_FILE.
+  require_systemd
+  if [[ "$_bm" == "dynamic" ]]; then
+    say
+    note "Re-applying dynamic binding from the restored config..."
+    install_dynamic_binding_from_existing_config
+  else
+    say
+    note "Re-applying early binding from the restored config..."
+    install_early_binding_from_existing_config
+  fi
+  say
+  say "Config picked up. Verify with: sudo $SCRIPT_NAME --verify"
+  say "(Re-run --menu if you want to do more, e.g. enable live-attach.)"
+  # Skip the wizard: we just restored + re-applied everything it would have.
+  exit 0
+}
+
+# Interactive menu: pick what to do without running the whole wizard or
+# remembering individual flags. Uses select_from_list (whiptail TUI + plain-text
+# fallback), loops back after each action so the operator can do multiple things
+# in one session. Root + writable-root are enforced by the main() --menu dispatch
+# (most actions write to /etc; that also preserves --menu across the sudo re-exec
+# that require_root performs). Read-only actions (verify/detect) run inside.
+vfio_menu() {
+  local _menu_opts _choice _conf_present _bmode
+
+  while :; do
+    # Refresh each iteration so the header reflects state changes (e.g. after a
+    # reset removes $CONF_FILE, or after switching binding mode).
+    _conf_present="no"
+    readable_file "$CONF_FILE" && _conf_present="yes"
+    _bmode="none"
+    if readable_file "$CONF_FILE"; then
+      # Read without sourcing (avoids SC1090 + scope leaks); same awk pattern
+      # used elsewhere in this script to read a quoted KEY="value" conf line.
+      _bmode="$(awk -F= '/^VFIO_BINDING_MODE=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+      [[ -n "$_bmode" ]] || _bmode="none"
+    fi
+
+    _menu_opts=(
+      "Full configure (the guided wizard — pick GPUs, audio, binding mode)"
+      "Switch to dynamic binding (RX 9070 / RDNA4 recommended)"
+      "Switch to early binding (boot-time, classic)"
+      "Set up live-attach / hotswap (VM starts without GPU, then hot-attached)"
+      "Attach virtio-win guest-agent ISO (smart handoff via guest-ping)"
+      "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials)"
+      "Revert stealth/perf VM tuning (from backup XML)"
+      "Verify setup (read-only check)"
+      "Detect / health check (read-only report)"
+      "Reset everything (full cleanup, removes all VFIO config)"
+      "Install vfio.sh to /usr/local/sbin (+ shell completions)"
+      "Uninstall the self-installed vfio.sh (+ completions)"
+      "Exit menu"
+    )
+    say
+    hdr "vfio.sh menu"
+    note "Config present: $_conf_present | Binding mode: $_bmode"
+    note "Pick an action (or Exit to quit):"
+    _choice="$(select_from_list "What do you want to do?" "vfio.sh menu" "${_menu_opts[@]}")"
+    case "$_choice" in
+      0)
+        # Full configure — the existing wizard (mirrors the main() fallthrough).
+        say
+        note "Starting full guided configure..."
+        require_systemd
+        detect_system
+        user_selection
+        apply_configuration
+        ;;
+      1)
+        # Switch to dynamic binding.
+        say
+        note "Switching to dynamic binding..."
+        require_systemd
+        install_dynamic_binding_from_existing_config
+        ;;
+      2)
+        # Switch to early binding.
+        say
+        note "Switching to early binding..."
+        require_systemd
+        install_early_binding_from_existing_config
+        ;;
+      3)
+        # Set up live-attach / hotswap.
+        say
+        note "Setting up live-attach / hotswap..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 (Full configure) or option 2 (Switch to dynamic binding) first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; live-attach needs libvirt to modify VM XML."
+          if prompt_yn "Continue anyway?" N "Live-attach"; then
+            install_live_attach
+          fi
+        else
+          install_live_attach
+        fi
+        ;;
+      4)
+        # Attach virtio-win guest-agent ISO.
+        say
+        note "Attaching virtio-win guest-agent ISO..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 or 2 first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; virtio-win guest-agent setup needs libvirt to attach the ISO to VM XML."
+          if prompt_yn "Continue anyway?" N "virtio-win guest agent"; then
+            install_virtio_win_guest_agent
+          fi
+        else
+          install_virtio_win_guest_agent
+        fi
+        ;;
+      5)
+        # Apply stealth/perf VM tuning.
+        say
+        note "Applying stealth/perf VM tuning..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 or 2 first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; stealth/perf VM tuning needs libvirt to dump/define VM XML."
+          if prompt_yn "Continue anyway?" N "Stealth/perf VM tuning"; then
+            install_stealth_vm_tuning
+          fi
+        else
+          install_stealth_vm_tuning
+        fi
+        ;;
+      6)
+        # Revert stealth/perf VM tuning.
+        say
+        note "Reverting stealth/perf VM tuning..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 or 2 first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; stealth/perf VM revert needs libvirt to dump/define VM XML."
+          if prompt_yn "Continue anyway?" N "Revert stealth/perf VM tuning"; then
+            reset_stealth_vm_tuning
+          fi
+        else
+          reset_stealth_vm_tuning
+        fi
+        ;;
+      7)
+        # Verify setup (read-only).
+        say
+        note "Verifying setup..."
+        verify_setup
+        ;;
+      8)
+        # Detect / health check (read-only). Subshell isolates the conf source.
+        say
+        note "Running detect + health check..."
+        detect_existing_vfio_report
+        say
+        hdr "Health check"
+        (
+          if readable_file "$CONF_FILE"; then
+            # shellcheck disable=SC1090
+            . "$CONF_FILE"
+            audit_vfio_health "${GUEST_GPU_BDF:-}"
+          else
+            audit_vfio_health ""
+          fi
+        )
+        ;;
+      9)
+        # Reset everything.
+        say
+        note "Resetting everything..."
+        require_systemd
+        if prompt_yn "This will remove ALL VFIO config installed by this script. Continue?" N "Reset"; then
+          if confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
+            reset_vfio_all
+          else
+            note "Reset cancelled (confirmation phrase not provided)."
+          fi
+        else
+          note "Reset cancelled."
+        fi
+        ;;
+      10)
+        # Install vfio.sh to a stable PATH location + shell completions.
+        say
+        note "Installing vfio.sh to /usr/local/sbin + shell completions..."
+        install_self
+        ;;
+      11)
+        # Uninstall the self-installed vfio.sh + completions.
+        say
+        note "Uninstalling the self-installed vfio.sh + completions..."
+        uninstall_self
+        ;;
+      12)
+        # Exit.
+        say
+        say "Exiting vfio.sh menu."
+        return 0
+        ;;
+      *)
+        note "Invalid selection."
+        ;;
+    esac
+    say
+    note "Returning to menu..."
+  done
+}
+
 main() {
   # Ensure this helper is marked executable so it can be run as ./vfio.sh
   # even if the user originally invoked it via "sh vfio.sh" or similar.
@@ -21323,6 +21758,27 @@ main() {
       fi
     fi
     install_virtio_win_guest_agent
+    exit 0
+  fi
+
+  if [[ "$MODE" == "menu" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    vfio_menu
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-self" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    install_self
+    exit 0
+  fi
+
+  if [[ "$MODE" == "uninstall-self" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    uninstall_self
     exit 0
   fi
 

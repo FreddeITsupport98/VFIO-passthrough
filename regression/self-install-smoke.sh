@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# R34 smoke: self-install (--install-self) into a temp root + config-pickup
+# extraction. Needs root (the --install-self dispatch calls require_root).
+# Run: sudo bash regression/self-install-smoke.sh
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+VFIO_SCRIPT="$PROJECT_ROOT/vfio.sh"
+
+fail=0
+FAILED_ASSERTIONS=()
+ok() { printf 'SMOKE PASS: %s\n' "$1"; }
+bad() { printf 'SMOKE FAIL: %s\n' "$1" >&2; FAILED_ASSERTIONS+=("$1"); fail=1; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  printf 'self-install-smoke.sh needs root (the --install-self dispatch calls require_root).\n' >&2
+  printf 'Run: sudo bash %s\n' "$0" >&2
+  exit 77
+fi
+
+if [[ ! -f "$VFIO_SCRIPT" ]]; then
+  printf 'FAIL: missing vfio.sh at %s\n' "$VFIO_SCRIPT" >&2
+  exit 1
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# Copy + redirect the 4 path constants to a temp root so nothing touches the
+# real /usr/local/sbin or /usr/share/* completion dirs.
+cp "$VFIO_SCRIPT" "$tmp/vfio.sh"
+sed -i \
+  -e 's#SELF_INSTALL_BIN="/usr/local/sbin/vfio.sh"#SELF_INSTALL_BIN="'"$tmp"'/bin/vfio.sh"#' \
+  -e 's#FISH_COMPLETION_DIR="/usr/share/fish/vendor_completions.d"#FISH_COMPLETION_DIR="'"$tmp"'/fish"#' \
+  -e 's#BASH_COMPLETION_DIR="/usr/share/bash-completion/completions"#BASH_COMPLETION_DIR="'"$tmp"'/bash"#' \
+  -e 's#ZSH_COMPLETION_DIR="/usr/share/zsh/site-functions"#ZSH_COMPLETION_DIR="'"$tmp"'/zsh"#' \
+  "$tmp/vfio.sh"
+
+# (a) install-self: copies the temp script to $tmp/bin/vfio.sh + 3 completion files.
+if setsid bash "$tmp/vfio.sh" --install-self --no-tui >/tmp/self_smoke_a.out 2>&1 </dev/null; then
+  ok "R34 --install-self exits 0"
+else
+  bad "R34 --install-self did not exit 0 (see /tmp/self_smoke_a.out)"
+fi
+
+if [[ -f "$tmp/bin/vfio.sh" && -x "$tmp/bin/vfio.sh" ]]; then
+  ok "R34 installed copy exists and is executable"
+else
+  bad "R34 installed copy missing or not executable"
+fi
+
+if bash -n "$tmp/bin/vfio.sh"; then
+  ok "R34 installed copy bash -n OK"
+else
+  bad "R34 installed copy bash -n FAILED"
+fi
+
+# Completion files exist + content equals --print-*-completion from the ORIGINAL.
+fish_exp="$(bash "$VFIO_SCRIPT" --print-fish-completion 2>/dev/null || true)"
+bash_exp="$(bash "$VFIO_SCRIPT" --print-bash-completion 2>/dev/null || true)"
+zsh_exp="$(bash "$VFIO_SCRIPT" --print-zsh-completion 2>/dev/null || true)"
+fish_got="$(cat "$tmp/fish/vfio.sh.fish" 2>/dev/null || true)"
+bash_got="$(cat "$tmp/bash/vfio.sh" 2>/dev/null || true)"
+zsh_got="$(cat "$tmp/zsh/_vfio.sh" 2>/dev/null || true)"
+
+if [[ -f "$tmp/fish/vfio.sh.fish" ]]; then ok "R34 fish completion file exists"; else bad "R34 fish completion file missing"; fi
+if [[ -f "$tmp/bash/vfio.sh" ]]; then ok "R34 bash completion file exists"; else bad "R34 bash completion file missing"; fi
+if [[ -f "$tmp/zsh/_vfio.sh" ]]; then ok "R34 zsh completion file exists"; else bad "R34 zsh completion file missing"; fi
+if [[ "$fish_exp" == "$fish_got" ]]; then ok "R34 fish completion content matches --print-fish-completion"; else bad "R34 fish completion content mismatch"; fi
+if [[ "$bash_exp" == "$bash_got" ]]; then ok "R34 bash completion content matches --print-bash-completion"; else bad "R34 bash completion content mismatch"; fi
+if [[ "$zsh_exp" == "$zsh_got" ]]; then ok "R34 zsh completion content matches --print-zsh-completion"; else bad "R34 zsh completion content mismatch"; fi
+
+# (b) idempotent re-install: a backup of the prior installed copy is made.
+if setsid bash "$tmp/vfio.sh" --install-self --no-tui >/tmp/self_smoke_b.out 2>&1 </dev/null; then
+  ok "R34 --install-self re-run (idempotent) exits 0"
+else
+  bad "R34 --install-self re-run did not exit 0 (see /tmp/self_smoke_b.out)"
+fi
+# shellcheck disable=SC2012
+if ls "$tmp"/bin/vfio.sh.bak.* >/dev/null 2>&1; then
+  ok "R34 re-install created a backup of the prior installed copy"
+else
+  bad "R34 re-install did not create a backup"
+fi
+
+# (c) same-file re-install: running the INSTALLED copy re-installs idempotently
+#     (refresh completions only, no cp "same file" error).
+if setsid bash "$tmp/bin/vfio.sh" --install-self --no-tui >/tmp/self_smoke_c.out 2>&1 </dev/null; then
+  ok "R34 --install-self from the installed copy (same-file guard) exits 0"
+else
+  bad "R34 --install-self from installed copy did not exit 0 (see /tmp/self_smoke_c.out)"
+fi
+
+# (d) uninstall-self: removes the installed copy + 3 completion files.
+if setsid bash "$tmp/vfio.sh" --uninstall-self --no-tui >/tmp/self_smoke_d.out 2>&1 <<<'y'; then
+  ok "R34 --uninstall-self exits 0"
+else
+  bad "R34 --uninstall-self did not exit 0 (see /tmp/self_smoke_d.out)"
+fi
+if [[ ! -e "$tmp/bin/vfio.sh" ]]; then ok "R34 uninstall removed the installed copy"; else bad "R34 uninstall left the installed copy"; fi
+if [[ ! -e "$tmp/fish/vfio.sh.fish" ]]; then ok "R34 uninstall removed the fish completion"; else bad "R34 uninstall left the fish completion"; fi
+if [[ ! -e "$tmp/bash/vfio.sh" ]]; then ok "R34 uninstall removed the bash completion"; else bad "R34 uninstall left the bash completion"; fi
+if [[ ! -e "$tmp/zsh/_vfio.sh" ]]; then ok "R34 uninstall removed the zsh completion"; else bad "R34 uninstall left the zsh completion"; fi
+
+# (e) config pickup extraction: plant two fake conf .bak files and verify the
+#     glob+awk the pickup function uses selects the newest and extracts the
+#     right BDFs + binding mode (read without sourcing).
+pickup_conf="$tmp/vfio-gpu-passthrough.conf"
+bak1="$pickup_conf.bak.20260101-120000"
+bak2="$pickup_conf.bak.20260824-180000"  # newer
+cat >"$bak1" <<'XEOF'
+GUEST_GPU_BDF="0000:0e:00.0"
+HOST_GPU_BDF="0000:06:00.0"
+VFIO_BINDING_MODE="early"
+XEOF
+cat >"$bak2" <<'XEOF'
+GUEST_GPU_BDF="0000:0e:00.0"
+HOST_GPU_BDF="0000:06:00.0"
+VFIO_BINDING_MODE="dynamic"
+XEOF
+touch -d "2026-01-01 12:00:00" "$bak1"
+touch -d "2026-08-24 18:00:00" "$bak2"
+_newest=""
+for _f in "$pickup_conf".bak.*; do
+  [[ -f "$_f" ]] || continue
+  if [[ -z "$_newest" || "$_f" -nt "$_newest" ]]; then _newest="$_f"; fi
+done
+if [[ "$_newest" == "$bak2" ]]; then ok "R34 pickup glob picks the newest .bak"; else bad "R34 pickup glob did not pick the newest .bak"; fi
+_gg="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_newest")"
+_bm="$(awk -F= '/^VFIO_BINDING_MODE=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_newest")"
+if [[ "$_gg" == "0000:0e:00.0" ]]; then ok "R34 pickup awk extracts guest GPU BDF"; else bad "R34 pickup awk guest BDF mismatch (got $_gg)"; fi
+if [[ "$_bm" == "dynamic" ]]; then ok "R34 pickup awk extracts binding mode from newest backup"; else bad "R34 pickup awk binding mode mismatch (got $_bm)"; fi
+
+if (( fail != 0 )); then
+  printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
+  for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done
+  exit 1
+fi
+printf '\nSMOKE SUMMARY: PASS\n'

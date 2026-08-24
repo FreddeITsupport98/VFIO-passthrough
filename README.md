@@ -32,6 +32,8 @@
 - [SBR Phase-2 force-kill recovery (R24)](#sbr-phase-2-force-kill-recovery-r24)
 - [Park-keepalive monitor](#park-keepalive-monitor)
 - [Idempotency + the stale-helper fix (R26/R31)](#idempotency--the-stale-helper-fix-r26r31)
+- [Interactive installer menu (--menu)](#interactive-installer-menu)
+- [Self-install (--install-self / --uninstall-self) + config pickup](#self-install)
 - [Table of Contents](#table-of-contents)
 
 ## Table of Contents
@@ -55,6 +57,8 @@
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Command-line modes](#command-line-modes)
+- [Interactive installer menu (--menu)](#interactive-installer-menu)
+- [Self-install (--install-self / --uninstall-self) + config pickup](#self-install)
 - [Interactive wizard (default mode)](#interactive-wizard-default-mode)
 - [Verification and troubleshooting](#verification-and-troubleshooting)
 - [Safety model](#safety-model)
@@ -83,6 +87,10 @@ The script is designed to be **interactive, defensive and reversible**, so that 
 vfio 6.0 adds reliable passthrough for **RDNA4 / RX 9070** and other cards that hit the `Unknown PCI header type 127` reset bug, plus automatic Wayland render-device pinning so your host desktop no longer crashes when the VM starts. No BIOS visit required on a dual-GPU setup. **The practical headline: an RX 9070 passed through to a Windows guest now survives a soft reboot AND a hard kill of the VM** — reboot from the Start menu and the guest comes back to a live display with no host reboot, and `virsh destroy` / force-poweroff / a BSOD no longer drops the card into the `Unknown PCI header type 127` zombie state. See [Keeping the RX 9070 alive](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card) below.
 
 vfio 7.0 adds the **live-attach (hotplug GPU) workflow** as the recommended RDNA4 path: the VM starts WITHOUT the GPU (Windows boots on a virtual display), and after a short delay the GPU is bound to `vfio-pci` and hot-attached to the RUNNING VM — sidestepping the cold-attach-at-boot death entirely. A **virtio-win guest-agent installer** (`--install-virtio-win-guest-agent`) attaches the driver ISO so the helper's `guest-ping` poll hot-attaches the GPU the MOMENT Windows is up (~15s vs the blind 30s), and a **hotplug-ready desktop notification** pops when the GPU is ready to use. A **SBR Phase-2 force-kill recovery** (R24) re-enumerates a force-killed card (`virsh destroy` / BSOD) via Secondary Bus Reset so it's reusable without a host reboot, and a **park-keepalive monitor** proactively recovers a card that dies while parked between sessions. See [Live-attach (hotplug GPU) workflow](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path) below.
+
+An **interactive installer menu** (`--menu`) lets you pick any of those actions from a TUI menu — full configure, switch dynamic/early binding, set up live-attach/hotswap, attach the virtio-win guest-agent ISO, apply/revert stealth tuning, verify, detect, reset — without running the whole wizard or remembering individual flags, and it loops back after each action so you can do several things in one session. See [Interactive installer menu](#interactive-installer-menu).
+
+A **self-install** (`--install-self`) puts `vfio.sh` on PATH at `/usr/local/sbin/vfio.sh` and drops the fish/bash/zsh completions into their vendor auto-load directories (no `source` step), so you can run `vfio ...` from anywhere with working completions; `--uninstall-self` removes both. And on a fresh install, if a prior run left a `/etc/vfio-gpu-passthrough.conf.bak.<ts>` backup (e.g. after `--reset`, or cloning the repo onto a host that already had VFIO) but the live config is missing, the wizard now **detects the backup and offers to pick up the same config** (restore the guest/host GPU BDFs + binding mode and re-apply the binding) instead of re-running the whole wizard. See [Self-install](#self-install).
 
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
@@ -415,6 +423,16 @@ sudo ./vfio.sh --install-live-attach
 #   On Fedora, adds the fedorapeople virtio-win repo first, then dnf install.
 sudo ./vfio.sh --install-virtio-win-guest-agent
 
+# Interactive installer menu — pick what to do without running the whole
+#   wizard or remembering individual flags (full configure, switch binding
+#   mode, live-attach, virtio-win, stealth tuning, verify, detect, reset).
+sudo ./vfio.sh --menu
+
+# Install vfio.sh to /usr/local/sbin (on PATH) + shell completions (auto-load):
+sudo ./vfio.sh --install-self
+# Remove the self-installed copy + completions (separate from --reset):
+sudo ./vfio.sh --uninstall-self
+
 # Full cleanup / undo everything:
 sudo ./vfio.sh --reset
 ```
@@ -449,6 +467,8 @@ Rapid VM stop/start cycles (stopping the VM and starting it again within a few s
 ## Unreleased
 - No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
+- **R34**: added self-install + config pickup. `--install-self` copies this script to `/usr/local/sbin/vfio.sh` (on PATH) and drops the fish/bash/zsh completions into their vendor auto-load directories (`/usr/share/fish/vendor_completions.d`, `/usr/share/bash-completion/completions`, `/usr/share/zsh/site-functions`) so they load with no `source` step; idempotent (re-run to update), backs up any prior installed copy, has a same-file guard so running the installed copy refreshes completions only, dry-run aware. `--uninstall-self` removes the installed copy + the 3 completion files (our names only); idempotent; prompts before removing; does NOT touch the VFIO config (`--reset`) or the repo copy. `--reset` gained an additive hint pointing at `--uninstall-self`. New `maybe_pickup_leftover_conf()`: when the install wizard (or `--menu` Full configure) starts and `$CONF_FILE` is missing but a `$CONF_FILE.bak.<ts>` exists, it globs the newest backup, prints a summary (guest/host GPU BDFs + binding mode + ts), prompts (default Y) to restore, copies the backup to `$CONF_FILE`, and re-applies the binding via the existing dynamic/early switchers, then exits 0 so the wizard is skipped. Wired into `preflight_existing_config_gate`. Full CLI wiring (MODE comment, parse_args, usage one-liner + help, fish/bash/zsh completions, main dispatch) mirroring the R33 `--menu` pattern; two new `--menu` entries. Also hardened `prompt_yn` to fall back to stdin when `/dev/tty` is unusable (setsid / sudo without an allocated tty / CI). New `regression/self-install-smoke.sh` (temp-root install + idempotency + same-file guard + uninstall + pickup extraction; rc=0) and an R34 assertion block in `regression/live-attach-regression.sh`; updated the R23/R27/R33 contiguous-substring assertions for the new `--install-self --uninstall-self` / `| install-self | uninstall-self |` tokens.
+- **R33**: added an interactive installer menu (`--menu`) — launches `vfio_menu()`, a whiptail TUI (plain-text numbered fallback under `--no-tui` / no whiptail) that loops back after each action so you can configure / switch binding / live-attach / virtio-win / stealth / verify / detect / reset without running the whole wizard or remembering individual flags. The `--menu` dispatch requires root + writable-root in `main()` (preserves `--menu` across the sudo re-exec that `require_root` performs); each menu option dispatches to the same installer function the corresponding `--install-*` flag uses, with the same root / systemd / writable-root / libvirt / conf guards, so a menu action is equivalent to running that flag. The status header (config present + binding mode) refreshes each loop. Full CLI wiring (MODE comment, parse_args, usage one-liner + help, fish/bash/zsh completions, main dispatch). Extended `regression/live-attach-regression.sh` with an R33 assertion block (vfio_menu function + dispatch targets + loop-back + exit + full CLI/completion wiring) and updated the R23/R27 contiguous-substring assertions for the new `--menu` / `| menu |` tokens; updated `regression/dynamic-binding-smoke.sh` likewise.
 - Added a PCI device alive-check to the generated bind script (`--bind-now`) so a guest GPU that has fallen off the PCI bus (D3cold reset bug from rapid VM stop/start cycles, config space all 0xff) is no longer reported as a successful bind: the "already on vfio-pci" early-return and the post-bind verify now both read `vendor` sysfs and live `config` space, attempt a PCI function-level reset once if the card is dead, and on a still-dead card log + exit non-zero with an actionable "Unknown PCI header type 127, card needs a host reboot" message so libvirt aborts the VM start cleanly instead of qemu crashing. Success log now says `bound to vfio-pci (verified, alive)`.
 - Documented rapid VM stop/start guidance: rapid cycles can still drop the RX 9070 / RDNA4 off the bus (hardware/firmware), so the alive-check fails clean; a cooldown between stop and start and optional `VFIO_DYNAMIC_PCI_RESET="1"` reduce the chance of the card dying between cycles.
 - Added a rapid stop/start cooldown readiness probe to the generated bind script: on every VM stop (`--release`) the bind script records a timestamp to `/var/lib/vfio-dynamic/last-vm-stop.ts`, and on the next VM start (`--bind-now`) within `VFIO_DYNAMIC_COOLDOWN_SECONDS` (default 10s, `0` disables) of that stop, it ACTIVELY polls the card's liveness (vendor sysfs + live config space) until the card is alive OR the cooldown window expires — instead of a dumb fixed-time gate. A card that recovered early proceeds immediately; a card that is still dead after the window dies with an actionable "card needs a host reboot" message so libvirt aborts the VM start cleanly before any sysfs writes. This is the PROACTIVE complement to the reactive alive-check (Q3n) — it gives the card time to recover from a rapid stop/start D3cold exit and only fails if it does NOT recover. New conf key `VFIO_DYNAMIC_COOLDOWN_SECONDS` with a WHY note; keep it below `VFIO_HOOK_BIND_TIMEOUT` (default 20) so the probe cannot hit the hook deadline.
@@ -636,8 +656,54 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
+
+### Interactive installer menu
+
+`--menu` launches an interactive TUI menu (whiptail when available; plain-text numbered fallback under `--no-tui` or when whiptail is absent) so you can pick what to do without running the whole wizard or remembering individual flags. It **loops back after each action**, so you can do several things in one root session. Requires root (most actions write to `/etc`); the read-only actions (verify / detect) run inside the menu.
+
+Menu options:
+
+1. **Full configure** — the existing guided wizard (pick GPUs, audio, binding mode).
+2. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
+3. **Switch to early binding** — boot-time, classic.
+4. **Set up live-attach / hotswap** — VM starts without the GPU, then it is hot-attached.
+5. **Attach virtio-win guest-agent ISO** — smart handoff via `guest-ping`.
+6. **Apply stealth/perf VM tuning** — SMBIOS / CPU / NIC / disk serials.
+7. **Revert stealth/perf VM tuning** — from the backup XML.
+8. **Verify setup** — read-only check.
+9. **Detect / health check** — read-only report.
+10. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
+11. **Exit menu**.
+
+```fish path=null start=null
+sudo ./vfio.sh --menu
+```
+
+Each option dispatches to the **same installer function** the corresponding `--install-*` flag uses, with the same root / systemd / writable-root / libvirt / `$CONF_FILE` guards — so a menu action is equivalent to running that flag. The status header (config present + binding mode) refreshes on every loop, so it reflects changes after a reset or a binding-mode switch. ESC / Cancel exits the menu (same as the Exit option).
+
+### Self-install
+
+`--install-self` copies this script to `/usr/local/sbin/vfio.sh` (so it is on PATH, consistent with the other `vfio-*` helpers in `/usr/local/sbin`) and drops the fish/bash/zsh completions into their vendor auto-load directories (`/usr/share/fish/vendor_completions.d`, `/usr/share/bash-completion/completions`, `/usr/share/zsh/site-functions`) so they load with **no `source` step**. Idempotent — re-run anytime to update the installed copy + completions to the latest version. Requires root. The repo copy is never touched.
+
+`--uninstall-self` removes the installed `/usr/local/sbin/vfio.sh` + the 3 completion files (our names only). Idempotent. It does **not** remove the VFIO config (use `--reset` for that) or your repo copy. `--reset` prints a hint pointing at `--uninstall-self` but does not auto-remove the self-installed script (reset stays scoped to VFIO config).
+
+```fish path=null start=null
+sudo ./vfio.sh --install-self      # install to /usr/local/sbin + auto-load completions
+sudo ./vfio.sh --uninstall-self    # remove the self-installed copy + completions
+```
+
+#### Config pickup (restore the same config from a leftover backup)
+
+When you start the install wizard (or pick **Full configure** in `--menu`) and the live `$CONF_FILE` is **missing** but a prior run left a `/etc/vfio-gpu-passthrough.conf.bak.<ts>` backup on disk (e.g. after `--reset` removed the live conf, or you cloned this repo onto a host that already had VFIO configured), the wizard now detects the newest backup and offers to **pick up the same config** instead of re-running the whole GPU picker:
+
+- it prints a one-line summary (guest GPU BDF, host GPU BDF, binding mode, backup timestamp);
+- prompts (default **Y**) to restore it;
+- on Yes, copies the backup to `$CONF_FILE` and re-applies the binding (`--install-dynamic-binding` if `VFIO_BINDING_MODE=dynamic`, else `--install-early-binding`) so the bind script / hook / cmdline match the restored config;
+- then exits — the wizard is skipped because the config is already re-applied. Verify with `sudo vfio.sh --verify`.
+
+This wires into the existing preflight gate, so it covers both the default wizard and `--menu` → Full configure. On No, it continues to the guided wizard as before.
 
 ### Common flags
 

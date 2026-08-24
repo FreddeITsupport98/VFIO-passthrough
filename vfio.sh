@@ -9975,6 +9975,12 @@ if ! [[ "$_la_timeout" =~ ^[0-9]+$ ]] || (( 10#$_la_timeout < 10 )); then
 fi
 if [[ -s "$GPU_XML" ]]; then
   jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live (timeout ${_la_timeout}s)"
+  # Best-effort detach FIRST: a rapid stop/start can leave a stale vfio lock
+  # (the kernel still thinks the device is owned by the previous qemu process),
+  # which makes attach-device fail with "device used by QEMU / driver". A
+  # detach-device --live clears that stale lock (no-op if the device isn't
+  # attached — the || true swallows the error). Then attach cleanly.
+  timeout "$_la_timeout" virsh -c qemu:///system detach-device "$DOMAIN" "$GPU_XML" --live >/dev/null 2>&1 || true
   if timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
     jlog "live-attach: GPU attached successfully to '$DOMAIN'"
     _notify_desktop "GPU hot-plug ready" "The GPU has been hot-attached to VM '$DOMAIN' — ready to use." normal
@@ -9997,6 +10003,7 @@ fi
 # Step 3: hot-attach the audio function (if configured and XML is non-empty).
 if [[ -s "$AUDIO_XML" ]]; then
   jlog "live-attach: attaching audio to domain '$DOMAIN'"
+  timeout "$_la_timeout" virsh -c qemu:///system detach-device "$DOMAIN" "$AUDIO_XML" --live >/dev/null 2>&1 || true
   timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
     jlog "live-attach: WARN audio attach failed or timed out (non-fatal)"
 fi

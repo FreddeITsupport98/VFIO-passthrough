@@ -744,7 +744,7 @@ assert_contains_text \
   "$_menu_fn"
 
 # --- R34: self-install (--install-self/--uninstall-self) + config pickup ---
-# --install-self copies this script to /usr/local/sbin/vfio.sh (on PATH) and
+# --install-self copies this script to /usr/local/bin/vfio (on PATH as vfio) and
 # drops the fish/bash/zsh completions into their vendor auto-load dirs (no
 # 'source' needed). --uninstall-self removes both (separate from --reset).
 # maybe_pickup_leftover_conf: when $CONF_FILE is missing but a .bak.* exists,
@@ -752,7 +752,7 @@ assert_contains_text \
 # wizard. Called from preflight_existing_config_gate (wizard + --menu option 0).
 assert_contains_file \
   "R34 SELF_INSTALL_BIN constant defined" \
-  'SELF_INSTALL_BIN="/usr/local/sbin/vfio.sh"' \
+  'SELF_INSTALL_BIN="/usr/local/bin/vfio"' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R34 FISH_COMPLETION_DIR constant defined" \
@@ -808,7 +808,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R34 usage help documents --install-self" \
-  'Install this script to /usr/local/sbin/vfio.sh' \
+  'Install this script to /usr/local/bin/vfio' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R34 usage one-liner includes --install-self/--uninstall-self" \
@@ -862,7 +862,7 @@ assert_contains_text \
   "$_unself_fn"
 assert_contains_text \
   "R34 uninstall_self prompts before removing" \
-  'prompt_yn "Uninstall the self-installed vfio.sh + completions now?"' \
+  'prompt_yn "Uninstall the self-installed vfio + completions now?"' \
   "$_unself_fn"
 _pickup_fn="$(sed -n '/^maybe_pickup_leftover_conf()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \

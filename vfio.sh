@@ -147,12 +147,13 @@ VIRTIO_WIN_REPO_URL="https://fedorapeople.org/groups/virt/virtio-win/virtio-win.
 # Stable virtio-win RPM (for the openSUSE manual-install fallback when zypper has no
 # matching repo): download it and `sudo rpm -iv virtio-win.noarch.rpm`.
 VIRTIO_WIN_RPM_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm"
-# Self-install: --install-self copies this script to a stable PATH location
-# (/usr/local/sbin, consistent with the other vfio-* helpers) AND drops the
+# Self-install: --install-self copies this script to /usr/local/bin/vfio (on
+# PATH for both root and users; the generated boot-time helpers stay in
+# /usr/local/sbin) and drops the
 # shell completions into the vendor auto-load directories so they load with no
 # 'source' step. --uninstall-self removes both (separate from --reset, which
 # stays scoped to VFIO config). The repo copy is never touched.
-SELF_INSTALL_BIN="/usr/local/sbin/vfio.sh"
+SELF_INSTALL_BIN="/usr/local/bin/vfio"
 FISH_COMPLETION_DIR="/usr/share/fish/vendor_completions.d"
 BASH_COMPLETION_DIR="/usr/share/bash-completion/completions"
 ZSH_COMPLETION_DIR="/usr/share/zsh/site-functions"
@@ -1627,13 +1628,13 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   exit. Loops back after each action so you can do multiple things in one
                   session. Requires root (most actions write to /etc).
   --install-self
-                  Install this script to /usr/local/sbin/vfio.sh (so it is on PATH) AND drop the
+                  Install this script to /usr/local/bin/vfio (so it is on PATH as the vfio command) AND drop the
                   fish/bash/zsh completions into their vendor auto-load directories (so they load
                   with no 'source' step). Idempotent: re-run anytime to update the installed copy
                   + completions to the latest version. The repo copy is never touched. Requires
                   root. Separate from --reset (VFIO config) and --uninstall-self.
   --uninstall-self
-                  Remove the self-installed /usr/local/sbin/vfio.sh + the 3 completion files
+                  Remove the self-installed /usr/local/bin/vfio + the 3 completion files
                   (our names only). Idempotent. Does NOT remove the VFIO config (use --reset for
                   that) or your repo copy. Requires root.
   --install-stealth-vm-tuning
@@ -21130,14 +21131,14 @@ apply_configuration() {
   say "  4) In your VM manager, passthrough the guest GPU and any selected guest audio PCI functions."
 }
 
-# Self-install: copy this script to /usr/local/sbin/vfio.sh (on PATH) and drop
+# Self-install: copy this script to /usr/local/bin/vfio (on PATH as the vfio command) and drop
 # the fish/bash/zsh completions into their vendor auto-load directories so they
 # load with no 'source' step. Idempotent: re-run to update the installed copy +
 # completions. Root + writable-root are enforced by the main() --install-self /
 # --uninstall-self dispatch (preserves the flag across the sudo re-exec). The
 # repo copy is never touched.
 install_self() {
-  hdr "Install vfio.sh to a stable PATH location"
+  hdr "Install vfio to a stable PATH location (/usr/local/bin/vfio)"
 
   # Resolve the source script we are installing. $0 may be a relative path
   # (./vfio.sh) or an absolute one; canonicalize it. Refuse if it is not a
@@ -21152,7 +21153,7 @@ install_self() {
   note "Target: $(_link "$SELF_INSTALL_BIN")"
 
   if (( DRY_RUN )); then
-    note "DRY-RUN: would copy $src -> $SELF_INSTALL_BIN (0755) and install 3 completion files"
+    note "DRY-RUN: would copy $src -> $SELF_INSTALL_BIN (0755) and install 3 completion files (command name: $(basename "$SELF_INSTALL_BIN"))"
     return 0
   fi
 
@@ -21172,25 +21173,35 @@ install_self() {
 
   # Install the 3 shell completions into the vendor auto-load directories so
   # they load with no 'source' step. Idempotent: overwrite = update.
-  local _fc
+  # The completions must target the INSTALLED command name (basename of
+  # SELF_INSTALL_BIN = "vfio"), not the source script name (vfio.sh), and the
+  # completion FILE names must match what fish/bash/zsh look up by command
+  # name. print_*_completion read $SCRIPT_NAME, so override it locally here.
+  local _fc _installed_cmd _saved_script_name
+  _installed_cmd="$(basename "$SELF_INSTALL_BIN")"
+  _saved_script_name="$SCRIPT_NAME"
+  SCRIPT_NAME="$_installed_cmd"
+
   run mkdir -p "$FISH_COMPLETION_DIR"
-  _fc="${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish"
+  _fc="${FISH_COMPLETION_DIR}/${_installed_cmd}.fish"
   print_fish_completion >"$_fc"
   say "Installed fish completion: $(_link "$_fc")"
 
   run mkdir -p "$BASH_COMPLETION_DIR"
-  _fc="${BASH_COMPLETION_DIR}/${SCRIPT_NAME}"
+  _fc="${BASH_COMPLETION_DIR}/${_installed_cmd}"
   print_bash_completion >"$_fc"
   say "Installed bash completion: $(_link "$_fc")"
 
   run mkdir -p "$ZSH_COMPLETION_DIR"
-  _fc="${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}"
+  _fc="${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
   print_zsh_completion >"$_fc"
   say "Installed zsh completion: $(_link "$_fc")"
 
+  SCRIPT_NAME="$_saved_script_name"
+
   say
   say "Done. Next steps:"
-  say "  - vfio.sh is now on PATH via /usr/local/sbin (open a new shell or 'hash -r' / 'rehash')."
+  say "  - vfio is now on PATH as $(basename "$SELF_INSTALL_BIN") (open a new shell or 'hash -r' / 'rehash')."
   say "  - Fish/bash/zsh completions auto-load from the vendor dirs (no 'source' needed)."
   say "  - Re-run anytime to update the installed copy + completions to the latest version."
 }
@@ -21199,30 +21210,33 @@ install_self() {
 # which stays scoped to VFIO config). Removes only our 4 files (by name); never
 # touches the repo copy or the VFIO config.
 uninstall_self() {
-  hdr "Uninstall the self-installed vfio.sh"
+  hdr "Uninstall the self-installed vfio"
 
-  local _found=0
+  # Completion files are filed by the INSTALLED command name (basename of
+  # SELF_INSTALL_BIN = "vfio"), not the source script name (vfio.sh).
+  local _found=0 _installed_cmd
+  _installed_cmd="$(basename "$SELF_INSTALL_BIN")"
   if [[ -f "$SELF_INSTALL_BIN" ]] \
-    || [[ -f "${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish" ]] \
-    || [[ -f "${BASH_COMPLETION_DIR}/${SCRIPT_NAME}" ]] \
-    || [[ -f "${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}" ]]; then
+    || [[ -f "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" ]] \
+    || [[ -f "${BASH_COMPLETION_DIR}/${_installed_cmd}" ]] \
+    || [[ -f "${ZSH_COMPLETION_DIR}/_${_installed_cmd}" ]]; then
     _found=1
   fi
 
   if (( ! _found )); then
-    note "No self-installed vfio.sh or completion files found; nothing to uninstall."
+    note "No self-installed vfio or completion files found; nothing to uninstall."
     note "(This does NOT touch the VFIO config — use --reset for that.)"
     return 0
   fi
 
   note "This removes:"
   note "  - $SELF_INSTALL_BIN"
-  note "  - ${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish"
-  note "  - ${BASH_COMPLETION_DIR}/${SCRIPT_NAME}"
-  note "  - ${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}"
+  note "  - ${FISH_COMPLETION_DIR}/${_installed_cmd}.fish"
+  note "  - ${BASH_COMPLETION_DIR}/${_installed_cmd}"
+  note "  - ${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
   note "It does NOT remove the VFIO config (use --reset) or your repo copy."
 
-  if ! prompt_yn "Uninstall the self-installed vfio.sh + completions now?" N "Uninstall self"; then
+  if ! prompt_yn "Uninstall the self-installed vfio + completions now?" N "Uninstall self"; then
     note "Uninstall cancelled."
     return 0
   fi
@@ -21233,12 +21247,12 @@ uninstall_self() {
   fi
 
   run rm -f "$SELF_INSTALL_BIN" \
-    "${FISH_COMPLETION_DIR}/${SCRIPT_NAME}.fish" \
-    "${BASH_COMPLETION_DIR}/${SCRIPT_NAME}" \
-    "${ZSH_COMPLETION_DIR}/_${SCRIPT_NAME}"
-  say "Removed self-installed vfio.sh + completion files."
+    "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" \
+    "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
+    "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+  say "Removed self-installed vfio + completion files."
   say
-  note "If vfio.sh was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
+  note "If vfio was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
   note "The VFIO config ($CONF_FILE) is untouched — use --reset to remove it."
 }
 
@@ -21350,8 +21364,8 @@ vfio_menu() {
       "Verify setup (read-only check)"
       "Detect / health check (read-only report)"
       "Reset everything (full cleanup, removes all VFIO config)"
-      "Install vfio.sh to /usr/local/sbin (+ shell completions)"
-      "Uninstall the self-installed vfio.sh (+ completions)"
+      "Install vfio to /usr/local/bin (+ shell completions)"
+      "Uninstall the self-installed vfio (+ completions)"
       "Exit menu"
     )
     say

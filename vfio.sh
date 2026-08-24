@@ -1509,6 +1509,11 @@ usage() {
   cat <<EOF
 Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
+  With NO arguments: launches the interactive menu (same as --menu) — pick an
+  action (full configure, switch binding, live-attach, verify, reset, …).
+  The full guided wizard is menu option 1 (Full configure), or run any
+  --install-* flag below to do one thing directly.
+
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
   --no-tui          Force plain-text prompts even if whiptail is installed.
@@ -1622,10 +1627,11 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   be run first. The fixed-delay FALLBACK still works until the agent is installed.
   --menu
                   Interactive menu — pick what to do without running the whole wizard or
-                  remembering individual flags. Options: full configure, switch dynamic/early
-                  binding, set up live-attach/hotswap, attach virtio-win guest-agent ISO,
-                  apply/revert stealth/perf VM tuning, verify, detect/health-check, reset,
-                  exit. Loops back after each action so you can do multiple things in one
+                  remembering individual flags. This is also the default when you run vfio
+                  with NO arguments. Options: full configure, switch dynamic/early binding,
+                  set up live-attach/hotswap, attach virtio-win guest-agent ISO, apply/revert
+                  stealth/perf VM tuning, verify, detect/health-check, reset, install/uninstall
+                  vfio, exit. Loops back after each action so you can do multiple things in one
                   session. Requires root (most actions write to /etc).
   --install-self
                   Install this script to /usr/local/bin/vfio (so it is on PATH as the vfio command) AND drop the
@@ -21530,6 +21536,12 @@ main() {
     chmod +x "$0" 2>/dev/null || true
   fi
 
+  # Capture the original argument count before parse_args so we can detect a
+  # bare invocation (no flags at all) and route it to the interactive menu
+  # instead of auto-running the full wizard. parse_args shifts its own copy;
+  # main's "$@" is unchanged after it returns, but capture upfront for clarity.
+  local _VFIO_ORIG_ARGC=$#
+
   parse_args "$@"
 
   if [[ "$MODE" == "print-fish-completion" ]]; then
@@ -21824,6 +21836,16 @@ main() {
 
   if [[ "$MODE" == "usb-mitigation-status" ]]; then
     usb_bt_mitigation_status
+    exit 0
+  fi
+
+  # No-arguments default: launch the interactive menu instead of auto-running
+  # the full wizard. The full wizard is still reachable via menu option 0
+  # (Full configure) or any --install-* flag. Matches the R33/R34 menu-first UX.
+  if [[ "$MODE" == "install" && "${_VFIO_ORIG_ARGC:-0}" -eq 0 ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    vfio_menu
     exit 0
   fi
 

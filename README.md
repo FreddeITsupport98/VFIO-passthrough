@@ -645,15 +645,17 @@ On first run it will:
 1. Ensure required commands are available.
 2. Ensure it is running as root and under systemd.
 3. Run a **preflight check** for existing VFIO/passthrough configuration.
-4. Launch an **interactive wizard** to select GPUs and audio devices and apply the configuration.
+4. Launch the **interactive menu** — pick **Full configure** for the guided wizard (select GPUs + audio + binding mode), or any other action.
 
 Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directories, GRUB configs, and run kernel tools.
+
+> **Tip:** run `sudo ./vfio.sh --install-self` once to install the `vfio` command on PATH (`/usr/local/bin/vfio`) with auto-loading shell completions. After that, bare `sudo vfio` (no args) launches the interactive menu — type `vfio --<TAB>` to see all flags.
 
 ---
 
 ## Command‑line modes
 
-The script supports several modes controlled by flags. By default, without any flag, it runs the **interactive installer**.
+The script supports several modes controlled by flags. By default, with **no flag** it launches the **interactive menu** (`--menu`) — pick an action (full configure, switch binding, live-attach, verify, reset, install/uninstall `vfio`, …). The full guided wizard is menu option 1 (Full configure); or run any `--install-*` flag below to do one thing directly.
 
 ```text
 ./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
@@ -661,7 +663,7 @@ The script supports several modes controlled by flags. By default, without any f
 
 ### Interactive installer menu
 
-`--menu` launches an interactive TUI menu (whiptail when available; plain-text numbered fallback under `--no-tui` or when whiptail is absent) so you can pick what to do without running the whole wizard or remembering individual flags. It **loops back after each action**, so you can do several things in one root session. Requires root (most actions write to `/etc`); the read-only actions (verify / detect) run inside the menu.
+`--menu` launches an interactive TUI menu (whiptail when available; plain-text numbered fallback under `--no-tui` or when whiptail is absent) so you can pick what to do without running the whole wizard or remembering individual flags. It **loops back after each action**, so you can do several things in one root session. Requires root (most actions write to `/etc`); the read-only actions (verify / detect) run inside the menu. Running `vfio` (or `./vfio.sh`) with **no arguments** also launches this menu — it is the default.
 
 Menu options:
 
@@ -675,7 +677,9 @@ Menu options:
 8. **Verify setup** — read-only check.
 9. **Detect / health check** — read-only report.
 10. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
-11. **Exit menu**.
+11. **Install vfio** to /usr/local/bin (+ shell completions).
+12. **Uninstall the self-installed vfio** (+ completions).
+13. **Exit menu**.
 
 ```fish path=null start=null
 sudo ./vfio.sh --menu

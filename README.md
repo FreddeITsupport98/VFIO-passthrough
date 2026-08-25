@@ -335,6 +335,13 @@ vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning ins
 
 **Live-attach aware**: the tuner detects a guest-GPU VM by the GPU PCI hostdev in its XML **or** by membership in the live-attach VM list (`/var/lib/vfio-dynamic/live-attach-vms`). Live-attach strips the GPU hostdev from the persistent XML so the VM can boot without the GPU and hot-attach it later — so a hostdev-only check would miss an already-live-attach-configured VM and force you to revert live-attach before tuning. The live-attach fallback (shared with the stealth tuner and the virtio-win ISO installer) lets you tune a live-attach VM directly in its shut-off state without touching the live-attach setup. The perf, stealth, and status functions all use this shared detection.
 
+**SATA→virtio-blk disk conversion (opt-in, DANGEROUS)**: the disk perf knobs (`cache=none`/`io=native`/`discard=unmap` + multiqueue + iothread) only apply to **virtio/scsi** disks — a SATA boot disk gets none of them. When you opt in (`--ultimate-perf-virtio-disk` or the `ULTIMATE_PERF_VIRTIO_DISK=1` conf key), the tuner converts each non-cdrom disk on a non-virtio/non-scsi bus to `bus='virtio'` (`sdX`→`vdX`, collision-checked, SATA `<address type='drive'>` dropped so libvirt reassigns PCI on define), then applies the perf knobs to the now-virtio disk. CDROMs are never converted. **DANGER: Windows needs the virtio-blk (viostor) driver installed FIRST** or it will BSOD with `INACCESSIBLE_BOOT_DEVICE` on the next boot. The correct sequence:
+1. `sudo vfio --install-virtio-win-guest-agent` — attaches the virtio-win driver ISO as a CD-ROM
+2. Boot the VM, run `virtio-win-guest-tools.exe` inside Windows (installs viostor + all virtio drivers), shut down
+3. `sudo vfio --install-ultimate-perf-vm-tuning --ultimate-perf-virtio-disk` — now safe to convert
+
+Default OFF (a plain run never changes the disk bus). Idempotent (a re-run on an already-virtio disk is a no-op).
+
 **Safety / verify-before-define**: for each VM it dumps + backs up the XML to `${vm}_perf_<ts>.xml`, runs the tuning on a temp copy, validates with `virt-xml-validate`, and prompts before `virsh define`. Running VMs are skipped. `--dry-run` shows a `diff -u` of the changes. Idempotent (a re-run on an already-tuned VM reports "no changes needed").
 
 ```fish path=null start=null
@@ -343,6 +350,11 @@ sudo ./vfio.sh --install-ultimate-perf-vm-tuning
 
 # Same, but also reserve host hugepages (opt-in) for each tuned VM:
 sudo ./vfio.sh --install-ultimate-perf-vm-tuning --ultimate-perf-hugepages
+
+# Same, but also convert SATA disks to virtio-blk (DANGER: install viostor in
+# Windows first via --install-virtio-win-guest-agent + virtio-win-guest-tools.exe,
+# or Windows BSODs INACCESSIBLE_BOOT_DEVICE on next boot):
+sudo ./vfio.sh --install-ultimate-perf-vm-tuning --ultimate-perf-virtio-disk
 
 # Preview the changes without redefining (dry-run diff per VM):
 sudo ./vfio.sh --install-ultimate-perf-vm-tuning --dry-run
@@ -354,7 +366,7 @@ sudo ./vfio.sh --reset-ultimate-perf-vm-tuning
 sudo ./vfio.sh --verify
 ```
 
-Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` in **KiB** (default `2048` KiB = 2 MiB = the standard 2MB hugepage; `1048576` for 1GB pages — guarded, see above). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
+Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` in **KiB** (default `2048` KiB = 2 MiB = the standard 2MB hugepage; `1048576` for 1GB pages — guarded, see above). SATA→virtio disk conversion is `ULTIMATE_PERF_VIRTIO_DISK` (default empty = opt-in prompt; `1` = convert, `0` = skip). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
 
 ### Why this matters for newer AMD cards
 

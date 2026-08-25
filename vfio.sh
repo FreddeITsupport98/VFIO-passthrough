@@ -172,6 +172,7 @@ AMD_D3_OVERRIDE=""            # 1=force add, 0=force skip, empty=prompt (install
 AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install mode only)
 STEALTH_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: stealth/perf VM XML tuning)
 ULTIMATE_PERF_HUGEPAGES_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ultimate-perf VM tuning: host hugepages reservation)
+ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ultimate-perf VM tuning: SATA->virtio disk conversion)
 VBIOS_INJECTION_OVERRIDE=""   # 1=force on, 0=force skip+remove, empty=prompt (dynamic install: vBIOS ROM pin)
 BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
@@ -779,6 +780,8 @@ complete -c $cmd -l install-ultimate-perf-vm-tuning -d 'Apply ultimate-performan
 complete -c $cmd -l reset-ultimate-perf-vm-tuning -d 'Revert ultimate-performance VM tuning from backup XML (also restores host nr_hugepages)'
 complete -c $cmd -l ultimate-perf-hugepages -d 'Ultimate-perf: reserve host hugepages + add memoryBacking (skip prompt)'
 complete -c $cmd -l no-ultimate-perf-hugepages -d 'Ultimate-perf: skip host hugepages reservation (skip prompt)'
+complete -c $cmd -l ultimate-perf-virtio-disk -d 'Ultimate-perf: convert SATA disks to virtio-blk (DANGER: install viostor in Windows first or BSOD) (skip prompt)'
+complete -c $cmd -l no-ultimate-perf-virtio-disk -d 'Ultimate-perf: do not convert disk buses (skip prompt)'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -818,7 +821,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -885,6 +888,8 @@ _vfio_sh_complete() {
     '--reset-ultimate-perf-vm-tuning[Revert ultimate-performance VM tuning from backup XML (also restores host nr_hugepages)]' \\
     '--ultimate-perf-hugepages[Ultimate-perf: reserve host hugepages + add memoryBacking (skip prompt)]' \\
     '--no-ultimate-perf-hugepages[Ultimate-perf: skip host hugepages reservation (skip prompt)]' \\
+    '--ultimate-perf-virtio-disk[Ultimate-perf: convert SATA disks to virtio-blk (DANGER: install viostor in Windows first or BSOD) (skip prompt)]' \\
+    '--no-ultimate-perf-virtio-disk[Ultimate-perf: do not convert disk buses (skip prompt)]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1516,7 +1521,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1690,6 +1695,20 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
   --no-ultimate-perf-hugepages
                    Ultimate-perf override: skip host hugepages reservation (skip the opt-in
                    prompt). All other perf knobs still apply.
+  --ultimate-perf-virtio-disk
+                   Ultimate-perf override: convert each non-cdrom disk on a tuned VM from
+                   SATA (or other non-virtio bus) to virtio-blk (sdX->vdX) so the disk perf
+                   knobs (cache=none/io=native/discard=unmap + multiqueue + iothread) apply.
+                   DANGEROUS: Windows needs the virtio-blk (viostor) driver installed FIRST
+                   or it will BSOD with INACCESSIBLE_BOOT_DEVICE on the next boot. Install
+                   virtio-win-guest-tools.exe in Windows first (run
+                   --install-virtio-win-guest-agent to attach the driver ISO, boot, run
+                   the installer, shut down), THEN run --install-ultimate-perf-vm-tuning
+                   with this flag. Skips the opt-in prompt.
+  --no-ultimate-perf-virtio-disk
+                   Ultimate-perf override: do NOT convert disk buses (skip the opt-in
+                   prompt). SATA/other disks keep their bus and get NO disk perf knobs
+                   (only iothreads/cputune/topology/etc. apply).
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev).
                    Default behavior detaches USB Bluetooth adapters from host drivers while keeping devices VM-pass-through eligible.
@@ -1943,6 +1962,12 @@ parse_args() {
         ;;
       --no-ultimate-perf-hugepages)
         ULTIMATE_PERF_HUGEPAGES_OVERRIDE=0
+        ;;
+      --ultimate-perf-virtio-disk)
+        ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE=1
+        ;;
+      --no-ultimate-perf-virtio-disk)
+        ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE=0
         ;;
       --stealth-vm-tuning)
         STEALTH_VM_TUNING_OVERRIDE=1
@@ -4774,6 +4799,17 @@ ULTIMATE_PERF_HUGEPAGES=""
 # and warns). The tuner computes the page count from each VM's <memory> (KiB)
 # and reserves that many host pages.
 ULTIMATE_PERF_HUGEPAGES_SIZE="2048"
+# Ultimate-performance VM tuning: opt-in SATA->virtio-blk disk-bus conversion
+# (read by the perf tuner). The disk perf knobs (cache=none/io=native/
+# discard=unmap + multiqueue + iothread) only apply to virtio/scsi disks, so a
+# SATA boot disk gets NONE of them. This converts each non-cdrom disk whose bus
+# is not virtio/scsi to bus=virtio (sdX->vdX, drive address dropped so libvirt
+# reassigns PCI on define), THEN applies the perf knobs. DANGEROUS: Windows
+# needs the viostor (virtio-blk) driver installed first or it BSODs with
+# INACCESSIBLE_BOOT_DEVICE on the next boot. 1=convert, 0=skip (default).
+# WHY this value: empty keeps it opt-in so a plain run never changes the disk
+# bus. Set 1 only AFTER you have installed virtio-win-guest-tools in Windows.
+ULTIMATE_PERF_VIRTIO_DISK=""
 # Dynamic-mode park-keepalive monitor (read by vfio-gpu-park-keepalive.sh):
 # - 1 (default, instant on): while the guest GPU is parked on vfio-pci between
 #   VM sessions (VFIO_DYNAMIC_REBIND_HOST=0), periodically probe whether it is
@@ -13133,6 +13169,8 @@ install_ultimate_perf_vm_tuning() {
   hdr "Ultimate-performance VM tuning (stealth-safe)"
   note "This applies maximum-throughput tuning to each shut-off VM that has the guest GPU:"
   note "  - disk: cache=none (O_DIRECT) + io=native (Linux AIO) + discard=unmap + virtio-blk multiqueue"
+  note "    (disk perf knobs apply ONLY to virtio/scsi disks; SATA disks are skipped unless you
+   opt in to the SATA->virtio conversion below — Windows needs the virtio-blk driver first)"
   note "  - iothreads scaled to min(vcpu,4); disks round-robin-assigned across iothreads"
   note "  - cputune: vCPUs pinned to physical cores, emulator to a housekeeping core, iothreadpin"
   note "  - numatune: memory strict pinning (ONLY when NUMA-safe; skipped otherwise so the VM still starts)"
@@ -13180,6 +13218,43 @@ install_ultimate_perf_vm_tuning() {
   _hp_size="$(trim "${_hp_size:-}")"
   [[ "$_hp_size" =~ ^[0-9]+$ ]] || _hp_size="2048"
 
+  # SATA->virtio-blk disk-bus conversion opt-in. Default N. The disk perf knobs
+  # (cache=none/io=native/discard=unmap + multiqueue + iothread) only apply to
+  # virtio/scsi disks, so a SATA boot disk gets NONE of them without this.
+  # DANGEROUS: Windows needs the virtio-blk (viostor) driver installed FIRST or
+  # it BSODs with INACCESSIBLE_BOOT_DEVICE on the next boot. The correct sequence:
+  #   1. sudo vfio --install-virtio-win-guest-agent   (attaches the driver ISO)
+  #   2. boot the VM, run virtio-win-guest-tools.exe inside Windows, shut down
+  #   3. sudo vfio --install-ultimate-perf-vm-tuning --ultimate-perf-virtio-disk
+  local _vd_on=0
+  if [[ "${ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE:-}" == "1" ]]; then
+    _vd_on=1
+  elif [[ "${ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE:-}" == "0" ]]; then
+    _vd_on=0
+  else
+    _vd_on="$(awk -F= '/^ULTIMATE_PERF_VIRTIO_DISK=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    _vd_on="$(trim "${_vd_on:-}")"
+    [[ "$_vd_on" == "1" ]] || _vd_on=0
+    if (( ! _vd_on )); then
+      say
+      note "Disk perf knobs (cache=none/io=native/discard=unmap + multiqueue + iothread) apply"
+      note "ONLY to virtio/scsi disks. A SATA boot disk gets NONE of them."
+      note "You can OPT IN to convert SATA disks to virtio-blk so the knobs apply."
+      if (( ENABLE_COLOR )); then
+        note "${C_BOLD}${C_RED}DANGER:${C_RESET} Windows needs the virtio-blk (viostor) driver installed FIRST"
+      else
+        note "DANGER: Windows needs the virtio-blk (viostor) driver installed FIRST"
+      fi
+      note "or it will BSOD with INACCESSIBLE_BOOT_DEVICE on the next boot."
+      note "If you have NOT installed virtio-win-guest-tools in Windows yet, answer N."
+      note "To prepare: sudo $SCRIPT_NAME --install-virtio-win-guest-agent, boot, run"
+      note "virtio-win-guest-tools.exe inside Windows, shut down, THEN re-run with this."
+      if prompt_yn "Convert SATA disks to virtio-blk on each tuned VM? (viostor must be installed in Windows first!)" N "Ultimate-perf virtio-disk"; then
+        _vd_on=1
+      fi
+    fi
+  fi
+
   # Read host CPU/NUMA topology once (exported to the python patcher). Defensive:
   # if unreadable, the patcher falls back to simple v->v cputune and skips numatune.
   local _host_cpus_csv _numa_csv _n _nid _cl
@@ -13198,6 +13273,7 @@ install_ultimate_perf_vm_tuning() {
   export VFIO_PERF_NUMA="$_numa_csv"
   export VFIO_PERF_HUGEPAGES="$_hp_on"
   export VFIO_PERF_HUGEPAGES_SIZE="$_hp_size"
+  export VFIO_PERF_VIRTIO_DISK="$_vd_on"
   if [[ -n "$_host_cpus_csv" ]]; then
     note "Host CPU topology: $(awk -F, '{print NF}' <<<"$_host_cpus_csv" 2>/dev/null || echo '?') CPUs${_numa_csv:+, NUMA: $_numa_csv}"
   else
@@ -13499,8 +13575,51 @@ if add_numatune:
             if _nm.get(k) != v:
                 _nm.set(k, v); changed = True
 
-# --- disk I/O perf ---
+# --- SATA->virtio-blk disk-bus conversion (opt-in, DANGEROUS) ---
+# The disk perf knobs below only apply to virtio/scsi disks. When opted in
+# (VFIO_PERF_VIRTIO_DISK=1), convert each non-cdrom disk whose bus is NOT
+# virtio/scsi to bus=virtio so the knobs apply: target dev sdX->vdX
+# (collision-checked against existing vdX targets), bus->virtio, and drop the
+# SATA/AHCI <address type='drive'> (bus-specific; libvirt reassigns a PCI
+# address on define). Preserves boot/serial/source. Idempotent: a re-run skips
+# disks already on virtio/scsi. DANGEROUS: Windows needs the virtio-blk
+# (viostor) driver installed first or it BSODs with INACCESSIBLE_BOOT_DEVICE
+# — the bash wrapper warns + gates this behind an opt-in prompt.
 devices = root.find('devices')
+if devices is not None and os.environ.get('VFIO_PERF_VIRTIO_DISK', '0') == '1':
+    used_vd = set()
+    for d in devices.findall('disk'):
+        t = d.find('target')
+        if t is not None and (t.get('dev', '') or '').startswith('vd'):
+            used_vd.add(t.get('dev'))
+    for disk in devices.findall('disk'):
+        if disk.get('device', 'disk') == 'cdrom':
+            continue
+        target = disk.find('target')
+        if target is None:
+            continue
+        bus = target.get('bus')
+        if bus in ('virtio', 'scsi'):
+            continue
+        old_dev = target.get('dev', '')
+        new_dev = None
+        for i in range(26):
+            cand = 'vd' + chr(ord('a') + i)
+            if cand not in used_vd:
+                new_dev = cand
+                break
+        if new_dev is None:
+            sys.stderr.write(f"Cannot convert disk {old_dev}: no free vdX target\n")
+            continue
+        target.set('dev', new_dev)
+        target.set('bus', 'virtio')
+        used_vd.add(new_dev)
+        addr = disk.find('address')
+        if addr is not None and addr.get('type') == 'drive':
+            disk.remove(addr)
+        changed = True
+
+# --- disk I/O perf ---
 if devices is not None:
     disk_idx = 0
     for disk in devices.findall('disk'):
@@ -13630,7 +13749,11 @@ PYEOF
     else
       say "✔ Ultimate-performance tuning applied to VM '$_dom'"
     fi
-    say "  ✔ disk cache=none + io=native + discard=unmap + virtio-blk multiqueue"
+    if (( _vd_on )); then
+      say "  ✔ disk bus converted SATA->virtio-blk (sdX->vdX) + cache=none + io=native + discard=unmap + multiqueue"
+    else
+      say "  ✔ disk cache=none + io=native + discard=unmap + virtio-blk multiqueue (virtio/scsi disks only)"
+    fi
     say "  ✔ iothreads scaled + disks round-robin across iothreads"
     say "  ✔ cputune vCPU/emulator/iothread pinning (+ numatune when NUMA-safe)"
     say "  ✔ CPU topology + <cache mode='passthrough'/>"

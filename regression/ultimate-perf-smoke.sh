@@ -141,6 +141,100 @@ if command -v virt-xml-validate >/dev/null 2>&1; then
   if virt-xml-validate "$hp2" >/dev/null 2>&1; then ok "hugepages-tuned XML validates"; else bad "hugepages-tuned XML fails validate"; fi
 fi
 
+# SATA->virtio-blk disk conversion (R35 follow-up, opt-in): a SATA boot disk is
+# converted to virtio-blk (sdX->vdX) so the disk perf knobs apply. DANGEROUS in
+# real life (Windows needs viostor first or BSOD) — this only tests the XML
+# patching logic on a mock. CDROMs are NOT converted.
+mock_sata="$tmp/mock_sata.xml"
+cat >"$mock_sata" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type><smbios mode="sysinfo"/></os>
+  <features>
+    <acpi/><apic/>
+    <hyperv mode="custom"><vendor_id state="on" value="GENUINE00000"/><relaxed state="on"/></hyperv>
+    <kvm><hidden state="on"/></kvm>
+    <vmport state="off"/>
+  </features>
+  <cpu mode="host-passthrough" check="none" migratable="on"><feature policy="disable" name="hypervisor"/></cpu>
+  <clock offset="localtime">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="hypervclock" present="no"/>
+    <timer name="tsc" mode="native" present="yes"/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>
+  <devices>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/var/lib/libvirt/images/win11.qcow2"/>
+      <target dev="sda" bus="sata"/>
+      <serial>Samsung_ABCD1234</serial>
+      <boot order="1"/>
+      <address type="drive" controller="0" bus="0" target="0" unit="0"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="/usr/share/virtio-win/virtio-win.iso"/>
+      <target dev="sdb" bus="sata"/>
+      <readonly/>
+      <address type="drive" controller="0" bus="0" target="0" unit="1"/>
+    </disk>
+    <interface type="network"><model type="e1000e"/><source network="default"/></interface>
+    <memballoon model="none"/>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+    </hostdev>
+  </devices>
+  <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <qemu:arg value="-cpu"/>
+    <qemu:arg value="host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on"/>
+    <qemu:arg value="-smbios"/>
+    <qemu:arg value="type=1,manufacturer=ASUS,product=ROG,serial=ABCDEF1234,uuid=12345678-1234-1234-1234-123456789abc"/>
+  </qemu:commandline>
+</domain>
+XEOF
+sata_vd="$tmp/sata_vd.xml"
+cp "$mock_sata" "$sata_vd"
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="1" \
+    python3 "$perf_py" "$sata_vd" >/dev/null 2>&1
+rc_sv=$?
+set -e
+if [[ "$rc_sv" -eq 0 ]]; then ok "perf patcher exit 0 with VIRTIO_DISK=1"; else bad "perf patcher exit $rc_sv with VIRTIO_DISK=1"; fi
+if grep -Fq '<target dev="vda" bus="virtio"' "$sata_vd"; then ok "SATA boot disk converted to vda virtio"; else bad "SATA boot disk not converted"; fi
+if grep -Fq '<target dev="sdb" bus="sata"' "$sata_vd"; then ok "cdrom NOT converted (stays sdb sata)"; else bad "cdrom wrongly converted"; fi
+if grep -Fq 'cache="none" io="native"' "$sata_vd"; then ok "perf knobs applied to converted disk"; else bad "perf knobs missing on converted disk"; fi
+if grep -Fq 'Samsung_ABCD1234' "$sata_vd"; then ok "disk serial preserved through conversion"; else bad "disk serial lost in conversion"; fi
+if grep -Fq 'GENUINE00000' "$sata_vd"; then ok "stealth survives virtio conversion"; else bad "stealth lost in virtio conversion"; fi
+if command -v virt-xml-validate >/dev/null 2>&1; then
+  if virt-xml-validate "$sata_vd" >/dev/null 2>&1; then ok "virtio-converted XML validates"; else bad "virtio-converted XML fails validate"; fi
+fi
+# Idempotent: re-run exits 3.
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="1" \
+    python3 "$perf_py" "$sata_vd" >/dev/null 2>&1
+rc_sv2=$?
+set -e
+if [[ "$rc_sv2" -eq 3 ]]; then ok "virtio conversion idempotent (exit 3)"; else bad "virtio conversion not idempotent (exit $rc_sv2)"; fi
+# Opt-in default off: SATA disk untouched when VIRTIO_DISK=0.
+sata_no="$tmp/sata_no.xml"
+cp "$mock_sata" "$sata_no"
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="0" \
+    python3 "$perf_py" "$sata_no" >/dev/null 2>&1
+rc_sn=$?
+set -e
+if [[ "$rc_sn" -eq 0 ]]; then ok "perf patcher exit 0 with VIRTIO_DISK=0"; else bad "perf patcher exit $rc_sn with VIRTIO_DISK=0"; fi
+if grep -Fq '<target dev="sda" bus="sata"' "$sata_no"; then ok "SATA disk NOT converted when opted out"; else bad "SATA disk wrongly converted when opted out"; fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

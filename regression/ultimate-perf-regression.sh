@@ -403,6 +403,167 @@ if command -v virt-xml-validate >/dev/null 2>&1; then
   fi
 fi
 
+# ===================== SATA->virtio-blk disk conversion (opt-in) =====================
+# Static wiring: the new flags + conf key + export must be present.
+assert_contains_file "ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE var declared" "ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE=" "$VFIO_SCRIPT"
+assert_contains_file "parse_args handles --ultimate-perf-virtio-disk" "--ultimate-perf-virtio-disk)" "$VFIO_SCRIPT"
+assert_contains_file "parse_args handles --no-ultimate-perf-virtio-disk" "--no-ultimate-perf-virtio-disk)" "$VFIO_SCRIPT"
+assert_contains_file "conf key ULTIMATE_PERF_VIRTIO_DISK present" 'ULTIMATE_PERF_VIRTIO_DISK=""' "$VFIO_SCRIPT"
+assert_contains_file "install exports VFIO_PERF_VIRTIO_DISK" 'export VFIO_PERF_VIRTIO_DISK="$_vd_on"' "$VFIO_SCRIPT"
+assert_contains_file "python reads VFIO_PERF_VIRTIO_DISK" "os.environ.get('VFIO_PERF_VIRTIO_DISK', '0')" "$VFIO_SCRIPT"
+assert_contains_file "install opt-in warns about BSOD INACCESSIBLE_BOOT_DEVICE" "INACCESSIBLE_BOOT_DEVICE" "$VFIO_SCRIPT"
+assert_contains_file "install opt-in names virtio-win-guest-tools.exe" "virtio-win-guest-tools.exe" "$VFIO_SCRIPT"
+assert_contains_file "install opt-in names --install-virtio-win-guest-agent" "--install-virtio-win-guest-agent" "$VFIO_SCRIPT"
+assert_contains_file "usage one-liner includes --ultimate-perf-virtio-disk" "[--ultimate-perf-virtio-disk]" "$VFIO_SCRIPT"
+assert_contains_file "fish completion includes --ultimate-perf-virtio-disk" "complete -c \$cmd -l ultimate-perf-virtio-disk" "$VFIO_SCRIPT"
+assert_contains_file "zsh completion includes --ultimate-perf-virtio-disk" "'--ultimate-perf-virtio-disk[" "$VFIO_SCRIPT"
+
+# Functional: mock VM with a SATA boot disk + a SATA cdrom.
+mock_sata="$tmp_dir/mock_sata.xml"
+cat >"$mock_sata" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type><smbios mode="sysinfo"/></os>
+  <features>
+    <acpi/><apic/>
+    <hyperv mode="custom"><vendor_id state="on" value="GENUINE00000"/><relaxed state="on"/></hyperv>
+    <kvm><hidden state="on"/></kvm>
+    <vmport state="off"/>
+  </features>
+  <cpu mode="host-passthrough" check="none" migratable="on"><feature policy="disable" name="hypervisor"/></cpu>
+  <clock offset="localtime">
+    <timer name="rtc" tickpolicy="catchup"/>
+    <timer name="hypervclock" present="no"/>
+    <timer name="tsc" mode="native" present="yes"/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>
+  <devices>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/var/lib/libvirt/images/win11.qcow2"/>
+      <target dev="sda" bus="sata"/>
+      <serial>Samsung_ABCD1234</serial>
+      <boot order="1"/>
+      <address type="drive" controller="0" bus="0" target="0" unit="0"/>
+    </disk>
+    <disk type="file" device="cdrom">
+      <driver name="qemu" type="raw"/>
+      <source file="/usr/share/virtio-win/virtio-win.iso"/>
+      <target dev="sdb" bus="sata"/>
+      <readonly/>
+      <address type="drive" controller="0" bus="0" target="0" unit="1"/>
+    </disk>
+    <interface type="network"><model type="e1000e"/><source network="default"/></interface>
+    <memballoon model="none"/>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+    </hostdev>
+  </devices>
+  <qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+    <qemu:arg value="-cpu"/>
+    <qemu:arg value="host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on"/>
+    <qemu:arg value="-smbios"/>
+    <qemu:arg value="type=1,manufacturer=ASUS,product=ROG,serial=ABCDEF1234,uuid=12345678-1234-1234-1234-123456789abc"/>
+  </qemu:commandline>
+</domain>
+XEOF
+
+# --- VIRTIO_DISK=1: SATA boot disk converts to virtio + gets perf knobs ---
+sata_vd="$tmp_dir/sata_vd.xml"
+cp "$mock_sata" "$sata_vd"
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="1" \
+    python3 "$perf_py" "$sata_vd" >/dev/null 2>&1
+rc_sata_vd=$?
+set -e
+assert_eq "perf patcher exit 0 with VIRTIO_DISK=1 on SATA mock" "0" "$rc_sata_vd"
+assert_contains_file "SATA boot disk converted to vda virtio" '<target dev="vda" bus="virtio"' "$sata_vd"
+assert_not_contains_file "no sda target left after conversion" '<target dev="sda"' "$sata_vd"
+assert_contains_file "cdrom NOT converted (stays sdb sata)" '<target dev="sdb" bus="sata"' "$sata_vd"
+assert_contains_file "perf knobs applied to converted disk" 'cache="none" io="native"' "$sata_vd"
+assert_contains_file "virtio multiqueue queues applied" 'queues="4"' "$sata_vd"
+assert_contains_file "disk serial preserved through conversion" "Samsung_ABCD1234" "$sata_vd"
+assert_contains_file "boot order preserved through conversion" 'boot order="1"' "$sata_vd"
+assert_contains_file "stealth survives virtio conversion" "GENUINE00000" "$sata_vd"
+if command -v virt-xml-validate >/dev/null 2>&1; then
+  if virt-xml-validate "$sata_vd" >/dev/null 2>&1; then
+    printf 'PASS: virtio-converted XML validates\n'
+  else
+    printf 'FAIL: virtio-converted XML fails virt-xml-validate\n' >&2
+    record_failure "virtio-converted XML validates"
+  fi
+fi
+
+# --- Idempotency: re-run on the already-converted XML exits 3 ---
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="1" \
+    python3 "$perf_py" "$sata_vd" >/dev/null 2>&1
+rc_sata_vd_idem=$?
+set -e
+assert_eq "virtio conversion idempotent (exit 3 on re-run)" "3" "$rc_sata_vd_idem"
+
+# --- VIRTIO_DISK=0: SATA boot disk is NOT converted (opt-in default off) ---
+sata_no="$tmp_dir/sata_no.xml"
+cp "$mock_sata" "$sata_no"
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="0" \
+    python3 "$perf_py" "$sata_no" >/dev/null 2>&1
+rc_sata_no=$?
+set -e
+assert_eq "perf patcher exit 0 with VIRTIO_DISK=0 on SATA mock" "0" "$rc_sata_no"
+assert_contains_file "SATA boot disk NOT converted when opted out" '<target dev="sda" bus="sata"' "$sata_no"
+assert_not_contains_file "no virtio bus when opted out" 'bus="virtio"' "$sata_no"
+
+# --- Collision-safe: existing vda + SATA sda -> sda converts to vdb (not vda) ---
+mock_col="$tmp_dir/mock_collision.xml"
+cat >"$mock_col" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type></os>
+  <features><acpi/><apic/></features>
+  <cpu mode="host-passthrough" check="none" migratable="on"/>
+  <clock offset="localtime"/>
+  <on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash>
+  <devices>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/existing.qcow2"/>
+      <target dev="vda" bus="virtio"/>
+    </disk>
+    <disk type="file" device="disk">
+      <driver name="qemu" type="qcow2"/>
+      <source file="/sata-boot.qcow2"/>
+      <target dev="sda" bus="sata"/>
+      <address type="drive" controller="0" bus="0" target="0" unit="0"/>
+    </disk>
+    <memballoon model="none"/>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+    </hostdev>
+  </devices>
+</domain>
+XEOF
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    VFIO_PERF_VIRTIO_DISK="1" \
+    python3 "$perf_py" "$mock_col" >/dev/null 2>&1
+rc_col=$?
+set -e
+assert_eq "perf patcher exit 0 on collision mock" "0" "$rc_col"
+assert_contains_file "existing vda preserved (not overwritten)" '<target dev="vda" bus="virtio"' "$mock_col"
+assert_contains_file "SATA sda converted to vdb (collision-safe)" '<target dev="vdb" bus="virtio"' "$mock_col"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

@@ -12502,26 +12502,10 @@ install_stealth_vm_tuning() {
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    # Parse PCI hostdev BDFs (same awk parser as install_hypervisor_hiding).
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+    # Detect guest-GPU VMs: BDF match in the XML OR in the live-attach VM list
+    # (live-attach strips the GPU hostdev from the persistent XML, so a BDF
+    # grep alone would miss an already-live-attach-configured VM).
+    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
       continue
     fi
     # Only define shut-off VMs.
@@ -12853,25 +12837,9 @@ reset_stealth_vm_tuning() {
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
+    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
+    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
       continue
     fi
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
@@ -12929,25 +12897,9 @@ stealth_vm_tuning_status() {
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null || continue
+    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
+    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
+    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
     _has_vendor=0; _has_cpu=0; _has_smbios=0
     grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && _has_vendor=1
     grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && _has_cpu=1
@@ -12966,6 +12918,52 @@ stealth_vm_tuning_status() {
       fi
     fi
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+}
+
+# R35: Detect whether a libvirt domain is a guest-GPU VM. A VM qualifies if
+# its persistent XML has the guest GPU PCI hostdev (BDF match), OR it is in the
+# live-attach VM list. Live-attach strips the GPU hostdev from the persistent
+# XML so the VM can boot without the GPU and hot-attach it later — so a BDF
+# grep ALONE misses an already-live-attach-configured VM, which would make the
+# stealth/perf tuners unable to tune a live-attach VM without reverting
+# live-attach first (the wrong UX). This mirrors the proven fallback already
+# used by install_virtio_win_guest_agent (which attaches the virtio-win ISO).
+# $1 = domain name, $2 = optional pre-fetched dumpxml (avoids a redundant
+# virsh dumpxml when the caller already has the XML). Returns 0 if the domain
+# is a guest-GPU VM, 1 otherwise. VFIO_LIVE_ATTACH_VM_LIST (env) overrides the
+# live-attach list path for regression testing.
+_vm_is_guest_gpu_vm() {
+  local _dom="$1" _xml="${2:-}" _guest_gpu _bdfs _la_list
+  [[ -n "$_xml" ]] || _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+  [[ -n "$_xml" ]] || return 1
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_guest_gpu" ]] || return 1
+  _bdfs="$(printf '%s' "$_xml" | awk '
+    /<hostdev/ { in_hostdev=1; is_pci=0 }
+    in_hostdev && /type=.pci./ { is_pci=1 }
+    in_hostdev && is_pci && /<address/ {
+      line=$0; dom=""; bus=""; slot=""; fn=""
+      if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+      if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+      if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+      if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+      if (dom != "" && bus != "" && slot != "" && fn != "") {
+        while (length(dom) < 4) dom = "0" dom
+        while (length(bus) < 2) bus = "0" bus
+        while (length(slot) < 2) slot = "0" slot
+        printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+      }
+    }
+    /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+  ')"
+  if grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+    return 0
+  fi
+  _la_list="${VFIO_LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
+  if [[ -f "$_la_list" ]] && grep -Fixq "$_dom" "$_la_list" 2>/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 # R35: Read the VM's <memory> (KiB) from a dumpxml. $1 = xml. Prints the
@@ -13211,25 +13209,10 @@ install_ultimate_perf_vm_tuning() {
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/, "", s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/, "", s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/, "", s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/, "", s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+    # Detect guest-GPU VMs: BDF match in the XML OR in the live-attach VM list
+    # (live-attach strips the GPU hostdev from the persistent XML, so a BDF
+    # grep alone would miss an already-live-attach-configured VM).
+    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
       continue
     fi
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
@@ -13669,6 +13652,7 @@ PYEOF
       note "No VMs were tuned (running VMs must be shut off first). Shut off the VM and re-run."
     else
       note "No shut-off VMs with the guest GPU found; nothing to tune."
+      note "Ensure a VM has the guest GPU attached (or is in the live-attach VM list) and re-run."
     fi
   fi
 }
@@ -13713,25 +13697,9 @@ reset_ultimate_perf_vm_tuning() {
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/, "", s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/, "", s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/, "", s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/, "", s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
+    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
+    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
       continue
     fi
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
@@ -13790,25 +13758,9 @@ ultimate_perf_vm_tuning_status() {
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/, "", s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/, "", s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/, "", s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/, "", s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null || continue
+    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
+    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
+    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
     _has_cache=0; _has_io=0; _has_cputune=0; _has_pm=0; _has_hp=0
     grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && _has_cache=1
     grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && _has_io=1

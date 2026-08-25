@@ -320,6 +320,65 @@ assert_contains_file "owned-file accounting present" "_perf_hugepages_owned.txt"
 # was NOT redefined with <memoryBacking>hugepages this run.
 assert_contains_file "rollback on skip paths calls restore helper" "_restore_host_hugepages_for_vm" "$VFIO_SCRIPT"
 
+# ===================== Live-attach-aware detection (R35 design fix) =====================
+# _vm_is_guest_gpu_vm detects a guest-GPU VM by BDF match OR membership in the
+# live-attach VM list. Live-attach strips the GPU hostdev from the persistent
+# XML, so a BDF grep alone misses an already-live-attach-configured VM — the
+# design flaw that made the stealth/perf tuners unable to tune a live-attach VM
+# without reverting live-attach first. The perf/stealth install+revert+status
+# functions all route through this helper now (mirroring install_virtio_win_
+# guest_agent, which already had the fallback).
+assert_contains_file "_vm_is_guest_gpu_vm helper exists" "_vm_is_guest_gpu_vm()" "$VFIO_SCRIPT"
+assert_contains_file "helper honors VFIO_LIVE_ATTACH_VM_LIST override" "VFIO_LIVE_ATTACH_VM_LIST" "$VFIO_SCRIPT"
+assert_contains_file "helper falls back to live-attach VM list" 'grep -Fixq "$_dom" "$_la_list"' "$VFIO_SCRIPT"
+assert_contains_file "R35 install uses helper (not inline BDF grep)" '_vm_is_guest_gpu_vm "$_dom" "$_xml"' "$VFIO_SCRIPT"
+assert_contains_file "R35 'nothing to tune' message mentions live-attach list" "live-attach VM list) and re-run" "$VFIO_SCRIPT"
+
+# Functional tests: self-contained (temp CONF_FILE + temp live-attach list, no
+# virsh/root needed — the helper takes the XML as $2 so it never calls virsh).
+_la_conf="$tmp_dir/fake.conf"
+printf 'GUEST_GPU_BDF="0000:0e:00.0"\nGUEST_GPU_VENDOR_ID="1002"\n' >"$_la_conf"
+_la_list_in="$tmp_dir/la_in.txt"    # contains the dom name -> fallback hits
+_la_list_out="$tmp_dir/la_out.txt"  # empty -> fallback misses
+printf 'win11\n' >"$_la_list_in"
+: >"$_la_list_out"
+_save_conf="$CONF_FILE"
+CONF_FILE="$_la_conf"
+
+# 1) Mock WITH the GPU PCI hostdev (0000:0e:00.0) -> BDF match path returns 0.
+set +e
+_vm_is_guest_gpu_vm "win11" "$(cat "$mock")"; rc_bdf=$?
+set -e
+assert_eq "_vm_is_guest_gpu_vm BDF match returns 0" "0" "$rc_bdf"
+
+# 2) Mock WITHOUT the GPU hostdev (only a USB hostdev) + in live-attach list ->
+#    fallback path returns 0 (the fix: a live-attach VM is still detected).
+_mock_nogpu="$tmp_dir/mock_nogpu.xml"
+cat >"$_mock_nogpu" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <devices>
+    <hostdev mode="subsystem" type="usb" managed="yes">
+      <source><vendor id="0x13d3"/><product id="0x3585"/></source>
+    </hostdev>
+  </devices>
+</domain>
+XEOF
+set +e
+VFIO_LIVE_ATTACH_VM_LIST="$_la_list_in" _vm_is_guest_gpu_vm "win11" "$(cat "$_mock_nogpu")"; rc_la_in=$?
+set -e
+assert_eq "_vm_is_guest_gpu_vm live-attach fallback (in list) returns 0" "0" "$rc_la_in"
+
+# 3) Mock WITHOUT the GPU hostdev + NOT in live-attach list -> returns 1.
+set +e
+VFIO_LIVE_ATTACH_VM_LIST="$_la_list_out" _vm_is_guest_gpu_vm "win11" "$(cat "$_mock_nogpu")"; rc_la_out=$?
+set -e
+assert_eq "_vm_is_guest_gpu_vm no BDF + not in list returns 1" "1" "$rc_la_out"
+
+CONF_FILE="$_save_conf"
+
 # --- NUMA-unsafe (multi-node, pinned vCPUs span nodes): numatune must be SKIPPED ---
 # so the VM can still start. Pin vcpus to CPUs 1,2,9,10 which span node0(0-7)+node1(8-15).
 multi="$tmp_dir/multi.xml"

@@ -333,6 +333,8 @@ vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning ins
 
 **Stealth coexistence guarantee**: the perf patcher only touches the elements above; it never reads/writes `features/hyperv/vendor_id`, `kvm/hidden`, `vmport`, `os/smbios`, `sysinfo`, `interface/model` (e1000e), `disk/serial`, `memballoon`, `clock/timer` (hypervclock/tsc), or `qemu:commandline` (-cpu/-smbios). Reverting perf restores the pre-perf XML backup (which still contains stealth), so stealth survives a perf revert.
 
+**Live-attach aware**: the tuner detects a guest-GPU VM by the GPU PCI hostdev in its XML **or** by membership in the live-attach VM list (`/var/lib/vfio-dynamic/live-attach-vms`). Live-attach strips the GPU hostdev from the persistent XML so the VM can boot without the GPU and hot-attach it later — so a hostdev-only check would miss an already-live-attach-configured VM and force you to revert live-attach before tuning. The live-attach fallback (shared with the stealth tuner and the virtio-win ISO installer) lets you tune a live-attach VM directly in its shut-off state without touching the live-attach setup. The perf, stealth, and status functions all use this shared detection.
+
 **Safety / verify-before-define**: for each VM it dumps + backs up the XML to `${vm}_perf_<ts>.xml`, runs the tuning on a temp copy, validates with `virt-xml-validate`, and prompts before `virsh define`. Running VMs are skipped. `--dry-run` shows a `diff -u` of the changes. Idempotent (a re-run on an already-tuned VM reports "no changes needed").
 
 ```fish path=null start=null

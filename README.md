@@ -342,6 +342,8 @@ vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning ins
 
 Default OFF (a plain run never changes the disk bus). Idempotent (a re-run on an already-virtio disk is a no-op).
 
+**Offered during dynamic binding setup**: `--install-dynamic-binding` (and the full wizard's dynamic path) now prompts for ultimate-performance VM tuning (default N) right after the stealth tuning opt-in — so a dynamic install can apply both the stealth layer AND the ultimate-perf layer in one pass. Honors `--ultimate-perf-vm-tuning` / `--no-ultimate-perf-vm-tuning` for non-interactive runs. (You can still apply it standalone later with `--install-ultimate-perf-vm-tuning`.)
+
 **Safety / verify-before-define**: for each VM it dumps + backs up the XML to `${vm}_perf_<ts>.xml`, runs the tuning on a temp copy, validates with `virt-xml-validate`, and prompts before `virsh define`. Running VMs are skipped. `--dry-run` shows a `diff -u` of the changes. Idempotent (a re-run on an already-tuned VM reports "no changes needed").
 
 ```fish path=null start=null

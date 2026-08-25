@@ -320,6 +320,48 @@ assert_contains_file "owned-file accounting present" "_perf_hugepages_owned.txt"
 # was NOT redefined with <memoryBacking>hugepages this run.
 assert_contains_file "rollback on skip paths calls restore helper" "_restore_host_hugepages_for_vm" "$VFIO_SCRIPT"
 
+# ===================== Dynamic-install integration (R35) =====================
+# The dynamic binding switcher (--install-dynamic-binding) and the full wizard's
+# dynamic path must BOTH offer ultimate-perf VM tuning (opt-in, default N),
+# mirroring the stealth tuning opt-in. Honors --ultimate-perf-vm-tuning /
+# --no-ultimate-perf-vm-tuning overrides via ULTIMATE_PERF_VM_TUNING_OVERRIDE.
+assert_contains_file "ULTIMATE_PERF_VM_TUNING_OVERRIDE var declared" "ULTIMATE_PERF_VM_TUNING_OVERRIDE=" "$VFIO_SCRIPT"
+assert_contains_file "parse_args handles --ultimate-perf-vm-tuning" "--ultimate-perf-vm-tuning)" "$VFIO_SCRIPT"
+assert_contains_file "parse_args handles --no-ultimate-perf-vm-tuning" "--no-ultimate-perf-vm-tuning)" "$VFIO_SCRIPT"
+assert_contains_file "usage one-liner includes --ultimate-perf-vm-tuning" "[--ultimate-perf-vm-tuning]" "$VFIO_SCRIPT"
+assert_contains_file "fish completion includes --ultimate-perf-vm-tuning" "complete -c \$cmd -l ultimate-perf-vm-tuning" "$VFIO_SCRIPT"
+assert_contains_file "zsh completion includes --ultimate-perf-vm-tuning" "'--ultimate-perf-vm-tuning[" "$VFIO_SCRIPT"
+# The dynamic binding switcher (install_dynamic_binding_from_existing_config)
+# must call install_ultimate_perf_vm_tuning + honor the override. The switcher's
+# block sits at 2-space base indent (4 spaces to the call). The full wizard's
+# dynamic path (apply_configuration) is nested one level deeper (6 spaces to the
+# call). Count call occurrences at each indent to prove BOTH paths wire it in,
+# without a fragile awk function-region extraction (heredocs inside those
+# functions contain func-like lines that break region slicing).
+_switcher_calls="$(grep -cE '^    install_ultimate_perf_vm_tuning$' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+_wizard_calls="$(grep -cE '^      install_ultimate_perf_vm_tuning$' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _switcher_calls >= 2 )); then
+  printf 'PASS: dynamic binding switcher calls install_ultimate_perf_vm_tuning (%d)\n' "$_switcher_calls"
+else
+  printf 'FAIL: dynamic binding switcher does NOT call install_ultimate_perf_vm_tuning (only %d at 4-space indent)\n' "$_switcher_calls" >&2
+  record_failure "dynamic binding switcher calls install_ultimate_perf_vm_tuning"
+fi
+if (( _wizard_calls >= 2 )); then
+  printf 'PASS: full wizard dynamic path calls install_ultimate_perf_vm_tuning (%d)\n' "$_wizard_calls"
+else
+  printf 'FAIL: full wizard dynamic path does NOT call install_ultimate_perf_vm_tuning (only %d at 6-space indent)\n' "$_wizard_calls" >&2
+  record_failure "full wizard dynamic path calls install_ultimate_perf_vm_tuning"
+fi
+# Both dynamic paths must honor the override var (it appears in their opt-in block).
+_override_in_switcher="$(grep -cE '^  if \[\[ "\$\{ULTIMATE_PERF_VM_TUNING_OVERRIDE' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+_override_in_wizard="$(grep -cE '^    if \[\[ "\$\{ULTIMATE_PERF_VM_TUNING_OVERRIDE' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _override_in_switcher >= 1 && _override_in_wizard >= 1 )); then
+  printf 'PASS: both dynamic paths honor ULTIMATE_PERF_VM_TUNING_OVERRIDE\n'
+else
+  printf 'FAIL: override not honored in both dynamic paths (switcher=%d, wizard=%d)\n' "$_override_in_switcher" "$_override_in_wizard" >&2
+  record_failure "both dynamic paths honor ULTIMATE_PERF_VM_TUNING_OVERRIDE"
+fi
+
 # ===================== Live-attach-aware detection (R35 design fix) =====================
 # _vm_is_guest_gpu_vm detects a guest-GPU VM by BDF match OR membership in the
 # live-attach VM list. Live-attach strips the GPU hostdev from the persistent

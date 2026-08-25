@@ -173,6 +173,7 @@ AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install
 STEALTH_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: stealth/perf VM XML tuning)
 ULTIMATE_PERF_HUGEPAGES_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ultimate-perf VM tuning: host hugepages reservation)
 ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ultimate-perf VM tuning: SATA->virtio disk conversion)
+ULTIMATE_PERF_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: ultimate-perf VM XML tuning)
 VBIOS_INJECTION_OVERRIDE=""   # 1=force on, 0=force skip+remove, empty=prompt (dynamic install: vBIOS ROM pin)
 BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
@@ -782,6 +783,8 @@ complete -c $cmd -l ultimate-perf-hugepages -d 'Ultimate-perf: reserve host huge
 complete -c $cmd -l no-ultimate-perf-hugepages -d 'Ultimate-perf: skip host hugepages reservation (skip prompt)'
 complete -c $cmd -l ultimate-perf-virtio-disk -d 'Ultimate-perf: convert SATA disks to virtio-blk (DANGER: install viostor in Windows first or BSOD) (skip prompt)'
 complete -c $cmd -l no-ultimate-perf-virtio-disk -d 'Ultimate-perf: do not convert disk buses (skip prompt)'
+complete -c $cmd -l ultimate-perf-vm-tuning -d 'Dynamic-install: apply ultimate-perf VM tuning (skip prompt)'
+complete -c $cmd -l no-ultimate-perf-vm-tuning -d 'Dynamic-install: skip ultimate-perf VM tuning'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -821,7 +824,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -890,6 +893,8 @@ _vfio_sh_complete() {
     '--no-ultimate-perf-hugepages[Ultimate-perf: skip host hugepages reservation (skip prompt)]' \\
     '--ultimate-perf-virtio-disk[Ultimate-perf: convert SATA disks to virtio-blk (DANGER: install viostor in Windows first or BSOD) (skip prompt)]' \\
     '--no-ultimate-perf-virtio-disk[Ultimate-perf: do not convert disk buses (skip prompt)]' \\
+    '--ultimate-perf-vm-tuning[Dynamic-install: apply ultimate-perf VM tuning (skip prompt)]' \\
+    '--no-ultimate-perf-vm-tuning[Dynamic-install: skip ultimate-perf VM tuning]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1521,7 +1526,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1709,6 +1714,14 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Ultimate-perf override: do NOT convert disk buses (skip the opt-in
                    prompt). SATA/other disks keep their bus and get NO disk perf knobs
                    (only iothreads/cputune/topology/etc. apply).
+  --ultimate-perf-vm-tuning
+                   Dynamic-install override: apply ultimate-performance VM XML tuning
+                   (disk I/O, iothreads, cputune/numatune, topology, hugepages opt-in)
+                   to detected guest-GPU VMs during --install-dynamic-binding without
+                   prompting. DISCLAIMER: performance tuning ONLY.
+  --no-ultimate-perf-vm-tuning
+                   Dynamic-install override: skip ultimate-performance VM XML tuning
+                   during --install-dynamic-binding.
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev).
                    Default behavior detaches USB Bluetooth adapters from host drivers while keeping devices VM-pass-through eligible.
@@ -1968,6 +1981,12 @@ parse_args() {
         ;;
       --no-ultimate-perf-virtio-disk)
         ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE=0
+        ;;
+      --ultimate-perf-vm-tuning)
+        ULTIMATE_PERF_VM_TUNING_OVERRIDE=1
+        ;;
+      --no-ultimate-perf-vm-tuning)
+        ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
         ;;
       --stealth-vm-tuning)
         STEALTH_VM_TUNING_OVERRIDE=1
@@ -16485,6 +16504,35 @@ install_dynamic_binding_from_existing_config() {
     fi
   fi
 
+  # 3d2. Ultimate-performance VM tuning (opt-in) — a SEPARATE, more aggressive
+  #      perf layer than the basic perf subset bundled into stealth tuning above.
+  #      Applies maximum-throughput knobs (disk cache=none/io=native/discard=unmap
+  #      + virtio-blk multiqueue, scaled iothreads, aggressive cputune/numatune
+  #      pinning, CPU topology + cache passthrough, no startup balloon, S3/S4
+  #      disabled, optional hugepages + SATA->virtio conversion) to each shut-off
+  #      guest-GPU VM WITHOUT touching stealth. Honors --ultimate-perf-vm-tuning
+  #      (force on) / --no-ultimate-perf-vm-tuning (force skip). Selecting "no"
+  #      just skips (reverting ultimate-perf is a separate explicit action:
+  #      --reset-ultimate-perf-vm-tuning). The function prompts internally for
+  #      the hugepages + SATA->virtio opt-ins.
+  if [[ "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" == "1" ]]; then
+    install_ultimate_perf_vm_tuning
+  elif [[ "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
+    note "Ultimate-performance VM tuning skipped (--no-ultimate-perf-vm-tuning)."
+  else
+    say
+    note "Ultimate-performance VM tuning is a SEPARATE, more aggressive perf layer (stealth-safe:"
+    note "it NEVER touches stealth). Knobs: disk I/O + multiqueue, scaled iothreads, aggressive"
+    note "cputune/numatune pinning, CPU topology + cache passthrough, no startup balloon, S3/S4 off."
+    note "Hugepages + SATA->virtio disk conversion are opt-in within it (prompted separately)."
+    note "DISCLAIMER: performance tuning ONLY."
+    if prompt_yn "Apply ultimate-performance VM tuning (stealth-safe) to detected guest-GPU VMs now?" N "Ultimate-perf VM tuning"; then
+      install_ultimate_perf_vm_tuning
+    else
+      note "Skipping ultimate-performance VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning"
+    fi
+  fi
+
   # 3b. Pin KDE/KWin Wayland to the HOST GPU so binding the (Boot VGA) guest
   #     GPU at VM start does not crash the host compositor. No-op unless the
   #     guest GPU is Boot VGA.
@@ -21917,6 +21965,30 @@ apply_configuration() {
         note "Skipping stealth/perf VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-stealth-vm-tuning"
         note "Reverting any previously-applied stealth tuning..."
         reset_stealth_vm_tuning
+      fi
+    fi
+    # Ultimate-performance VM tuning (opt-in) — a SEPARATE, more aggressive perf
+    # layer than the basic perf subset bundled into stealth tuning above. Applies
+    # maximum-throughput knobs to each shut-off guest-GPU VM WITHOUT touching
+    # stealth. Honors --ultimate-perf-vm-tuning / --no-ultimate-perf-vm-tuning.
+    # Selecting "no" just skips (reverting is a separate explicit action:
+    # --reset-ultimate-perf-vm-tuning). The function prompts internally for the
+    # hugepages + SATA->virtio opt-ins.
+    if [[ "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" == "1" ]]; then
+      install_ultimate_perf_vm_tuning
+    elif [[ "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" == "0" ]]; then
+      note "Ultimate-performance VM tuning skipped (--no-ultimate-perf-vm-tuning)."
+    else
+      say
+      note "Ultimate-performance VM tuning is a SEPARATE, more aggressive perf layer (stealth-safe:"
+      note "it NEVER touches stealth). Knobs: disk I/O + multiqueue, scaled iothreads, aggressive"
+      note "cputune/numatune pinning, CPU topology + cache passthrough, no startup balloon, S3/S4 off."
+      note "Hugepages + SATA->virtio disk conversion are opt-in within it (prompted separately)."
+      note "DISCLAIMER: performance tuning ONLY."
+      if prompt_yn "Apply ultimate-performance VM tuning (stealth-safe) to detected guest-GPU VMs now?" N "Ultimate-perf VM tuning"; then
+        install_ultimate_perf_vm_tuning
+      else
+        note "Skipping ultimate-performance VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning"
       fi
     fi
   fi

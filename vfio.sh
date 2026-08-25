@@ -163,7 +163,7 @@ DRY_RUN=0
 JSON_OUTPUT=0
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | menu | install-self | uninstall-self | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -171,6 +171,7 @@ AMD_NORETRY_OVERRIDE=""       # 1=force add, 0=force skip, empty=prompt (install
 AMD_D3_OVERRIDE=""            # 1=force add, 0=force skip, empty=prompt (install mode only)
 AMD_PORTPM_OVERRIDE=""        # 1=force add, 0=force skip, empty=prompt (install mode only)
 STEALTH_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: stealth/perf VM XML tuning)
+ULTIMATE_PERF_HUGEPAGES_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ultimate-perf VM tuning: host hugepages reservation)
 VBIOS_INJECTION_OVERRIDE=""   # 1=force on, 0=force skip+remove, empty=prompt (dynamic install: vBIOS ROM pin)
 BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
@@ -774,6 +775,10 @@ complete -c $cmd -l install-self -d 'Install this script to /usr/local/sbin + sh
 complete -c $cmd -l uninstall-self -d 'Remove the self-installed vfio.sh + completion files'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
 complete -c $cmd -l reset-stealth-vm-tuning -d 'Revert stealth/perf VM tuning from backup XML'
+complete -c $cmd -l install-ultimate-perf-vm-tuning -d 'Apply ultimate-performance VM XML tuning (stealth-safe: disk I/O, iothreads, cputune/numatune, topology, hugepages opt-in)'
+complete -c $cmd -l reset-ultimate-perf-vm-tuning -d 'Revert ultimate-performance VM tuning from backup XML (also restores host nr_hugepages)'
+complete -c $cmd -l ultimate-perf-hugepages -d 'Ultimate-perf: reserve host hugepages + add memoryBacking (skip prompt)'
+complete -c $cmd -l no-ultimate-perf-hugepages -d 'Ultimate-perf: skip host hugepages reservation (skip prompt)'
 complete -c $cmd -l verify -d 'Validate existing setup'
 complete -c $cmd -l detect -d 'Print detailed existing-setup report'
 complete -c $cmd -l sync-bls-only -d 'Sync BLS entry options from /etc/kernel/cmdline and verify drift'
@@ -813,7 +818,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -876,6 +881,10 @@ _vfio_sh_complete() {
     '--uninstall-self[Remove the self-installed vfio.sh + completion files]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
     '--reset-stealth-vm-tuning[Revert stealth/perf VM tuning from backup XML]' \\
+    '--install-ultimate-perf-vm-tuning[Apply ultimate-performance VM XML tuning (stealth-safe: disk I/O, iothreads, cputune/numatune, topology, hugepages opt-in)]' \\
+    '--reset-ultimate-perf-vm-tuning[Revert ultimate-performance VM tuning from backup XML (also restores host nr_hugepages)]' \\
+    '--ultimate-perf-hugepages[Ultimate-perf: reserve host hugepages + add memoryBacking (skip prompt)]' \\
+    '--no-ultimate-perf-hugepages[Ultimate-perf: skip host hugepages reservation (skip prompt)]' \\
     '--verify[Validate existing setup]' \\
     '--detect[Print detailed existing-setup report]' \\
     '--sync-bls-only[Sync BLS entry options from /etc/kernel/cmdline and verify drift]' \\
@@ -1507,7 +1516,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1652,6 +1661,32 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Revert stealth/perf VM XML tuning by redefining each shut-off guest-GPU VM
                    from its most recent *_stealth_*.xml backup. Verifies the backup XML and
                    prompts before redefining. Requires an existing $CONF_FILE and libvirt.
+  --install-ultimate-perf-vm-tuning
+                   Apply ultimate-performance VM XML tuning to each shut-off guest-GPU VM
+                   WITHOUT touching stealth (vendor_id/kvm hidden/vmport/SMBIOS/e1000e
+                   NIC/disk serials/memballoon/hypervclock/TSC/QEMU -cpu/-smbios stay intact).
+                   Knobs: disk cache=none + io=native + discard=unmap + virtio-blk multiqueue;
+                   iothreads scaled to min(vcpu,4) with round-robin disk assignment; aggressive
+                   cputune pinning (vCPUs to physical cores, emulator to a housekeeping core,
+                   iothreadpin) + numatune (ONLY when NUMA-safe, else skipped so the VM still
+                   starts); CPU topology matching vCPU count + <cache mode='passthrough'/>;
+                   currentMemory=memory (no startup balloon); <pm> S3/S4 disabled. Hugepages is
+                   the ONLY host-RAM knob and is opt-in (prompted default N, or
+                   --ultimate-perf-hugepages/--no-ultimate-perf-hugepages): when on, adds
+                   <memoryBacking><hugepages> and reserves host nr_hugepages (prior value backed
+                   up, reverted by --reset-ultimate-perf-vm-tuning). Idempotent. Requires an
+                   existing $CONF_FILE and libvirt. DISCLAIMER: performance tuning ONLY.
+  --reset-ultimate-perf-vm-tuning
+                   Revert ultimate-performance VM tuning by redefining each shut-off guest-GPU
+                   VM from its most recent *_perf_*.xml backup (which still contains stealth),
+                   and restoring the host nr_hugepages that was reserved for it. Verifies the
+                   backup XML and prompts before redefining. Requires $CONF_FILE and libvirt.
+  --ultimate-perf-hugepages
+                   Ultimate-perf override: reserve host hugepages + add <memoryBacking> for
+                   each tuned VM (skip the opt-in prompt).
+  --no-ultimate-perf-hugepages
+                   Ultimate-perf override: skip host hugepages reservation (skip the opt-in
+                   prompt). All other perf knobs still apply.
   --install-usb-bt-mitigation
                    Install ONLY the optional USB Bluetooth reset-spam mitigation (systemd+udev).
                    Default behavior detaches USB Bluetooth adapters from host drivers while keeping devices VM-pass-through eligible.
@@ -1893,6 +1928,18 @@ parse_args() {
         ;;
       --reset-stealth-vm-tuning)
         MODE="reset-stealth-vm-tuning"
+        ;;
+      --install-ultimate-perf-vm-tuning)
+        MODE="install-ultimate-perf-vm-tuning"
+        ;;
+      --reset-ultimate-perf-vm-tuning)
+        MODE="reset-ultimate-perf-vm-tuning"
+        ;;
+      --ultimate-perf-hugepages)
+        ULTIMATE_PERF_HUGEPAGES_OVERRIDE=1
+        ;;
+      --no-ultimate-perf-hugepages)
+        ULTIMATE_PERF_HUGEPAGES_OVERRIDE=0
         ;;
       --stealth-vm-tuning)
         STEALTH_VM_TUNING_OVERRIDE=1
@@ -3843,6 +3890,15 @@ detect_existing_vfio_report() {
   fi
   stealth_vm_tuning_status || true
 
+  # R35: ultimate-performance VM tuning status for guest-GPU VMs (informational).
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_CYAN}-- Ultimate-performance VM tuning status --${C_RESET}"
+  else
+    say "-- Ultimate-performance VM tuning status --"
+  fi
+  ultimate_perf_vm_tuning_status || true
+
   say "==== End report ===="
 }
 
@@ -4693,6 +4749,24 @@ VFIO_REBOOT_FLR_MAX_GEN=""
 # (read by install_stealth_vm_tuning / reset_stealth_vm_tuning). Default empty
 # = $HOME/Desktop; falls back to /var/lib/vfio-stealth-vm/backups if not writable.
 STEALTH_VM_BACKUP_DIR=""
+# Ultimate-performance VM tuning backup directory for *_perf_*.xml VM XML backups
+# (read by install_ultimate_perf_vm_tuning / reset_ultimate_perf_vm_tuning). Default
+# empty = $HOME/Desktop; falls back to /var/lib/vfio-perf-vm/backups if not writable.
+# Separate from STEALTH_VM_BACKUP_DIR so the two layers' backups do not collide.
+ULTIMATE_PERF_VM_BACKUP_DIR=""
+# Ultimate-performance VM tuning: opt-in host hugepages reservation. When the
+# perf tuner runs, it prompts (default N) whether to reserve host hugepages and
+# add <memoryBacking><hugepages> to each tuned VM. This key forces the choice so
+# a non-interactive re-run skips the prompt: 1 = reserve + add memoryBacking,
+# 0 = skip (all other perf knobs still apply). Default empty = prompt.
+# WHY this value: empty keeps hugepages opt-in so a plain run never touches host
+# RAM (nr_hugepages). Set 1 only if you want hugepages every time without asking.
+ULTIMATE_PERF_HUGEPAGES=""
+# Hugepage size in MiB for ULTIMATE_PERF_HUGEPAGES (read by the perf tuner).
+# 2048 = 2MB pages (default, widely available); 1048576 = 1GB pages (needs the
+# kernel hugepagesz=1G boot param and a supporting CPU). The tuner computes the
+# page count from each VM's <memory> and reserves that many host pages.
+ULTIMATE_PERF_HUGEPAGES_SIZE="2048"
 # Dynamic-mode park-keepalive monitor (read by vfio-gpu-park-keepalive.sh):
 # - 1 (default, instant on): while the guest GPU is parked on vfio-pci between
 #   VM sessions (VFIO_DYNAMIC_REBIND_HOST=0), periodically probe whether it is
@@ -12882,6 +12956,766 @@ stealth_vm_tuning_status() {
         say "${C_YELLOW}INFO${C_RESET}: VM '$_dom' is NOT stealth-tuned (use 'sudo $SCRIPT_NAME --install-stealth-vm-tuning')"
       else
         say "INFO: VM '$_dom' is NOT stealth-tuned (use 'sudo $SCRIPT_NAME --install-stealth-vm-tuning')"
+      fi
+    fi
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+}
+
+# R35: Reserve host hugepages for a VM. $1 = VM dumpxml, $2 = page size in MiB,
+# $3 = backup dir, $4 = domain name. Computes the page count from the VM's
+# <memory> (KiB), backs up the current /proc/sys/vm/nr_hugepages to
+# $3/${4}_perf_hugepages_prev_<ts>.txt, then writes the ADDITIVE new count
+# (prior + needed) so multiple tuned VMs accumulate. Best-effort: a write
+# failure logs a WARN (the VM has <memoryBacking><hugepages> but host pages
+# may be insufficient — the VM may fail to start until the operator fixes it).
+_reserve_host_hugepages_for_vm() {
+  local _xml="$1" _size_mib="$2" _backup_dir="$3" _dom="$4"
+  local _mem_kib _page_kib _need _prev _new _ts
+  _mem_kib="$(printf '%s' "$_xml" | grep -oE '<memory[^>]*>[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -n1 2>/dev/null || true)"
+  _mem_kib="$(trim "${_mem_kib:-0}")"
+  [[ "$_mem_kib" =~ ^[0-9]+$ ]] || _mem_kib=0
+  _page_kib=$(( _size_mib * 1024 ))
+  (( _page_kib > 0 )) || _page_kib=2097152
+  _need=$(( _mem_kib / _page_kib ))
+  (( _need * _page_kib < _mem_kib )) && _need=$(( _need + 1 ))
+  if (( _need <= 0 )); then
+    note "VM '$_dom' memory unreadable or zero; skipping hugepages reservation."
+    return 0
+  fi
+  _prev="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+  [[ "$_prev" =~ ^[0-9]+$ ]] || _prev=0
+  _ts="$(date +%Y%m%d-%H%M%S)"
+  printf '%s\n' "$_prev" >"$_backup_dir/${_dom}_perf_hugepages_prev_${_ts}.txt" 2>/dev/null || true
+  _new=$(( _prev + _need ))
+  note "Reserving $_need hugepage(s) of ${_size_mib}MiB for '$_dom' (host nr_hugepages: $_prev -> $_new)."
+  if (( ! DRY_RUN )); then
+    if ! printf '%s\n' "$_new" >/proc/sys/vm/nr_hugepages 2>/dev/null; then
+      note "WARN: failed to set /proc/sys/vm/nr_hugepages for '$_dom'. The VM has <memoryBacking><hugepages> but host pages may be insufficient — increase nr_hugepages manually or the VM may fail to start."
+    fi
+  fi
+}
+
+# R35: Restore the most recently backed-up nr_hugepages for a VM (revert helper).
+# $1 = backup dir, $2 = domain name. Reads the newest ${2}_perf_hugepages_prev_*.txt
+# and writes it back to /proc/sys/vm/nr_hugepages. Best-effort. Returns 0 even if
+# no backup exists (the VM simply never had hugepages reserved).
+_restore_host_hugepages_for_vm() {
+  local _backup_dir="$1" _dom="$2" _newest _prev _f
+  _newest=""
+  for _f in "$_backup_dir/${_dom}_perf_hugepages_prev_"*.txt; do
+    [[ -f "$_f" ]] || continue
+    if [[ -z "$_newest" || "$_f" -nt "$_newest" ]]; then
+      _newest="$_f"
+    fi
+  done
+  [[ -n "$_newest" ]] || return 0
+  _prev="$(cat "$_newest" 2>/dev/null || true)"
+  [[ "$_prev" =~ ^[0-9]+$ ]] || { rm -f "$_newest" 2>/dev/null || true; return 0; }
+  note "Restoring host nr_hugepages to $_prev for '$_dom' (was reserved by ultimate-perf)."
+  if (( ! DRY_RUN )); then
+    printf '%s\n' "$_prev" >/proc/sys/vm/nr_hugepages 2>/dev/null \
+      || note "WARN: failed to restore /proc/sys/vm/nr_hugepages (left as-is)."
+  fi
+  rm -f "$_newest" 2>/dev/null || true
+}
+
+# R35: Ultimate-performance VM XML tuning (stealth-safe). A SEPARATE, more
+# aggressive perf layer than the basic perf subset bundled inside
+# install_stealth_vm_tuning(). Applies maximum-throughput knobs to each shut-off
+# guest-GPU VM while NEVER touching the stealth elements (vendor_id, kvm hidden,
+# vmport, SMBIOS, e1000e NIC, disk serials, memballoon, hypervclock/TSC, QEMU
+# -cpu/-smbios) — so a VM that was stealth-tuned stays stealth-tuned through a
+# perf pass, and reverting perf (from the pre-perf XML backup, which still
+# contains stealth) leaves stealth intact. Knobs: disk cache=none/io=native/
+# discard=unmap + virtio-blk multiqueue queues; iothreads scaled to min(vcpu,4)
+# with round-robin disk assignment; aggressive cputune pinning (vcpus to physical
+# cores, emulator to a housekeeping core, iothreadpin) + numatune (ONLY when
+# NUMA-safe: single node, or all pinned vCPUs fit one node — otherwise skipped
+# so the VM never fails to start); CPU topology matching vCPU count + <cache
+# mode='passthrough'/>; currentMemory=memory (no startup balloon, synergizes
+# with stealth's memballoon=none); <pm> S3/S4 disabled. Hugepages is the ONLY
+# host-touching knob and is OPT-IN (prompted default N, or --ultimate-perf-hugepages
+# / --no-ultimate-perf-hugepages): when opted in, adds <memoryBacking><hugepages>
+# and reserves the matching host nr_hugepages (prior value backed up, reverted by
+# --reset-ultimate-perf-vm-tuning). Idempotent (python exit 3 = no changes). Only
+# acts on shut-off VMs. AMD-gated (consistency with stealth tuning). Verifies the
+# tuned XML with virt-xml-validate + prompts per VM before redefine.
+install_ultimate_perf_vm_tuning() {
+  if ! readable_file "$CONF_FILE"; then
+    note "Missing $CONF_FILE; skipping ultimate-performance VM tuning."
+    return 0
+  fi
+  local _guest_gpu _vendor
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -z "$_guest_gpu" ]]; then
+    note "No GUEST_GPU_BDF in $CONF_FILE; skipping ultimate-performance VM tuning."
+    return 0
+  fi
+  if [[ "${_vendor,,}" != "1002" ]]; then
+    note "Guest GPU is not AMD; skipping ultimate-performance VM tuning (consistency with stealth tuning, which is AMD-gated)."
+    return 0
+  fi
+  if ! have_cmd virsh; then
+    note "virsh not available; skipping ultimate-performance VM tuning."
+    return 0
+  fi
+  if ! have_cmd python3; then
+    note "python3 not available; skipping ultimate-performance VM tuning (the XML patcher needs python3)."
+    return 0
+  fi
+
+  say
+  hdr "Ultimate-performance VM tuning (stealth-safe)"
+  note "This applies maximum-throughput tuning to each shut-off VM that has the guest GPU:"
+  note "  - disk: cache=none (O_DIRECT) + io=native (Linux AIO) + discard=unmap + virtio-blk multiqueue"
+  note "  - iothreads scaled to min(vcpu,4); disks round-robin-assigned across iothreads"
+  note "  - cputune: vCPUs pinned to physical cores, emulator to a housekeeping core, iothreadpin"
+  note "  - numatune: memory strict pinning (ONLY when NUMA-safe; skipped otherwise so the VM still starts)"
+  note "  - CPU topology matching vCPU count + <cache mode='passthrough'/>"
+  note "  - currentMemory=memory (no startup balloon; synergizes with stealth's memballoon=none)"
+  note "  - <pm> S3/S4 disabled (faster boot; avoids guest suspend breaking passthrough)"
+  note "  - hugepages: OPT-IN (default N) — adds <memoryBacking> + reserves host nr_hugepages"
+  note "STEALTH-SAFE: this NEVER touches vendor_id/kvm hidden/vmport/SMBIOS/e1000e NIC/"
+  note "disk serials/memballoon/hypervclock/TSC/QEMU -cpu/-smbios. A stealth-tuned VM"
+  note "stays stealth-tuned through a perf pass; reverting perf restores a backup that"
+  note "still contains stealth. Only shut-off VMs are touched; running VMs are skipped."
+  note "The tuned XML is validated (virt-xml-validate) and you are prompted before each redefine."
+  say
+
+  # Resolve backup dir (same fallback chain as stealth tuning, but a separate dir).
+  local _backup_dir
+  _backup_dir="$(awk -F= '/^ULTIMATE_PERF_VM_BACKUP_DIR=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _backup_dir="$(trim "${_backup_dir:-}")"
+  if [[ -z "$_backup_dir" ]]; then
+    _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  fi
+  if ! mkdir -p "$_backup_dir" 2>/dev/null || ! [[ -w "$_backup_dir" ]]; then
+    _backup_dir="/var/lib/vfio-perf-vm/backups"
+    mkdir -p "$_backup_dir" 2>/dev/null || true
+    note "ULTIMATE_PERF_VM_BACKUP_DIR not writable; using $_backup_dir for VM XML backups."
+  fi
+  note "Ultimate-perf VM XML backups: $_backup_dir"
+
+  # Hugepages opt-in decision. Default N (never touches host RAM on a plain run).
+  local _hp_on=0
+  if [[ "${ULTIMATE_PERF_HUGEPAGES_OVERRIDE:-}" == "1" ]]; then
+    _hp_on=1
+  elif [[ "${ULTIMATE_PERF_HUGEPAGES_OVERRIDE:-}" == "0" ]]; then
+    _hp_on=0
+  else
+    say
+    note "Hugepages is the ONLY knob that touches host RAM (reserves nr_hugepages). It is opt-in."
+    note "With hugepages OFF, all the other perf knobs still apply and the VM stays startable."
+    if prompt_yn "Reserve host hugepages for each tuned VM (adds <memoryBacking> + reserves nr_hugepages)?" N "Ultimate-perf hugepages"; then
+      _hp_on=1
+    fi
+  fi
+  local _hp_size
+  _hp_size="$(awk -F= '/^ULTIMATE_PERF_HUGEPAGES_SIZE=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _hp_size="$(trim "${_hp_size:-}")"
+  [[ "$_hp_size" =~ ^[0-9]+$ ]] || _hp_size="2048"
+
+  # Read host CPU/NUMA topology once (exported to the python patcher). Defensive:
+  # if unreadable, the patcher falls back to simple v->v cputune and skips numatune.
+  local _host_cpus_csv _numa_csv _n _nid _cl
+  _host_cpus_csv="$(lscpu -p=CPU 2>/dev/null | grep -vE '^(#|$)' | paste -sd, 2>/dev/null || true)"
+  _numa_csv=""
+  if [[ -d /sys/devices/system/node ]]; then
+    for _n in /sys/devices/system/node/node*/cpulist; do
+      [[ -f "$_n" ]] || continue
+      _nid="$(basename "$(dirname "$_n")" | sed 's/^node//')"
+      _cl="$(cat "$_n" 2>/dev/null || true)"
+      [[ -n "$_cl" ]] || continue
+      _numa_csv="${_numa_csv:+${_numa_csv};}${_nid}:${_cl}"
+    done
+  fi
+  export VFIO_PERF_HOST_CPUS="$_host_cpus_csv"
+  export VFIO_PERF_NUMA="$_numa_csv"
+  export VFIO_PERF_HUGEPAGES="$_hp_on"
+  export VFIO_PERF_HUGEPAGES_SIZE="$_hp_size"
+  if [[ -n "$_host_cpus_csv" ]]; then
+    note "Host CPU topology: $(awk -F, '{print NF}' <<<"$_host_cpus_csv" 2>/dev/null || echo '?') CPUs${_numa_csv:+, NUMA: $_numa_csv}"
+  else
+    note "Host topology unreadable; cputune will use simple v->v pinning and numatune will be skipped."
+  fi
+
+  local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp _backup_xml
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/, "", s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/, "", s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/, "", s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/, "", s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+      continue
+    fi
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping ultimate-perf tuning. Shut it off and re-run."
+      _skipped_running=1
+      continue
+    fi
+    _tmp="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp"
+    _backup_xml="$_backup_dir/${_dom}_perf_$(date +%Y%m%d-%H%M%S).xml"
+    mkdir -p "$_backup_dir" 2>/dev/null || true
+    cp "$_tmp" "$_backup_xml" 2>/dev/null || true
+    # Was hugepages backing already present in the CURRENT xml? If so, do NOT
+    # reserve host pages again (idempotent: a prior run already reserved them).
+    local _have_hp=0
+    grep -Fq '<hugepages' <<<"$_xml" 2>/dev/null && _have_hp=1
+    local _py_status=0
+    python3 - "$_tmp" <<'PYEOF' || _py_status=$?
+import sys, xml.etree.ElementTree as ET, os, re
+QEMU_NS = 'http://libvirt.org/schemas/domain/qemu/1.0'
+ET.register_namespace('qemu', QEMU_NS)
+ET.register_namespace('libosinfo', 'http://libosinfo.org/xmlns/libvirt/domain/1.0')
+path = sys.argv[1]
+tree = ET.parse(path); root = tree.getroot()
+domain_type = root.get('type')
+if domain_type not in (None, 'kvm', 'qemu'):
+    sys.stderr.write(f"Unsupported domain type: {domain_type}\n"); sys.exit(4)
+changed = False
+
+def parse_cpulist(s):
+    out = []
+    if not s: return out
+    for part in str(s).split(','):
+        part = part.strip()
+        if not part: continue
+        m = re.match(r'^(\d+)-(\d+)$', part)
+        if m: out.extend(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif part.isdigit(): out.append(int(part))
+    return out
+
+def insert_after(parent, after_tag, new_el):
+    kids = list(parent); idx = -1
+    for i, c in enumerate(kids):
+        if c.tag == after_tag: idx = i
+    if idx < 0:
+        parent.append(new_el)
+    else:
+        parent.insert(idx + 1, new_el)
+
+def set_pin_idem(parent, tag, key_attr, key_val, attrs):
+    # Set a keyed pin child idempotently; return True if added or changed.
+    el = None
+    for ch in parent:
+        if ch.tag == tag and ch.get(key_attr) == str(key_val):
+            el = ch; break
+    if el is None:
+        ET.SubElement(parent, tag, attrs); return True
+    for k, v in attrs.items():
+        if el.get(k) != v:
+            el.set(k, v); return True
+    return False
+
+vcpu_el = root.find('vcpu')
+vcpu_count = 0
+if vcpu_el is not None and vcpu_el.text:
+    try: vcpu_count = int(vcpu_el.text.strip())
+    except ValueError: vcpu_count = 0
+host_cpus = parse_cpulist(os.environ.get('VFIO_PERF_HOST_CPUS', ''))
+if not host_cpus:
+    host_cpus = list(range(os.cpu_count() or 4))
+if vcpu_count < 1:
+    vcpu_count = max(1, min(len(host_cpus), 4))
+
+# --- currentMemory = memory (no startup balloon) ---
+mem_el = root.find('memory')
+if mem_el is not None and mem_el.text:
+    mem_text = mem_el.text.strip()
+    mem_unit = mem_el.get('unit', 'KiB')
+    cur_el = root.find('currentMemory')
+    if cur_el is None:
+        cur_el = ET.Element('currentMemory'); cur_el.text = mem_text; cur_el.set('unit', mem_unit)
+        insert_after(root, 'memory', cur_el); changed = True
+    else:
+        if (cur_el.text or '').strip() != mem_text:
+            cur_el.text = mem_text; changed = True
+        if cur_el.get('unit', 'KiB') != mem_unit:
+            cur_el.set('unit', mem_unit); changed = True
+
+# --- pm: disable S3/S4 ---
+pm = root.find('pm')
+if pm is None:
+    pm = ET.Element('pm')
+    if root.find('on_crash') is not None:
+        insert_after(root, 'on_crash', pm)
+    elif root.find('on_reboot') is not None:
+        insert_after(root, 'on_reboot', pm)
+    else:
+        root.append(pm)
+    changed = True
+for tag in ('suspend-to-mem', 'suspend-to-disk'):
+    el = None
+    for ch in pm:
+        if ch.tag == tag: el = ch; break
+    if el is None:
+        el = ET.SubElement(pm, tag); changed = True
+    if el.get('enabled') != 'no':
+        el.set('enabled', 'no'); changed = True
+
+# --- iothreads scaling ---
+target_iothreads = max(1, min(vcpu_count, 4))
+iothreads_el = root.find('iothreads')
+if iothreads_el is None:
+    it = ET.Element('iothreads'); it.text = str(target_iothreads)
+    insert_after(root, 'vcpu', it); changed = True
+else:
+    try: cur_it = int(iothreads_el.text.strip())
+    except (ValueError, AttributeError): cur_it = 0
+    if cur_it != target_iothreads:
+        iothreads_el.text = str(target_iothreads); changed = True
+n_iothreads = target_iothreads
+
+# --- cpu: topology + cache passthrough (NEVER touch mode/features) ---
+cpu = root.find('cpu')
+if cpu is not None:
+    sockets = 1; threads = 1; cores = vcpu_count
+    if vcpu_count % 2 == 0 and vcpu_count >= 2:
+        threads = 2; cores = vcpu_count // 2
+    want = {'sockets': str(sockets), 'cores': str(cores), 'threads': str(threads)}
+    topo = cpu.find('topology')
+    if topo is None:
+        topo = ET.Element('topology', want)
+        anchor = None
+        for c in cpu:
+            if c.tag in ('model', 'vendor'): anchor = c
+        if anchor is not None:
+            cpu.insert(list(cpu).index(anchor) + 1, topo)
+        else:
+            cpu.insert(0, topo)
+        changed = True
+    else:
+        for k, v in want.items():
+            if topo.get(k) != v:
+                topo.set(k, v); changed = True
+    cache_el = cpu.find('cache')
+    if cache_el is None:
+        cache_el = ET.Element('cache', {'mode': 'passthrough'})
+        t = cpu.find('topology')
+        if t is not None:
+            cpu.insert(list(cpu).index(t) + 1, cache_el)
+        else:
+            cpu.append(cache_el)
+        changed = True
+    elif cache_el.get('mode') != 'passthrough':
+        cache_el.set('mode', 'passthrough'); changed = True
+
+# --- cputune (aggressive pinning, defensive fallback) ---
+reserve_emulator = host_cpus[0] if host_cpus else 0
+vcpu_pool = [c for c in host_cpus if c != reserve_emulator]
+if len(vcpu_pool) >= vcpu_count:
+    pinned_vcpus = vcpu_pool[:vcpu_count]
+    iothread_pool = vcpu_pool[vcpu_count:] or pinned_vcpus
+else:
+    pinned_vcpus = list(range(vcpu_count))
+    iothread_pool = list(range(n_iothreads))
+
+# NUMA safety: only add numatune if single node OR all pinned vCPUs fit one node.
+numa_csv = os.environ.get('VFIO_PERF_NUMA', '')
+nodes = {}
+if numa_csv:
+    for entry in numa_csv.split(';'):
+        entry = entry.strip()
+        if not entry or ':' not in entry: continue
+        nid, cl = entry.split(':', 1)
+        nodes[nid.strip()] = parse_cpulist(cl)
+add_numatune = False
+node_id_for_mem = None
+if len(nodes) <= 1:
+    if nodes:
+        only_nid = list(nodes.keys())[0]
+        only = list(nodes.values())[0]
+        if all(c in only for c in pinned_vcpus):
+            add_numatune = True; node_id_for_mem = only_nid
+else:
+    for nid, cl in nodes.items():
+        if all(c in cl for c in pinned_vcpus):
+            add_numatune = True; node_id_for_mem = nid; break
+
+cputune = root.find('cputune')
+if cputune is None:
+    cputune = ET.Element('cputune')
+    # Canonical libvirt domain order: cputune comes after <pm> (and the
+    # on_poweroff/on_reboot/on_crash block), before <numatune>/<resource>/
+    # <features>. Placing it after <clock> makes virt-xml-validate fail with
+    # "Invalid sequence in interleave", so anchor on <pm> first.
+    if root.find('pm') is not None:
+        insert_after(root, 'pm', cputune)
+    elif root.find('on_crash') is not None:
+        insert_after(root, 'on_crash', cputune)
+    elif root.find('clock') is not None:
+        insert_after(root, 'clock', cputune)
+    elif root.find('cpu') is not None:
+        insert_after(root, 'cpu', cputune)
+    else:
+        root.append(cputune)
+    changed = True
+# Idempotent pin rebuild: update/add only what differs; drop stale pins for
+# vcpus/iothreads outside our current range (e.g. after a vCPU count change).
+for el in list(cputune.findall('vcpupin')):
+    _v = el.get('vcpu')
+    if _v is None or not _v.isdigit() or int(_v) >= vcpu_count:
+        cputune.remove(el); changed = True
+for v in range(vcpu_count):
+    if set_pin_idem(cputune, 'vcpupin', 'vcpu', v, {'vcpu': str(v), 'cpuset': str(pinned_vcpus[v])}):
+        changed = True
+_emp = None
+for ch in cputune:
+    if ch.tag == 'emulatorpin': _emp = ch; break
+if _emp is None:
+    ET.SubElement(cputune, 'emulatorpin', {'cpuset': str(reserve_emulator)}); changed = True
+elif _emp.get('cpuset') != str(reserve_emulator):
+    _emp.set('cpuset', str(reserve_emulator)); changed = True
+for el in list(cputune.findall('iothreadpin')):
+    _it = el.get('iothread')
+    if _it is None or not _it.isdigit() or int(_it) > n_iothreads:
+        cputune.remove(el); changed = True
+for i in range(n_iothreads):
+    c = iothread_pool[i % len(iothread_pool)] if iothread_pool else reserve_emulator
+    if set_pin_idem(cputune, 'iothreadpin', 'iothread', i + 1, {'iothread': str(i + 1), 'cpuset': str(c)}):
+        changed = True
+
+if add_numatune:
+    numatune = root.find('numatune')
+    if numatune is None:
+        numatune = ET.Element('numatune')
+        if root.find('cputune') is not None:
+            insert_after(root, 'cputune', numatune)
+        else:
+            root.append(numatune)
+        changed = True
+    # numatune <memory> uses `nodeset` (NUMA node IDs, per libvirt RNG), NOT a
+    # cpuset of CPU IDs, and has no `cellid` attr (cellid is for <memnode>).
+    # Pin VM memory to the single NUMA node that holds all pinned vCPUs.
+    # Idempotent: update only if mode/nodeset differ.
+    want_mem_attrs = {'mode': 'strict', 'nodeset': str(node_id_for_mem)}
+    _nm = None
+    for ch in numatune:
+        if ch.tag == 'memory': _nm = ch; break
+    if _nm is None:
+        ET.SubElement(numatune, 'memory', want_mem_attrs); changed = True
+    else:
+        for k, v in want_mem_attrs.items():
+            if _nm.get(k) != v:
+                _nm.set(k, v); changed = True
+
+# --- disk I/O perf ---
+devices = root.find('devices')
+if devices is not None:
+    disk_idx = 0
+    for disk in devices.findall('disk'):
+        if disk.get('device', 'disk') == 'cdrom':
+            continue
+        target = disk.find('target')
+        bus = target.get('bus') if target is not None else None
+        if bus not in ('virtio', 'scsi'):
+            continue
+        driver = disk.find('driver')
+        if driver is None:
+            driver = ET.Element('driver', {'name': 'qemu', 'type': 'raw'})
+            disk.insert(0, driver); changed = True
+        if driver.get('cache') != 'none':
+            driver.set('cache', 'none'); changed = True
+        if driver.get('io') != 'native':
+            driver.set('io', 'native'); changed = True
+        if driver.get('discard') != 'unmap':
+            driver.set('discard', 'unmap'); changed = True
+        if bus == 'virtio':
+            want_q = str(vcpu_count)
+            if driver.get('queues') != want_q:
+                driver.set('queues', want_q); changed = True
+        want_it = str((disk_idx % n_iothreads) + 1)
+        if driver.get('iothread') != want_it:
+            driver.set('iothread', want_it); changed = True
+        disk_idx += 1
+
+# --- hugepages (opt-in) ---
+if os.environ.get('VFIO_PERF_HUGEPAGES', '0') == '1':
+    hp_size = os.environ.get('VFIO_PERF_HUGEPAGES_SIZE', '2048')
+    mb = root.find('memoryBacking')
+    if mb is None:
+        mb = ET.Element('memoryBacking')
+        if root.find('currentMemory') is not None:
+            insert_after(root, 'currentMemory', mb)
+        elif root.find('memory') is not None:
+            insert_after(root, 'memory', mb)
+        else:
+            root.append(mb)
+        changed = True
+    # hugepages/page + locked + nosharepages: idempotent (add/update only on diff).
+    hp_el = mb.find('hugepages')
+    if hp_el is None:
+        hp_el = ET.SubElement(mb, 'hugepages'); changed = True
+    _page = None
+    for ch in hp_el:
+        if ch.tag == 'page': _page = ch; break
+    want_page = {'size': str(hp_size), 'unit': 'MiB'}
+    if _page is None:
+        ET.SubElement(hp_el, 'page', want_page); changed = True
+    else:
+        for k, v in want_page.items():
+            if _page.get(k) != v:
+                _page.set(k, v); changed = True
+    for tag in ('locked', 'nosharepages'):
+        if mb.find(tag) is None:
+            ET.SubElement(mb, tag); changed = True
+
+if not changed: sys.exit(3)
+tree.write(path)
+PYEOF
+    if (( _py_status == 3 )); then
+      say "VM '$_dom' is already ultimate-perf tuned (no changes needed)."
+      _updated=1
+      rm -f "$_tmp"
+      continue
+    elif (( _py_status == 4 )); then
+      note "WARN: VM '$_dom' has an unsupported domain type; skipping ultimate-perf tuning."
+      rm -f "$_tmp"
+      continue
+    elif (( _py_status != 0 )); then
+      note "WARN: ultimate-perf XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      rm -f "$_tmp"
+      continue
+    fi
+    if ! virt-xml-validate "$_tmp" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for tuned '$_dom'; skipping redefine (backup at $_backup_xml)."
+      rm -f "$_tmp"
+      continue
+    fi
+    say "Tuned XML for '$_dom' validates. Backup of original: $_backup_xml"
+    if (( DRY_RUN )); then
+      say "Dry run: showing diff (current -> tuned) for '$_dom' (no redefine will happen):"
+      if command -v diff >/dev/null 2>&1; then
+        diff -u "$_backup_xml" "$_tmp" || true
+      else
+        say "diff(1) not available; tuned XML is in $_tmp"
+      fi
+    fi
+    if ! prompt_yn "Redefine VM '$_dom' with the ultimate-perf tuning now?" N "Ultimate-perf VM tuning"; then
+      note "Skipped '$_dom' by user choice (tuned XML left in $_tmp; backup at $_backup_xml)."
+      rm -f "$_tmp"
+      continue
+    fi
+    local _define_rc=0 _define_err
+    if (( ! DRY_RUN )); then
+      _define_err="$(virsh -c qemu:///system define "$_tmp" 2>&1 >/dev/null)" || _define_rc=$?
+    fi
+    if (( _define_rc != 0 )); then
+      note "ERROR: virsh define failed for '$_dom' (exit $_define_rc): $_define_err"
+      note "The tuned XML is in $_tmp; backup at $_backup_xml. You can define it manually:"
+      note "  virsh -c qemu:///system define $_tmp"
+      rm -f "$_tmp"
+      continue
+    fi
+    # Reserve host hugepages AFTER a successful define, only if hugepages is on
+    # AND the VM did not already have hugepages backing (idempotent).
+    if (( _hp_on )) && (( ! _have_hp )); then
+      _reserve_host_hugepages_for_vm "$_xml" "$_hp_size" "$_backup_dir" "$_dom"
+    fi
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}${C_BOLD}✔ Ultimate-performance tuning applied to VM '$_dom'${C_RESET}"
+    else
+      say "✔ Ultimate-performance tuning applied to VM '$_dom'"
+    fi
+    say "  ✔ disk cache=none + io=native + discard=unmap + virtio-blk multiqueue"
+    say "  ✔ iothreads scaled + disks round-robin across iothreads"
+    say "  ✔ cputune vCPU/emulator/iothread pinning (+ numatune when NUMA-safe)"
+    say "  ✔ CPU topology + <cache mode='passthrough'/>"
+    say "  ✔ currentMemory=memory (no startup balloon)"
+    say "  ✔ <pm> S3/S4 disabled"
+    if (( _hp_on )); then
+      say "  ✔ hugepages <memoryBacking> + host nr_hugepages reserved (${_hp_size}MiB pages)"
+    fi
+    say "  Backup of original XML: $_backup_xml"
+    note "Restore with: sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning  (or: virsh -c qemu:///system define $_backup_xml)"
+    _updated=1
+    rm -f "$_tmp"
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  if (( ! _updated )); then
+    if (( _skipped_running )); then
+      note "No VMs were tuned (running VMs must be shut off first). Shut off the VM and re-run."
+    else
+      note "No shut-off VMs with the guest GPU found; nothing to tune."
+    fi
+  fi
+}
+
+# R35: Revert ultimate-performance VM tuning by redefining each guest-GPU VM from
+# its most recent *_perf_*.xml backup, and restoring the host nr_hugepages that
+# was reserved for it. Standalone mode (--reset-ultimate-perf-vm-tuning). Only
+# acts on shut-off VMs (running VMs are skipped with a note). Verifies the backup
+# XML with virt-xml-validate and prompts before redefining.
+reset_ultimate_perf_vm_tuning() {
+  if ! readable_file "$CONF_FILE"; then
+    note "Missing $CONF_FILE; nothing to revert."
+    return 0
+  fi
+  local _guest_gpu _vendor
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  if [[ -z "$_guest_gpu" ]]; then
+    note "No GUEST_GPU_BDF in $CONF_FILE; nothing to revert."
+    return 0
+  fi
+  if ! have_cmd virsh; then
+    note "virsh not available; cannot revert ultimate-performance VM tuning."
+    return 0
+  fi
+  local _backup_dir
+  _backup_dir="$(awk -F= '/^ULTIMATE_PERF_VM_BACKUP_DIR=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _backup_dir="$(trim "${_backup_dir:-}")"
+  if [[ -z "$_backup_dir" ]]; then _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"; fi
+  if ! [[ -d "$_backup_dir" ]]; then
+    _backup_dir="/var/lib/vfio-perf-vm/backups"
+  fi
+  say
+  hdr "Revert ultimate-performance VM tuning (restore from backup XML)"
+  note "This redefines each shut-off guest-GPU VM from its most recent"
+  note "${_dom:-<vm>}_perf_*.xml backup in $_backup_dir (which still contains stealth),"
+  note "and restores the host nr_hugepages that was reserved for it. Only shut-off"
+  note "VMs are touched; running VMs are skipped."
+  say
+  local _reverted=0 _skipped_running=0 _dom _xml _bdfs _state _backup _newest
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/, "", s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/, "", s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/, "", s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/, "", s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    if ! grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null; then
+      continue
+    fi
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping revert. Shut it off and re-run."
+      _skipped_running=1
+      continue
+    fi
+    _newest=""
+    for _backup in "$_backup_dir/${_dom}_perf_"*.xml; do
+      [[ -f "$_backup" ]] || continue
+      if [[ -z "$_newest" || "$_backup" -nt "$_newest" ]]; then
+        _newest="$_backup"
+      fi
+    done
+    if [[ -z "$_newest" ]]; then
+      note "No perf backup XML found for '$_dom' in $_backup_dir; skipping."
+      continue
+    fi
+    if ! virt-xml-validate "$_newest" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for backup '$_newest'; skipping revert of '$_dom'."
+      continue
+    fi
+    say "Found backup for '$_dom': $_newest (validates)."
+    if ! prompt_yn "Redefine VM '$_dom' from the pre-perf backup now?" N "Revert ultimate-perf VM tuning"; then
+      note "Skipped '$_dom' by user choice."
+      continue
+    fi
+    if (( ! DRY_RUN )); then
+      virsh -c qemu:///system define "$_newest" 2>/dev/null
+    fi
+    say "Reverted VM '$_dom' from backup: $_newest"
+    _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"
+    _reverted=1
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  if (( ! _reverted )); then
+    if (( _skipped_running )); then
+      note "No VMs were reverted (running VMs must be shut off first)."
+    else
+      note "No perf backups found for guest-GPU VMs; nothing to revert."
+    fi
+  fi
+}
+
+# R35: Report ultimate-performance VM tuning status for each guest-GPU VM (used
+# by --detect and --verify). Checks for the perf markers (disk cache=none +
+# io=native, cputune, pm disabled, optional hugepages) in the VM XML. Prints one
+# status line per guest-GPU VM.
+ultimate_perf_vm_tuning_status() {
+  if ! readable_file "$CONF_FILE"; then return 0; fi
+  local _guest_gpu _dom _xml _bdfs _has_cache _has_io _has_cputune _has_pm _has_hp
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_guest_gpu" ]] || return 0
+  have_cmd virsh || return 0
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; is_pci=0 }
+      in_hostdev && /type=.pci./ { is_pci=1 }
+      in_hostdev && is_pci && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/, "", s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/, "", s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/, "", s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/, "", s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+    ')"
+    grep -Fixq "$_guest_gpu" <<<"$_bdfs" 2>/dev/null || continue
+    _has_cache=0; _has_io=0; _has_cputune=0; _has_pm=0; _has_hp=0
+    grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && _has_cache=1
+    grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && _has_io=1
+    grep -Fq '<cputune>' <<<"$_xml" 2>/dev/null && _has_cputune=1
+    grep -Fq "suspend-to-mem enabled='no'" <<<"$_xml" 2>/dev/null && _has_pm=1
+    grep -Fq '<hugepages' <<<"$_xml" 2>/dev/null && _has_hp=1
+    local _hp_marker=""
+    (( _has_hp )) && _hp_marker=", hugepages"
+    if (( _has_cache && _has_io && _has_cputune )); then
+      if (( ENABLE_COLOR )); then
+        say "${C_GREEN}✔ OK${C_RESET}: VM '$_dom' is ultimate-perf tuned (disk cache=none/io=native, cputune pinning${_hp_marker})"
+      else
+        say "OK: VM '$_dom' is ultimate-perf tuned (disk cache=none/io=native, cputune pinning${_hp_marker})"
+      fi
+    else
+      if (( ENABLE_COLOR )); then
+        say "${C_YELLOW}INFO${C_RESET}: VM '$_dom' is NOT ultimate-perf tuned (use 'sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning')"
+      else
+        say "INFO: VM '$_dom' is NOT ultimate-perf tuned (use 'sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning')"
       fi
     fi
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
@@ -21379,6 +22213,8 @@ vfio_menu() {
       "Attach virtio-win guest-agent ISO (smart handoff via guest-ping)"
       "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials)"
       "Revert stealth/perf VM tuning (from backup XML)"
+      "Apply ultimate-perf VM tuning (stealth-safe: disk I/O, iothreads, pinning, hugepages opt-in)"
+      "Revert ultimate-perf VM tuning (from backup XML, restores nr_hugepages)"
       "Verify setup (read-only check)"
       "Detect / health check (read-only report)"
       "Reset everything (full cleanup, removes all VFIO config)"
@@ -21476,12 +22312,42 @@ vfio_menu() {
         fi
         ;;
       7)
+        # Apply ultimate-perf VM tuning (stealth-safe).
+        say
+        note "Applying ultimate-performance VM tuning..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 or 2 first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; ultimate-perf VM tuning needs libvirt to dump/define VM XML."
+          if prompt_yn "Continue anyway?" N "Ultimate-perf VM tuning"; then
+            install_ultimate_perf_vm_tuning
+          fi
+        else
+          install_ultimate_perf_vm_tuning
+        fi
+        ;;
+      8)
+        # Revert ultimate-perf VM tuning.
+        say
+        note "Reverting ultimate-performance VM tuning..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 or 2 first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; ultimate-perf VM revert needs libvirt to dump/define VM XML."
+          if prompt_yn "Continue anyway?" N "Revert ultimate-perf VM tuning"; then
+            reset_ultimate_perf_vm_tuning
+          fi
+        else
+          reset_ultimate_perf_vm_tuning
+        fi
+        ;;
+      9)
         # Verify setup (read-only).
         say
         note "Verifying setup..."
         verify_setup
         ;;
-      8)
+      10)
         # Detect / health check (read-only). Subshell isolates the conf source.
         say
         note "Running detect + health check..."
@@ -21498,7 +22364,7 @@ vfio_menu() {
           fi
         )
         ;;
-      9)
+      11)
         # Reset everything.
         say
         note "Resetting everything..."
@@ -21513,19 +22379,19 @@ vfio_menu() {
           note "Reset cancelled."
         fi
         ;;
-      10)
+      12)
         # Install vfio.sh to a stable PATH location + shell completions.
         say
         note "Installing vfio.sh to /usr/local/sbin + shell completions..."
         install_self
         ;;
-      11)
+      13)
         # Uninstall the self-installed vfio.sh + completions.
         say
         note "Uninstalling the self-installed vfio.sh + completions..."
         uninstall_self
         ;;
-      12)
+      14)
         # Exit.
         say
         say "Exiting vfio.sh menu."
@@ -21764,6 +22630,38 @@ main() {
       fi
     fi
     reset_stealth_vm_tuning
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-ultimate-perf-vm-tuning" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run the full installer first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; ultimate-perf VM tuning needs libvirt to dump/define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Ultimate-perf VM tuning"; then
+        die "Aborted by user"
+      fi
+    fi
+    install_ultimate_perf_vm_tuning
+    exit 0
+  fi
+
+  if [[ "$MODE" == "reset-ultimate-perf-vm-tuning" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run the full installer first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; ultimate-perf VM revert needs libvirt to dump/define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Revert ultimate-perf VM tuning"; then
+        die "Aborted by user"
+      fi
+    fi
+    reset_ultimate_perf_vm_tuning
     exit 0
   fi
 

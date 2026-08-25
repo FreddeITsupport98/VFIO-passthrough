@@ -34,6 +34,7 @@
 - [Idempotency + the stale-helper fix (R26/R31)](#idempotency--the-stale-helper-fix-r26r31)
 - [Interactive installer menu (--menu)](#interactive-installer-menu)
 - [Self-install (--install-self / --uninstall-self) + config pickup](#self-install)
+- [Ultimate-performance VM tuning (stealth-safe)](#ultimate-performance-vm-tuning-stealth-safe)
 - [Table of Contents](#table-of-contents)
 
 ## Table of Contents
@@ -59,6 +60,7 @@
 - [Command-line modes](#command-line-modes)
 - [Interactive installer menu (--menu)](#interactive-installer-menu)
 - [Self-install (--install-self / --uninstall-self) + config pickup](#self-install)
+- [Ultimate-performance VM tuning (stealth-safe)](#ultimate-performance-vm-tuning-stealth-safe)
 - [Interactive wizard (default mode)](#interactive-wizard-default-mode)
 - [Verification and troubleshooting](#verification-and-troubleshooting)
 - [Safety model](#safety-model)
@@ -91,6 +93,8 @@ vfio 7.0 adds the **live-attach (hotplug GPU) workflow** as the recommended RDNA
 An **interactive installer menu** (`--menu`) lets you pick any of those actions from a TUI menu — full configure, switch dynamic/early binding, set up live-attach/hotswap, attach the virtio-win guest-agent ISO, apply/revert stealth tuning, verify, detect, reset — without running the whole wizard or remembering individual flags, and it loops back after each action so you can do several things in one session. See [Interactive installer menu](#interactive-installer-menu).
 
 A **self-install** (`--install-self`) puts `vfio` on PATH at `/usr/local/bin/vfio` and drops the fish/bash/zsh completions into their vendor auto-load directories (no `source` step), so you can run `vfio ...` (no `.sh`) from anywhere with working completions; `--uninstall-self` removes both. And on a fresh install, if a prior run left a `/etc/vfio-gpu-passthrough.conf.bak.<ts>` backup (e.g. after `--reset`, or cloning the repo onto a host that already had VFIO) but the live config is missing, the wizard now **detects the backup and offers to pick up the same config** (restore the guest/host GPU BDFs + binding mode and re-apply the binding) instead of re-running the whole wizard. See [Self-install](#self-install).
+
+An **ultimate-performance VM tuning** installer (`--install-ultimate-perf-vm-tuning`) layers maximum-throughput knobs (disk `cache=none`/`io=native`/multiqueue, scaled iothreads, aggressive cputune/numatune pinning, CPU topology + cache passthrough, no startup balloon, S3/S4 disabled, optional hugepages) on each guest-GPU VM **without disturbing the stealth tuning** — the perf patcher never touches the stealth elements, and reverting perf restores a backup that still contains stealth. See [Ultimate-performance VM tuning (stealth-safe)](#ultimate-performance-vm-tuning-stealth-safe).
 
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
@@ -308,6 +312,42 @@ sudo ./vfio.sh --verify
 ```
 
 Backups go to `STEALTH_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-stealth-vm/backups`). `--reset` does NOT revert VM XMLs — use `--reset-stealth-vm-tuning` for that. This is cosmetic realism + perf tuning, **not** an anti-cheat bypass.
+
+### Ultimate-performance VM tuning (stealth-safe)
+
+vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning installer that layers maximum-throughput knobs on each shut-off guest-GPU VM, **while keeping the stealth tuning intact**. The stealth tuning (vendor_id, kvm hidden, vmport, SMBIOS, e1000e NIC, disk serials, memballoon=none, hypervclock/TSC, QEMU -cpu/-smbios) is never touched by the perf patcher — a stealth-tuned VM stays stealth-tuned through a perf pass, and reverting perf restores a pre-perf backup that still contains stealth.
+
+**What it does** (to each shut-off VM that has the guest GPU attached):
+- **Disk I/O** (the biggest safe win): `cache=none` (O_DIRECT, no double cache) + `io=native` (Linux AIO, best latency) + `discard=unmap` (SSD trim passthrough); virtio-blk multiqueue `queues=<vcpu>`; per-disk `iothread` round-robin assignment.
+- **iothreads scaling**: bumps `<iothreads>` to `min(vcpu,4)` and round-robin-assigns disks across them (the stealth `iothreads=1` is upgraded, not duplicated — idempotent).
+- **cputune + numatune (aggressive pinning)**: reads host topology (`lscpu` + `/sys/devices/system/node`); pins vCPUs to physical cores, `emulatorpin` to a housekeeping core, `iothreadpin` per iothread. `numatune` memory strict-pinning is added **only when NUMA-safe** (single node, or all pinned vCPUs fit one node) — otherwise skipped so the VM never fails to start. Falls back to simple `v->v` pinning if host topology is unreadable.
+- **CPU topology + cache**: adds `<topology sockets/cores/threads>` matching the vCPU count + `<cache mode='passthrough'/>` under `<cpu>`. Does NOT change stealth's `host-passthrough` mode or the `hypervisor` CPUID disable.
+- **currentMemory = memory**: the VM starts at full allocation (no startup balloon) — synergizes with stealth's `memballoon=none`.
+- **`<pm>` S3/S4 disabled**: faster boot; avoids guest suspend breaking passthrough.
+- **Hugepages (OPT-IN, the only host-RAM knob)**: when opted in, adds `<memoryBacking><hugepages>` + reserves the matching host `nr_hugepages` (prior value backed up, reverted by `--reset-ultimate-perf-vm-tuning`). Default OFF so a plain run never touches host RAM; all other perf knobs still apply without it.
+
+**Stealth coexistence guarantee**: the perf patcher only touches the elements above; it never reads/writes `features/hyperv/vendor_id`, `kvm/hidden`, `vmport`, `os/smbios`, `sysinfo`, `interface/model` (e1000e), `disk/serial`, `memballoon`, `clock/timer` (hypervclock/tsc), or `qemu:commandline` (-cpu/-smbios). Reverting perf restores the pre-perf XML backup (which still contains stealth), so stealth survives a perf revert.
+
+**Safety / verify-before-define**: for each VM it dumps + backs up the XML to `${vm}_perf_<ts>.xml`, runs the tuning on a temp copy, validates with `virt-xml-validate`, and prompts before `virsh define`. Running VMs are skipped. `--dry-run` shows a `diff -u` of the changes. Idempotent (a re-run on an already-tuned VM reports "no changes needed").
+
+```fish path=null start=null
+# Apply ultimate-performance tuning (stealth-safe) to detected guest-GPU VMs:
+sudo ./vfio.sh --install-ultimate-perf-vm-tuning
+
+# Same, but also reserve host hugepages (opt-in) for each tuned VM:
+sudo ./vfio.sh --install-ultimate-perf-vm-tuning --ultimate-perf-hugepages
+
+# Preview the changes without redefining (dry-run diff per VM):
+sudo ./vfio.sh --install-ultimate-perf-vm-tuning --dry-run
+
+# Revert from the most recent *_perf_*.xml backup (also restores nr_hugepages):
+sudo ./vfio.sh --reset-ultimate-perf-vm-tuning
+
+# Check perf status (in --detect / --verify):
+sudo ./vfio.sh --verify
+```
+
+Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` (default `2048` MiB = 2MB pages; `1048576` for 1GB pages). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
 
 ### Why this matters for newer AMD cards
 

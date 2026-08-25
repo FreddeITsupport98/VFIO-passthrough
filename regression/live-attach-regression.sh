@@ -643,7 +643,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 MODE comment lists install-virtio-win-guest-agent" \
-  'install-virtio-win-guest-agent | menu | install-self | uninstall-self | completion printers' \
+  'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 usage help documents --install-virtio-win-guest-agent" \

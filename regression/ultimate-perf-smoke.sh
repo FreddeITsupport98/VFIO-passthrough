@@ -123,6 +123,24 @@ rc2=$?
 set -e
 if [[ "$rc2" -eq 3 ]]; then ok "perf patcher idempotent (exit 3 on re-run)"; else bad "perf patcher not idempotent (exit $rc2 on re-run)"; fi
 
+# Hugepages ON (R35 follow-up): memoryBacking added with KiB units (2048 KiB =
+# 2 MiB = standard 2MB hugepage; libvirt <page> uses KiB, NOT MiB), still
+# validates, and stealth survives the hugepages pass.
+hp2="$tmp/hp2.xml"
+cp "$mock" "$hp2"
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="1" VFIO_PERF_HUGEPAGES_SIZE="2048" \
+    python3 "$perf_py" "$hp2" >/dev/null 2>&1
+rc_hp=$?
+set -e
+if [[ "$rc_hp" -eq 0 ]]; then ok "perf patcher exit 0 with hugepages on"; else bad "perf patcher exit $rc_hp with hugepages on"; fi
+if grep -Fq '<page size="2048" unit="KiB"' "$hp2"; then ok "hugepages page uses KiB units"; else bad "hugepages page not KiB units"; fi
+if grep -Fq 'GENUINE00000' "$hp2"; then ok "stealth survives hugepages run"; else bad "stealth lost in hugepages run"; fi
+if command -v virt-xml-validate >/dev/null 2>&1; then
+  if virt-xml-validate "$hp2" >/dev/null 2>&1; then ok "hugepages-tuned XML validates"; else bad "hugepages-tuned XML fails validate"; fi
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

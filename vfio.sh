@@ -1673,8 +1673,11 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    currentMemory=memory (no startup balloon); <pm> S3/S4 disabled. Hugepages is
                    the ONLY host-RAM knob and is opt-in (prompted default N, or
                    --ultimate-perf-hugepages/--no-ultimate-perf-hugepages): when on, adds
-                   <memoryBacking><hugepages> and reserves host nr_hugepages (prior value backed
-                   up, reverted by --reset-ultimate-perf-vm-tuning). Idempotent. Requires an
+                   <memoryBacking><hugepages> and reserves host nr_hugepages (reserve-first +
+                   verify the kernel delivered the full count; RAM-change aware so a VM RAM
+                   grow/shrink between runs adjusts the pool; reboot-safe re-reserve after a
+                   host reboot reset; 1GB page sizes are guarded and skipped with a cmdline
+                   hint). Reverted by --reset-ultimate-perf-vm-tuning. Idempotent. Requires an
                    existing $CONF_FILE and libvirt. DISCLAIMER: performance tuning ONLY.
   --reset-ultimate-perf-vm-tuning
                    Revert ultimate-performance VM tuning by redefining each shut-off guest-GPU
@@ -4762,10 +4765,14 @@ ULTIMATE_PERF_VM_BACKUP_DIR=""
 # WHY this value: empty keeps hugepages opt-in so a plain run never touches host
 # RAM (nr_hugepages). Set 1 only if you want hugepages every time without asking.
 ULTIMATE_PERF_HUGEPAGES=""
-# Hugepage size in MiB for ULTIMATE_PERF_HUGEPAGES (read by the perf tuner).
-# 2048 = 2MB pages (default, widely available); 1048576 = 1GB pages (needs the
-# kernel hugepagesz=1G boot param and a supporting CPU). The tuner computes the
-# page count from each VM's <memory> and reserves that many host pages.
+# Hugepage size in KiB for ULTIMATE_PERF_HUGEPAGES (read by the perf tuner, and
+# written to the libvirt XML <page size=... unit='KiB'/> — KiB is libvirt's
+# standard unit for hugepage size). 2048 = 2048 KiB = 2 MiB = the standard 2MB
+# hugepage (default, widely available, controlled by /proc/sys/vm/nr_hugepages);
+# 1048576 = 1048576 KiB = 1 GiB = 1GB pages (needs the kernel hugepagesz=1G boot
+# param + a supporting CPU; CANNOT be reserved at runtime so the tuner skips it
+# and warns). The tuner computes the page count from each VM's <memory> (KiB)
+# and reserves that many host pages.
 ULTIMATE_PERF_HUGEPAGES_SIZE="2048"
 # Dynamic-mode park-keepalive monitor (read by vfio-gpu-park-keepalive.sh):
 # - 1 (default, instant on): while the guest GPU is parked on vfio-pci between
@@ -12961,62 +12968,121 @@ stealth_vm_tuning_status() {
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
 }
 
-# R35: Reserve host hugepages for a VM. $1 = VM dumpxml, $2 = page size in MiB,
-# $3 = backup dir, $4 = domain name. Computes the page count from the VM's
-# <memory> (KiB), backs up the current /proc/sys/vm/nr_hugepages to
-# $3/${4}_perf_hugepages_prev_<ts>.txt, then writes the ADDITIVE new count
-# (prior + needed) so multiple tuned VMs accumulate. Best-effort: a write
-# failure logs a WARN (the VM has <memoryBacking><hugepages> but host pages
-# may be insufficient — the VM may fail to start until the operator fixes it).
-_reserve_host_hugepages_for_vm() {
-  local _xml="$1" _size_mib="$2" _backup_dir="$3" _dom="$4"
-  local _mem_kib _page_kib _need _prev _new _ts
+# R35: Read the VM's <memory> (KiB) from a dumpxml. $1 = xml. Prints the
+# integer KiB, or 0 on failure. Never fails.
+_vm_memory_kib() {
+  local _xml="$1" _mem_kib
   _mem_kib="$(printf '%s' "$_xml" | grep -oE '<memory[^>]*>[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -n1 2>/dev/null || true)"
-  _mem_kib="$(trim "${_mem_kib:-0}")"
+  _mem_kib="$(trim "${_mem_kib:-}")"
   [[ "$_mem_kib" =~ ^[0-9]+$ ]] || _mem_kib=0
-  _page_kib=$(( _size_mib * 1024 ))
-  (( _page_kib > 0 )) || _page_kib=2097152
+  printf '%s' "$_mem_kib"
+}
+
+# R35: Reserve host hugepages for a VM — RAM-change aware + reserve-first +
+# verify + reboot-safe + 1GB-guarded.
+# $1 = VM dumpxml, $2 = page size in KiB (matches libvirt <page size=... unit='KiB'/>),
+# $3 = backup dir, $4 = domain name. Returns 0 if the host pool now has >= the
+# pages this VM needs (safe to add <memoryBacking>), or 1 if not (caller turns
+# hugepages OFF for this run so the VM keeps every other perf knob and still
+# starts).
+#
+# Behavior:
+#  - Computes the page count from the VM's CURRENT <memory> (KiB) divided by the
+#    page size (KiB), so a RAM allocation change between runs is honored (grow =
+#    add, shrink = free), instead of only ever adding. The count THIS VM owns is
+#    persisted to ${3}/${4}_perf_hugepages_owned.txt so a shrink frees exactly
+#    its surplus while preserving other tuned VMs' reservations (target = sum of
+#    other VMs' owned + this VM's new need).
+#  - RESERVE-FIRST + VERIFY: writes /proc/sys/vm/nr_hugepages, then re-reads the
+#    knob — the runtime write can grant FEWER than requested on a fragmented
+#    host. On a shortfall it reverts the pool and returns 1 (so no mismatched
+#    <memoryBacking> is defined), with a WARN naming the shortfall and the
+#    boot-time 'hugepages=N' kernel-cmdline fallback (reboot-safe, can't be
+#    fragmented out).
+#  - 1GB guard: a 1GB page size (1048576 KiB) CANNOT be reserved at runtime (the
+#    runtime knob only controls the 2MB pool); returns 1 + warns and skips the
+#    write (the operator must use 'hugepagesz=1G hugepages=N' on the cmdline).
+#  - Reboot-safe re-reserve: after a host reboot resets nr_hugepages to 0, the
+#    next run re-reserves automatically (target > 0 while the pool is 0).
+_reserve_host_hugepages_for_vm() {
+  local _xml="$1" _size_kib="$2" _backup_dir="$3" _dom="$4"
+  local _mem_kib _page_kib _need _cur _other_owned _want _got _owned_file _f _o _disp_size
+  _mem_kib="$(_vm_memory_kib "$_xml")"
+  if (( _mem_kib <= 0 )); then
+    note "VM '$_dom' memory unreadable or zero; skipping hugepages reservation."
+    return 1
+  fi
+  # 1GB pages guard.
+  if (( _size_kib >= 1048576 )); then
+    note "WARN: hugepages size ${_size_kib}KiB is 1GB — 1GB pages cannot be reserved at runtime (the /proc/sys/vm/nr_hugepages knob only controls the 2MB pool). Add 'hugepagesz=1G hugepages=<count>' to the kernel cmdline and reboot, then re-run. Skipping hugepages for '$_dom' (no mismatched <memoryBacking> will be added)."
+    return 1
+  fi
+  _page_kib="$_size_kib"
+  (( _page_kib > 0 )) || _page_kib=2048
   _need=$(( _mem_kib / _page_kib ))
   (( _need * _page_kib < _mem_kib )) && _need=$(( _need + 1 ))
   if (( _need <= 0 )); then
-    note "VM '$_dom' memory unreadable or zero; skipping hugepages reservation."
-    return 0
+    note "VM '$_dom' memory smaller than one hugepage; skipping hugepages reservation."
+    return 1
   fi
-  _prev="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
-  [[ "$_prev" =~ ^[0-9]+$ ]] || _prev=0
-  _ts="$(date +%Y%m%d-%H%M%S)"
-  printf '%s\n' "$_prev" >"$_backup_dir/${_dom}_perf_hugepages_prev_${_ts}.txt" 2>/dev/null || true
-  _new=$(( _prev + _need ))
-  note "Reserving $_need hugepage(s) of ${_size_mib}MiB for '$_dom' (host nr_hugepages: $_prev -> $_new)."
+  _cur="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+  [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
+  _owned_file="$_backup_dir/${_dom}_perf_hugepages_owned.txt"
+  _other_owned=0
+  for _f in "$_backup_dir"/*_perf_hugepages_owned.txt; do
+    [[ -f "$_f" ]] || continue
+    [[ "$_f" == "$_owned_file" ]] && continue
+    _o="$(cat "$_f" 2>/dev/null || echo 0)"
+    [[ "$_o" =~ ^[0-9]+$ ]] || _o=0
+    _other_owned=$(( _other_owned + _o ))
+  done
+  _want=$(( _other_owned + _need ))
+  (( _want < 0 )) && _want=0
+  _disp_size=$(( _size_kib / 1024 ))
+  note "Reserving $_need hugepage(s) of ${_disp_size}MiB (${_size_kib}KiB) for '$_dom' (host nr_hugepages: $_cur -> $_want)."
   if (( ! DRY_RUN )); then
-    if ! printf '%s\n' "$_new" >/proc/sys/vm/nr_hugepages 2>/dev/null; then
-      note "WARN: failed to set /proc/sys/vm/nr_hugepages for '$_dom'. The VM has <memoryBacking><hugepages> but host pages may be insufficient — increase nr_hugepages manually or the VM may fail to start."
+    if ! printf '%s\n' "$_want" >/proc/sys/vm/nr_hugepages 2>/dev/null; then
+      note "WARN: failed to write /proc/sys/vm/nr_hugepages for '$_dom'. Skipping hugepages for this VM (other perf knobs still apply)."
+      return 1
     fi
+    _got="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+    [[ "$_got" =~ ^[0-9]+$ ]] || _got=0
+    if (( _got < _want )); then
+      note "WARN: host granted only $_got of $_want hugepage(s) for '$_dom' (fragmented RAM; VM needs $_need). Reverting the pool to $_cur and skipping hugepages for this VM (other perf knobs still apply). Reliable fix: add 'hugepages=$_want' to the kernel cmdline and reboot (boot-time reservation can't be fragmented out)."
+      printf '%s\n' "$_cur" >/proc/sys/vm/nr_hugepages 2>/dev/null || true
+      return 1
+    fi
+    printf '%s\n' "$_need" >"$_owned_file" 2>/dev/null || true
   fi
+  return 0
 }
 
-# R35: Restore the most recently backed-up nr_hugepages for a VM (revert helper).
-# $1 = backup dir, $2 = domain name. Reads the newest ${2}_perf_hugepages_prev_*.txt
-# and writes it back to /proc/sys/vm/nr_hugepages. Best-effort. Returns 0 even if
-# no backup exists (the VM simply never had hugepages reserved).
+# R35: Restore the host nr_hugepages after reverting a VM (revert helper).
+# $1 = backup dir, $2 = domain name. Removes this VM's owned-count file and
+# rewrites nr_hugepages to the sum of the REMAINING tuned VMs' owned counts (so
+# reverting one VM frees its pages but keeps the others reserved); 0 if none
+# remain. Best-effort. Returns 0 even if no owned file exists.
 _restore_host_hugepages_for_vm() {
-  local _backup_dir="$1" _dom="$2" _newest _prev _f
-  _newest=""
-  for _f in "$_backup_dir/${_dom}_perf_hugepages_prev_"*.txt; do
+  local _backup_dir="$1" _dom="$2"
+  local _owned_file _sum _o _f _cur
+  _owned_file="$_backup_dir/${_dom}_perf_hugepages_owned.txt"
+  [[ -f "$_owned_file" ]] || return 0
+  rm -f "$_owned_file" 2>/dev/null || true
+  _sum=0
+  for _f in "$_backup_dir"/*_perf_hugepages_owned.txt; do
     [[ -f "$_f" ]] || continue
-    if [[ -z "$_newest" || "$_f" -nt "$_newest" ]]; then
-      _newest="$_f"
-    fi
+    _o="$(cat "$_f" 2>/dev/null || echo 0)"
+    [[ "$_o" =~ ^[0-9]+$ ]] || _o=0
+    _sum=$(( _sum + _o ))
   done
-  [[ -n "$_newest" ]] || return 0
-  _prev="$(cat "$_newest" 2>/dev/null || true)"
-  [[ "$_prev" =~ ^[0-9]+$ ]] || { rm -f "$_newest" 2>/dev/null || true; return 0; }
-  note "Restoring host nr_hugepages to $_prev for '$_dom' (was reserved by ultimate-perf)."
+  _cur="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+  [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
+  note "Restoring host nr_hugepages to $_sum for '$_dom' (was $_cur; freed this VM's pages, kept other tuned VMs' reservations)."
   if (( ! DRY_RUN )); then
-    printf '%s\n' "$_prev" >/proc/sys/vm/nr_hugepages 2>/dev/null \
+    printf '%s\n' "$_sum" >/proc/sys/vm/nr_hugepages 2>/dev/null \
       || note "WARN: failed to restore /proc/sys/vm/nr_hugepages (left as-is)."
   fi
-  rm -f "$_newest" 2>/dev/null || true
+  return 0
 }
 
 # R35: Ultimate-performance VM XML tuning (stealth-safe). A SEPARATE, more
@@ -13177,10 +13243,41 @@ install_ultimate_perf_vm_tuning() {
     _backup_xml="$_backup_dir/${_dom}_perf_$(date +%Y%m%d-%H%M%S).xml"
     mkdir -p "$_backup_dir" 2>/dev/null || true
     cp "$_tmp" "$_backup_xml" 2>/dev/null || true
-    # Was hugepages backing already present in the CURRENT xml? If so, do NOT
-    # reserve host pages again (idempotent: a prior run already reserved them).
+    # Hugepages decision for THIS VM (per-VM so a failed reservation on one VM
+    # does not turn it off for the others):
+    #   _hp_vm = 1  -> python adds <memoryBacking><hugepages> and we reserve host pages.
+    #   _hp_vm = 0  -> python skips <memoryBacking>; all other perf knobs still apply.
+    # RESERVE-FIRST: try the host reservation BEFORE the python patcher runs, so a
+    # failed/short reservation (fragmented RAM, 1GB size, RAM-change recompute)
+    # turns _hp_vm off and the VM is defined WITHOUT a mismatched <memoryBacking>
+    # (it still starts). _reserve_host_hugepages_for_vm is RAM-change aware: it
+    # recomputes the need from the CURRENT <memory> and adjusts the pool up/down,
+    # persisting the count this VM owns. On a re-run where the VM already has
+    # <hugepages> it re-reserves (instead of skipping) so a host-reboot reset of
+    # nr_hugepages to 0 no longer silently breaks virsh start.
+    local _hp_vm=0
     local _have_hp=0
     grep -Fq '<hugepages' <<<"$_xml" 2>/dev/null && _have_hp=1
+    if (( _hp_on )); then
+      _hp_vm=1
+      if (( DRY_RUN )); then
+        note "Dry run: would reserve host hugepages for '$_dom' (no nr_hugepages write)."
+      else
+        if _reserve_host_hugepages_for_vm "$_xml" "$_hp_size" "$_backup_dir" "$_dom"; then
+          : # reservation OK; _hp_vm stays 1
+        else
+          _hp_vm=0
+          note "Hugepages reservation did not complete for '$_dom'; defining the VM WITHOUT <memoryBacking>hugepages (all other perf knobs still apply)."
+        fi
+      fi
+    elif (( _have_hp )); then
+      # Hugepages was opted OUT this run but the VM already has <hugepages> from a
+      # prior run: keep the existing backing intact (do not strip it) and leave the
+      # host reservation as-is. The python's VFIO_PERF_HUGEPAGES=0 means it will
+      # NOT touch the memoryBacking block, so the existing hugepages survives.
+      : # _hp_vm stays 0; python preserves the existing block
+    fi
+    export VFIO_PERF_HUGEPAGES="$_hp_vm"
     local _py_status=0
     python3 - "$_tmp" <<'PYEOF' || _py_status=$?
 import sys, xml.etree.ElementTree as ET, os, re
@@ -13469,7 +13566,7 @@ if os.environ.get('VFIO_PERF_HUGEPAGES', '0') == '1':
     _page = None
     for ch in hp_el:
         if ch.tag == 'page': _page = ch; break
-    want_page = {'size': str(hp_size), 'unit': 'MiB'}
+    want_page = {'size': str(hp_size), 'unit': 'KiB'}
     if _page is None:
         ET.SubElement(hp_el, 'page', want_page); changed = True
     else:
@@ -13483,6 +13580,19 @@ if os.environ.get('VFIO_PERF_HUGEPAGES', '0') == '1':
 if not changed: sys.exit(3)
 tree.write(path)
 PYEOF
+    # On ANY skip path below (already-tuned, validate-fail, user-decline, define
+    # fail), reserve-first already wrote this VM's hugepages ownership file, so
+    # roll it back so the host pool is not left claiming pages for a VM that was
+    # NOT redefined with <memoryBacking>hugepages this run. The revert helper
+    # removes the owned file and rewrites nr_hugepages to the sum of the remaining
+    # tuned VMs' owned counts. (No-op if the file was never written.)
+    if (( _hp_vm )) && (( ! DRY_RUN )); then
+      if (( _py_status == 3 )); then
+        : # already-tuned idempotent path: keep the ownership (VM still has hugepages)
+      else
+        _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"
+      fi
+    fi
     if (( _py_status == 3 )); then
       say "VM '$_dom' is already ultimate-perf tuned (no changes needed)."
       _updated=1
@@ -13527,11 +13637,10 @@ PYEOF
       rm -f "$_tmp"
       continue
     fi
-    # Reserve host hugepages AFTER a successful define, only if hugepages is on
-    # AND the VM did not already have hugepages backing (idempotent).
-    if (( _hp_on )) && (( ! _have_hp )); then
-      _reserve_host_hugepages_for_vm "$_xml" "$_hp_size" "$_backup_dir" "$_dom"
-    fi
+    # Reservation already happened BEFORE the define (reserve-first). The define
+    # succeeded, so the VM now has <memoryBacking>hugepages and the host pool
+    # matches; keep the ownership file so a later re-run/RAM-change recompute is
+    # accurate and a revert frees exactly these pages.
     say
     if (( ENABLE_COLOR )); then
       say "${C_GREEN}${C_BOLD}✔ Ultimate-performance tuning applied to VM '$_dom'${C_RESET}"
@@ -13544,8 +13653,11 @@ PYEOF
     say "  ✔ CPU topology + <cache mode='passthrough'/>"
     say "  ✔ currentMemory=memory (no startup balloon)"
     say "  ✔ <pm> S3/S4 disabled"
-    if (( _hp_on )); then
-      say "  ✔ hugepages <memoryBacking> + host nr_hugepages reserved (${_hp_size}MiB pages)"
+    if (( _hp_vm )); then
+      local _disp=$(( _hp_size / 1024 ))
+      say "  ✔ hugepages <memoryBacking> + host nr_hugepages reserved (${_disp}MiB = ${_hp_size}KiB pages)"
+    elif (( _have_hp )); then
+      say "  ✔ hugepages <memoryBacking> preserved (existing, not re-reserved this run)"
     fi
     say "  Backup of original XML: $_backup_xml"
     note "Restore with: sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning  (or: virsh -c qemu:///system define $_backup_xml)"

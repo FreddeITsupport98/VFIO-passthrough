@@ -261,7 +261,7 @@ env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
 rc_hp=$?
 set -e
 assert_eq "perf patcher exit 0 with hugepages on" "0" "$rc_hp"
-assert_contains_file "hugepages page added when opted in" '<hugepages><page size="2048" unit="MiB"' "$hp"
+assert_contains_file "hugepages page added when opted in (KiB units)" '<hugepages><page size="2048" unit="KiB"' "$hp"
 assert_contains_file "memoryBacking locked added" "<locked" "$hp"
 assert_contains_file "memoryBacking nosharepages added" "<nosharepages" "$hp"
 assert_contains_file "stealth vendor_id survives hugepages run" "GENUINE00000" "$hp"
@@ -273,6 +273,52 @@ if command -v virt-xml-validate >/dev/null 2>&1; then
     record_failure "hugepages-tuned XML validates"
   fi
 fi
+
+# ===================== Hugepages hardening (R35 follow-up) =====================
+# Units fix: libvirt <page> uses KiB (2048 KiB = 2 MiB = standard 2MB hugepage),
+# NOT MiB. The patcher must emit unit="KiB" and never leak unit="MiB".
+assert_contains_file "hugepages page uses KiB units" 'unit="KiB"' "$hp"
+assert_not_contains_file "no stale MiB unit in hugepages page" 'unit="MiB"' "$hp"
+
+# _vm_memory_kib parses <memory> correctly (functional; read-only helper, safe).
+_mem_out="$(_vm_memory_kib "$(cat "$mock")")"
+assert_eq "_vm_memory_kib reads 8GiB as 8388608 KiB" "8388608" "$_mem_out"
+_mem_zero="$(_vm_memory_kib "<domain><memory unit='KiB'>0</memory></domain>")"
+assert_eq "_vm_memory_kib returns 0 on zero memory" "0" "$_mem_zero"
+
+# RAM-change recompute math: need = ceil(mem_kib / page_kib). The helper computes
+# this from the CURRENT <memory> so a RAM grow/shrink between runs adjusts the
+# pool up/down (instead of only ever adding). 8GiB/2MiB=4096; 4GiB/2MiB=2048.
+_need_8g=$(( 8388608 / 2048 )); (( _need_8g * 2048 < 8388608 )) && _need_8g=$(( _need_8g + 1 ))
+assert_eq "RAM-change math 8GiB/2MiB = 4096 pages" "4096" "$_need_8g"
+_need_4g=$(( 4194304 / 2048 )); (( _need_4g * 2048 < 4194304 )) && _need_4g=$(( _need_4g + 1 ))
+assert_eq "RAM-change math 4GiB/2MiB = 2048 pages" "2048" "$_need_4g"
+
+# 1GB guard: page size >= 1048576 KiB (1GB) cannot be reserved at runtime (the
+# nr_hugepages knob only controls the 2MB pool); the helper warns + returns 1.
+assert_contains_file "1GB guard threshold (1048576 KiB)" "_size_kib >= 1048576" "$VFIO_SCRIPT"
+assert_contains_file "1GB guard warns runtime reservation impossible" "cannot be reserved at runtime" "$VFIO_SCRIPT"
+
+# Reserve-first + verify: helper writes nr_hugepages then RE-READS the knob to
+# confirm the kernel delivered the full count (runtime grants can fall short on
+# fragmented RAM); on a shortfall it reverts the pool and returns 1.
+assert_contains_file "reserve-first + verify documented" "RESERVE-FIRST + VERIFY" "$VFIO_SCRIPT"
+assert_contains_file "verify re-reads nr_hugepages after write" '_got="$(cat /proc/sys/vm/nr_hugepages' "$VFIO_SCRIPT"
+assert_contains_file "shortfall check compares got vs want" "_got < _want" "$VFIO_SCRIPT"
+
+# Reboot-safe re-reserve: on a re-run the helper recomputes from the CURRENT
+# <memory> (no early skip when the pool already has pages), so a post-reboot
+# nr_hugepages=0 is re-reserved automatically instead of silently breaking start.
+assert_contains_file "reboot-safe re-reserve documented" "re-reserve" "$VFIO_SCRIPT"
+
+# Owned-file accounting: per-VM owned count persisted so a RAM shrink frees this
+# VM's surplus while preserving other tuned VMs' reservations.
+assert_contains_file "owned-file accounting present" "_perf_hugepages_owned.txt" "$VFIO_SCRIPT"
+
+# Rollback on skip paths: a short reservation / user-decline / define-fail calls
+# the restore helper so the host pool is not left claiming pages for a VM that
+# was NOT redefined with <memoryBacking>hugepages this run.
+assert_contains_file "rollback on skip paths calls restore helper" "_restore_host_hugepages_for_vm" "$VFIO_SCRIPT"
 
 # --- NUMA-unsafe (multi-node, pinned vCPUs span nodes): numatune must be SKIPPED ---
 # so the VM can still start. Pin vcpus to CPUs 1,2,9,10 which span node0(0-7)+node1(8-15).

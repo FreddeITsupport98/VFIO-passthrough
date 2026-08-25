@@ -324,7 +324,12 @@ vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning ins
 - **CPU topology + cache**: adds `<topology sockets/cores/threads>` matching the vCPU count + `<cache mode='passthrough'/>` under `<cpu>`. Does NOT change stealth's `host-passthrough` mode or the `hypervisor` CPUID disable.
 - **currentMemory = memory**: the VM starts at full allocation (no startup balloon) — synergizes with stealth's `memballoon=none`.
 - **`<pm>` S3/S4 disabled**: faster boot; avoids guest suspend breaking passthrough.
-- **Hugepages (OPT-IN, the only host-RAM knob)**: when opted in, adds `<memoryBacking><hugepages>` + reserves the matching host `nr_hugepages` (prior value backed up, reverted by `--reset-ultimate-perf-vm-tuning`). Default OFF so a plain run never touches host RAM; all other perf knobs still apply without it.
+- **Hugepages (OPT-IN, the only host-RAM knob)**: when opted in, adds `<memoryBacking><hugepages>` + reserves the matching host `nr_hugepages` (prior value backed up, reverted by `--reset-ultimate-perf-vm-tuning`). Default OFF so a plain run never touches host RAM; all other perf knobs still apply without it. The reservation is hardened so a failed/short reservation never leaves a VM defined with a `<memoryBacking>` it can't satisfy:
+  - **KiB units**: the `<page>` element uses libvirt's `unit="KiB"` convention (2048 KiB = 2 MiB = the standard 2MB hugepage), NOT MiB — so the page size matches what the kernel's `nr_hugepages` knob actually allocates.
+  - **Reserve-first + verify**: the host `nr_hugepages` is reserved BEFORE the VM XML is defined, and the knob is re-read after the write to confirm the kernel delivered the full count. A runtime write can grant FEWER pages than requested on a fragmented host; on a shortfall the pool is reverted and hugepages is turned OFF for that run (the VM keeps every other perf knob and still starts), with a WARN naming the shortfall and the boot-time `hugepages=N` kernel-cmdline fallback (reboot-safe, can't be fragmented out).
+  - **RAM-change aware**: the page count is recomputed from the VM's CURRENT `<memory>` each run (grow = add, shrink = free), instead of only ever adding. The count THIS VM owns is persisted per-VM, so a RAM shrink frees exactly this VM's surplus while preserving other tuned VMs' reservations.
+  - **Reboot-safe re-reserve**: after a host reboot resets `nr_hugepages` to 0, the next run re-reserves automatically (no early skip), so a rebooted host no longer silently breaks `virsh start`.
+  - **1GB guard**: a 1GB page size (`1048576` KiB) cannot be reserved at runtime (the `nr_hugepages` knob only controls the 2MB pool); the helper warns and skips the runtime write, pointing at the `hugepagesz=1G hugepages=N` kernel-cmdline requirement.
 
 **Stealth coexistence guarantee**: the perf patcher only touches the elements above; it never reads/writes `features/hyperv/vendor_id`, `kvm/hidden`, `vmport`, `os/smbios`, `sysinfo`, `interface/model` (e1000e), `disk/serial`, `memballoon`, `clock/timer` (hypervclock/tsc), or `qemu:commandline` (-cpu/-smbios). Reverting perf restores the pre-perf XML backup (which still contains stealth), so stealth survives a perf revert.
 
@@ -347,7 +352,7 @@ sudo ./vfio.sh --reset-ultimate-perf-vm-tuning
 sudo ./vfio.sh --verify
 ```
 
-Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` (default `2048` MiB = 2MB pages; `1048576` for 1GB pages). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
+Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` in **KiB** (default `2048` KiB = 2 MiB = the standard 2MB hugepage; `1048576` for 1GB pages — guarded, see above). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
 
 ### Why this matters for newer AMD cards
 

@@ -10092,6 +10092,54 @@ if (( _bind_rc != 0 )); then
 fi
 jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
 
+# Step 1b: verify every guest audio function is on vfio-pci BEFORE the GPU
+# hot-attach. qemu's attach-time bus reset on the GPU requires ALL devices in
+# the GPU's IOMMU group to be owned by vfio-pci — if the audio sibling is still
+# on snd_hda_intel (e.g. a fresh boot where the boot unit only pinned D0 but
+# did not bind vfio-pci, or GUEST_AUDIO_BDFS_CSV was added later), qemu surfaces
+# "vfio: Cannot reset device <gpu>, depends on group <N> which is not owned"
+# and the GPU is attached in an uninitialized state (contributes to the ~25s
+# session death + black screen). do_bind (called by --bind-now above) DOES bind
+# the audio, but this is a belt-and-suspenders check: if any audio BDF is NOT
+# on vfio-pci after --bind-now returns, bind it explicitly here so the IOMMU
+# group is fully owned before the hot-attach fires.
+_audio_ok=1
+for _abdf in $(printf '%s\n' "${GUEST_AUDIO_BDFS_CSV:-}" | tr ',' '\n'); do
+  [[ -n "$_abdf" ]] || continue
+  _asys="/sys/bus/pci/devices/$_abdf"
+  if [[ ! -d "$_asys" ]]; then
+    jlog "live-attach: WARN audio $_abdf not on the PCI bus — skipping (may be off-bus from a prior death); group ownership may fail"
+    continue
+  fi
+  _adrv=""
+  if [[ -L "$_asys/driver" ]]; then
+    _adrv="$(basename "$(readlink "$_asys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+  fi
+  if [[ "$_adrv" != "vfio-pci" ]]; then
+    jlog "live-attach: audio $_abdf is on '$_adrv' (not vfio-pci) after --bind-now; binding it explicitly so the IOMMU group is owned before the GPU hot-attach"
+    # Unbind from the current driver (snd_hda_intel etc) if any.
+    if [[ -n "$_adrv" && -w "/sys/bus/pci/drivers/$_adrv/unbind" ]]; then
+      echo "$_abdf" >"/sys/bus/pci/drivers/$_adrv/unbind" 2>/dev/null || true
+      sleep 0.2
+    fi
+    echo 0 >"$_asys/d3cold_allowed" 2>/dev/null || true
+    echo on >"$_asys/power/control" 2>/dev/null || true
+    echo vfio-pci >"$_asys/driver_override" 2>/dev/null || true
+    echo "$_abdf" >/sys/bus/pci/drivers/vfio-pci/bind 2>/dev/null || true
+    sleep 0.2
+    _adrv=""
+    if [[ -L "$_asys/driver" ]]; then
+      _adrv="$(basename "$(readlink "$_asys/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+    fi
+    if [[ "$_adrv" == "vfio-pci" ]]; then
+      jlog "live-attach: audio $_abdf now on vfio-pci (IOMMU group owned)"
+    else
+      jlog "live-attach: WARN audio $_abdf FAILED to bind to vfio-pci (still on '$_adrv'); qemu's GPU reset may fail with 'depends on group not owned'"
+      _audio_ok=0
+    fi
+  fi
+done
+
 # Step 2: hot-attach the GPU to the running VM.
 # Use [[ -s ]] (non-empty), not [[ -f ]] — an empty/stale XML file makes virsh
 # attach-device hang on empty input and block libvirt's VM lock (observed: a

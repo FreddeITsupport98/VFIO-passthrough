@@ -320,6 +320,39 @@ assert_contains_file "owned-file accounting present" "_perf_hugepages_owned.txt"
 # was NOT redefined with <memoryBacking>hugepages this run.
 assert_contains_file "rollback on skip paths calls restore helper" "_restore_host_hugepages_for_vm" "$VFIO_SCRIPT"
 
+# CRITICAL regression: the restore must fire ONLY on the skip paths (unsupported
+# domain, patching failed, validate failed, user declined, define failed), NOT on
+# the success path. An earlier version had an early-rollback block right after
+# the python heredoc that fired on _py_status != 3 -- which included the SUCCESS
+# exit 0 -- freeing the host hugepages the VM was just defined to demand, leaving
+# the VM unstartable (XML has <memoryBacking>hugepages but host nr_hugepages=0).
+# The fix moved the restore onto each skip-path continue; the already-tuned path
+# (exit 3) and the SUCCESS path (define succeeded) keep the ownership.
+# Assert: the fixed inline restore-on-skip form appears on all 5 skip paths.
+_inline_restores="$(grep -cF "then _restore_host_hugepages_for_vm" "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _inline_restores >= 5 )); then
+  printf 'PASS: restore fires on all 5 skip paths (inline form: %d)\n' "$_inline_restores"
+else
+  printf 'FAIL: restore not on all skip paths (only %d inline calls, expected >= 5)\n' "$_inline_restores" >&2
+  record_failure "restore fires on all 5 skip paths"
+fi
+# Assert: the buggy early-rollback block (8-space-indented _restore inside an
+# else of a _py_status==3 check, right after PYEOF) is GONE. The buggy form was:
+#     else
+#       _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"
+#     fi
+# at 8-space indent. The fixed code has no such 8-space-indented restore call.
+set +e
+_buggy_restores="$(grep -cE '^        _restore_host_hugepages_for_vm ' "$VFIO_SCRIPT" 2>/dev/null)"
+set -e
+: "${_buggy_restores:=0}"
+if [[ "$_buggy_restores" == "0" ]]; then
+  printf 'PASS: buggy early-rollback block (fires on success) is gone\n'
+else
+  printf 'FAIL: buggy early-rollback block still present (%d 8-space restore calls)\n' "$_buggy_restores" >&2
+  record_failure "buggy early-rollback block is gone"
+fi
+
 # ===================== Dynamic-install integration (R35) =====================
 # The dynamic binding switcher (--install-dynamic-binding) and the full wizard's
 # dynamic path must BOTH offer ultimate-perf VM tuning (opt-in, default N),

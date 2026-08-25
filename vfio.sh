@@ -13701,19 +13701,15 @@ if os.environ.get('VFIO_PERF_HUGEPAGES', '0') == '1':
 if not changed: sys.exit(3)
 tree.write(path)
 PYEOF
-    # On ANY skip path below (already-tuned, validate-fail, user-decline, define
-    # fail), reserve-first already wrote this VM's hugepages ownership file, so
-    # roll it back so the host pool is not left claiming pages for a VM that was
-    # NOT redefined with <memoryBacking>hugepages this run. The revert helper
-    # removes the owned file and rewrites nr_hugepages to the sum of the remaining
-    # tuned VMs' owned counts. (No-op if the file was never written.)
-    if (( _hp_vm )) && (( ! DRY_RUN )); then
-      if (( _py_status == 3 )); then
-        : # already-tuned idempotent path: keep the ownership (VM still has hugepages)
-      else
-        _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"
-      fi
-    fi
+    # Hugepages rollback: reserve-first already wrote this VM's hugepages
+    # ownership file + reserved the host pages. Roll them back ONLY on a path
+    # where the VM will NOT be redefined with <memoryBacking>hugepages this run
+    # (unsupported domain, patching failed, validate failed, user declined,
+    # define failed). The already-tuned path (exit 3) and the SUCCESS path
+    # (define succeeded) KEEP the ownership — the VM still has hugepages, so the
+    # host pool must keep matching it. (The previous early-rollback fired on
+    # _py_status != 3, which included the success exit 0, freeing the pages the
+    # VM was just defined to demand — leaving the VM unstartable.)
     if (( _py_status == 3 )); then
       say "VM '$_dom' is already ultimate-perf tuned (no changes needed)."
       _updated=1
@@ -13721,15 +13717,18 @@ PYEOF
       continue
     elif (( _py_status == 4 )); then
       note "WARN: VM '$_dom' has an unsupported domain type; skipping ultimate-perf tuning."
+      if (( _hp_vm )) && (( ! DRY_RUN )); then _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"; fi
       rm -f "$_tmp"
       continue
     elif (( _py_status != 0 )); then
       note "WARN: ultimate-perf XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      if (( _hp_vm )) && (( ! DRY_RUN )); then _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"; fi
       rm -f "$_tmp"
       continue
     fi
     if ! virt-xml-validate "$_tmp" 2>/dev/null; then
       note "WARN: virt-xml-validate failed for tuned '$_dom'; skipping redefine (backup at $_backup_xml)."
+      if (( _hp_vm )) && (( ! DRY_RUN )); then _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"; fi
       rm -f "$_tmp"
       continue
     fi
@@ -13744,6 +13743,7 @@ PYEOF
     fi
     if ! prompt_yn "Redefine VM '$_dom' with the ultimate-perf tuning now?" N "Ultimate-perf VM tuning"; then
       note "Skipped '$_dom' by user choice (tuned XML left in $_tmp; backup at $_backup_xml)."
+      if (( _hp_vm )) && (( ! DRY_RUN )); then _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"; fi
       rm -f "$_tmp"
       continue
     fi
@@ -13755,6 +13755,7 @@ PYEOF
       note "ERROR: virsh define failed for '$_dom' (exit $_define_rc): $_define_err"
       note "The tuned XML is in $_tmp; backup at $_backup_xml. You can define it manually:"
       note "  virsh -c qemu:///system define $_tmp"
+      if (( _hp_vm )) && (( ! DRY_RUN )); then _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"; fi
       rm -f "$_tmp"
       continue
     fi

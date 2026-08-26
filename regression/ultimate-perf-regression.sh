@@ -675,8 +675,25 @@ assert_contains_file "boot script is standalone (never sources vfio.sh)" "Standa
 assert_contains_file "boot script reads registry path" 'REGISTRY="$PERF_HP_DIRS_FILE"' "$VFIO_SCRIPT"
 assert_contains_file "boot script 1GB guard present" "hp_size >= 1048576" "$VFIO_SCRIPT"
 assert_contains_file "boot script warns on fragmented shortfall" "fragmented RAM at boot" "$VFIO_SCRIPT"
-assert_contains_file "boot script no-ops when pool already satisfies" '>= \$total needed' "$VFIO_SCRIPT"
+assert_contains_file "boot script no-ops when pool already satisfies" '>= \${total} needed' "$VFIO_SCRIPT"
 assert_contains_file "boot script writes total to nr_hugepages" '"\$total" >"\$NR_HUGEPAGES"' "$VFIO_SCRIPT"
+
+# --- Boot script two-mode: boot-regenerate + --ensure-domain dynamic ---
+# The boot script now REGENERATES owned counts from the on-disk libvirt VM XML
+# (so a RAM grow/shrink between boots is honored) and supports a --ensure-domain
+# mode called by the libvirt hook at VM start (so a RAM change without a reboot
+# is honored at the moment qemu needs the backing store).
+assert_contains_file "boot script declares --ensure-domain mode" '"--ensure-domain"' "$VFIO_SCRIPT"
+assert_contains_file "boot script reads on-disk libvirt XML dir" 'QEMU_XML_DIR="/etc/libvirt/qemu"' "$VFIO_SCRIPT"
+assert_contains_file "boot script has recompute_owned_from_disk fn" 'recompute_owned_from_disk() {' "$VFIO_SCRIPT"
+assert_contains_file "boot script has memory_kib fn" 'memory_kib() {' "$VFIO_SCRIPT"
+assert_contains_file "boot script has pages_needed fn" 'pages_needed() {' "$VFIO_SCRIPT"
+assert_contains_file "boot script has sum_all_owned fn" 'sum_all_owned() {' "$VFIO_SCRIPT"
+assert_contains_file "boot script regenerate loop recomputes owned from disk" 'recompute_owned_from_disk "\$dom" "\$f"' "$VFIO_SCRIPT"
+assert_contains_file "boot script dynamic ensure grows the pool" 'ensuring nr_hugepages' "$VFIO_SCRIPT"
+assert_contains_file "boot script dynamic ensure aborts on shortfall" 'Aborting VM start' "$VFIO_SCRIPT"
+assert_contains_file "boot script dynamic ensure grow-only (never shrink at start)" 'grow only; never shrink at start' "$VFIO_SCRIPT"
+assert_contains_file "boot script ensure no-ops for non-hugepages VM" 'not a hugepages-tuned VM; nothing to ensure' "$VFIO_SCRIPT"
 
 # --- Boot unit content ---
 assert_contains_file "boot unit ConditionPathExists on registry" 'ConditionPathExists=$PERF_HP_DIRS_FILE' "$VFIO_SCRIPT"
@@ -767,6 +784,48 @@ _unregister_perf_hugepages_dir "$tmp_dir/bk1"; _rc_unreg_nofile=$?
 set -e
 assert_eq "unregister with no registry file is a no-op (rc 0)" "0" "$_rc_unreg_nofile"
 PERF_HP_DIRS_FILE="$_save_reg"
+
+# --- Functional: --ensure-domain dynamic mode (recompute + grow + no-op) ---
+# Reuse the generated runtime boot script ($tmp_dir/fake-boot.sh) with its
+# hardcoded paths sed-redirected to temp files, then exercise --ensure-domain
+# (the mode the libvirt hook calls at VM prepare). 8GiB = 8388608 KiB = 4096 pages.
+_ensure_src="$tmp_dir/fake-boot.sh"
+_ensure_t="$tmp_dir/ensure_test.sh"
+cp "$_ensure_src" "$_ensure_t"
+_ensure_reg="$tmp_dir/ensure_reg"
+_ensure_nr="$tmp_dir/ensure_nr"
+_ensure_conf="$tmp_dir/ensure_conf"
+_ensure_xmldir="$tmp_dir/ensure_qemu"
+mkdir -p "$_ensure_xmldir" "$tmp_dir/ensure_bkdir"
+sed -i "s#REGISTRY=\".*\"#REGISTRY=\"$_ensure_reg\"#; s#NR_HUGEPAGES=\".*\"#NR_HUGEPAGES=\"$_ensure_nr\"#; s#CONF_FILE=\".*\"#CONF_FILE=\"$_ensure_conf\"#; s#QEMU_XML_DIR=\".*\"#QEMU_XML_DIR=\"$_ensure_xmldir\"#" "$_ensure_t"
+printf 'ULTIMATE_PERF_HUGEPAGES_SIZE=2048\n' >"$_ensure_conf"
+printf '%s\n' "$tmp_dir/ensure_bkdir" >"$_ensure_reg"
+printf '1000\n' >"$tmp_dir/ensure_bkdir/win11_perf_hugepages_owned.txt"
+cat >"$_ensure_xmldir/win11.xml" <<'XEOF'
+<domain type='kvm'><name>win11</name><memory unit='KiB'>8388608</memory></domain>
+XEOF
+printf '0\n' >"$_ensure_nr"
+set +e
+printf '%s' "$(cat "$_ensure_xmldir/win11.xml")" | bash "$_ensure_t" --ensure-domain win11 >/tmp/ensure1.log 2>&1
+_rc1=$?
+set -e
+_owned_after="$(cat "$tmp_dir/ensure_bkdir/win11_perf_hugepages_owned.txt" 2>/dev/null || true)"
+_pool_after="$(cat "$_ensure_nr" 2>/dev/null || true)"
+assert_eq "ensure-domain recomputes owned 1000 -> 4096" "4096" "$_owned_after"
+assert_eq "ensure-domain grows pool 0 -> 4096" "4096" "$_pool_after"
+assert_eq "ensure-domain exits 0 after grow" "0" "$_rc1"
+# No-op: pool already satisfies -> exit 0, no change.
+set +e
+printf '%s' "$(cat "$_ensure_xmldir/win11.xml")" | bash "$_ensure_t" --ensure-domain win11 >/tmp/ensure2.log 2>&1
+_rc2=$?
+set -e
+assert_eq "ensure-domain no-op exit 0 when pool satisfies" "0" "$_rc2"
+# Non-hugepages VM (no owned file) -> exit 0 no-op.
+set +e
+printf '%s' "$(cat "$_ensure_xmldir/win11.xml")" | bash "$_ensure_t" --ensure-domain other-vm >/tmp/ensure3.log 2>&1
+_rc3=$?
+set -e
+assert_eq "ensure-domain no-op exit 0 for non-hugepages VM" "0" "$_rc3"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

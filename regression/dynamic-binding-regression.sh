@@ -241,6 +241,34 @@ assert_contains_text \
   'PHASE="${2:-}"' \
   "$hook_block"
 
+# --- Static wiring: generated hook dynamic hugepages ensure (R35 follow-up) ---
+# The hook's prepare phase now (a) captures the domain XML from stdin ONCE so
+# both the hugepages ensure and vm_uses_guest_gpu can use it, (b) calls the
+# boot-reserve script's --ensure-domain mode BEFORE the GPU bind so a RAM
+# change without a reboot is honored at VM start and a fragmented-RAM shortfall
+# aborts cleanly before the GPU is ripped off the host, and (c) pipes the
+# captured XML to vm_uses_guest_gpu (which still reads stdin).
+assert_contains_text \
+  "generated hook captures stdin XML once at prepare" \
+  'DOMAIN_XML="$(cat' \
+  "$hook_block"
+assert_contains_text \
+  "generated hook has _ensure_hp bounded wrapper" \
+  '_ensure_hp() {' \
+  "$hook_block"
+assert_contains_text \
+  "generated hook calls --ensure-domain at prepare" \
+  '--ensure-domain "$_dom"' \
+  "$hook_block"
+assert_contains_text \
+  "generated hook ensures hugepages before GPU bind" \
+  'action=hugepages-ensure-failed' \
+  "$hook_block"
+assert_contains_text \
+  "generated hook pipes captured XML to vm_uses_guest_gpu" \
+  '"$DOMAIN_XML" | vm_uses_guest_gpu' \
+  "$hook_block"
+
 # --- Static wiring: generated bind script dynamic no-op + d3cold_allowed ---
 bind_block="$(sed -n '/write_file_atomic "$BIND_SCRIPT" 0755 "root:root" <<.EOF./,/^EOF$/p' "$VFIO_SCRIPT")"
 assert_contains_text \

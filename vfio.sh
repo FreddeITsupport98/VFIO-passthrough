@@ -9888,12 +9888,49 @@ _release() {
   fi
 }
 
+# Dynamic hugepages re-reserve at VM start: ensure the host pool covers THIS VM's
+# current <memory> (recomputed from the XML on stdin) so a RAM change without a
+# reboot is honored at the moment qemu mmaps the backing store. No-op for non-
+# hugepages VMs. Bounded so a hung sysfs write cannot stall the VM start; on a
+# fragmented-RAM shortfall it exits non-zero so libvirt aborts the start cleanly
+# (a clear error instead of qemu's cryptic "Cannot allocate memory"). Reads the
+# VM XML from stdin (piped by the prepare phase).
+_ensure_hp() {
+  local _dom="$1" _to="${VFIO_HOOK_HUGEPAGES_TIMEOUT:-10}"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_to" /usr/local/sbin/vfio-perf-hugepages-reserve.sh --ensure-domain "$_dom"
+  else
+    /usr/local/sbin/vfio-perf-hugepages-reserve.sh --ensure-domain "$_dom"
+  fi
+}
+
 case "$PHASE" in
   prepare)
     # VM is about to start. Only bind if this VM has the guest GPU attached.
     # A non-zero exit from --bind-now is INTENTIONAL and will abort the VM start
     # cleanly (libvirt treats a non-zero qemu hook exit as a fatal error), so a
     # broken/mid-reset device does not get attached to the VM.
+    #
+    # Capture the domain XML from stdin ONCE: libvirt pipes it on stdin for the
+    # prepare phase, and BOTH the hugepages ensure and vm_uses_guest_gpu (via
+    # extract_hostdev_bdfs) need it. Consuming stdin twice would leave the GPU
+    # detection with an empty pipe and silently skip the bind.
+    DOMAIN_XML="$(cat 2>/dev/null || true)"
+    #
+    # Dynamic hugepages re-reserve BEFORE the GPU bind: ensure the host pool
+    # covers this VM's current <memory> (recomputed from DOMAIN_XML) so a RAM
+    # change without a reboot is honored at the moment qemu mmaps the backing
+    # store. No-op for non-hugepages VMs. On a fragmented-RAM shortfall it exits
+    # non-zero so libvirt aborts the start with a clear error instead of qemu's
+    # cryptic "Cannot allocate memory" — and BEFORE the GPU is ripped off the
+    # host (a clean abort leaves the host desktop untouched).
+    if [[ -x /usr/local/sbin/vfio-perf-hugepages-reserve.sh ]]; then
+      if ! printf '%s' "$DOMAIN_XML" | _ensure_hp "$DOMAIN"; then
+        _rc=$?
+        hook_log "action=hugepages-ensure-failed rc=$_rc"
+        exit "$_rc"
+      fi
+    fi
     #
     # LIVE-ATTACH MODE (VFIO_DYNAMIC_LIVE_ATTACH=1): the VM XML has the GPU
     # hostdev REMOVED (by --install-live-attach), so vm_uses_guest_gpu will NOT
@@ -9924,7 +9961,7 @@ case "$PHASE" in
         setsid /usr/local/sbin/vfio-live-attach.sh "$DOMAIN" "$_la_delay" \
           </dev/null >>/var/log/vfio-live-attach.log 2>&1 &
         : # let libvirt proceed — VM starts without the GPU.
-      elif vm_uses_guest_gpu; then
+      elif printf '%s' "$DOMAIN_XML" | vm_uses_guest_gpu; then
         say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
         hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
         if _bind_now; then
@@ -9937,7 +9974,7 @@ case "$PHASE" in
       else
         hook_log "action=skip-not-attached"
       fi
-    elif vm_uses_guest_gpu; then
+    elif printf '%s' "$DOMAIN_XML" | vm_uses_guest_gpu; then
       say "vfio-libvirt-hook: VM '$DOMAIN' has guest GPU attached; binding to vfio-pci."
       hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
       # Run under `if` so set -e does not kill the hook before we can log the
@@ -13263,39 +13300,146 @@ install_perf_hugepages_boot_service() {
   mkdir -p "$(dirname "$PERF_HP_DIRS_FILE")" 2>/dev/null || true
   write_file_atomic "$PERF_HP_BOOT_SCRIPT" 0755 "root:root" <<EOF
 #!/usr/bin/env bash
-# Managed by vfio.sh — reboot-persistent hugepages re-reserve for
-# ultimate-perf-tuned VMs. After a host reboot /proc/sys/vm/nr_hugepages resets
-# to 0; this reads the registry of perf backup dirs and re-reserves the sum of
-# the per-VM owned counts so hugepages-backed VMs can start without a manual
-# --install-ultimate-perf-vm-tuning re-run. Standalone (never sources vfio.sh).
+# Managed by vfio.sh — reboot-persistent + dynamic hugepages re-reserve for
+# ultimate-perf-tuned VMs. Standalone (never sources vfio.sh).
+#
+# Two modes:
+#   1) boot (default, no args): for every perf-hugepages owned file, RECOMPUTE
+#      the owned count from the on-disk libvirt VM XML (/etc/libvirt/qemu/<dom>.xml)
+#      so a RAM grow/shrink between boots is honored automatically (regenerate),
+#      then reserve nr_hugepages = sum of all owned. Runs at boot before libvirt
+#      starts autostart VMs. Falls back to the recorded count if the XML is
+#      unreadable.
+#   2) --ensure-domain <dom>: read the VM XML for <dom> from stdin, recompute
+#      THIS VM's owned count, then ensure nr_hugepages >= sum of all owned (grow
+#      only). Called by the libvirt qemu hook at VM prepare so a RAM change
+#      WITHOUT a reboot is honored at the moment qemu needs the backing store. On
+#      a fragmented-RAM shortfall it exits non-zero so libvirt aborts the VM
+#      start cleanly (a clear error instead of qemu's cryptic
+#      "unable to map backing store for guest RAM: Cannot allocate memory").
 # Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --reset-ultimate-perf-vm-tuning when no hugepages VMs remain)
 set -o pipefail
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 REGISTRY="$PERF_HP_DIRS_FILE"
 NR_HUGEPAGES="/proc/sys/vm/nr_hugepages"
+QEMU_XML_DIR="/etc/libvirt/qemu"
 log() { printf '[vfio-perf-hugepages] %s\n' "\$*" >&2; }
-[[ -f "\$REGISTRY" ]] || { log "no hugepages registry (\$REGISTRY); nothing to reserve."; exit 0; }
+# Read ULTIMATE_PERF_HUGEPAGES_SIZE (KiB) from conf; default 2048 (2MB pages).
 hp_size="\$(awk -F= '/^ULTIMATE_PERF_HUGEPAGES_SIZE=/{v=\$2; gsub(/"/,"",v); print v; exit}' "\$CONF_FILE" 2>/dev/null || true)"
 hp_size="\${hp_size:-2048}"
 [[ "\$hp_size" =~ ^[0-9]+\$ ]] || hp_size=2048
+# 1GB guard: the nr_hugepages knob only controls the 2MB pool.
 if (( hp_size >= 1048576 )); then
   log "WARN: configured hugepages size \${hp_size}KiB is 1GB — cannot reserve at runtime. Add 'hugepagesz=1G hugepages=N' to the kernel cmdline. Skipping."
   exit 0
 fi
-total=0
-seen=""
+# Extract <memory> KiB from XML on stdin. Prints nothing on failure (caller guards).
+memory_kib() { grep -oE '<memory[^>]*>[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -n1 2>/dev/null || true; }
+# ceil(mem_kib / page_kib); echoes 0 if mem<=0.
+pages_needed() {
+  local _mem="\$1" _size="\$2" _need
+  (( _mem <= 0 )) && { echo 0; return; }
+  _need=\$(( _mem / _size ))
+  (( _need * _size < _mem )) && _need=\$(( _need + 1 ))
+  echo "\$_need"
+}
+# Sum every *_perf_hugepages_owned.txt across all registered backup dirs.
+sum_all_owned() {
+  local _total=0 _dir _f _n
+  [[ -f "\$REGISTRY" ]] || { echo 0; return; }
+  while IFS= read -r _dir; do
+    [[ -n "\$_dir" && -d "\$_dir" ]] || continue
+    for _f in "\$_dir"/*_perf_hugepages_owned.txt; do
+      [[ -f "\$_f" ]] || continue
+      _n="\$(cat "\$_f" 2>/dev/null || echo 0)"
+      [[ "\$_n" =~ ^[0-9]+\$ ]] || _n=0
+      _total=\$(( _total + _n ))
+    done
+  done < "\$REGISTRY"
+  echo "\$_total"
+}
+# Recompute owned count for \$1 (domain) from its on-disk libvirt XML; update \$2
+# (owned file). Keep the recorded count if the XML is unreadable.
+recompute_owned_from_disk() {
+  local _dom="\$1" _owned="\$2" _xml _mem _need _cur
+  _cur="\$(cat "\$_owned" 2>/dev/null || echo 0)"
+  [[ "\$_cur" =~ ^[0-9]+\$ ]] || _cur=0
+  _xml="\$QEMU_XML_DIR/\${_dom}.xml"
+  if [[ -r "\$_xml" ]]; then
+    _mem="\$(memory_kib < "\$_xml" 2>/dev/null || true)"
+    [[ "\$_mem" =~ ^[0-9]+\$ ]] || _mem=0
+    if (( _mem > 0 )); then
+      _need="\$(pages_needed "\$_mem" "\$hp_size")"
+      if [[ "\$_need" != "\$_cur" ]]; then
+        printf '%s\n' "\$_need" >"\$_owned" 2>/dev/null || true
+        log "recomputed '\$_dom' owned: \$_cur -> \$_need pages (memory \${_mem}KiB / \${hp_size}KiB)."
+      fi
+      return 0
+    fi
+  fi
+  log "WARN: could not recompute '\$_dom' from \${_xml}; keeping recorded owned count (\$_cur)."
+}
+# --- Mode 2: --ensure-domain <dom> (dynamic, VM start) ---
+if [[ "\${1:-}" == "--ensure-domain" ]]; then
+  dom="\${2:-}"
+  [[ -n "\$dom" ]] || { log "ensure-domain: missing domain arg"; exit 0; }
+  [[ -f "\$REGISTRY" ]] || exit 0   # no hugepages setup at all
+  # Find the owned file for this domain across registered backup dirs.
+  owned=""
+  while IFS= read -r dir; do
+    [[ -n "\$dir" && -d "\$dir" ]] || continue
+    if [[ -f "\$dir/\${dom}_perf_hugepages_owned.txt" ]]; then
+      owned="\$dir/\${dom}_perf_hugepages_owned.txt"
+      break
+    fi
+  done < "\$REGISTRY"
+  [[ -n "\$owned" ]] || exit 0   # not a hugepages-tuned VM; nothing to ensure
+  # Recompute this VM's owned count from the XML on stdin.
+  mem="\$(memory_kib 2>/dev/null || true)"
+  [[ "\$mem" =~ ^[0-9]+\$ ]] || mem=0
+  if (( mem > 0 )); then
+    need="\$(pages_needed "\$mem" "\$hp_size")"
+    cur_owned="\$(cat "\$owned" 2>/dev/null || echo 0)"
+    [[ "\$cur_owned" =~ ^[0-9]+\$ ]] || cur_owned=0
+    if [[ "\$need" != "\$cur_owned" ]]; then
+      printf '%s\n' "\$need" >"\$owned" 2>/dev/null || true
+      log "dynamic recompute '\$dom': owned \${cur_owned} -> \${need} pages (memory \${mem}KiB)."
+    fi
+  fi
+  # Ensure the pool covers the sum of all owned (grow only; never shrink at start).
+  total="\$(sum_all_owned)"
+  cur_pool="\$(cat "\$NR_HUGEPAGES" 2>/dev/null || echo 0)"
+  [[ "\$cur_pool" =~ ^[0-9]+\$ ]] || cur_pool=0
+  if (( cur_pool >= total )); then
+    exit 0   # pool already satisfies
+  fi
+  log "ensuring nr_hugepages \${cur_pool} -> \${total} for '\$dom' at VM start."
+  if ! printf '%s\n' "\$total" >"\$NR_HUGEPAGES" 2>/dev/null; then
+    log "WARN: failed to grow nr_hugepages for '\$dom'. VM may fail to start."
+    exit 0   # let qemu try; don't hard-abort on a plain write error
+  fi
+  got="\$(cat "\$NR_HUGEPAGES" 2>/dev/null || echo 0)"
+  [[ "\$got" =~ ^[0-9]+\$ ]] || got=0
+  if (( got < total )); then
+    log "WARN: host granted only \${got} of \${total} hugepage(s) for '\$dom' (fragmented RAM). Aborting VM start so libvirt reports a clear error instead of qemu's 'Cannot allocate memory'. Reliable fix: add 'hugepages=\${total}' to the kernel cmdline."
+    exit 1
+  fi
+  log "OK: ensured \${got} hugepage(s) for '\$dom' at VM start."
+  exit 0
+fi
+# --- Mode 1: boot (default) ---
+[[ -f "\$REGISTRY" ]] || { log "no hugepages registry (\${REGISTRY}); nothing to reserve."; exit 0; }
+# Regenerate: recompute every owned count from the on-disk VM XML.
 while IFS= read -r dir; do
-  [[ -n "\$dir" ]] || continue
-  [[ -d "\$dir" ]] || continue
-  case ":\$seen:" in *":\$dir:"*) continue ;; esac
-  seen="\$seen:\$dir"
+  [[ -n "\$dir" && -d "\$dir" ]] || continue
   for f in "\$dir"/*_perf_hugepages_owned.txt; do
     [[ -f "\$f" ]] || continue
-    n="\$(cat "\$f" 2>/dev/null || echo 0)"
-    [[ "\$n" =~ ^[0-9]+\$ ]] || n=0
-    total=\$(( total + n ))
+    dom="\${f##*/}"
+    dom="\${dom%_perf_hugepages_owned.txt}"
+    recompute_owned_from_disk "\$dom" "\$f"
   done
 done < "\$REGISTRY"
+total="\$(sum_all_owned)"
 if (( total <= 0 )); then
   log "registry has no owned hugepage counts; nothing to reserve."
   exit 0
@@ -13303,21 +13447,21 @@ fi
 cur="\$(cat "\$NR_HUGEPAGES" 2>/dev/null || echo 0)"
 [[ "\$cur" =~ ^[0-9]+\$ ]] || cur=0
 if (( cur >= total )); then
-  log "host already has \$cur hugepages (>= \$total needed); nothing to do."
+  log "host already has \${cur} hugepages (>= \${total} needed); nothing to do."
   exit 0
 fi
-log "re-reserving \$total hugepage(s) after reboot (host nr_hugepages: \$cur -> \$total)."
+log "re-reserving \${total} hugepage(s) after reboot (host nr_hugepages: \${cur} -> \${total})."
 if ! printf '%s\n' "\$total" >"\$NR_HUGEPAGES" 2>/dev/null; then
-  log "WARN: failed to write \$NR_HUGEPAGES."
+  log "WARN: failed to write \${NR_HUGEPAGES}."
   exit 0
 fi
 got="\$(cat "\$NR_HUGEPAGES" 2>/dev/null || echo 0)"
 [[ "\$got" =~ ^[0-9]+\$ ]] || got=0
 if (( got < total )); then
-  log "WARN: host granted only \$got of \$total hugepage(s) (fragmented RAM at boot). Hugepages-backed VMs may fail to start. Reliable fix: add 'hugepages=\$total' to the kernel cmdline. Leaving the partial reservation in place."
+  log "WARN: host granted only \${got} of \${total} hugepage(s) (fragmented RAM at boot). Hugepages-backed VMs may fail to start. Reliable fix: add 'hugepages=\${total}' to the kernel cmdline. Leaving the partial reservation in place."
   exit 0
 fi
-log "OK: reserved \$got hugepage(s) for ultimate-perf-tuned VMs."
+log "OK: reserved \${got} hugepage(s) for ultimate-perf-tuned VMs."
 exit 0
 EOF
   write_file_atomic "$PERF_HP_BOOT_UNIT" 0644 "root:root" <<EOF

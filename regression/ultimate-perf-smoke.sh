@@ -235,6 +235,43 @@ set -e
 if [[ "$rc_sn" -eq 0 ]]; then ok "perf patcher exit 0 with VIRTIO_DISK=0"; else bad "perf patcher exit $rc_sn with VIRTIO_DISK=0"; fi
 if grep -Fq '<target dev="sda" bus="sata"' "$sata_no"; then ok "SATA disk NOT converted when opted out"; else bad "SATA disk wrongly converted when opted out"; fi
 
+# Reboot-persistent hugepages re-reserve (R35 follow-up): install_perf_hugepages_
+# boot_service must generate a STANDALONE, syntactically-valid boot script that
+# re-reserves nr_hugepages from the registry at boot. Generate it with temp paths
+# + a no-op systemctl + a non-root write_file_atomic (no root/virsh needed).
+# shellcheck disable=SC1090
+source "$VFIO_SCRIPT"
+_sm_save_script="$PERF_HP_BOOT_SCRIPT"; _sm_save_unit="$PERF_HP_BOOT_UNIT"
+_sm_save_wfa="$(declare -f write_file_atomic)"
+PERF_HP_BOOT_SCRIPT="$tmp/fake-boot.sh"
+PERF_HP_BOOT_UNIT="$tmp/fake-boot.service"
+# shellcheck disable=SC2034 # owner_group intentionally unused in this non-root override.
+write_file_atomic() {
+  local dst="$1" mode="$2" owner_group="$3" tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  install -m "$mode" "$tmp" "$dst" 2>/dev/null || cp "$tmp" "$dst"
+  rm -f "$tmp" || true
+}
+# shellcheck disable=SC2329 # invoked indirectly via `run systemctl ...` inside install_perf_hugepages_boot_service.
+systemctl() { return 0; }
+install_perf_hugepages_boot_service >/dev/null 2>&1
+if [[ -s "$PERF_HP_BOOT_SCRIPT" ]]; then
+  ok "boot-reserve service generated the runtime script"
+  if bash -n "$PERF_HP_BOOT_SCRIPT" 2>/dev/null; then
+    ok "generated boot script is valid bash (bash -n)"
+  else
+    bad "generated boot script has syntax errors"
+  fi
+  if grep -Fq 'REGISTRY=' "$PERF_HP_BOOT_SCRIPT"; then ok "boot script reads the registry"; else bad "boot script missing REGISTRY"; fi
+  if grep -Fq 'hp_size >= 1048576' "$PERF_HP_BOOT_SCRIPT"; then ok "boot script has 1GB guard"; else bad "boot script missing 1GB guard"; fi
+else
+  bad "boot-reserve service did not generate the runtime script"
+fi
+PERF_HP_BOOT_SCRIPT="$_sm_save_script"; PERF_HP_BOOT_UNIT="$_sm_save_unit"
+unset -f systemctl
+eval "$_sm_save_wfa"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

@@ -639,6 +639,135 @@ assert_eq "perf patcher exit 0 on collision mock" "0" "$rc_col"
 assert_contains_file "existing vda preserved (not overwritten)" '<target dev="vda" bus="virtio"' "$mock_col"
 assert_contains_file "SATA sda converted to vdb (collision-safe)" '<target dev="vdb" bus="virtio"' "$mock_col"
 
+# ===================== Reboot-persistent hugepages re-reserve (R35 follow-up) =====================
+# After a host reboot /proc/sys/vm/nr_hugepages resets to 0, but the per-VM owned
+# files persist. Without a boot-time re-reserve, a hugepages-backed VM
+# (memoryBacking/hugepages) fails to start with "unable to map backing store for
+# guest RAM: Cannot allocate memory" until the operator manually re-runs
+# --install-ultimate-perf-vm-tuning. A boot-time systemd oneshot now re-reserves
+# the pool from a registry of perf backup dirs. This section asserts the wiring,
+# the standalone boot script, the unit, and the registry helper round-trip.
+
+# --- Static wiring: constants + helpers + install/remove functions ---
+assert_contains_file "PERF_HP_BOOT_SCRIPT constant declared" 'PERF_HP_BOOT_SCRIPT=' "$VFIO_SCRIPT"
+assert_contains_file "PERF_HP_BOOT_UNIT constant declared" 'PERF_HP_BOOT_UNIT=' "$VFIO_SCRIPT"
+assert_contains_file "PERF_HP_DIRS_FILE constant declared" 'PERF_HP_DIRS_FILE=' "$VFIO_SCRIPT"
+assert_contains_file "_register_perf_hugepages_dir helper exists" "_register_perf_hugepages_dir() {" "$VFIO_SCRIPT"
+assert_contains_file "_unregister_perf_hugepages_dir helper exists" "_unregister_perf_hugepages_dir() {" "$VFIO_SCRIPT"
+assert_contains_file "install_perf_hugepages_boot_service function exists" "install_perf_hugepages_boot_service() {" "$VFIO_SCRIPT"
+assert_contains_file "remove_perf_hugepages_boot_service function exists" "remove_perf_hugepages_boot_service() {" "$VFIO_SCRIPT"
+# Reserve helper registers the backup dir in the boot-reserve registry.
+assert_contains_file "_reserve registers backup dir in registry" '_register_perf_hugepages_dir "$_backup_dir"' "$VFIO_SCRIPT"
+# Restore helper unregisters the backup dir when its last owned file is gone.
+assert_contains_file "_restore unregisters backup dir from registry" '_unregister_perf_hugepages_dir "$_backup_dir"' "$VFIO_SCRIPT"
+# install_ultimate_perf_vm_tuning wires the boot-service install after the loop.
+assert_contains_file "perf install wires boot-service install" 'install_perf_hugepages_boot_service' "$VFIO_SCRIPT"
+# reset_ultimate_perf_vm_tuning wires the boot-service removal after the loop.
+assert_contains_file "perf revert wires boot-service removal" 'remove_perf_hugepages_boot_service' "$VFIO_SCRIPT"
+# The install is guarded so it only fires when there is perf-hugepages ownership.
+assert_contains_file "perf install boot-service guard checks ownership" '_any_hp_reserved )) || [[ -f "$PERF_HP_DIRS_FILE" ]]' "$VFIO_SCRIPT"
+# The removal is guarded so it only fires when the registry is gone (last owned
+# dir unregistered), and is skipped in dry-run.
+assert_contains_file "perf revert boot-service removal guard" '! [[ -f "$PERF_HP_DIRS_FILE" ]]' "$VFIO_SCRIPT"
+
+# --- Boot script content (standalone, never sources vfio.sh) ---
+assert_contains_file "boot script is standalone (never sources vfio.sh)" "Standalone (never sources vfio.sh)" "$VFIO_SCRIPT"
+assert_contains_file "boot script reads registry path" 'REGISTRY="$PERF_HP_DIRS_FILE"' "$VFIO_SCRIPT"
+assert_contains_file "boot script 1GB guard present" "hp_size >= 1048576" "$VFIO_SCRIPT"
+assert_contains_file "boot script warns on fragmented shortfall" "fragmented RAM at boot" "$VFIO_SCRIPT"
+assert_contains_file "boot script no-ops when pool already satisfies" '>= \$total needed' "$VFIO_SCRIPT"
+assert_contains_file "boot script writes total to nr_hugepages" '"\$total" >"\$NR_HUGEPAGES"' "$VFIO_SCRIPT"
+
+# --- Boot unit content ---
+assert_contains_file "boot unit ConditionPathExists on registry" 'ConditionPathExists=$PERF_HP_DIRS_FILE' "$VFIO_SCRIPT"
+assert_contains_file "boot unit runs before libvirt" 'Before=virtqemud.service libvirtd.service' "$VFIO_SCRIPT"
+assert_contains_file "boot unit WantedBy multi-user.target" 'WantedBy=multi-user.target' "$VFIO_SCRIPT"
+assert_contains_file "boot unit is oneshot" 'Type=oneshot' "$VFIO_SCRIPT"
+assert_contains_file "boot unit ExecStart points at the boot script" 'ExecStart=$PERF_HP_BOOT_SCRIPT' "$VFIO_SCRIPT"
+
+# --- --reset leaves the boot-reserve service in place (does NOT break the VM) ---
+# --reset does NOT revert perf VM XMLs, so it must NOT remove the boot-reserve
+# service either (else a hugepages-backed VM fails to start across reboots).
+# Cleanup is via --reset-ultimate-perf-vm-tuning instead.
+assert_contains_file "reset note documents --reset leaves boot-reserve in place" "hugepages boot-reserve service in place" "$VFIO_SCRIPT"
+assert_contains_file "reset note points to --reset-ultimate-perf-vm-tuning" "boot-reserve service removal" "$VFIO_SCRIPT"
+
+# --- Functional: install generates a valid runtime boot script (bash -n) ---
+# Call install_perf_hugepages_boot_service with temp paths + a no-op systemctl +
+# a non-root write_file_atomic, then bash -n the generated runtime script. This
+# validates the ACTUAL script vfio.sh's unquoted heredoc produces (with the
+# backslash-dollar runtime-var markers unescaped to dollar and the install-time
+# registry path expanded) — stronger than bash -n on the raw source, which
+# mis-parses those markers inside command substitution.
+_save_script="$PERF_HP_BOOT_SCRIPT"; _save_unit="$PERF_HP_BOOT_UNIT"
+_save_wfa="$(declare -f write_file_atomic)"
+PERF_HP_BOOT_SCRIPT="$tmp_dir/fake-boot.sh"
+PERF_HP_BOOT_UNIT="$tmp_dir/fake-boot.service"
+# Non-root write_file_atomic: install -m (no -o/-g) to a temp path.
+# shellcheck disable=SC2034 # owner_group is intentionally unused in this non-root override.
+write_file_atomic() {
+  local dst="$1" mode="$2" owner_group="$3" tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  install -m "$mode" "$tmp" "$dst" 2>/dev/null || cp "$tmp" "$dst"
+  rm -f "$tmp" || true
+}
+# No-op systemctl so enable/start/daemon-reload don't touch the real system.
+systemctl() { return 0; }
+install_perf_hugepages_boot_service
+if [[ -s "$PERF_HP_BOOT_SCRIPT" ]]; then
+  if bash -n "$PERF_HP_BOOT_SCRIPT" 2>/dev/null; then
+    printf 'PASS: generated runtime boot script is valid bash (bash -n)\n'
+  else
+    printf 'FAIL: generated runtime boot script has syntax errors\n' >&2
+    record_failure "generated runtime boot script is valid bash"
+  fi
+else
+  printf 'FAIL: install did not generate the boot script\n' >&2
+  record_failure "install generates boot script"
+fi
+# Restore overrides so later steps see the real functions/paths.
+PERF_HP_BOOT_SCRIPT="$_save_script"; PERF_HP_BOOT_UNIT="$_save_unit"
+unset -f systemctl
+eval "$_save_wfa"
+
+# --- Functional: registry helper round-trip (dedup + unregister + empty removal) ---
+# Uses a temp PERF_HP_DIRS_FILE so no real state is touched; restore after.
+_save_reg="$PERF_HP_DIRS_FILE"
+PERF_HP_DIRS_FILE="$tmp_dir/fake-perf-hugepages-dirs"
+rm -f "$PERF_HP_DIRS_FILE"
+_register_perf_hugepages_dir "$tmp_dir/bk1"
+_line1="$(cat "$PERF_HP_DIRS_FILE" 2>/dev/null || true)"
+assert_eq "register writes first dir line" "$tmp_dir/bk1" "$_line1"
+_register_perf_hugepages_dir "$tmp_dir/bk1"   # dedup: second call must NOT add a duplicate
+set +e
+_n1="$(grep -c . "$PERF_HP_DIRS_FILE" 2>/dev/null)"
+set -e
+: "${_n1:=0}"
+assert_eq "register dedups (still one line)" "1" "$_n1"
+_register_perf_hugepages_dir "$tmp_dir/bk2"
+set +e
+_n2="$(grep -c . "$PERF_HP_DIRS_FILE" 2>/dev/null)"
+set -e
+: "${_n2:=0}"
+assert_eq "register adds second dir" "2" "$_n2"
+_unregister_perf_hugepages_dir "$tmp_dir/bk1"
+_line2="$(cat "$PERF_HP_DIRS_FILE" 2>/dev/null || true)"
+assert_eq "unregister removes one dir (leaves bk2)" "$tmp_dir/bk2" "$_line2"
+_unregister_perf_hugepages_dir "$tmp_dir/bk2"
+if [[ ! -f "$PERF_HP_DIRS_FILE" ]]; then
+  printf 'PASS: registry file removed when last dir unregistered\n'
+else
+  printf 'FAIL: registry file not removed after last unregister\n' >&2
+  record_failure "registry file removed when empty"
+fi
+# Unregister on a non-existent registry is a safe no-op (returns 0).
+set +e
+_unregister_perf_hugepages_dir "$tmp_dir/bk1"; _rc_unreg_nofile=$?
+set -e
+assert_eq "unregister with no registry file is a no-op (rc 0)" "0" "$_rc_unreg_nofile"
+PERF_HP_DIRS_FILE="$_save_reg"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

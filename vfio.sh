@@ -124,6 +124,20 @@ LIVE_ATTACH_HELPER="/usr/local/sbin/vfio-live-attach.sh"
 LIVE_ATTACH_GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
 LIVE_ATTACH_AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
 LIVE_ATTACH_VM_LIST="/var/lib/vfio-dynamic/live-attach-vms"
+# Reboot-persistent hugepages re-reserve (ultimate-perf only): after a host
+# reboot /proc/sys/vm/nr_hugepages resets to 0, but the per-VM ownership files
+# (*_perf_hugepages_owned.txt) persist in the perf backup dir. Without a
+# boot-time re-reserve, a hugepages-backed VM (memoryBacking/hugepages) fails
+# to start with "unable to map backing store for guest RAM: Cannot allocate
+# memory" until the operator manually re-runs --install-ultimate-perf-vm-tuning.
+# This oneshot service reads the registry of perf backup dirs (one owned-file
+# dir per line in PERF_HP_DIRS_FILE), sums the owned counts, and re-reserves the
+# pool at boot before libvirt starts autostart VMs. Installed/enabled
+# automatically when hugepages is opted in during --install-ultimate-perf-vm-tuning;
+# removed by --reset-ultimate-perf-vm-tuning (when no owned files remain) and --reset.
+PERF_HP_BOOT_SCRIPT="/usr/local/sbin/vfio-perf-hugepages-reserve.sh"
+PERF_HP_BOOT_UNIT="/etc/systemd/system/vfio-perf-hugepages-reserve.service"
+PERF_HP_DIRS_FILE="/var/lib/vfio-dynamic/perf-hugepages-dirs"
 # virtio-win guest-agent support (smart live-attach handoff). The live-attach
 # helper polls the qemu guest agent (guest-ping) so the GPU hot-attaches the
 # MOMENT Windows is up instead of after a blind fixed delay; that needs the
@@ -13154,6 +13168,11 @@ _reserve_host_hugepages_for_vm() {
       return 1
     fi
     printf '%s\n' "$_need" >"$_owned_file" 2>/dev/null || true
+    # Register this backup dir in the boot-reserve registry so the boot-time
+    # oneshot re-reserves the pool after a host reboot (nr_hugepages resets to
+    # 0 on reboot; without this a hugepages-backed VM fails to start until the
+    # operator manually re-runs --install-ultimate-perf-vm-tuning).
+    _register_perf_hugepages_dir "$_backup_dir"
   fi
   return 0
 }
@@ -13165,10 +13184,18 @@ _reserve_host_hugepages_for_vm() {
 # remain. Best-effort. Returns 0 even if no owned file exists.
 _restore_host_hugepages_for_vm() {
   local _backup_dir="$1" _dom="$2"
-  local _owned_file _sum _o _f _cur
+  local _owned_file _sum _o _f _cur _left _lf
   _owned_file="$_backup_dir/${_dom}_perf_hugepages_owned.txt"
   [[ -f "$_owned_file" ]] || return 0
   rm -f "$_owned_file" 2>/dev/null || true
+  # Unregister this backup dir from the boot-reserve registry when its last
+  # owned file is gone, so the boot oneshot's ConditionPathExists cleanly
+  # skips once every perf-hugepages VM has been reverted.
+  _left=0
+  for _lf in "$_backup_dir"/*_perf_hugepages_owned.txt; do
+    [[ -f "$_lf" ]] && { _left=1; break; }
+  done
+  (( _left )) || _unregister_perf_hugepages_dir "$_backup_dir"
   _sum=0
   for _f in "$_backup_dir"/*_perf_hugepages_owned.txt; do
     [[ -f "$_f" ]] || continue
@@ -13184,6 +13211,158 @@ _restore_host_hugepages_for_vm() {
       || note "WARN: failed to restore /proc/sys/vm/nr_hugepages (left as-is)."
   fi
   return 0
+}
+
+# R35: Register a perf-hugepages backup dir in the boot-reserve registry
+# (dedup-safe). Called by _reserve_host_hugepages_for_vm after it writes the
+# owned file, so the boot-time oneshot can re-reserve the pool after a reboot.
+_register_perf_hugepages_dir() {
+  local _dir="$1"
+  [[ -n "$_dir" ]] || return 0
+  mkdir -p "$(dirname "$PERF_HP_DIRS_FILE")" 2>/dev/null || true
+  if [[ -f "$PERF_HP_DIRS_FILE" ]] && grep -Fixq "$_dir" "$PERF_HP_DIRS_FILE" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$_dir" >>"$PERF_HP_DIRS_FILE" 2>/dev/null || true
+}
+
+# R35: Unregister a perf-hugepages backup dir from the boot-reserve registry.
+# Called by _restore_host_hugepages_for_vm when its last owned file is removed.
+# If the registry empties, remove it so the boot unit's ConditionPathExists
+# cleanly skips. Best-effort.
+_unregister_perf_hugepages_dir() {
+  local _dir="$1" _tmp
+  [[ -n "$_dir" && -f "$PERF_HP_DIRS_FILE" ]] || return 0
+  _tmp="$(mktemp 2>/dev/null || true)"
+  [[ -n "$_tmp" ]] || return 0
+  grep -Fixv "$_dir" "$PERF_HP_DIRS_FILE" 2>/dev/null >"$_tmp" || true
+  if [[ -s "$_tmp" ]]; then
+    cat "$_tmp" >"$PERF_HP_DIRS_FILE" 2>/dev/null || true
+  else
+    rm -f "$PERF_HP_DIRS_FILE" 2>/dev/null || true
+  fi
+  rm -f "$_tmp" 2>/dev/null || true
+}
+
+# R35: Install + enable the reboot-persistent hugepages re-reserve oneshot
+# service. Writes a STANDALONE boot script (it never sources vfio.sh — at boot
+# /usr/local/bin/vfio may be absent and sourcing would re-parse args / re-run
+# detection) that reads PERF_HP_DIRS_FILE, sums the per-VM owned counts, and
+# re-reserves the pool before libvirt starts autostart VMs. Idempotent. Called
+# after at least one VM successfully reserves hugepages in
+# install_ultimate_perf_vm_tuning. Honors the 1GB-page guard (skip + warn) and
+# verifies the kernel delivered the full count (warns on a fragmented shortfall
+# without reverting — a partial reservation is better than none at boot).
+install_perf_hugepages_boot_service() {
+  if ! have_cmd systemctl; then
+    note "WARN: systemd not available; cannot install the boot-time hugepages re-reserve service. After each host reboot you must re-run 'sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning --ultimate-perf-hugepages' (or manually echo the owned count into /proc/sys/vm/nr_hugepages) or hugepages-backed VMs will fail to start."
+    return 0
+  fi
+  local _unit
+  _unit="$(basename "$PERF_HP_BOOT_UNIT")"
+  mkdir -p "$(dirname "$PERF_HP_DIRS_FILE")" 2>/dev/null || true
+  write_file_atomic "$PERF_HP_BOOT_SCRIPT" 0755 "root:root" <<EOF
+#!/usr/bin/env bash
+# Managed by vfio.sh — reboot-persistent hugepages re-reserve for
+# ultimate-perf-tuned VMs. After a host reboot /proc/sys/vm/nr_hugepages resets
+# to 0; this reads the registry of perf backup dirs and re-reserves the sum of
+# the per-VM owned counts so hugepages-backed VMs can start without a manual
+# --install-ultimate-perf-vm-tuning re-run. Standalone (never sources vfio.sh).
+# Removed by: sudo vfio.sh --reset  (or sudo vfio.sh --reset-ultimate-perf-vm-tuning when no hugepages VMs remain)
+set -o pipefail
+CONF_FILE="/etc/vfio-gpu-passthrough.conf"
+REGISTRY="$PERF_HP_DIRS_FILE"
+NR_HUGEPAGES="/proc/sys/vm/nr_hugepages"
+log() { printf '[vfio-perf-hugepages] %s\n' "\$*" >&2; }
+[[ -f "\$REGISTRY" ]] || { log "no hugepages registry (\$REGISTRY); nothing to reserve."; exit 0; }
+hp_size="\$(awk -F= '/^ULTIMATE_PERF_HUGEPAGES_SIZE=/{v=\$2; gsub(/"/,"",v); print v; exit}' "\$CONF_FILE" 2>/dev/null || true)"
+hp_size="\${hp_size:-2048}"
+[[ "\$hp_size" =~ ^[0-9]+\$ ]] || hp_size=2048
+if (( hp_size >= 1048576 )); then
+  log "WARN: configured hugepages size \${hp_size}KiB is 1GB — cannot reserve at runtime. Add 'hugepagesz=1G hugepages=N' to the kernel cmdline. Skipping."
+  exit 0
+fi
+total=0
+seen=""
+while IFS= read -r dir; do
+  [[ -n "\$dir" ]] || continue
+  [[ -d "\$dir" ]] || continue
+  case ":\$seen:" in *":\$dir:"*) continue ;; esac
+  seen="\$seen:\$dir"
+  for f in "\$dir"/*_perf_hugepages_owned.txt; do
+    [[ -f "\$f" ]] || continue
+    n="\$(cat "\$f" 2>/dev/null || echo 0)"
+    [[ "\$n" =~ ^[0-9]+\$ ]] || n=0
+    total=\$(( total + n ))
+  done
+done < "\$REGISTRY"
+if (( total <= 0 )); then
+  log "registry has no owned hugepage counts; nothing to reserve."
+  exit 0
+fi
+cur="\$(cat "\$NR_HUGEPAGES" 2>/dev/null || echo 0)"
+[[ "\$cur" =~ ^[0-9]+\$ ]] || cur=0
+if (( cur >= total )); then
+  log "host already has \$cur hugepages (>= \$total needed); nothing to do."
+  exit 0
+fi
+log "re-reserving \$total hugepage(s) after reboot (host nr_hugepages: \$cur -> \$total)."
+if ! printf '%s\n' "\$total" >"\$NR_HUGEPAGES" 2>/dev/null; then
+  log "WARN: failed to write \$NR_HUGEPAGES."
+  exit 0
+fi
+got="\$(cat "\$NR_HUGEPAGES" 2>/dev/null || echo 0)"
+[[ "\$got" =~ ^[0-9]+\$ ]] || got=0
+if (( got < total )); then
+  log "WARN: host granted only \$got of \$total hugepage(s) (fragmented RAM at boot). Hugepages-backed VMs may fail to start. Reliable fix: add 'hugepages=\$total' to the kernel cmdline. Leaving the partial reservation in place."
+  exit 0
+fi
+log "OK: reserved \$got hugepage(s) for ultimate-perf-tuned VMs."
+exit 0
+EOF
+  write_file_atomic "$PERF_HP_BOOT_UNIT" 0644 "root:root" <<EOF
+[Unit]
+Description=Re-reserve host hugepages for ultimate-perf-tuned VMs at boot
+Documentation=man:vfio(8)
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=virtqemud.service libvirtd.service
+ConditionPathExists=$PERF_HP_DIRS_FILE
+
+[Service]
+Type=oneshot
+ExecStart=$PERF_HP_BOOT_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run systemctl daemon-reload 2>/dev/null || true
+  run systemctl enable "$_unit" 2>/dev/null || true
+  # Run once now so the current boot is covered too (idempotent: the script
+  # no-ops when the pool already satisfies the owned counts).
+  run systemctl start "$_unit" 2>/dev/null || true
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Installed reboot-persistent hugepages re-reserve: $(_link "$PERF_HP_BOOT_SCRIPT")"
+    note "    service: $(_link "$PERF_HP_BOOT_UNIT")"
+  else
+    say "  ✔ Installed reboot-persistent hugepages re-reserve: $PERF_HP_BOOT_SCRIPT"
+    note "    service: $PERF_HP_BOOT_UNIT"
+  fi
+  note "After a host reboot this re-reserves nr_hugepages from the owned files so"
+  note "hugepages-backed VMs start without a manual re-tune."
+}
+
+# R35: Remove + disable the reboot-persistent hugepages re-reserve service.
+# Called by --reset-ultimate-perf-vm-tuning (when no owned files remain) and
+# --reset. Best-effort.
+remove_perf_hugepages_boot_service() {
+  local _unit
+  _unit="$(basename "$PERF_HP_BOOT_UNIT")"
+  if command -v systemctl >/dev/null 2>&1; then
+    run systemctl disable --now "$_unit" 2>/dev/null || true
+    run systemctl daemon-reload 2>/dev/null || true
+  fi
+  run rm -f "$PERF_HP_BOOT_SCRIPT" "$PERF_HP_BOOT_UNIT" "$PERF_HP_DIRS_FILE" 2>/dev/null || true
 }
 
 # R35: Ultimate-performance VM XML tuning (stealth-safe). A SEPARATE, more
@@ -13347,7 +13526,7 @@ install_ultimate_perf_vm_tuning() {
     note "Host topology unreadable; cputune will use simple v->v pinning and numatune will be skipped."
   fi
 
-  local _updated=0 _skipped_running=0 _dom _xml _bdfs _state _tmp _backup_xml
+  local _updated=0 _skipped_running=0 _any_hp_reserved=0 _dom _xml _bdfs _state _tmp _backup_xml
   while IFS= read -r _dom; do
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
@@ -13390,7 +13569,7 @@ install_ultimate_perf_vm_tuning() {
         note "Dry run: would reserve host hugepages for '$_dom' (no nr_hugepages write)."
       else
         if _reserve_host_hugepages_for_vm "$_xml" "$_hp_size" "$_backup_dir" "$_dom"; then
-          : # reservation OK; _hp_vm stays 1
+          _any_hp_reserved=1 # reservation OK; _hp_vm stays 1
         else
           _hp_vm=0
           note "Hugepages reservation did not complete for '$_dom'; defining the VM WITHOUT <memoryBacking>hugepages (all other perf knobs still apply)."
@@ -13846,6 +14025,15 @@ PYEOF
       note "Ensure a VM has the guest GPU attached (or is in the live-attach VM list) and re-run."
     fi
   fi
+  # Install the reboot-persistent hugepages re-reserve service whenever there
+  # is any perf-hugepages ownership: this run reserved (_any_hp_reserved) OR a
+  # prior run's registry still lists owned files (covers upgrading an existing
+  # hugepages setup that predates the boot service). Skipped in dry-run (no
+  # reservation writes happen so _any_hp_reserved stays 0; the pre-existing
+  # registry is left untouched and the service is not (re)installed).
+  if (( ! DRY_RUN )) && { (( _any_hp_reserved )) || [[ -f "$PERF_HP_DIRS_FILE" ]]; }; then
+    install_perf_hugepages_boot_service
+  fi
 }
 
 # R35: Revert ultimate-performance VM tuning by redefining each guest-GPU VM from
@@ -13932,6 +14120,15 @@ reset_ultimate_perf_vm_tuning() {
     else
       note "No perf backups found for guest-GPU VMs; nothing to revert."
     fi
+  fi
+  # Remove the reboot-persistent hugepages re-reserve service once the last
+  # perf-hugepages owned dir is gone. _restore_host_hugepages_for_vm calls
+  # _unregister_perf_hugepages_dir, which deletes PERF_HP_DIRS_FILE when its
+  # last owned file is cleaned up — so an empty/absent registry means no VM
+  # still demands hugepages and the boot oneshot is no longer needed. Skipped
+  # in dry-run so a dry-run revert does not uninstall the live service.
+  if (( ! DRY_RUN )) && ! [[ -f "$PERF_HP_DIRS_FILE" ]]; then
+    remove_perf_hugepages_boot_service
   fi
 }
 
@@ -20931,6 +21128,11 @@ reset_vfio_all() {
   note "NOTE: stealth/perf-tuned VM XMLs are NOT reverted by --reset. Use"
   note "      'sudo $SCRIPT_NAME --reset-stealth-vm-tuning' to restore them"
   note "      from their *_stealth_*.xml backups before or after this reset."
+  note "      For ultimate-perf (hugepages/iothreads/cputune) revert + host hugepages"
+  note "      release + boot-reserve service removal, run:"
+  note "      'sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning'. (--reset leaves the"
+  note "      hugepages boot-reserve service in place so hugepages-backed VMs still"
+  note "      start across reboots until you explicitly revert perf.)"
 
   if ! confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
     die "Reset cancelled"

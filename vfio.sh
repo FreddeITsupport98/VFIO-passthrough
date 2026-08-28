@@ -22587,18 +22587,33 @@ apply_configuration() {
     fi
   fi
 
-  say
-
-  hdr "Apply changes"
-  note "If you continue, this script will install the core VFIO binding setup:" 
-  note "  - Write $CONF_FILE (your selected PCI BDFs)"
-  note "  - Write $MODULES_LOAD (load vfio modules at boot)"
-  note "  - Write $BIND_SCRIPT (bind ONLY the selected guest BDF(s) to vfio-pci)"
-  note "  - Write + enable $SYSTEMD_UNIT (runs the bind script early at boot)"
-  note "On dracut-based systems (including openSUSE), it will also install a VFIO dracut config so rd.driver.pre=vfio-pci cannot cause a boot hang."
-  note "It will then ASK about remaining optional steps (GRUB/IOMMU, ACS override, host audio unit, udev isolation, etc.)."
-  note "On KDE Plasma systems, it can also (optionally) set Plasma Wayland as the default SDDM session to better match these settings."
-  note "Important: The VFIO binding will fully take effect AFTER a reboot."
+  # R38: GUI path shows the apply-changes explanation as a popup so a GUI-only
+  # operator sees what will be installed before the yes/no choice; plain-text
+  # path keeps the inline notes.
+  if (( HAS_TUI )); then
+    gui_msgbox "Apply changes" \
+"If you continue, this script will install the core VFIO binding setup:
+  - Write $CONF_FILE (your selected PCI BDFs)
+  - Write $MODULES_LOAD (load vfio modules at boot)
+  - Write $BIND_SCRIPT (bind ONLY the selected guest BDF(s) to vfio-pci)
+  - Write + enable $SYSTEMD_UNIT (runs the bind script early at boot)
+On dracut-based systems (including openSUSE), it will also install a VFIO dracut config so rd.driver.pre=vfio-pci cannot cause a boot hang.
+It will then ASK about remaining optional steps (GRUB/IOMMU, ACS override, host audio unit, udev isolation, etc.).
+On KDE Plasma systems, it can also (optionally) set Plasma Wayland as the default SDDM session to better match these settings.
+Important: The VFIO binding will fully take effect AFTER a reboot."
+  else
+    say
+    hdr "Apply changes"
+    note "If you continue, this script will install the core VFIO binding setup:" 
+    note "  - Write $CONF_FILE (your selected PCI BDFs)"
+    note "  - Write $MODULES_LOAD (load vfio modules at boot)"
+    note "  - Write $BIND_SCRIPT (bind ONLY the selected guest BDF(s) to vfio-pci)"
+    note "  - Write + enable $SYSTEMD_UNIT (runs the bind script early at boot)"
+    note "On dracut-based systems (including openSUSE), it will also install a VFIO dracut config so rd.driver.pre=vfio-pci cannot cause a boot hang."
+    note "It will then ASK about remaining optional steps (GRUB/IOMMU, ACS override, host audio unit, udev isolation, etc.)."
+    note "On KDE Plasma systems, it can also (optionally) set Plasma Wayland as the default SDDM session to better match these settings."
+    note "Important: The VFIO binding will fully take effect AFTER a reboot."
+  fi
 
   prompt_yn "Apply these changes now?" N "Apply VFIO configuration" || die "Aborted by user"
 
@@ -22683,37 +22698,62 @@ apply_configuration() {
     binding_mode="${binding_mode^^}"
     note "CLI override applied: --binding-mode ${binding_mode,,}"
   else
-    say
-    hdr "GPU binding mode"
-    note "Choose how the guest GPU is handed to the VM:"
-    say
-    # Two labeled bullet blocks are easier to scan than a cramped two-column
-    # table whose cells wrap mid-phrase. One complete thought per bullet, and
-    # bold mode labels (with a plain-text fallback when color is disabled).
-    local _early_lbl _dyn_lbl
-    if (( ENABLE_COLOR )); then
-      _early_lbl="${C_BOLD}early binding${C_RESET}"
-      _dyn_lbl="${C_BOLD}dynamic binding${C_RESET} ${C_DIM}(libvirt hook)${C_RESET}"
+    # R38: GUI path shows the early-vs-dynamic explanation as a popup so a
+    # GUI-only operator sees the tradeoff before the yes/no choice; plain-text
+    # path keeps the inline colored bullet blocks.
+    if (( HAS_TUI )); then
+      gui_msgbox "GPU binding mode" \
+"Choose how the guest GPU is handed to the VM:
+
+early binding
+  - vfio-pci claims the GPU at boot (vfio-pci.ids + rd.driver.pre + systemd unit)
+  - GPU is NOT usable by the host between reboots
+  - works with raw qemu too
+  - can trigger \"header type 127\" on some AMD cards
+
+dynamic binding (libvirt hook)
+  - amdgpu loads first; a libvirt qemu hook switches the GPU to vfio-pci
+    only when a VM that has it attached is started
+  - GPU stays usable by the host until VM start (and after VM stop if REBIND_HOST=1)
+  - requires libvirt-managed VMs
+  - more reliable for RX 9070 / RDNA4 reset bug
+
+Both modes keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off.
+(RX 9070 / RDNA4 Navi 48 skips disable_idle_d3=1: it worsens D3 issues there; the bind script's D0-lock handles the reset bug.)
+dynamic is the recommended default for RX 9070 / RDNA4 cards."
     else
-      _early_lbl="early binding"
-      _dyn_lbl="dynamic binding (libvirt hook)"
+      say
+      hdr "GPU binding mode"
+      note "Choose how the guest GPU is handed to the VM:"
+      say
+      # Two labeled bullet blocks are easier to scan than a cramped two-column
+      # table whose cells wrap mid-phrase. One complete thought per bullet, and
+      # bold mode labels (with a plain-text fallback when color is disabled).
+      local _early_lbl _dyn_lbl
+      if (( ENABLE_COLOR )); then
+        _early_lbl="${C_BOLD}early binding${C_RESET}"
+        _dyn_lbl="${C_BOLD}dynamic binding${C_RESET} ${C_DIM}(libvirt hook)${C_RESET}"
+      else
+        _early_lbl="early binding"
+        _dyn_lbl="dynamic binding (libvirt hook)"
+      fi
+      say "  $_early_lbl"
+      say "    - vfio-pci claims the GPU at boot (vfio-pci.ids + rd.driver.pre + systemd unit)"
+      say "    - GPU is NOT usable by the host between reboots"
+      say "    - works with raw qemu too"
+      say "    - can trigger \"header type 127\" on some AMD cards"
+      say
+      say "  $_dyn_lbl"
+      say "    - amdgpu loads first; a libvirt qemu hook switches the GPU to vfio-pci"
+      say "      only when a VM that has it attached is started"
+      say "    - GPU stays usable by the host until VM start (and after VM stop if REBIND_HOST=1)"
+      say "    - requires libvirt-managed VMs"
+      say "    - more reliable for RX 9070 / RDNA4 reset bug"
+      say
+      note "Both modes keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off."
+      note "(RX 9070 / RDNA4 Navi 48 skips disable_idle_d3=1: it worsens D3 issues there; the bind script's D0-lock handles the reset bug.)"
+      note "dynamic is the recommended default for RX 9070 / RDNA4 cards."
     fi
-    say "  $_early_lbl"
-    say "    - vfio-pci claims the GPU at boot (vfio-pci.ids + rd.driver.pre + systemd unit)"
-    say "    - GPU is NOT usable by the host between reboots"
-    say "    - works with raw qemu too"
-    say "    - can trigger \"header type 127\" on some AMD cards"
-    say
-    say "  $_dyn_lbl"
-    say "    - amdgpu loads first; a libvirt qemu hook switches the GPU to vfio-pci"
-    say "      only when a VM that has it attached is started"
-    say "    - GPU stays usable by the host until VM start (and after VM stop if REBIND_HOST=1)"
-    say "    - requires libvirt-managed VMs"
-    say "    - more reliable for RX 9070 / RDNA4 reset bug"
-    say
-    note "Both modes keep vfio-pci.disable_idle_d3=1 and pcie_port_pm=off."
-    note "(RX 9070 / RDNA4 Navi 48 skips disable_idle_d3=1: it worsens D3 issues there; the bind script's D0-lock handles the reset bug.)"
-    note "dynamic is the recommended default for RX 9070 / RDNA4 cards."
     local binding_default="N"
     if [[ "${guest_vendor,,}" == "1002" ]]; then
       local guest_drv
@@ -23174,6 +23214,47 @@ apply_configuration() {
     note "Skipping user systemd audio helper. You can install it later by re-running this helper."
   fi
   apply_selected_graphics_protocol_mode "$host_gpu" "$guest_gpu"
+
+  # R38: final end-of-config recap so the operator sees, at a glance, which
+  # card went where (same GUEST/HOST role tags as the wizard) AND which binding
+  # mode they chose. GUI path = popup; plain-text path = colored inline recap.
+  local _recap_mode="${CTX[binding_mode]:-EARLY}"
+  local _recap_gfx="${CTX[graphics_protocol_mode]:-AUTO}"
+  if (( HAS_TUI )); then
+    gui_msgbox "VFIO setup recap" \
+"Configuration applied:
+
+  [HOST -> desktop]    $host_gpu
+  [GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))
+
+  [HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}
+  [GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}
+
+Binding mode:        $_recap_mode
+Graphics protocol:   $_recap_gfx
+Host default sink:   ${host_audio_node_name:-<not set>}
+Boot-VGA policy:     ${boot_vga_policy_mode}
+
+Reboot to make the VFIO binding take effect."
+  else
+    say
+    hdr "VFIO setup recap"
+    if (( ENABLE_COLOR )); then
+      say "  $(_role_tag host)   $host_gpu"
+      say "  $(_role_tag guest)  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
+      say "  $(_role_tag host-audio)   ${host_audio_bdfs_csv:-<none>}"
+      say "  $(_role_tag guest-audio)  ${guest_audio_csv:-<none>}"
+    else
+      say "  [HOST -> desktop]    $host_gpu"
+      say "  [GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
+      say "  [HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}"
+      say "  [GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}"
+    fi
+    say "  Binding mode:      $_recap_mode"
+    say "  Graphics protocol: $_recap_gfx"
+    say "  Host default sink: ${host_audio_node_name:-<not set>}"
+    say "  Boot-VGA policy:   ${boot_vga_policy_mode}"
+  fi
 
   say
   say "Done. Next steps:"

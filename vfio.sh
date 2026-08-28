@@ -4306,11 +4306,15 @@ note() {
 }
 
 short_gpu_desc() {
-  # Make lspci GPU description shorter for menus.
-  # Keep model info, drop trailing [vvvv:dddd] and (rev ..) when present.
+  # Make an lspci GPU description shorter for menus. Robust against the
+  # leading ": " that lspci -Dnn parsing can leave, and against vendor
+  # corporation prefixes that don't start the string. Keeps the marketing
+  # sub-bracket (e.g. [Radeon RX 9070 XT]); drops only the trailing PCI-id
+  # [vvvv:dddd] and (rev ..) tail.
   local d="$1"
-  d="$(echo "$d" | sed -E 's/^Advanced Micro Devices, Inc\. \[[^]]+\] //; s/^NVIDIA Corporation //; s/^Intel Corporation //')"
-  d="$(echo "$d" | sed -E 's/ \[[0-9a-f]{4}:[0-9a-f]{4}\].*$//; s/ \(rev [^)]+\)$//')"
+  d="$(echo "$d" | sed -E 's/^[[:space:]]*:[[:space:]]*//')"
+  d="$(echo "$d" | sed -E 's/^Advanced Micro Devices, Inc\. \[[^]]+\] //; s/^Advanced Micro Devices, Inc\. //; s/^NVIDIA Corporation //; s/^Intel Corporation //')"
+  d="$(echo "$d" | sed -E 's/ \[[0-9a-f]{4}:[0-9a-f]{4}\].*$//; s/ \[[0-9a-f]{4}:[0-9a-f]{2}\].*$//; s/ \(rev [^)]+\)$//')"
   printf '%s' "$(trim "$d")"
 }
 
@@ -4323,6 +4327,32 @@ short_audio_desc() {
   else
     echo "Audio"
   fi
+}
+
+# R38: strip ANSI CSI color escapes from stdin so labels passed to whiptail
+# (which truncates at the ESC byte, leaving "Vendor: " empty) render as
+# readable plain text. Keeps the surrounding words; removes only the escape
+# sequences. Used by select_from_list's TUI path so colored labels survive.
+_ansi_strip() {
+  sed $'s/\033\\[[0-9;]*m//g'
+}
+
+# R38: short picker hint for a GPU BDF — boot-VGA status + current driver — so
+# the operator can tell which card is the host display (boot VGA, typical HOST)
+# vs the spare (typical GUEST) at a glance, inside the popup. Plain text only.
+_gpu_hint() {
+  local bdf="$1" hint="" bv drv
+  bv="$(pci_boot_vga_flag "$bdf" 2>/dev/null || echo unknown)"
+  case "$bv" in
+    1) hint="boot VGA" ;;
+    0) hint="secondary" ;;
+    *) hint="vga?" ;;
+  esac
+  drv="$(bdf_driver_name "$bdf" 2>/dev/null || true)"
+  if [[ -n "$drv" && "$drv" != "<none>" ]]; then
+    hint="$hint, $drv"
+  fi
+  printf '%s' "$hint"
 }
 
 select_from_list() {
@@ -4338,13 +4368,16 @@ select_from_list() {
     local i opt first_line
     for i in "${!options[@]}"; do
       opt="${options[$i]}"
-      # Use the first line of the option as the menu label.
+      # Use the first line of the option as the menu label. R38: strip ANSI
+      # before handing to whiptail — whiptail truncates a label at the first
+      # ESC byte, so a colored vendor/tag would render empty (e.g. "Vendor: ").
       first_line="${opt%%$'\n'*}"
+      first_line="$(printf '%s' "$first_line" | _ansi_strip)"
       menu_args+=("$i" "$first_line")
     done
 
     local choice
-    choice=$(whiptail --title "$title" --menu "$prompt" 20 75 10 "${menu_args[@]}" 3>&1 1>&2 2>&3) || die "Selection cancelled."
+    choice=$(whiptail --title "$title" --menu "$prompt" 20 78 10 "${menu_args[@]}" 3>&1 1>&2 2>&3) || die "Selection cancelled."
     # choice is already the zero-based index as a string.
     echo "$choice"
     return 0
@@ -4420,7 +4453,7 @@ gpu_discover_all_sysfs() {
     desc=""
     if [[ -n "$lspci_cache" ]]; then
       # Grep from cache instead of running lspci again.
-      desc="$(grep -F "$bdf" <<<"$lspci_cache" | head -n1 | sed 's/^[^]]*] *//')"
+      desc="$(grep -F "$bdf" <<<"$lspci_cache" | head -n1 | sed 's/^[^]]*] *//; s/^: *//')"
       desc="$(trim "$desc")"
     fi
 
@@ -4439,7 +4472,7 @@ gpu_discover_all_sysfs() {
         if [[ "$aclass_prefix" == "0403" ]]; then
           audio_bdfs+="${audio_bdfs:+,}$abdf"
           if [[ -n "$lspci_cache" ]]; then
-            adesc="$(grep -F "$abdf" <<<"$lspci_cache" | head -n1 | sed 's/^[^]]*] *//')"
+            adesc="$(grep -F "$abdf" <<<"$lspci_cache" | head -n1 | sed 's/^[^]]*] *//; s/^: *//')"
             adesc="$(trim "$adesc")"
           else
             adesc="Audio"
@@ -22264,15 +22297,22 @@ In the colored terminal output, GUEST is shown in RED and HOST in GREEN."
     assert_pci_bdf_exists "$gpu_bdf"
   done
 
+  # R38: build GPU menu options so the whiptail (GUI) FIRST line carries the
+  # model + a boot-VGA/driver hint — whiptail only shows line 1, so the old
+  # "Model: ..." on line 2 was invisible in the popup, and the colored vendor
+  # was stripped to empty by the ESC-byte truncation. Line 1 is plain-rich
+  # (ANSI stripped in select_from_list for whiptail; colored for --no-tui);
+  # line 2 keeps BDF + slot detail for the plain-text path.
   local -a options=()
   local i
   for i in "${!gpu_bdfs[@]}"; do
-    local bdf slot vend short
+    local bdf slot vend short hint
     bdf="${gpu_bdfs[$i]}"
     slot="$(pci_slot_of_bdf "$bdf")"
     vend="$(vendor_label "${gpu_vendor_ids[$i]}")"
     short="$(short_gpu_desc "${gpu_descs[$i]}")"
-    options+=("GPU: $bdf  |  Vendor: ${vend}"$'\n'"      Model: ${short}"$'\n'"      PCI slot: ${slot}")
+    hint="$(_gpu_hint "$bdf")"
+    options+=("${vend} ${short}  [${hint}]"$'\n'"      BDF: ${bdf}  |  PCI slot: ${slot}")
   done
 
   local guest_idx host_idx
@@ -22462,14 +22502,16 @@ The HOST GPU stays on your desktop."
       atype="$(short_audio_desc "$adesc")"
       vend="$(vendor_label "$avendor")"
 
+      # R38: RECOMMENDED tag as plain text in the FIRST line so it shows inside
+      # the whiptail popup (ANSI is stripped in select_from_list; the old
+      # colored-only tag was truncated to nothing by the ESC-byte chop).
       rec_tag=""
       if [[ "$aslot" == "$host_slot" ]]; then
         rec_tag="${C_BOLD}${C_GREEN}[RECOMMENDED for host GPU]${C_RESET} "
-        (( ! ENABLE_COLOR )) && rec_tag="[RECOMMENDED for host GPU] "
       fi
 
       aud_bdfs+=("$abdf")
-      aud_opts+=("${rec_tag}Audio: $abdf  |  Type: ${atype}  |  Vendor: ${vend}"$'\n'"      PCI slot: ${aslot}  |  IDs: ${avendor}:${adev}"$'\n'"      lspci: $(short_gpu_desc "$adesc")")
+      aud_opts+=("${rec_tag}${atype}: ${abdf} (${avendor}:${adev})"$'\n'"      slot: ${aslot} | vendor: ${vend} | $(short_gpu_desc "$adesc")")
     done < <(audio_devices_discover_all)
 
     if (( ${#aud_bdfs[@]} > 0 )); then

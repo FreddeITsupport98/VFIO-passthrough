@@ -899,6 +899,77 @@ assert_contains_text \
   "R34 reset hints at --uninstall-self" \
   '--uninstall-self' \
   "$_reset_fn2"
+# --- R37: --reset removes ALL stealth/perf backups + --full also removes the CLI ---
+# reset_vfio_all now calls _remove_vm_tuning_backups (wipes fixed-name + legacy
+# ~/Desktop timestamped stealth/perf XML backups) and accepts a 'full' arg that
+# also removes the self-installed vfio CLI + completions (repo script untouched).
+assert_contains_file \
+  "R37 _remove_vm_tuning_backups helper defined" \
+  '_remove_vm_tuning_backups()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R37 reset calls _remove_vm_tuning_backups" \
+  '_remove_vm_tuning_backups' \
+  "$_reset_fn2"
+# The backup-removal globs live in _remove_vm_tuning_backups (called by reset),
+# so extract that helper and assert the legacy ~/Desktop globs are present.
+_rm_bak_fn="$(sed -n '/^_remove_vm_tuning_backups()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R37 reset helper removes legacy ~/Desktop timestamped stealth backups" \
+  '*_stealth_*.xml' \
+  "$_rm_bak_fn"
+assert_contains_text \
+  "R37 reset helper removes legacy ~/Desktop timestamped perf backups" \
+  '*_perf_*.xml' \
+  "$_rm_bak_fn"
+assert_contains_text \
+  "R37 reset full-arg removes the self-installed CLI" \
+  'rm -f "$SELF_INSTALL_BIN"' \
+  "$_reset_fn2"
+assert_contains_text \
+  "R37 reset full-arg removes fish completion" \
+  'FISH_COMPLETION_DIR}/${_installed_cmd}.fish' \
+  "$_reset_fn2"
+assert_contains_file \
+  "R37 RESET_FULL var declared" \
+  'RESET_FULL=0' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R37 parse_args handles --full" \
+  '--full)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R37 usage one-liner includes --full" \
+  '[--full]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R37 fish completion includes --full" \
+  'complete -c $cmd -l full' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R37 zsh completion includes --full" \
+  "'--full[" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R37 bash completion opts include --full" \
+  '--reset --full --reset-usb-mitigation' \
+  "$VFIO_SCRIPT"
+# The mid-wizard preflight reset (preflight_existing_config_gate) must stay
+# SCOPED (no 'full' arg) so it does not nuke the CLI the user is configuring with.
+_preflight_reset_fn="$(sed -n '/^preflight_existing_config_gate()/,/^}/p' "$VFIO_SCRIPT")"
+_preflight_resets="$(printf '%s\n' "$_preflight_reset_fn" | grep -cF 'reset_vfio_all')"
+if (( _preflight_resets >= 1 )); then
+  printf 'PASS: R37 preflight reset calls reset_vfio_all (%d call(s))\n' "$_preflight_resets"
+else
+  printf 'FAIL: R37 preflight reset does not call reset_vfio_all\n' >&2
+  record_failure "R37 preflight reset calls reset_vfio_all"
+fi
+if printf '%s\n' "$_preflight_reset_fn" | grep -Fq 'reset_vfio_all full'; then
+  printf 'FAIL: R37 preflight reset passes full (would nuke the CLI mid-wizard)\n' >&2
+  record_failure "R37 preflight reset stays scoped (no full arg)"
+else
+  printf 'PASS: R37 preflight reset stays scoped (no full arg)\n'
+fi
 
 # Hotplug-ready desktop notification in the live-attach helper heredoc.
 assert_contains_text \

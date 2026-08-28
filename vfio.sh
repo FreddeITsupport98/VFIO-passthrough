@@ -175,6 +175,7 @@ ZSH_COMPLETION_DIR="/usr/share/zsh/site-functions"
 DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
+RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completions (R37)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
 MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers
@@ -818,6 +819,7 @@ complete -c $cmd -l health-check-previous -d 'Audit previous boot for VFIO frien
 complete -c $cmd -l health-check-all -d 'Audit all detected GPUs'
 complete -c $cmd -l usb-health-check -d 'Audit USB/xHCI instability markers'
 complete -c $cmd -l reset -d 'Remove VFIO setup installed by this script'
+complete -c $cmd -l full -d 'With --reset: also remove the self-installed vfio CLI + completions (repo script untouched)'
 complete -c $cmd -l reset-usb-mitigation -d 'Remove only USB mitigation artifacts'
 complete -c $cmd -l disable-bootlog -d 'Disable/remove optional VFIO boot-log dumper'
 complete -c $cmd -l boot-remove -d 'Alias of --disable-bootlog'
@@ -841,7 +843,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -930,6 +932,7 @@ _vfio_sh_complete() {
     '--health-check-all[Audit all detected GPUs]' \\
     '--usb-health-check[Audit USB/xHCI instability markers]' \\
     '--reset[Remove VFIO setup installed by this script]' \\
+    '--full[With --reset: also remove the self-installed vfio CLI + completions (repo script untouched)]' \\
     '--reset-usb-mitigation[Remove only USB mitigation artifacts]' \\
     '--disable-bootlog[Disable/remove optional VFIO boot-log dumper]' \\
     '--boot-remove[Alias of --disable-bootlog]' \\
@@ -1545,7 +1548,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1613,6 +1616,10 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Audit current and previous boot kernel logs for USB/xHCI crash signatures and print optional stability mitigation guidance.
                    Tip: run with full kernel-log access: sudo ./$SCRIPT_NAME --usb-health-check
   --reset           Reset/remove VFIO passthrough settings installed by this script (systemd/modprobe/grub/initramfs/user units).
+  --full            With --reset: also remove the self-installed 'vfio' CLI command (/usr/local/bin/vfio)
+                    + the fish/bash/zsh shell completions for a true "remove everything this script
+                    installed". Your repo copy of vfio.sh is NEVER touched — only the installed
+                    command. Without --full, --reset stays scoped to VFIO config + stealth/perf backups.
   --reset-usb-mitigation
                    Reset/remove only USB mitigation artifacts (helper/unit/udev/match policy),
                    including USB Ethernet EEE-off mitigation config, while keeping core VFIO GPU setup.
@@ -1945,6 +1952,9 @@ parse_args() {
         ;;
       --reset)
         MODE="reset"
+        ;;
+      --full)
+        RESET_FULL=1
         ;;
       --reset-usb-mitigation)
         MODE="reset-usb-mitigation"
@@ -21558,10 +21568,46 @@ remove_user_audio_unit() {
   fi
 }
 
+# R37: Remove ALL stealth/perf VM-XML backup files for a clean --reset: the
+# fixed-name pristine backups (${_dom}_stealth.xml / ${_dom}_perf.xml in the
+# resolved backup dirs) AND the legacy timestamped ~/Desktop litter
+# (*_stealth_*.xml / *_perf_*.xml). Does NOT touch the hugepages owned files
+# (*_perf_hugepages_owned.txt — NOT backups; the reboot-persistent boot-reserve
+# service + owned files are left in place per the R35 design so hugepages-backed
+# VMs still start across reboots; use --reset-ultimate-perf-vm-tuning to revert
+# perf + release host nr_hugepages + remove the boot service). Must run BEFORE
+# $CONF_FILE is deleted (reads the backup-dir conf keys). Best-effort.
+_remove_vm_tuning_backups() {
+  local _stealth_dir _perf_dir _legacy_dir _any=0 _f
+  _stealth_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _stealth_dir="$(trim "${_stealth_dir:-}")"
+  [[ -n "$_stealth_dir" ]] || _stealth_dir="/var/lib/vfio-stealth-vm/backups"
+  _perf_dir="$(awk -F= '/^ULTIMATE_PERF_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _perf_dir="$(trim "${_perf_dir:-}")"
+  [[ -n "$_perf_dir" ]] || _perf_dir="/var/lib/vfio-perf-vm/backups"
+  _legacy_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  for _f in "$_stealth_dir"/*_stealth*.xml "$_perf_dir"/*_perf*.xml "$_legacy_dir"/*_stealth_*.xml "$_legacy_dir"/*_perf_*.xml; do
+    [[ -f "$_f" ]] && { _any=1; break; }
+  done
+  (( _any )) || return 0
+  run rm -f "$_stealth_dir"/*_stealth*.xml "$_perf_dir"/*_perf*.xml \
+            "$_legacy_dir"/*_stealth_*.xml "$_legacy_dir"/*_perf_*.xml 2>/dev/null || true
+  note "Removed ALL stealth/perf VM XML backups (fixed-name in $_stealth_dir / $_perf_dir + legacy $_legacy_dir timestamped litter). The VM XMLs themselves are NOT reverted — run --reset-stealth-vm-tuning / --reset-ultimate-perf-vm-tuning to revert them (before --reset, since the backups are deleted here)."
+}
+
 reset_vfio_all() {
+  # R37: $1=full removes the self-installed CLI command + shell completions too
+  # (a true "remove everything this script installed"). The repo script itself
+  # is NEVER touched (only /usr/local/bin/vfio + the vendor completion files).
+  local _full="${1:-}"
   hdr "RESET / CLEANUP"
   note "This will remove VFIO passthrough settings installed by this script."
   note "It will NOT uninstall libvirt/QEMU, and it will NOT change your VM XMLs."
+  if [[ "$_full" == "full" ]]; then
+    note "FULL reset: will ALSO remove the self-installed 'vfio' CLI command"
+    note "($SELF_INSTALL_BIN) + the fish/bash/zsh shell completions. Your repo"
+    note "copy of vfio.sh is NOT touched — only the installed command is removed."
+  fi
   note "NOTE: stealth/perf-tuned VM XMLs are NOT reverted by --reset. Use"
   note "      'sudo $SCRIPT_NAME --reset-stealth-vm-tuning' to restore them"
   note "      from their *_stealth_*.xml backups before or after this reset."
@@ -21570,6 +21616,15 @@ reset_vfio_all() {
   note "      'sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning'. (--reset leaves the"
   note "      hugepages boot-reserve service in place so hugepages-backed VMs still"
   note "      start across reboots until you explicitly revert perf.)"
+  note "NOTE: --reset now ALSO removes ALL stealth/perf VM XML backup files"
+  note "      (the fixed-name pristine backups + legacy ~/Desktop timestamped litter)"
+  note "      for a clean slate. Revert VM XMLs from backup FIRST (the commands above)"
+  note "      if you need to restore a pre-tuning VM — the backups are deleted by --reset."
+  if [[ "$_full" == "full" ]]; then
+    note "NOTE: full --reset ALSO removes the installed 'vfio' CLI + completions."
+    note "      If you want to re-run vfio afterward, invoke the repo script directly"
+    note "      (./vfio.sh) or re-run --install-self first."
+  fi
 
   if ! confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
     die "Reset cancelled"
@@ -21612,6 +21667,11 @@ reset_vfio_all() {
   # Remove the live-attach (hotplug GPU) workflow artifacts. Must run before
   # $CONF_FILE is deleted (it reads VFIO_DYNAMIC_LIVE_ATTACH from it).
   remove_live_attach
+  # R37: remove ALL stealth/perf VM XML backups (fixed-name + legacy ~/Desktop
+  # timestamped). Must run before $CONF_FILE is deleted (reads the backup-dir
+  # conf keys). Leaves the hugepages owned files + boot-reserve service in place
+  # (R35 design; use --reset-ultimate-perf-vm-tuning for those).
+  _remove_vm_tuning_backups
 
   # Libvirt hook cleanup: restore pre-existing user-managed qemu hook or remove our managed entry.
   if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
@@ -21870,10 +21930,42 @@ reset_vfio_all() {
   say "Rebuilding initramfs (recommended after reset)..."
   maybe_update_initramfs
 
+  # R37: full reset also removes the self-installed CLI command + completions.
+  # ONLY the installed files are removed — the repo script ($0 / the file the
+  # operator is running) is never deleted. Reuse uninstall_self's exact removal
+  # list so the paths stay in sync; skip its prompt (the RESET VFIO confirm
+  # already gated entry) and skip its DRY_RUN early-return so a dry-run reset
+  # still reports what would be removed.
+  if [[ "$_full" == "full" ]]; then
+    local _installed_cmd
+    _installed_cmd="$(basename "$SELF_INSTALL_BIN")"
+    if [[ -f "$SELF_INSTALL_BIN" ]] \
+      || [[ -f "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" ]] \
+      || [[ -f "${BASH_COMPLETION_DIR}/${_installed_cmd}" ]] \
+      || [[ -f "${ZSH_COMPLETION_DIR}/_${_installed_cmd}" ]]; then
+      if (( ! DRY_RUN )); then
+        run rm -f "$SELF_INSTALL_BIN" \
+          "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" \
+          "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
+          "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+        note "Removed self-installed 'vfio' CLI command + shell completions (full reset). Repo script untouched."
+      else
+        note "DRY-RUN: would remove $SELF_INSTALL_BIN + 3 completion files (full reset). Repo script untouched."
+      fi
+    else
+      note "No self-installed 'vfio' CLI / completion files found; nothing extra to remove."
+    fi
+  fi
+
   say
   say "Reset complete. Reboot recommended."
   note "If any devices are currently bound to vfio-pci, a reboot is the cleanest way to restore host drivers."
-  note "This removed VFIO config only. To also remove the self-installed vfio.sh + shell completions, run: sudo $SCRIPT_NAME --uninstall-self"
+  if [[ "$_full" == "full" ]]; then
+    note "Full reset removed the VFIO config + stealth/perf backups + the 'vfio' CLI + completions. Your repo copy of vfio.sh is untouched — re-run ./vfio.sh or --install-self to use vfio again."
+  else
+    note "This removed VFIO config only. For a full reset (also the self-installed vfio CLI + completions + all stealth/perf backups), run: sudo $SCRIPT_NAME --reset --full"
+    note "To remove ONLY the self-installed vfio CLI + completions (keep VFIO config), run: sudo $SCRIPT_NAME --uninstall-self"
+  fi
 
   # Snapshot-aware hint for openSUSE/Btrfs users: each snapshot has its own
   # /etc/kernel/cmdline. If you later roll back to an older snapshot that
@@ -23318,7 +23410,7 @@ vfio_menu() {
         require_systemd
         if prompt_yn "This will remove ALL VFIO config installed by this script. Continue?" N "Reset"; then
           if confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
-            reset_vfio_all
+            reset_vfio_all full
           else
             note "Reset cancelled (confirmation phrase not provided)."
           fi
@@ -23497,7 +23589,11 @@ main() {
     require_root "$@"
     require_systemd
     require_writable_root_or_die
-    reset_vfio_all
+    if (( RESET_FULL )); then
+      reset_vfio_all full
+    else
+      reset_vfio_all
+    fi
     exit 0
   fi
   if [[ "$MODE" == "reset-usb-mitigation" ]]; then

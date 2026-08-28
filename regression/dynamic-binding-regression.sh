@@ -2595,6 +2595,29 @@ assert_contains_text \
   'complementary to the' \
   "$_dync_fn"
 
+# --- R36: live-attach opt-out reverts an already-active setup (bug fix) ---
+# Selecting "no" at the RX 9070 live-attach prompt (or --no-live-attach) now
+# calls remove_live_attach so an already-active live-attach setup is reverted
+# (restores the GPU hostdev to the VM XML from the per-VM backup, flips the
+# conf to 0). Previously "no" only printed skip notes and left live-attach
+# active on the system (the VM stayed GPU-less). Mirrors the vBIOS/stealth
+# opt-out-revert pattern; also adds --live-attach/--no-live-attach overrides.
+assert_contains_text \
+  "R36 dynamic install honors LIVE_ATTACH_OVERRIDE force-off (revert)" \
+  'LIVE_ATTACH_OVERRIDE:-}" == "0"' \
+  "$_dync_fn"
+assert_contains_text \
+  "R36 dynamic install prompt-no branch reverts live-attach" \
+  'Skipping live-attach setup.' \
+  "$_dync_fn"
+_r36_reverts="$(printf '%s\n' "$_dync_fn" | grep -cF 'remove_live_attach')"
+if (( _r36_reverts >= 2 )); then
+  printf 'PASS: R36 dynamic install reverts live-attach on opt-out (%d remove_live_attach calls)\n' "$_r36_reverts"
+else
+  printf 'FAIL: R36 dynamic install does NOT revert live-attach on opt-out (only %d remove_live_attach calls, expected >= 2)\n' "$_r36_reverts" >&2
+  record_failure "R36 dynamic install reverts live-attach on opt-out"
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

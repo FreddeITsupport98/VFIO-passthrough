@@ -2915,7 +2915,7 @@ fi
 if grep -Fq -- '--install-virtio-win-guest-agent)' "$VFIO_SCRIPT" \
   && grep -Fq 'MODE="install-virtio-win-guest-agent"' "$VFIO_SCRIPT" \
   && grep -Fq '[[ "$MODE" == "install-virtio-win-guest-agent" ]]' "$VFIO_SCRIPT" \
-  && grep -Fq 'install-virtio-win-guest-agent | menu | install-self | uninstall-self | completion printers' "$VFIO_SCRIPT"; then
+  && grep -Fq 'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers' "$VFIO_SCRIPT"; then
   ok "R27 CLI parse_args + dispatch + MODE comment"
 else
   bad "R27 CLI parse_args/dispatch/MODE-comment wiring missing"

@@ -1092,6 +1092,94 @@ assert_contains_text \
   'virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null || _define_rc=$?' \
   "$_vw_fn"
 
+# --- R36: live-attach opt-out reverts an already-active setup (bug fix) ---
+# BUG: in install_dynamic_binding_from_existing_config, selecting "no" at the
+# RX 9070 live-attach prompt only printed skip notes and NEVER reverted an
+# already-active live-attach setup -- so the VM stayed GPU-less (the hostdev
+# was still stripped from the persistent XML) and the conf key stayed 1. The
+# sibling opt-ins (vBIOS, stealth) both revert on "no"; live-attach was the
+# inconsistent one. R36 mirrors them: a "no" (prompt) AND --no-live-attach
+# both call remove_live_attach (restores the GPU hostdev to the VM XML from
+# the per-VM backup, detaches the virtio-win ISO, flips the conf to 0). Also
+# adds --live-attach / --no-live-attach override flags + LIVE_ATTACH_OVERRIDE
+# var, and makes remove_live_attach best-effort (return 0) so the bare calls
+# under set -e (dynamic opt-out, --install-early-binding, --reset) cannot
+# abort mid-cleanup when live-attach was never active.
+_r36_fn="$(sed -n '/^install_dynamic_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_file \
+  "R36 LIVE_ATTACH_OVERRIDE var declared" \
+  'LIVE_ATTACH_OVERRIDE=""' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 parse_args handles --live-attach" \
+  '--live-attach)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 parse_args handles --no-live-attach" \
+  '--no-live-attach)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 usage one-liner includes --live-attach" \
+  '[--live-attach]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 usage one-liner includes --no-live-attach" \
+  '[--no-live-attach]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 fish completion includes --live-attach" \
+  'complete -c $cmd -l live-attach' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 fish completion includes --no-live-attach" \
+  'complete -c $cmd -l no-live-attach' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 bash completion opts include --live-attach --no-live-attach" \
+  '--no-vbios --live-attach --no-live-attach --verify' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 zsh completion includes --live-attach" \
+  "'--live-attach[" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R36 zsh completion includes --no-live-attach" \
+  "'--no-live-attach[" \
+  "$VFIO_SCRIPT"
+# The dynamic installer must honor the override (force-on / force-skip+revert).
+assert_contains_text \
+  "R36 dynamic install honors LIVE_ATTACH_OVERRIDE force-on" \
+  'LIVE_ATTACH_OVERRIDE:-}" == "1"' \
+  "$_r36_fn"
+assert_contains_text \
+  "R36 dynamic install honors LIVE_ATTACH_OVERRIDE force-off (revert)" \
+  'LIVE_ATTACH_OVERRIDE:-}" == "0"' \
+  "$_r36_fn"
+# The RX 9070 recommendation prompt must be gated on NO override given.
+assert_contains_text \
+  "R36 dynamic install gates the RX9070 prompt on no override" \
+  '[[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]] && _is_guest_rx9070_family' \
+  "$_r36_fn"
+# CRITICAL: the prompt "no" branch must revert (the bug fix). The override-0
+# branch + the prompt-no branch = 2 remove_live_attach calls (the bug was 0).
+assert_contains_text \
+  "R36 dynamic install prompt-no branch says Skipping live-attach setup" \
+  'Skipping live-attach setup.' \
+  "$_r36_fn"
+_r36_reverts="$(printf '%s\n' "$_r36_fn" | grep -cF 'remove_live_attach')"
+if (( _r36_reverts >= 2 )); then
+  printf 'PASS: R36 dynamic install reverts live-attach on opt-out (%d remove_live_attach calls)\n' "$_r36_reverts"
+else
+  printf 'FAIL: R36 dynamic install does NOT revert live-attach on opt-out (only %d remove_live_attach calls, expected >= 2)\n' "$_r36_reverts" >&2
+  record_failure "R36 dynamic install reverts live-attach on opt-out"
+fi
+# remove_live_attach must be best-effort (return 0) so bare callers under set -e
+# are not aborted when live-attach was never active (nothing to remove).
+assert_contains_text \
+  "R36 remove_live_attach returns 0 (best-effort cleanup)" \
+  '  return 0' \
+  "$_rm_la_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

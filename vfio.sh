@@ -189,6 +189,7 @@ ULTIMATE_PERF_HUGEPAGES_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ult
 ULTIMATE_PERF_VIRTIO_DISK_OVERRIDE="" # 1=force on, 0=force off, empty=prompt (ultimate-perf VM tuning: SATA->virtio disk conversion)
 ULTIMATE_PERF_VM_TUNING_OVERRIDE="" # 1=force on, 0=force skip, empty=prompt (dynamic install: ultimate-perf VM XML tuning)
 VBIOS_INJECTION_OVERRIDE=""   # 1=force on, 0=force skip+remove, empty=prompt (dynamic install: vBIOS ROM pin)
+LIVE_ATTACH_OVERRIDE=""       # 1=force on, 0=force skip+revert, empty=prompt (dynamic install: live-attach hotplug GPU)
 BINDING_MODE_OVERRIDE=""      # early | dynamic (empty = auto-detect / prompt in install mode)
 INSTALL_GRAPHICS_DAEMON=1     # 1=install graphics protocol daemon, 0=skip
 GRAPHICS_DAEMON_INTERVAL_DEFAULT=1
@@ -782,6 +783,8 @@ complete -c $cmd -l stealth-vm-tuning -d 'Dynamic-install: apply stealth/perf VM
 complete -c $cmd -l no-stealth-vm-tuning -d 'Dynamic-install: skip stealth/perf VM XML tuning'
 complete -c $cmd -l vbios -d 'Dynamic-install: inject matching vBIOS ROM dump (skip prompt)'
 complete -c $cmd -l no-vbios -d 'Dynamic-install: skip vBIOS injection + remove existing script-installed pin'
+complete -c $cmd -l live-attach -d 'Dynamic-install: set up live-attach (hotplug GPU) workflow (skip prompt)'
+complete -c $cmd -l no-live-attach -d 'Dynamic-install: skip + revert live-attach (restore GPU hostdev to VM XML from backup)'
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-live-attach -d 'Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay'
@@ -838,7 +841,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -892,6 +895,8 @@ _vfio_sh_complete() {
     '--no-stealth-vm-tuning[Dynamic-install: skip stealth/perf VM XML tuning]' \\
     '--vbios[Dynamic-install: inject matching vBIOS ROM dump (skip prompt)]' \\
     '--no-vbios[Dynamic-install: skip vBIOS injection + remove existing script-installed pin]' \\
+    '--live-attach[Dynamic-install: set up live-attach (hotplug GPU) workflow (skip prompt)]' \\
+    '--no-live-attach[Dynamic-install: skip + revert live-attach (restore GPU hostdev to VM XML from backup)]' \\
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-live-attach[Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay]' \\
@@ -1540,7 +1545,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1642,6 +1647,14 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    script-installed vBIOS pin so VMs use the live ROM read (or
                    your manual XML config). Use this if you already have a vBIOS
                    configured in your VM XML manually.
+  --live-attach     Dynamic-install override: set up the live-attach (hotplug GPU)
+                   workflow for RX 9070 / RDNA4 guest-GPU VMs (skip prompt). The VM
+                   starts WITHOUT the GPU and it is hot-attached to the running VM
+                   after Windows is up. Requires the AMD Windows driver.
+  --no-live-attach  Dynamic-install override: skip the live-attach workflow AND revert
+                   any already-active live-attach setup (restores the GPU hostdev to
+                   the VM XML from the per-VM backup, flips VFIO_DYNAMIC_LIVE_ATTACH=0)
+                   so the VM uses normal dynamic binding. Use this to switch back.
   --install-live-attach
                   Set up the live-attach (hotplug GPU) workflow: the VM starts WITHOUT the
                   GPU, Windows boots on a virtual display, and after a configurable delay the
@@ -2013,6 +2026,12 @@ parse_args() {
         ;;
       --no-vbios)
         VBIOS_INJECTION_OVERRIDE=0
+        ;;
+      --live-attach)
+        LIVE_ATTACH_OVERRIDE=1
+        ;;
+      --no-live-attach)
+        LIVE_ATTACH_OVERRIDE=0
         ;;
       --install-usb-bt-mitigation)
         MODE="install-usb-bt-mitigation"
@@ -10992,6 +11011,11 @@ remove_live_attach() {
     _removed=1
   fi
   (( _removed )) && note "Removed live-attach workflow (VM XML restored from pre-live-attach backups where the VM was shut off)."
+  # Best-effort cleanup: always return 0 so bare callers (the dynamic-install
+  # opt-out, --install-early-binding, --reset) under `set -e` are not aborted
+  # when live-attach was never active (nothing to remove -> _removed=0 would
+  # otherwise make this function return 1 and trip set -e mid-cleanup).
+  return 0
 }
 # guest reboot lifecycle events and does a soft function-level reset on the
 # guest GPU to clear the display wedge. On RX 9070 / RDNA4 with on_reboot=restart
@@ -17009,7 +17033,30 @@ install_dynamic_binding_from_existing_config() {
   #     live-attach avoids the cold-attach-at-boot death in the first place.
   #     Opt-in (default N). PREREQUISITE: the AMD Windows driver MUST be
   #     installed in the guest before the hot-attach will survive.
-  if _is_guest_rx9070_family; then
+  #     Honors --live-attach (force on) / --no-live-attach (force skip). On a "no"
+  #     (prompt) or --no-live-attach, any already-active live-attach setup is
+  #     REVERTED (remove_live_attach restores the GPU hostdev to the VM XML from
+  #     the per-VM backup, detaches the virtio-win ISO, flips the conf to 0) so the
+  #     VM switches back to normal dynamic binding (fixes: selecting "no" used to
+  #     leave live-attach active on the system).
+  # Override handling: --live-attach forces the workflow on (regardless of GPU
+  # family); --no-live-attach skips it AND reverts any already-active setup back
+  # to normal dynamic binding. Both short-circuit the RX 9070 recommendation
+  # prompt below (which only runs when NO override was given).
+  if [[ "${LIVE_ATTACH_OVERRIDE:-}" == "1" ]]; then
+    # Force on regardless of GPU family (advanced override).
+    install_live_attach || {
+      note "Live-attach setup did not complete (no shut-off VM with the guest GPU was found,"
+      note "or a prerequisite was missing). Shut off the VM and re-run:"
+      note "  sudo $SCRIPT_NAME --install-live-attach"
+    }
+  elif [[ "${LIVE_ATTACH_OVERRIDE:-}" == "0" ]]; then
+    note "Live-attach (hotplug GPU) skipped (--no-live-attach)."
+    note "Reverting any already-active live-attach setup (restores the GPU hostdev to the"
+    note "VM XML from the per-VM backup) so the VM uses normal dynamic binding..."
+    remove_live_attach
+  fi
+  if [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]] && _is_guest_rx9070_family; then
     say
     if (( ENABLE_COLOR )); then
       say "${C_BOLD}${C_YELLOW}RECOMMENDED for RX 9070 / RDNA4:${C_RESET} live-attach (hotplug GPU) workflow"
@@ -17039,10 +17086,11 @@ install_dynamic_binding_from_existing_config() {
         note "  sudo $SCRIPT_NAME --install-live-attach"
       }
     else
-      note "Skipping live-attach setup for now."
-      note "Once the AMD Windows driver is installed and a VM session survives, enable it with:"
-      note "  sudo $SCRIPT_NAME --install-live-attach"
-      note "Reversible at any time with: sudo $SCRIPT_NAME --install-dynamic-binding"
+      note "Skipping live-attach setup."
+      note "Reverting any already-active live-attach setup (restores the GPU hostdev to the"
+      note "VM XML from the per-VM backup) so the VM uses normal dynamic binding..."
+      remove_live_attach
+      note "You can re-enable it later with: sudo $SCRIPT_NAME --install-live-attach"
     fi
     note ""
     note "Smart handoff (optional): with the virtio-win guest agent installed INSIDE Windows,"

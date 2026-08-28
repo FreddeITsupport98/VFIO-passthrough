@@ -4249,6 +4249,42 @@ gui_msgbox() {
   fi
 }
 
+# R38: Visually-framed block for the CLI/plain-text path, mirroring the GUI
+# gui_msgbox popup so a non-TUI operator still gets a clearly delimited "card"
+# instead of loose scrolling lines. Draws a Unicode box (LEFT-border style — no
+# right-pad is needed, so ANSI-colored body text like _role_tag stays aligned)
+# when color is enabled; falls back to ASCII + - | rules when color is off
+# (minimal/piped/NO_COLOR terminals). The title sits in the top rule. Each
+# argument after the title is one body line (may contain ANSI color codes).
+_boxed_block() {
+  local title="${1:-vfio.sh}"
+  shift
+  local width=64
+  local tl tr bl br hz vt bc rc
+  if (( ENABLE_COLOR )); then
+    tl='┌' tr='┐' bl='└' br='┘' hz='─' vt='│'
+    bc="${C_BOLD}${C_CYAN}" rc="${C_RESET}"
+  else
+    tl='+' tr='+' bl='+' br='+' hz='-' vt='|'
+    bc='' rc=''
+  fi
+  local title_seg=" $title "
+  local remaining=$(( width - ${#title_seg} - 3 ))
+  (( remaining < 0 )) && remaining=0
+  local rule
+  printf -v rule '%*s' "$remaining" ''
+  rule="${rule// /$hz}"
+  say "${bc}${tl}${hz}${title_seg}${rule}${tr}${rc}"
+  local line
+  for line in "$@"; do
+    say "${bc}${vt}${rc} ${line}"
+  done
+  local bottom_rule
+  printf -v bottom_rule '%*s' "$(( width - 2 ))" ''
+  bottom_rule="${bottom_rule// /$hz}"
+  say "${bc}${bl}${bottom_rule}${br}${rc}"
+}
+
 hdr() {
   # Header line for steps.
   local title="$1"
@@ -23237,38 +23273,53 @@ Boot-VGA policy:     ${boot_vga_policy_mode}
 
 Reboot to make the VFIO binding take effect."
   else
-    say
-    hdr "VFIO setup recap"
+    # R38: CLI/plain-text path gets a visually-framed "card" (mirroring the GUI
+    # popup) so the summary is a clear landmark, not loose scrolling lines. The
+    # colored _role_tag lines keep their ANSI color inside the box (left-border
+    # style, no right-pad, so alignment survives the color escapes).
+    local -a _recap_body=()
     if (( ENABLE_COLOR )); then
-      say "  $(_role_tag host)   $host_gpu"
-      say "  $(_role_tag guest)  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
-      say "  $(_role_tag host-audio)   ${host_audio_bdfs_csv:-<none>}"
-      say "  $(_role_tag guest-audio)  ${guest_audio_csv:-<none>}"
+      _recap_body+=("$(_role_tag host)   $host_gpu")
+      _recap_body+=("$(_role_tag guest)  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))")
+      _recap_body+=("$(_role_tag host-audio)   ${host_audio_bdfs_csv:-<none>}")
+      _recap_body+=("$(_role_tag guest-audio)  ${guest_audio_csv:-<none>}")
     else
-      say "  [HOST -> desktop]    $host_gpu"
-      say "  [GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
-      say "  [HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}"
-      say "  [GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}"
+      _recap_body+=("[HOST -> desktop]    $host_gpu")
+      _recap_body+=("[GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))")
+      _recap_body+=("[HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}")
+      _recap_body+=("[GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}")
     fi
-    say "  Binding mode:      $_recap_mode"
-    say "  Graphics protocol: $_recap_gfx"
-    say "  Host default sink: ${host_audio_node_name:-<not set>}"
-    say "  Boot-VGA policy:   ${boot_vga_policy_mode}"
+    _recap_body+=("")
+    _recap_body+=("Binding mode:      $_recap_mode")
+    _recap_body+=("Graphics protocol: $_recap_gfx")
+    _recap_body+=("Host default sink: ${host_audio_node_name:-<not set>}")
+    _recap_body+=("Boot-VGA policy:   ${boot_vga_policy_mode}")
+    _boxed_block "VFIO setup recap" "${_recap_body[@]}"
   fi
 
-  say
-  say "Done. Next steps:"
-  say "  1) Reboot."
-  say "  2) Verify guest devices are bound to vfio-pci:"
-  say "       lspci -nnk -s ${guest_gpu}"
+  # R38: visual end — build the next-steps once, then render as a framed "Done"
+  # card on the CLI path (clear terminal terminator) and plain on the GUI path
+  # (the recap popup above was the visual landmark there).
+  local -a _next_body=()
+  _next_body+=("  1) Reboot.")
+  _next_body+=("  2) Verify guest devices are bound to vfio-pci:")
+  _next_body+=("       lspci -nnk -s ${guest_gpu}")
   if [[ -n "$guest_audio_csv" ]]; then
-    say "       lspci -nnk -s ${guest_audio_csv//,/ }"
+    _next_body+=("       lspci -nnk -s ${guest_audio_csv//,/ }")
   fi
   if [[ -n "$host_audio_bdfs_csv" ]]; then
-    say "  3) Verify host audio device is NOT on vfio-pci:"
-    say "       lspci -nnk -s ${host_audio_bdfs_csv%%,*}"
+    _next_body+=("  3) Verify host audio device is NOT on vfio-pci:")
+    _next_body+=("       lspci -nnk -s ${host_audio_bdfs_csv%%,*}")
   fi
-  say "  4) In your VM manager, passthrough the guest GPU and any selected guest audio PCI functions."
+  _next_body+=("  4) In your VM manager, passthrough the guest GPU and any selected guest audio PCI functions.")
+  if (( HAS_TUI )); then
+    say
+    say "Done. Next steps:"
+    local _ns
+    for _ns in "${_next_body[@]}"; do say "$_ns"; done
+  else
+    _boxed_block "Done - next steps" "${_next_body[@]}"
+  fi
 }
 
 # Self-install: copy this script to /usr/local/bin/vfio (on PATH as the vfio command) and drop

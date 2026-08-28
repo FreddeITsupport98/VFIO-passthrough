@@ -1559,13 +1559,23 @@ prompt_yn() {
   fi
 
   # TUI path: use whiptail if available.
+  # R39b: the 3>&1 1>&2 2>&3 fd dance is MANDATORY here. Without it, when
+  # prompt_yn is called inside command substitution (e.g. from
+  # add_custom_kernel_params_interactive, which returns its updated cmdline on
+  # stdout), whiptail writes the whole dialog box -- including literal newlines
+  # and ANSI escapes -- to the captured stdout. Those embedded newlines then
+  # flow into grub_write_cmdline_in_place's sed expression and abort with
+  # "unterminated s command" (the R39 GUI/whiptail crash, sed tecken ~129).
+  # The dance routes the dialog to the terminal (stderr) and leaves stdout
+  # clean. (select_from_list and confirm_phrase already use this dance;
+  # prompt_yn was the one missing it.)
   if (( HAS_TUI )); then
     local exit_status
     if [[ "$def" =~ ^[Nn]$ ]]; then
-      whiptail --title "$title" --defaultno --yesno "$q" 10 60
+      whiptail --title "$title" --defaultno --yesno "$q" 10 60 3>&1 1>&2 2>&3
       exit_status=$?
     else
-      whiptail --title "$title" --yesno "$q" 10 60
+      whiptail --title "$title" --yesno "$q" 10 60 3>&1 1>&2 2>&3
       exit_status=$?
     fi
     # whiptail exit status: 0 = Yes, 1/255 = No/ESC
@@ -5609,6 +5619,20 @@ grub_write_cmdline_in_place() {
     die "Backup failed or empty ($bak). Aborting GRUB edit."
   fi
 
+  # R39b: defense-in-depth -- strip ANSI CSI escapes and ALL control bytes
+  # (0x00-0x1F and 0x7F, which includes CR and LF) and squeeze blank runs from
+  # new_cmdline before building the sed expression. The primary fix is the
+  # whiptail fd dance in prompt_yn (which stops dialog newlines entering the
+  # cmdline at all), but this guarantees that NO stray newline from any source
+  # can ever split the sed "s|||" expression ("unterminated s command") or
+  # write control garbage into /etc/default/grub. Kernel cmdline params are
+  # always plain printable ASCII, so this never removes legitimate content.
+  new_cmdline="$(printf '%s' "$new_cmdline" \
+    | sed $'s/\033\\[[0-9;]*[a-zA-Z]//g' \
+    | tr -d '\000-\037\177' \
+    | tr -s '[:blank:]' ' ')"
+  new_cmdline="$(trim "$new_cmdline")"
+
   # Apply edit: replace EXACTLY that line number.
   sed -i "${ln}s|^${key}=.*|${key}=\"${new_cmdline//|/\\|}\"|" /etc/default/grub
 
@@ -5787,13 +5811,23 @@ add_custom_kernel_params_interactive() {
   note "This can be useful for distro-specific or X11-specific passthrough tweaks." >"$out"
   note "Leave blank to keep defaults." >"$out"
 
-  if ! prompt_yn "Add custom kernel parameter(s) to ${target} now?" N "Boot options (custom)"; then
+  # R39b: title "Custom kernel parameters" matches the _RECOMMENDED_ANSWERS
+  # table entry (=No) so --recommended mode auto-skips this prompt instead of
+  # still popping a whiptail (the old title "Boot options (custom)" matched no
+  # table key, so recommended mode unexpectedly still asked). This also avoids
+  # the raw /dev/tty read after a whiptail in recommended mode.
+  if ! prompt_yn "Add custom kernel parameter(s) to ${target} now?" N "Custom kernel parameters"; then
     printf '%s\n' "$updated"
     return 0
   fi
 
   printf '%s' "Enter extra kernel parameter(s), space-separated: " >"$out"
   read -r extra <"$in" || extra=""
+  # R39b: strip any stray CR/LF captured from /dev/tty in a pty/GUI context
+  # (a trailing \r from Enter, or pasted multi-line input) so they can never
+  # embed a newline into the cmdline and break grub_write_cmdline_in_place.
+  extra="${extra//$'\r'}"
+  extra="${extra//$'\n'}"
   extra="$(trim "${extra:-}")"
   if [[ -z "$extra" ]]; then
     note "No custom kernel parameters entered." >"$out"

@@ -4438,6 +4438,105 @@ _gpu_hint() {
   printf '%s' "$hint"
 }
 
+# R39: RX 9070 family / RDNA4 (Navi 48) device ID — main-body copy for the
+# recommended preset engine. (The bind-script heredoc has its own copy; this one
+# is used by _guest_gpu_family below at vfio.sh runtime.) All 9070 / 9070 XT /
+# 9070 GRE SKUs share device ID 0x7550.
+_RX9070_DEVICE_ID="7550"
+
+# R39: Detect the guest GPU family from LIVE config space (first 4 bytes), so
+# the recommended preset engine works even on a card that is mid-recovery (same
+# rationale as the bind script's _is_rx9070: sysfs vendor is cached; live config
+# space is real). Returns a family token on stdout: amd-rdna4 | amd-other |
+# nvidia | intel | unknown. Used by _apply_recommended_overrides + the preset
+# preview.
+_guest_gpu_family() {
+  local _bdf="${1:-}" _sys _cfg _vendor _device
+  [[ -n "$_bdf" ]] || { echo unknown; return 0; }
+  _sys="/sys/bus/pci/devices/$_bdf"
+  if [[ ! -d "$_sys" ]]; then
+    echo unknown
+    return 0
+  fi
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ -z "$_cfg" || "$_cfg" == "ffffffff" ]]; then
+    # Live config space unreadable / card off-bus: fall back to sysfs vendor.
+    _vendor="$(sysfs_read "$_bdf" vendor 2>/dev/null || true)"
+    _device=""
+  else
+    _vendor="${_cfg:2:2}${_cfg:0:2}"
+    _device="${_cfg:6:2}${_cfg:4:2}"
+  fi
+  case "${_vendor,,}" in
+    1002)
+      if [[ -n "$_device" && "${_device,,}" == "$_RX9070_DEVICE_ID" ]]; then
+        echo amd-rdna4
+      else
+        echo amd-other
+      fi
+      ;;
+    10de) echo nvidia ;;
+    8086) echo intel ;;
+    *) echo unknown ;;
+  esac
+  return 0
+}
+
+# R39: Preset engine — fill the knob-style OVERRIDE vars with vendor-aware
+# recommended values. Called once in user_selection right after the GPU pick,
+# BEFORE any prompt fires. Only sets a var if it is currently EMPTY, so explicit
+# CLI flags (--no-vbios, --binding-mode early, etc.) always beat the preset
+# (stupid-proof). The prompt-level answers (yes/no prompts) are handled by the
+# _RECOMMENDED_ANSWERS table in prompt_yn, NOT here.
+_apply_recommended_overrides() {
+  local _family="${1:-unknown}"
+  case "$_family" in
+    amd-rdna4)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=dynamic
+      [[ -z "${AMD_RUNPM_OVERRIDE:-}" ]]           && AMD_RUNPM_OVERRIDE=1
+      [[ -z "${AMD_NORETRY_OVERRIDE:-}" ]]         && AMD_NORETRY_OVERRIDE=1
+      [[ -z "${AMD_PORTPM_OVERRIDE:-}" ]]          && AMD_PORTPM_OVERRIDE=1
+      [[ -z "${AMD_D3_OVERRIDE:-}" ]]              && AMD_D3_OVERRIDE=0
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    amd-other)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=dynamic
+      [[ -z "${AMD_RUNPM_OVERRIDE:-}" ]]           && AMD_RUNPM_OVERRIDE=1
+      [[ -z "${AMD_NORETRY_OVERRIDE:-}" ]]         && AMD_NORETRY_OVERRIDE=1
+      [[ -z "${AMD_PORTPM_OVERRIDE:-}" ]]          && AMD_PORTPM_OVERRIDE=1
+      [[ -z "${AMD_D3_OVERRIDE:-}" ]]              && AMD_D3_OVERRIDE=1
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    nvidia)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=early
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    intel)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=early
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    unknown)
+      # Binding left to the script's existing default logic (empty).
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+  esac
+}
+
 select_from_list() {
   # select_from_list "Prompt" "Title" options...
   local prompt="$1"; local title="$2"; shift 2
@@ -8594,98 +8693,6 @@ _is_rx9070() {
   _device="${_cfg:6:2}${_cfg:4:2}"
   [[ "${_vendor,,}" == "1002" ]] || return 1
   [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
-}
-
-# R39: Detect the guest GPU family from LIVE config space (first 4 bytes), so
-# the recommended preset engine works even on a card that is mid-recovery (same
-# rationale as _is_rx9070: sysfs vendor is cached; live config space is real).
-# Returns a family token on stdout: amd-rdna4 | amd-other | nvidia | intel |
-# unknown. Used by _apply_recommended_overrides and the GUI preset preview.
-_guest_gpu_family() {
-  local _bdf="${1:-}" _sys _cfg _vendor _device
-  [[ -n "$_bdf" ]] || { echo unknown; return 0; }
-  _sys="/sys/bus/pci/devices/$_bdf"
-  if [[ ! -d "$_sys" ]]; then
-    echo unknown
-    return 0
-  fi
-  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-  if [[ -z "$_cfg" || "$_cfg" == "ffffffff" ]]; then
-    # Live config space unreadable / card off-bus: fall back to sysfs vendor.
-    _vendor="$(sysfs_read "$_bdf" vendor 2>/dev/null || true)"
-    _device=""
-  else
-    _vendor="${_cfg:2:2}${_cfg:0:2}"
-    _device="${_cfg:6:2}${_cfg:4:2}"
-  fi
-  case "${_vendor,,}" in
-    1002)
-      if [[ -n "$_device" && "${_device,,}" == "$_RX9070_DEVICE_ID" ]]; then
-        echo amd-rdna4
-      else
-        echo amd-other
-      fi
-      ;;
-    10de) echo nvidia ;;
-    8086) echo intel ;;
-    *) echo unknown ;;
-  esac
-  return 0
-}
-
-# R39: Preset engine — fill the knob-style OVERRIDE vars with vendor-aware
-# recommended values. Called once in user_selection right after the GPU pick,
-# BEFORE any prompt fires. Only sets a var if it is currently EMPTY, so explicit
-# CLI flags (--no-vbios, --binding-mode early, etc.) always beat the preset
-# (stupid-proof). The prompt-level answers (yes/no prompts) are handled by the
-# _RECOMMENDED_ANSWERS table in prompt_yn, NOT here.
-_apply_recommended_overrides() {
-  local _family="${1:-unknown}"
-  case "$_family" in
-    amd-rdna4)
-      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=dynamic
-      [[ -z "${AMD_RUNPM_OVERRIDE:-}" ]]           && AMD_RUNPM_OVERRIDE=1
-      [[ -z "${AMD_NORETRY_OVERRIDE:-}" ]]         && AMD_NORETRY_OVERRIDE=1
-      [[ -z "${AMD_PORTPM_OVERRIDE:-}" ]]          && AMD_PORTPM_OVERRIDE=1
-      [[ -z "${AMD_D3_OVERRIDE:-}" ]]              && AMD_D3_OVERRIDE=0
-      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
-      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
-      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
-      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
-      ;;
-    amd-other)
-      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=dynamic
-      [[ -z "${AMD_RUNPM_OVERRIDE:-}" ]]           && AMD_RUNPM_OVERRIDE=1
-      [[ -z "${AMD_NORETRY_OVERRIDE:-}" ]]         && AMD_NORETRY_OVERRIDE=1
-      [[ -z "${AMD_PORTPM_OVERRIDE:-}" ]]          && AMD_PORTPM_OVERRIDE=1
-      [[ -z "${AMD_D3_OVERRIDE:-}" ]]              && AMD_D3_OVERRIDE=1
-      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
-      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
-      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
-      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
-      ;;
-    nvidia)
-      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=early
-      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
-      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
-      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
-      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
-      ;;
-    intel)
-      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=early
-      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
-      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
-      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
-      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
-      ;;
-    unknown)
-      # Binding left to the script's existing default logic (empty).
-      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
-      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
-      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
-      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
-      ;;
-  esac
 }
 
 # Read a 16-bit PCI config word via setpci as a clean 4-hex-digit lowercase

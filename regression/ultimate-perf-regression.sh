@@ -50,6 +50,15 @@ assert_not_contains_file() {
     printf 'PASS: %s\n' "$name"
   fi
 }
+assert_contains_text() {
+  local name="$1" pattern="$2" haystack="$3"
+  if grep -Fq -- "$pattern" <<<"$haystack"; then
+    printf 'PASS: %s\n' "$name"
+  else
+    printf 'FAIL: %s (pattern not found: %s)\n' "$name" "$pattern" >&2
+    record_failure "$name"
+  fi
+}
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -826,6 +835,256 @@ printf '%s' "$(cat "$_ensure_xmldir/win11.xml")" | bash "$_ensure_t" --ensure-do
 _rc3=$?
 set -e
 assert_eq "ensure-domain no-op exit 0 for non-hugepages VM" "0" "$_rc3"
+
+# ===================== R38: hugepages strip-on-opt-out + RAM safety cap =====
+# When perf is selected with hugepages OFF (the default), the tuner now REMOVES
+# any existing <memoryBacking><hugepages> (and frees host nr_hugepages) so the
+# VM no longer pins host RAM — the live-attach freeze root cause. A RAM safety
+# gate caps VM <memory> to ULTIMATE_PERF_MAX_VM_RAM_PCT (default 50) of host
+# RAM; notifies + applies the smaller size when the VM is too large.
+
+# --- Static wiring ---
+assert_contains_file "ULTIMATE_PERF_MAX_VM_RAM_PCT conf key present" 'ULTIMATE_PERF_MAX_VM_RAM_PCT="' "$VFIO_SCRIPT"
+assert_contains_file "install exports VFIO_PERF_VM_RAM_CAP_KIB" 'export VFIO_PERF_VM_RAM_CAP_KIB=' "$VFIO_SCRIPT"
+assert_contains_file "python reads VFIO_PERF_VM_RAM_CAP_KIB" "os.environ.get('VFIO_PERF_VM_RAM_CAP_KIB'" "$VFIO_SCRIPT"
+assert_contains_file "install exports VFIO_PERF_HUGEPAGES_STRIP" 'export VFIO_PERF_HUGEPAGES_STRIP=' "$VFIO_SCRIPT"
+assert_contains_file "python reads VFIO_PERF_HUGEPAGES_STRIP" "os.environ.get('VFIO_PERF_HUGEPAGES_STRIP'" "$VFIO_SCRIPT"
+assert_contains_file "install reads host MemTotal" "/proc/meminfo" "$VFIO_SCRIPT"
+assert_contains_file "reserve helper takes mem-override arg" '_mem_override_kib="${5:-0}"' "$VFIO_SCRIPT"
+assert_contains_file "install passes cap to reserve helper" '"$_cap_kib"' "$VFIO_SCRIPT"
+assert_contains_file "opt-out strips existing hugepages (comment)" "STRIP it" "$VFIO_SCRIPT"
+assert_contains_file "strip frees reservation on success" "_hp_strip )) && (( ! DRY_RUN ))" "$VFIO_SCRIPT"
+assert_contains_file "RAM cap notify message present" "exceeds" "$VFIO_SCRIPT"
+assert_contains_file "RAM cap applies smaller size" "capping to" "$VFIO_SCRIPT"
+assert_contains_file "boot service removed when all stripped" '(( ! _any_hp_reserved )) && ! [[ -f "$PERF_HP_DIRS_FILE" ]]' "$VFIO_SCRIPT"
+assert_contains_file "install intro notes NO removes hugepages" "selecting NO removes any existing hugepages" "$VFIO_SCRIPT"
+assert_contains_file "install intro notes RAM safety gate" "RAM safety gate: caps VM" "$VFIO_SCRIPT"
+# The 5 skip-path inline restores must STILL be present (R35 contract intact);
+# the new strip-success restore is on a separate multi-line if (not 'then ' on
+# the same line), so it must NOT inflate this count.
+_inline_restores_r38="$(grep -cF "then _restore_host_hugepages_for_vm" "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _inline_restores_r38 >= 5 )); then
+  printf 'PASS: R38 skip-path inline restores still >= 5 (%d)\n' "$_inline_restores_r38"
+else
+  printf 'FAIL: R38 skip-path inline restores dropped below 5 (%d)\n' "$_inline_restores_r38" >&2
+  record_failure "R38 skip-path inline restores still >= 5"
+fi
+
+# --- Functional: RAM cap applies (48GiB VM, cap=32GiB=33554432KiB) ---
+capmock="$tmp_dir/capmock.xml"
+cat >"$capmock" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">50331648</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type></os>
+  <devices>
+    <disk type="file" device="disk"><driver name="qemu" type="qcow2"/><target dev="vda" bus="virtio"/></disk>
+  </devices>
+</domain>
+XEOF
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_STRIP="0" \
+    VFIO_PERF_VM_RAM_CAP_KIB="33554432" \
+    python3 "$perf_py" "$capmock" >/dev/null 2>&1
+rc_cap=$?
+set -e
+assert_eq "RAM cap run exit 0" "0" "$rc_cap"
+assert_contains_file "RAM cap sets memory to 32GiB" '<memory unit="KiB">33554432</memory>' "$capmock"
+assert_contains_file "RAM cap syncs currentMemory to 32GiB" '<currentMemory unit="KiB">33554432</currentMemory>' "$capmock"
+
+# --- Functional: RAM cap no-op when VM under threshold (16GiB, cap=32GiB) ---
+capnoop="$tmp_dir/capnoop.xml"
+cat >"$capnoop" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">16777216</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type></os>
+  <devices>
+    <disk type="file" device="disk"><driver name="qemu" type="qcow2"/><target dev="vda" bus="virtio"/></disk>
+  </devices>
+</domain>
+XEOF
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_STRIP="0" \
+    VFIO_PERF_VM_RAM_CAP_KIB="33554432" \
+    python3 "$perf_py" "$capnoop" >/dev/null 2>&1
+rc_capnoop=$?
+set -e
+assert_eq "RAM cap no-op run exit 0" "0" "$rc_capnoop"
+assert_contains_file "RAM cap no-op leaves 16GiB memory" '<memory unit="KiB">16777216</memory>' "$capnoop"
+
+# --- Functional: strip removes existing hugepages (+ empty memoryBacking) ---
+stripmock="$tmp_dir/stripmock.xml"
+cat >"$stripmock" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type></os>
+  <memoryBacking><hugepages><page size="2048" unit="KiB"/></hugepages></memoryBacking>
+  <devices>
+    <disk type="file" device="disk"><driver name="qemu" type="qcow2"/><target dev="vda" bus="virtio"/></disk>
+  </devices>
+</domain>
+XEOF
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_STRIP="1" \
+    VFIO_PERF_VM_RAM_CAP_KIB="0" \
+    python3 "$perf_py" "$stripmock" >/dev/null 2>&1
+rc_strip=$?
+set -e
+assert_eq "strip run exit 0" "0" "$rc_strip"
+assert_not_contains_file "strip removes hugepages" "<hugepages" "$stripmock"
+assert_not_contains_file "strip removes empty memoryBacking" "<memoryBacking" "$stripmock"
+
+# --- Functional: strip preserves a non-hugepages memoryBacking sibling (locked) ---
+lockmock="$tmp_dir/lockmock.xml"
+cat >"$lockmock" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <os><type arch="x86_64" machine="pc-q35-9.2">hvm</type></os>
+  <memoryBacking><hugepages><page size="2048" unit="KiB"/></hugepages><locked/></memoryBacking>
+  <devices>
+    <disk type="file" device="disk"><driver name="qemu" type="qcow2"/><target dev="vda" bus="virtio"/></disk>
+  </devices>
+</domain>
+XEOF
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_STRIP="1" \
+    VFIO_PERF_VM_RAM_CAP_KIB="0" \
+    python3 "$perf_py" "$lockmock" >/dev/null 2>&1
+rc_lock=$?
+set -e
+assert_eq "strip-with-locked run exit 0" "0" "$rc_lock"
+assert_not_contains_file "strip-with-locked removes hugepages" "<hugepages" "$lockmock"
+assert_contains_file "strip-with-locked keeps memoryBacking (has locked)" "<memoryBacking" "$lockmock"
+assert_contains_file "strip-with-locked keeps locked sibling" "<locked" "$lockmock"
+
+# --- Functional: strip idempotent (re-run on already-stripped XML -> exit 3) ---
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_STRIP="1" \
+    VFIO_PERF_VM_RAM_CAP_KIB="0" \
+    python3 "$perf_py" "$stripmock" >/dev/null 2>&1
+rc_strip_idem=$?
+set -e
+assert_eq "strip idempotent re-run exit 3" "3" "$rc_strip_idem"
+
+# --- Functional: RAM cap idempotent (re-run on capped XML, same cap -> exit 3) ---
+set +e
+env VFIO_PERF_HOST_CPUS="0,1,2,3,4,5,6,7" VFIO_PERF_NUMA="0:0-7" \
+    VFIO_PERF_HUGEPAGES="0" VFIO_PERF_HUGEPAGES_STRIP="0" \
+    VFIO_PERF_VM_RAM_CAP_KIB="33554432" \
+    python3 "$perf_py" "$capmock" >/dev/null 2>&1
+rc_cap_idem=$?
+set -e
+assert_eq "RAM cap idempotent re-run exit 3" "3" "$rc_cap_idem"
+
+# --- Functional: reserve helper honors mem-override + 1GB guard still fires ---
+# The override arg is accepted (>0 used as-is); the 1GB guard still returns 1
+# without touching the pool, proving the new arg did not regress the guard.
+set +e
+_save_conf_r38="$CONF_FILE"
+CONF_FILE="$tmp_dir/fake_hp_r38.conf"
+printf 'ULTIMATE_PERF_HUGEPAGES_SIZE=1048576\n' >"$CONF_FILE"
+_reserve_host_hugepages_for_vm "" "1048576" "$tmp_dir" "win11" "8388608"; _rc_ovr=$?
+CONF_FILE="$_save_conf_r38"
+set -e
+assert_eq "reserve helper 1GB guard returns 1 (override arg accepted)" "1" "$_rc_ovr"
+
+# ===================== R37: stop Desktop XML-backup litter (perf) =====
+# Mirrors the stealth R37 block. Plus: the perf backup dir holds the hugepages
+# owned file the boot oneshot sums across registered dirs, so moving the default
+# dir requires migrating the owned file from the legacy $HOME/Desktop + fixing
+# PERF_HP_DIRS_FILE (else sum_all_owned double-counts = 2x pages). _migrate_legacy_perf_owned
+# is idempotent and called in both install (before reserve) and revert (before restore).
+_perf_fn="$(sed -n '/^install_ultimate_perf_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_file \
+  "R37 _vm_is_perf_tuned helper defined" \
+  '_vm_is_perf_tuned()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R37 _migrate_legacy_perf_owned helper defined" \
+  '_migrate_legacy_perf_owned()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R37 perf install uses fixed-name backup (no timestamp)" \
+  '${_dom}_perf.xml' \
+  "$_perf_fn"
+if printf '%s\n' "$_perf_fn" | grep -Fq '_perf_$(date'; then
+  printf 'FAIL: R37 perf install still uses a timestamped backup name (litter)\n' >&2
+  record_failure "R37 perf install uses fixed-name backup (no $(date))"
+else
+  printf 'PASS: R37 perf install uses fixed-name backup (no $(date))\n'
+fi
+assert_contains_text \
+  "R37 perf install keeps pristine backup on re-tune (no overwrite)" \
+  'Re-tune: keeping existing pristine backup' \
+  "$_perf_fn"
+assert_contains_text \
+  "R37 perf install default dir is /var/lib/vfio-perf-vm/backups" \
+  '_backup_dir="/var/lib/vfio-perf-vm/backups"' \
+  "$_perf_fn"
+assert_contains_text \
+  "R37 perf install calls _migrate_legacy_perf_owned before reserving" \
+  '_migrate_legacy_perf_owned "$_backup_dir" "$_dom"' \
+  "$_perf_fn"
+_perf_revert_fn="$(sed -n '/^reset_ultimate_perf_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R37 perf revert reads fixed-name backup" \
+  '${_dom}_perf.xml' \
+  "$_perf_revert_fn"
+assert_contains_text \
+  "R37 perf revert falls back to legacy $HOME/Desktop timestamped backups" \
+  '${_dom}_perf_"*.xml' \
+  "$_perf_revert_fn"
+assert_contains_text \
+  "R37 perf revert calls _migrate_legacy_perf_owned before restore" \
+  '_migrate_legacy_perf_owned "$_backup_dir" "$_dom"' \
+  "$_perf_revert_fn"
+# Functional: _migrate_legacy_perf_owned moves the owned file legacy -> new dir
+# and unregisters the legacy dir (no double-count). The helper reads the legacy
+# dir from ${BACKUP_DIR:-$HOME/Desktop}, so set BACKUP_DIR to the temp legacy dir.
+# Uses a temp PERF_HP_DIRS_FILE; restore after.
+_save_reg2="$PERF_HP_DIRS_FILE"
+_mig_reg="$tmp_dir/mig-reg"
+_mig_new="$tmp_dir/mig-new"
+_mig_legacy="$tmp_dir/mig-legacy"
+mkdir -p "$_mig_new" "$_mig_legacy"
+rm -f "$_mig_reg"
+PERF_HP_DIRS_FILE="$_mig_reg"
+printf '%s\n' "$_mig_legacy" >"$_mig_reg"   # legacy dir registered (pre-R37 state)
+printf '16096\n' >"$_mig_legacy/win11_perf_hugepages_owned.txt"
+set +e
+BACKUP_DIR="$_mig_legacy" _migrate_legacy_perf_owned "$_mig_new" "win11"; _mig_rc1=$?
+set -e
+assert_eq "R37 migration returns 0" "0" "$_mig_rc1"
+if [[ -f "$_mig_new/win11_perf_hugepages_owned.txt" ]] && ! [[ -f "$_mig_legacy/win11_perf_hugepages_owned.txt" ]]; then
+  printf 'PASS: R37 migration moved owned file legacy -> new dir\n'
+else
+  printf 'FAIL: R37 migration did not move the owned file legacy -> new dir\n' >&2
+  record_failure "R37 migration moves owned file"
+fi
+if ! grep -Fixq "$_mig_legacy" "$_mig_reg" 2>/dev/null; then
+  printf 'PASS: R37 migration unregistered the legacy dir (no double-count)\n'
+else
+  printf 'FAIL: R37 migration left the legacy dir registered (would double-count)\n' >&2
+  record_failure "R37 migration unregisters legacy dir"
+fi
+# Idempotent: a second call is a no-op (legacy owned file already gone -> return 0).
+set +e
+BACKUP_DIR="$_mig_legacy" _migrate_legacy_perf_owned "$_mig_new" "win11"; _mig_rc2=$?
+set -e
+assert_eq "R37 migration is idempotent (rc 0 on second call)" "0" "$_mig_rc2"
+PERF_HP_DIRS_FILE="$_save_reg2"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

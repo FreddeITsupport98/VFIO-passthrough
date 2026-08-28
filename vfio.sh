@@ -4851,6 +4851,18 @@ ULTIMATE_PERF_HUGEPAGES=""
 # and warns). The tuner computes the page count from each VM's <memory> (KiB)
 # and reserves that many host pages.
 ULTIMATE_PERF_HUGEPAGES_SIZE="2048"
+# Ultimate-performance VM tuning: max VM RAM as a percentage of host RAM (read
+# by the perf tuner). When a tuned VM's <memory> exceeds this fraction of the
+# host's MemTotal, the tuner NOTIFIES the operator and CAPS the VM <memory> (and
+# <currentMemory>) down to this fraction (rounded to the nearest 512 MiB below)
+# so an oversized VM cannot exhaust the host and freeze it — the exact root cause
+# of the live-attach freeze (a 31GiB VM on 64GiB host pinned by hugepages left the
+# host with zero free pages under attach pressure). 0 = disable the cap.
+# WHY this value: 50 keeps a typical dual-GPU host stable with half its RAM free
+# for the compositor + live-attach pressure; lower it (e.g. 40) for more host
+# headroom, raise it only on RAM-rich hosts. The cap applies even when hugepages
+# is opted in (the reservation then uses the capped memory).
+ULTIMATE_PERF_MAX_VM_RAM_PCT="50"
 # Ultimate-performance VM tuning: opt-in SATA->virtio-blk disk-bus conversion
 # (read by the perf tuner). The disk perf knobs (cache=none/io=native/
 # discard=unmap + multiqueue + iothread) only apply to virtio/scsi disks, so a
@@ -12648,8 +12660,12 @@ install_stealth_vm_tuning() {
   # then $HOME/Desktop, then a root-writable /var/lib fallback.
   _backup_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _backup_dir="$(trim "${_backup_dir:-}")"
+  # R37: default to a predefined /var/lib dir (not $HOME/Desktop, which littered
+  # the Desktop with a new timestamped backup every run). $HOME/Desktop is kept
+  # only as a legacy READ fallback (see reset_stealth_vm_tuning) for backups
+  # created before this change. The STEALTH_VM_BACKUP_DIR conf key still overrides.
   if [[ -z "$_backup_dir" ]]; then
-    _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"
+    _backup_dir="/var/lib/vfio-stealth-vm/backups"
   fi
   if ! mkdir -p "$_backup_dir" 2>/dev/null || ! [[ -w "$_backup_dir" ]]; then
     _backup_dir="/var/lib/vfio-stealth-vm/backups"
@@ -12695,11 +12711,27 @@ install_stealth_vm_tuning() {
     fi
     _tmp="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp"
-    _backup_xml="$_backup_dir/${_dom}_stealth_$(date +%Y%m%d-%H%M%S).xml"
-    # Write the backup XML even in dry-run so the dry-run diff (below) has a
-    # baseline to diff against. The tuned temp copy is the "after".
-    mkdir -p "$_backup_dir" 2>/dev/null || true
-    cp "$_tmp" "$_backup_xml" 2>/dev/null || true
+    _backup_xml="$_backup_dir/${_dom}_stealth.xml"
+    # R37: keep ONE pristine backup per VM (fixed name, no timestamp) so the
+    # backup dir no longer accumulates a new file every run AND revert restores
+    # the real pre-tuning XML. The old newest-by-mtime scheme wrote a backup of
+    # the ALREADY-TUNED XML on a re-tune, so revert restored the tuned XML (a
+    # silent no-op). Now: only write when the VM is NOT already tuned (current
+    # dumpxml is pristine); on a re-tune keep the existing pristine backup; if
+    # already tuned with NO backup (orphaned), warn and do NOT fabricate a
+    # "pristine" backup from already-tuned XML. Written even in dry-run so the
+    # dry-run diff below has a baseline (cp does not honor DRY_RUN by design).
+    if _vm_is_stealth_tuned "$_dom" "$_xml"; then
+      if [[ -f "$_backup_xml" ]]; then
+        note "Re-tune: keeping existing pristine backup $_backup_xml (not overwriting with already-tuned XML)."
+      else
+        note "WARN: '$_dom' is already stealth-tuned but has no pristine backup; revert won't be possible until you reset from a known-good state. Not writing a backup from already-tuned XML."
+      fi
+    else
+      mkdir -p "$_backup_dir" 2>/dev/null || true
+      cp "$_tmp" "$_backup_xml" 2>/dev/null || true
+      note "Saved pristine pre-tuning VM XML backup: $_backup_xml"
+    fi
     # Run the python tuning (profile=all) on the temp XML.
     # Exit codes: 0 = changed, 3 = no changes needed (idempotent), 4 = unsupported domain.
     local _py_status=0
@@ -13000,14 +13032,16 @@ reset_stealth_vm_tuning() {
   local _backup_dir
   _backup_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _backup_dir="$(trim "${_backup_dir:-}")"
-  if [[ -z "$_backup_dir" ]]; then _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"; fi
+  # R37: default to the predefined /var/lib dir (same as install). $HOME/Desktop
+  # is kept as a legacy READ fallback below for backups created before R37.
+  if [[ -z "$_backup_dir" ]]; then _backup_dir="/var/lib/vfio-stealth-vm/backups"; fi
   if ! [[ -d "$_backup_dir" ]]; then
     _backup_dir="/var/lib/vfio-stealth-vm/backups"
   fi
   say
   hdr "Revert stealth/perf VM tuning (restore from backup XML)"
   note "This redefines each shut-off guest-GPU VM from its most recent"
-  note "${_dom:-<vm>}_stealth_*.xml backup in $_backup_dir."
+  note "${_dom:-<vm>}_stealth.xml backup in $_backup_dir."
   note "Only shut-off VMs are touched; running VMs are skipped."
   say
   local _reverted=0 _skipped_running=0 _dom _xml _bdfs _state _backup _newest
@@ -13026,16 +13060,26 @@ reset_stealth_vm_tuning() {
       _skipped_running=1
       continue
     fi
-    # Find the most recent *_stealth_*.xml backup for this VM.
+    # R37: read the fixed-name pristine backup directly. Fall back to the newest
+    # timestamped *_stealth_*.xml in the legacy $HOME/Desktop dir for setups
+    # created before R37 (so an existing user can still revert).
     _newest=""
-    for _backup in "$_backup_dir/${_dom}_stealth_"*.xml; do
-      [[ -f "$_backup" ]] || continue
-      if [[ -z "$_newest" || "$_backup" -nt "$_newest" ]]; then
-        _newest="$_backup"
+    if [[ -f "$_backup_dir/${_dom}_stealth.xml" ]]; then
+      _newest="$_backup_dir/${_dom}_stealth.xml"
+    else
+      local _legacy_dir="${BACKUP_DIR:-$HOME/Desktop}"
+      for _backup in "$_legacy_dir/${_dom}_stealth_"*.xml; do
+        [[ -f "$_backup" ]] || continue
+        if [[ -z "$_newest" || "$_backup" -nt "$_newest" ]]; then
+          _newest="$_backup"
+        fi
+      done
+      if [[ -n "$_newest" ]]; then
+        note "Using legacy timestamped backup $_newest (pre-R37). Re-running --install-stealth-vm-tuning will write the fixed-name backup in $_backup_dir."
       fi
-    done
+    fi
     if [[ -z "$_newest" ]]; then
-      note "No stealth backup XML found for '$_dom' in $_backup_dir; skipping."
+      note "No stealth backup XML found for '$_dom' (checked $_backup_dir/${_dom}_stealth.xml and legacy $HOME/Desktop); skipping."
       continue
     fi
     if ! virt-xml-validate "$_newest" 2>/dev/null; then
@@ -13144,6 +13188,29 @@ _vm_is_guest_gpu_vm() {
   return 1
 }
 
+# R37: Boolean — is <dom> (with dumpxml <xml>) already stealth-tuned? Greps the
+# same markers stealth_vm_tuning_status reports (vendor_id + QEMU -cpu/-smbios).
+# Used by install_stealth_vm_tuning so a re-tune does NOT overwrite the pristine
+# pre-tuning backup with already-tuned XML (which would make revert a no-op).
+_vm_is_stealth_tuned() {
+  local _xml="$2"
+  grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && \
+  grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && \
+  grep -Fq 'type=1,manufacturer=' <<<"$_xml" 2>/dev/null
+}
+
+# R37: Boolean — is <dom> (with dumpxml <xml>) already ultimate-perf-tuned?
+# Greps the same markers ultimate_perf_vm_tuning_status reports (disk
+# cache=none + io=native + cputune). Used by install_ultimate_perf_vm_tuning so
+# a re-tune does NOT overwrite the pristine pre-tuning backup with already-tuned
+# XML (which would make revert a no-op).
+_vm_is_perf_tuned() {
+  local _xml="$2"
+  grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && \
+  grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && \
+  grep -Fq '<cputune>' <<<"$_xml" 2>/dev/null
+}
+
 # R35: Read the VM's <memory> (KiB) from a dumpxml. $1 = xml. Prints the
 # integer KiB, or 0 on failure. Never fails.
 _vm_memory_kib() {
@@ -13181,9 +13248,13 @@ _vm_memory_kib() {
 #  - Reboot-safe re-reserve: after a host reboot resets nr_hugepages to 0, the
 #    next run re-reserves automatically (target > 0 while the pool is 0).
 _reserve_host_hugepages_for_vm() {
-  local _xml="$1" _size_kib="$2" _backup_dir="$3" _dom="$4"
+  local _xml="$1" _size_kib="$2" _backup_dir="$3" _dom="$4" _mem_override_kib="${5:-0}"
   local _mem_kib _page_kib _need _cur _other_owned _want _got _owned_file _f _o _disp_size
-  _mem_kib="$(_vm_memory_kib "$_xml")"
+  if (( _mem_override_kib > 0 )); then
+    _mem_kib="$_mem_override_kib"
+  else
+    _mem_kib="$(_vm_memory_kib "$_xml")"
+  fi
   if (( _mem_kib <= 0 )); then
     note "VM '$_dom' memory unreadable or zero; skipping hugepages reservation."
     return 1
@@ -13303,6 +13374,40 @@ _unregister_perf_hugepages_dir() {
     rm -f "$PERF_HP_DIRS_FILE" 2>/dev/null || true
   fi
   rm -f "$_tmp" 2>/dev/null || true
+}
+
+# R37: Migrate a VM's perf-hugepages owned file from the legacy default backup
+# dir ($HOME/Desktop, used before R37) to the resolved backup dir, and fix the
+# boot-reserve registry so the boot oneshot's sum_all_owned does not count BOTH
+# the legacy + new dir (double-count = 2x the pages = a wasted/failed reservation).
+# Idempotent: no-op once the owned file is gone from the legacy dir. Called by
+# install_ultimate_perf_vm_tuning (before reserving) and reset_ultimate_perf_vm_tuning
+# (before restoring) so the owned file is in the resolved dir the reserve/restore
+# helpers scan. Best-effort (never aborts the caller).
+_migrate_legacy_perf_owned() {
+  local _new_dir="$1" _dom="$2"
+  local _legacy_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  local _new_owned _legacy_owned _lf _left
+  [[ -n "$_new_dir" && -n "$_dom" ]] || return 0
+  [[ "$_new_dir" != "$_legacy_dir" ]] || return 0
+  _new_owned="$_new_dir/${_dom}_perf_hugepages_owned.txt"
+  _legacy_owned="$_legacy_dir/${_dom}_perf_hugepages_owned.txt"
+  [[ -f "$_legacy_owned" ]] || return 0
+  mkdir -p "$_new_dir" 2>/dev/null || true
+  if [[ ! -f "$_new_owned" ]]; then
+    mv -f "$_legacy_owned" "$_new_owned" 2>/dev/null || cp -f "$_legacy_owned" "$_new_owned" 2>/dev/null || true
+  else
+    # A prior run already migrated (or reserved fresh in the new dir); just drop the stale legacy copy.
+    rm -f "$_legacy_owned" 2>/dev/null || true
+  fi
+  # Unregister the legacy dir when it has no remaining owned files so the boot
+  # oneshot's sum_all_owned no longer counts it (avoids double-counting).
+  _left=0
+  for _lf in "$_legacy_dir"/*_perf_hugepages_owned.txt; do
+    [[ -f "$_lf" ]] && { _left=1; break; }
+  done
+  (( _left )) || _unregister_perf_hugepages_dir "$_legacy_dir"
+  note "Migrated hugepages owned file for '$_dom': '$_legacy_dir' -> '$_new_dir' (registry fixed to avoid double-count)."
 }
 
 # R35: Install + enable the reboot-persistent hugepages re-reserve oneshot
@@ -13591,7 +13696,11 @@ install_ultimate_perf_vm_tuning() {
   note "  - CPU topology matching vCPU count + <cache mode='passthrough'/>"
   note "  - currentMemory=memory (no startup balloon; synergizes with stealth's memballoon=none)"
   note "  - <pm> S3/S4 disabled (faster boot; avoids guest suspend breaking passthrough)"
-  note "  - hugepages: OPT-IN (default N) — adds <memoryBacking> + reserves host nr_hugepages"
+  note "  - hugepages: OPT-IN (default N) — adds <memoryBacking> + reserves host nr_hugepages;"
+  note "    selecting NO removes any existing hugepages (frees host nr_hugepages) so the VM"
+  note "    no longer pins host RAM (the freeze root cause)"
+  note "  - RAM safety gate: caps VM <memory> to ULTIMATE_PERF_MAX_VM_RAM_PCT (default 50)"
+  note "    of host RAM; notifies + applies a smaller size if the VM is too large"
   note "STEALTH-SAFE: this NEVER touches vendor_id/kvm hidden/vmport/SMBIOS/e1000e NIC/"
   note "disk serials/memballoon/hypervclock/TSC/QEMU -cpu/-smbios. A stealth-tuned VM"
   note "stays stealth-tuned through a perf pass; reverting perf restores a backup that"
@@ -13603,8 +13712,13 @@ install_ultimate_perf_vm_tuning() {
   local _backup_dir
   _backup_dir="$(awk -F= '/^ULTIMATE_PERF_VM_BACKUP_DIR=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _backup_dir="$(trim "${_backup_dir:-}")"
+  # R37: default to a predefined /var/lib dir (not $HOME/Desktop, which littered
+  # the Desktop with a new timestamped backup every run). $HOME/Desktop is kept
+  # only as a legacy READ fallback (see reset_ultimate_perf_vm_tuning) for
+  # backups/owned files created before this change. The ULTIMATE_PERF_VM_BACKUP_DIR
+  # conf key still overrides.
   if [[ -z "$_backup_dir" ]]; then
-    _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"
+    _backup_dir="/var/lib/vfio-perf-vm/backups"
   fi
   if ! mkdir -p "$_backup_dir" 2>/dev/null || ! [[ -w "$_backup_dir" ]]; then
     _backup_dir="/var/lib/vfio-perf-vm/backups"
@@ -13631,6 +13745,24 @@ install_ultimate_perf_vm_tuning() {
   _hp_size="$(awk -F= '/^ULTIMATE_PERF_HUGEPAGES_SIZE=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _hp_size="$(trim "${_hp_size:-}")"
   [[ "$_hp_size" =~ ^[0-9]+$ ]] || _hp_size="2048"
+
+  # RAM safety gate: read host MemTotal once + the max-VM-RAM percentage from
+  # conf (ULTIMATE_PERF_MAX_VM_RAM_PCT, default 50). Per VM, if the VM <memory>
+  # exceeds this fraction of host RAM, the tuner notifies the operator and caps
+  # the VM <memory> down to it (rounded to the nearest 512 MiB below) so an
+  # oversized VM cannot exhaust the host and freeze it (the live-attach freeze
+  # root cause: a too-large VM pinned by hugepages left the host with zero free
+  # pages under attach pressure). 0 disables the cap.
+  local _host_mem_kib _max_pct
+  _host_mem_kib="$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)"
+  [[ "$_host_mem_kib" =~ ^[0-9]+$ ]] || _host_mem_kib=0
+  _max_pct="$(awk -F= '/^ULTIMATE_PERF_MAX_VM_RAM_PCT=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _max_pct="$(trim "${_max_pct:-}")"
+  [[ "$_max_pct" =~ ^[0-9]+$ ]] || _max_pct=50
+  if (( _max_pct <= 0 || _max_pct > 100 )); then _max_pct=50; fi
+  if (( _host_mem_kib > 0 )); then
+    note "RAM safety gate: capping any tuned VM > ${_max_pct}% of host RAM (${_host_mem_kib} KiB) to keep the host stable."
+  fi
 
   # SATA->virtio-blk disk-bus conversion opt-in. Default N. The disk perf knobs
   # (cache=none/io=native/discard=unmap + multiqueue + iothread) only apply to
@@ -13713,9 +13845,31 @@ install_ultimate_perf_vm_tuning() {
     fi
     _tmp="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp"
-    _backup_xml="$_backup_dir/${_dom}_perf_$(date +%Y%m%d-%H%M%S).xml"
-    mkdir -p "$_backup_dir" 2>/dev/null || true
-    cp "$_tmp" "$_backup_xml" 2>/dev/null || true
+    _backup_xml="$_backup_dir/${_dom}_perf.xml"
+    # R37: keep ONE pristine backup per VM (fixed name, no timestamp) so the
+    # backup dir no longer accumulates a new file every run AND revert restores
+    # the real pre-tuning XML. Only write when the VM is NOT already tuned
+    # (current dumpxml is pristine); on a re-tune keep the existing pristine
+    # backup; if already tuned with NO backup (orphaned), warn and do NOT
+    # fabricate a "pristine" backup from already-tuned XML. Written even in
+    # dry-run so the dry-run diff has a baseline (cp does not honor DRY_RUN).
+    if _vm_is_perf_tuned "$_dom" "$_xml"; then
+      if [[ -f "$_backup_xml" ]]; then
+        note "Re-tune: keeping existing pristine backup $_backup_xml (not overwriting with already-tuned XML)."
+      else
+        note "WARN: '$_dom' is already ultimate-perf-tuned but has no pristine backup; revert won't be possible until you reset from a known-good state. Not writing a backup from already-tuned XML."
+      fi
+    else
+      mkdir -p "$_backup_dir" 2>/dev/null || true
+      cp "$_tmp" "$_backup_xml" 2>/dev/null || true
+      note "Saved pristine pre-tuning VM XML backup: $_backup_xml"
+    fi
+    # R37: migrate this VM's hugepages owned file from the legacy $HOME/Desktop
+    # backup dir (pre-R37 default) to the resolved dir, and fix the boot-reserve
+    # registry, BEFORE reserving — so the boot oneshot's sum_all_owned does not
+    # count BOTH dirs (double-count = 2x pages = wasted/failed reservation).
+    # Idempotent. Best-effort (never aborts the tune).
+    _migrate_legacy_perf_owned "$_backup_dir" "$_dom"
     # Hugepages decision for THIS VM (per-VM so a failed reservation on one VM
     # does not turn it off for the others):
     #   _hp_vm = 1  -> python adds <memoryBacking><hugepages> and we reserve host pages.
@@ -13728,15 +13882,33 @@ install_ultimate_perf_vm_tuning() {
     # persisting the count this VM owns. On a re-run where the VM already has
     # <hugepages> it re-reserves (instead of skipping) so a host-reboot reset of
     # nr_hugepages to 0 no longer silently breaks virsh start.
-    local _hp_vm=0
+    local _hp_vm=0 _hp_strip=0
     local _have_hp=0
     grep -Fq '<hugepages' <<<"$_xml" 2>/dev/null && _have_hp=1
+    # RAM safety gate: compute the cap for THIS VM. If the VM <memory> exceeds
+    # ULTIMATE_PERF_MAX_VM_RAM_PCT (default 50) of host MemTotal, notify and pass
+    # the capped KiB to the python patcher (which sets <memory>/<currentMemory>).
+    # The cap also feeds the hugepages reservation (so a capped VM reserves the
+    # capped page count, not the original oversized count).
+    local _vm_mem_kib=0 _cap_kib=0
+    _vm_mem_kib="$(_vm_memory_kib "$_xml")"
+    if (( _host_mem_kib > 0 && _vm_mem_kib > 0 )); then
+      local _max_vm_kib=$(( _host_mem_kib * _max_pct / 100 ))
+      if (( _vm_mem_kib > _max_vm_kib )); then
+        # Round down to the nearest 512 MiB (524288 KiB) for a clean value.
+        _cap_kib=$(( (_max_vm_kib / 524288) * 524288 ))
+        (( _cap_kib > 0 )) || _cap_kib="$_max_vm_kib"
+        local _vm_gib=$(( _vm_mem_kib / 1048576 )) _cap_gib=$(( _cap_kib / 1048576 ))
+        note "WARN: VM '$_dom' memory (${_vm_gib}GiB = ${_vm_mem_kib}KiB) exceeds ${_max_pct}% of host RAM; capping to ${_cap_gib}GiB = ${_cap_kib}KiB to keep the host stable. Set ULTIMATE_PERF_MAX_VM_RAM_PCT in $CONF_FILE to change (0 disables)."
+      fi
+    fi
+    export VFIO_PERF_VM_RAM_CAP_KIB="$_cap_kib"
     if (( _hp_on )); then
       _hp_vm=1
       if (( DRY_RUN )); then
         note "Dry run: would reserve host hugepages for '$_dom' (no nr_hugepages write)."
       else
-        if _reserve_host_hugepages_for_vm "$_xml" "$_hp_size" "$_backup_dir" "$_dom"; then
+        if _reserve_host_hugepages_for_vm "$_xml" "$_hp_size" "$_backup_dir" "$_dom" "$_cap_kib"; then
           _any_hp_reserved=1 # reservation OK; _hp_vm stays 1
         else
           _hp_vm=0
@@ -13745,12 +13917,15 @@ install_ultimate_perf_vm_tuning() {
       fi
     elif (( _have_hp )); then
       # Hugepages was opted OUT this run but the VM already has <hugepages> from a
-      # prior run: keep the existing backing intact (do not strip it) and leave the
-      # host reservation as-is. The python's VFIO_PERF_HUGEPAGES=0 means it will
-      # NOT touch the memoryBacking block, so the existing hugepages survives.
-      : # _hp_vm stays 0; python preserves the existing block
+      # prior run: STRIP it (the perf default removes existing hugepages so the VM
+      # no longer pins host RAM — the freeze root cause). The python patcher
+      # removes <memoryBacking><hugepages> (and the whole <memoryBacking> if it
+      # becomes empty); after the redefine succeeds the host nr_hugepages
+      # reservation is freed via _restore_host_hugepages_for_vm.
+      _hp_strip=1
     fi
     export VFIO_PERF_HUGEPAGES="$_hp_vm"
+    export VFIO_PERF_HUGEPAGES_STRIP="$_hp_strip"
     local _py_status=0
     python3 - "$_tmp" <<'PYEOF' || _py_status=$?
 import sys, xml.etree.ElementTree as ET, os, re
@@ -13808,8 +13983,25 @@ if not host_cpus:
 if vcpu_count < 1:
     vcpu_count = max(1, min(len(host_cpus), 4))
 
-# --- currentMemory = memory (no startup balloon) ---
+# --- RAM safety cap (ultimate-perf): cap VM <memory> to a safe fraction of
+# host RAM so an oversized VM cannot exhaust the host and freeze it (the
+# live-attach freeze root cause). The bash wrapper computes the cap (KiB) from
+# ULTIMATE_PERF_MAX_VM_RAM_PCT and passes it via VFIO_PERF_VM_RAM_CAP_KIB.
+# 0 = no cap. Applied BEFORE the currentMemory=memory sync so the sync uses the
+# capped value. ---
 mem_el = root.find('memory')
+_cap_kib = os.environ.get('VFIO_PERF_VM_RAM_CAP_KIB', '0')
+try: _cap_kib = int(_cap_kib)
+except ValueError: _cap_kib = 0
+if _cap_kib > 0 and mem_el is not None and mem_el.text:
+    try: _cur_mem = int(mem_el.text.strip())
+    except ValueError: _cur_mem = 0
+    if _cur_mem > _cap_kib:
+        mem_el.text = str(_cap_kib)
+        if mem_el.get('unit', 'KiB') != 'KiB':
+            mem_el.set('unit', 'KiB')
+        changed = True
+# --- currentMemory = memory (no startup balloon) ---
 if mem_el is not None and mem_el.text:
     mem_text = mem_el.text.strip()
     mem_unit = mem_el.get('unit', 'KiB')
@@ -14062,7 +14254,12 @@ if devices is not None:
             driver.set('iothread', want_it); changed = True
         disk_idx += 1
 
-# --- hugepages (opt-in) ---
+# --- hugepages: opt-in ADD, OR strip existing when perf is selected with
+# hugepages OFF (the default). The perf default REMOVES any existing
+# <memoryBacking><hugepages> so the VM no longer pins host RAM — the freeze root
+# cause (a too-large VM pinned by hugepages left the host with zero free pages
+# under live-attach pressure). The bash wrapper frees the host nr_hugepages
+# reservation after the redefine succeeds. ---
 if os.environ.get('VFIO_PERF_HUGEPAGES', '0') == '1':
     hp_size = os.environ.get('VFIO_PERF_HUGEPAGES_SIZE', '2048')
     mb = root.find('memoryBacking')
@@ -14092,6 +14289,16 @@ if os.environ.get('VFIO_PERF_HUGEPAGES', '0') == '1':
     for tag in ('locked', 'nosharepages'):
         if mb.find(tag) is None:
             ET.SubElement(mb, tag); changed = True
+elif os.environ.get('VFIO_PERF_HUGEPAGES_STRIP', '0') == '1':
+    mb = root.find('memoryBacking')
+    if mb is not None:
+        hp_el = mb.find('hugepages')
+        if hp_el is not None:
+            mb.remove(hp_el); changed = True
+        # Drop <memoryBacking> entirely if it is now empty (no other children),
+        # so the XML does not carry a vestigial empty backing block.
+        if list(mb) == []:
+            root.remove(mb); changed = True
 
 if not changed: sys.exit(3)
 tree.write(path)
@@ -14158,6 +14365,13 @@ PYEOF
     # succeeded, so the VM now has <memoryBacking>hugepages and the host pool
     # matches; keep the ownership file so a later re-run/RAM-change recompute is
     # accurate and a revert frees exactly these pages.
+    # Strip path: the VM was redefined WITHOUT <hugepages> (the perf default
+    # removes existing hugepages so the VM no longer pins host RAM — the freeze
+    # root cause). Free this VM's host nr_hugepages reservation now that the XML
+    # no longer demands it.
+    if (( _hp_strip )) && (( ! DRY_RUN )); then
+      _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"
+    fi
     say
     if (( ENABLE_COLOR )); then
       say "${C_GREEN}${C_BOLD}✔ Ultimate-performance tuning applied to VM '$_dom'${C_RESET}"
@@ -14174,9 +14388,15 @@ PYEOF
     say "  ✔ CPU topology + <cache mode='passthrough'/>"
     say "  ✔ currentMemory=memory (no startup balloon)"
     say "  ✔ <pm> S3/S4 disabled"
+    if (( _cap_kib > 0 )); then
+      local _cap_gib=$(( _cap_kib / 1048576 )) _vm_gib=$(( _vm_mem_kib / 1048576 ))
+      say "  ✔ VM memory capped to ${_cap_gib}GiB (was ${_vm_gib}GiB; exceeded ${_max_pct}% of host RAM)"
+    fi
     if (( _hp_vm )); then
       local _disp=$(( _hp_size / 1024 ))
       say "  ✔ hugepages <memoryBacking> + host nr_hugepages reserved (${_disp}MiB = ${_hp_size}KiB pages)"
+    elif (( _hp_strip )); then
+      say "  ✔ hugepages <memoryBacking> REMOVED + host nr_hugepages freed (perf default; prevents host RAM pinning freeze)"
     elif (( _have_hp )); then
       say "  ✔ hugepages <memoryBacking> preserved (existing, not re-reserved this run)"
     fi
@@ -14201,6 +14421,13 @@ PYEOF
   # registry is left untouched and the service is not (re)installed).
   if (( ! DRY_RUN )) && { (( _any_hp_reserved )) || [[ -f "$PERF_HP_DIRS_FILE" ]]; }; then
     install_perf_hugepages_boot_service
+  fi
+  # If every perf-hugepages VM was STRIPPED this run (no reservation made and the
+  # registry is now empty/gone), remove the reboot-persistent re-reserve service
+  # so an unused unit does not linger. Skipped in dry-run (no strip writes happen
+  # so the registry is left untouched).
+  if (( ! DRY_RUN )) && (( ! _any_hp_reserved )) && ! [[ -f "$PERF_HP_DIRS_FILE" ]]; then
+    remove_perf_hugepages_boot_service
   fi
 }
 
@@ -14228,14 +14455,17 @@ reset_ultimate_perf_vm_tuning() {
   local _backup_dir
   _backup_dir="$(awk -F= '/^ULTIMATE_PERF_VM_BACKUP_DIR=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _backup_dir="$(trim "${_backup_dir:-}")"
-  if [[ -z "$_backup_dir" ]]; then _backup_dir="${BACKUP_DIR:-$HOME/Desktop}"; fi
+  # R37: default to the predefined /var/lib dir (same as install). $HOME/Desktop
+  # is kept as a legacy READ fallback below for backups/owned files created
+  # before R37.
+  if [[ -z "$_backup_dir" ]]; then _backup_dir="/var/lib/vfio-perf-vm/backups"; fi
   if ! [[ -d "$_backup_dir" ]]; then
     _backup_dir="/var/lib/vfio-perf-vm/backups"
   fi
   say
   hdr "Revert ultimate-performance VM tuning (restore from backup XML)"
   note "This redefines each shut-off guest-GPU VM from its most recent"
-  note "${_dom:-<vm>}_perf_*.xml backup in $_backup_dir (which still contains stealth),"
+  note "${_dom:-<vm>}_perf.xml backup in $_backup_dir (which still contains stealth),"
   note "and restores the host nr_hugepages that was reserved for it. Only shut-off"
   note "VMs are touched; running VMs are skipped."
   say
@@ -14255,15 +14485,30 @@ reset_ultimate_perf_vm_tuning() {
       _skipped_running=1
       continue
     fi
+    # R37: migrate this VM's hugepages owned file from the legacy $HOME/Desktop
+    # dir to the resolved dir (and fix the boot-reserve registry) BEFORE the
+    # restore below, so _restore_host_hugepages_for_vm finds + removes it here.
+    _migrate_legacy_perf_owned "$_backup_dir" "$_dom"
+    # R37: read the fixed-name pristine backup directly. Fall back to the newest
+    # timestamped *_perf_*.xml in the legacy $HOME/Desktop dir for setups created
+    # before R37 (so an existing user can still revert).
     _newest=""
-    for _backup in "$_backup_dir/${_dom}_perf_"*.xml; do
-      [[ -f "$_backup" ]] || continue
-      if [[ -z "$_newest" || "$_backup" -nt "$_newest" ]]; then
-        _newest="$_backup"
+    if [[ -f "$_backup_dir/${_dom}_perf.xml" ]]; then
+      _newest="$_backup_dir/${_dom}_perf.xml"
+    else
+      local _legacy_dir="${BACKUP_DIR:-$HOME/Desktop}"
+      for _backup in "$_legacy_dir/${_dom}_perf_"*.xml; do
+        [[ -f "$_backup" ]] || continue
+        if [[ -z "$_newest" || "$_backup" -nt "$_newest" ]]; then
+          _newest="$_backup"
+        fi
+      done
+      if [[ -n "$_newest" ]]; then
+        note "Using legacy timestamped backup $_newest (pre-R37). Re-running --install-ultimate-perf-vm-tuning will write the fixed-name backup in $_backup_dir."
       fi
-    done
+    fi
     if [[ -z "$_newest" ]]; then
-      note "No perf backup XML found for '$_dom' in $_backup_dir; skipping."
+      note "No perf backup XML found for '$_dom' (checked $_backup_dir/${_dom}_perf.xml and legacy $HOME/Desktop); skipping."
       continue
     fi
     if ! virt-xml-validate "$_newest" 2>/dev/null; then

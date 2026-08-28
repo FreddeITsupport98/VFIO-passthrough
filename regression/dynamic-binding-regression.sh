@@ -2618,6 +2618,51 @@ else
   record_failure "R36 dynamic install reverts live-attach on opt-out"
 fi
 
+# --- R37: stop Desktop XML-backup litter (predefined dir + keep one pristine) ---
+# The stealth tuner wrote a NEW timestamped backup to $HOME/Desktop every run
+# (litter + a latent revert bug: a re-tune backed up the ALREADY-TUNED XML, so
+# the newest-by-mtime revert restored the tuned XML = a silent no-op). R37:
+# default backup dir -> /var/lib/vfio-stealth-vm/backups, fixed-name
+# ${_dom}_stealth.xml, keep ONE pristine backup (write only if NOT already
+# tuned), legacy $HOME/Desktop read fallback in revert. STEALTH_VM_BACKUP_DIR
+# conf key still overrides; the dry-run diff baseline line is preserved.
+_stealth_fn="$(sed -n '/^install_stealth_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_file \
+  "R37 _vm_is_stealth_tuned helper defined" \
+  '_vm_is_stealth_tuned()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R37 stealth install uses fixed-name backup (no timestamp)" \
+  '${_dom}_stealth.xml' \
+  "$_stealth_fn"
+if printf '%s\n' "$_stealth_fn" | grep -Fq '_stealth_$(date'; then
+  printf 'FAIL: R37 stealth install still uses a timestamped backup name (litter)\n' >&2
+  record_failure "R37 stealth install uses fixed-name backup (no $(date))"
+else
+  printf 'PASS: R37 stealth install uses fixed-name backup (no $(date))\n'
+fi
+assert_contains_text \
+  "R37 stealth install keeps pristine backup on re-tune (no overwrite)" \
+  'Re-tune: keeping existing pristine backup' \
+  "$_stealth_fn"
+assert_contains_text \
+  "R37 stealth install warns on orphaned (tuned, no backup)" \
+  'already stealth-tuned but has no pristine backup' \
+  "$_stealth_fn"
+assert_contains_text \
+  "R37 stealth install default dir is /var/lib/vfio-stealth-vm/backups" \
+  '_backup_dir="/var/lib/vfio-stealth-vm/backups"' \
+  "$_stealth_fn"
+_stealth_revert_fn="$(sed -n '/^reset_stealth_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R37 stealth revert reads fixed-name backup" \
+  '${_dom}_stealth.xml' \
+  "$_stealth_revert_fn"
+assert_contains_text \
+  "R37 stealth revert falls back to legacy $HOME/Desktop timestamped backups" \
+  '${_dom}_stealth_"*.xml' \
+  "$_stealth_revert_fn"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

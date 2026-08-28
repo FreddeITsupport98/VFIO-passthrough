@@ -2202,6 +2202,20 @@ confirm_phrase() {
   # confirm_phrase "Prompt" "PHRASE"
   local prompt="$1" phrase="$2" ans
 
+  # R38: GUI path so the destructive/safety confirmation stays in the TUI
+  # (whiptail --inputbox) and the operator never has to drop to a plain CLI
+  # prompt to type the phrase. whiptail writes the dialog to stderr and
+  # returns the typed text on stdout via the fd dance; Cancel/Esc or a
+  # mismatched phrase returns non-zero (declined). Falls back to the original
+  # plain-text /dev/tty read when there is no TUI or no tty.
+  if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
+    ans="$(whiptail --title "Confirm" --inputbox "$prompt
+
+Type exactly: $phrase" 12 70 "" 3>&1 1>&2 2>&3)" || return 1
+    [[ "$ans" == "$phrase" ]]
+    return $?
+  fi
+
   # IMPORTANT: do not print prompts to stdout (stdout may be captured).
   local in="/dev/stdin"
   local out="/dev/stderr"
@@ -4168,6 +4182,71 @@ vendor_label() {
     8086) echo "${C_BOLD}${C_BLUE}${name}${C_RESET}";;  # Intel = blue
     *) echo "${C_BOLD}${name}${C_RESET}";;
   esac
+}
+
+# R38: Color-coded role tag for the wizard flow so the operator can see at a
+# glance which device goes where. GUEST = passed through to the VM (bound to
+# vfio-pci, removed from the host) -> RED. HOST = stays on the host desktop
+# (keeps the host driver) -> GREEN. Plain-text fallback when color is off.
+# Used by the GPU-picker step headers + selection summary. (whiptail strips
+# ANSI from its menu items, so this colors the surrounding flow instead.)
+_role_tag() {
+  local role="${1:-}"
+  case "$role" in
+    guest|GUEST)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_BOLD}${C_RED}[GUEST -> vfio-pci]${C_RESET}"
+      else
+        printf '%s' '[GUEST -> vfio-pci]'
+      fi
+      ;;
+    host|HOST)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_BOLD}${C_GREEN}[HOST -> desktop]${C_RESET}"
+      else
+        printf '%s' '[HOST -> desktop]'
+      fi
+      ;;
+    guest-audio|GUEST-AUDIO)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_BOLD}${C_RED}[GUEST AUDIO -> vfio-pci]${C_RESET}"
+      else
+        printf '%s' '[GUEST AUDIO -> vfio-pci]'
+      fi
+      ;;
+    host-audio|HOST-AUDIO)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_BOLD}${C_GREEN}[HOST AUDIO -> desktop]${C_RESET}"
+      else
+        printf '%s' '[HOST AUDIO -> desktop]'
+      fi
+      ;;
+    *)
+      if (( ENABLE_COLOR )); then
+        printf '%s' "${C_BOLD}[$role]${C_RESET}"
+      else
+        printf '%s' "[$role]"
+      fi
+      ;;
+  esac
+}
+
+# R38: GUI message box for the wizard flow. Presents an informational message
+# as a whiptail --msgbox when a TUI + tty are available, so a GUI-only operator
+# sees it as a popup instead of scrollback text that the next whiptail covers.
+# Falls back to hdr()+say() (plain text) when there is no TUI or no tty.
+# whiptail strips ANSI, so callers pass PLAIN text (no color codes). This is
+# informational only (OK to dismiss) — not a choice; use prompt_yn /
+# select_from_list for choices.
+gui_msgbox() {
+  local title="${1:-vfio.sh}" msg="${2:-}"
+  if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
+    whiptail --title "$title" --msgbox "$msg" 18 72 3>&1 1>&2 2>&3 || true
+  else
+    say
+    hdr "$title"
+    say "$msg"
+  fi
 }
 
 hdr() {
@@ -22100,7 +22179,32 @@ user_selection() {
   if (( DEBUG )); then
     say "- DEBUG enabled"
   fi
-  say
+  # R38: color legend so the operator can see at a glance which color means
+  # what throughout the wizard. GUEST (red) is passed through to the VM;
+  # HOST (green) stays on the host desktop. GUI (whiptail) path shows the
+  # legend as a popup so a GUI-only operator sees it instead of scrollback
+  # text that the next popup covers; plain-text path keeps the inline legend.
+  if (( HAS_TUI )); then
+    gui_msgbox "VFIO color legend" \
+"Color legend for this wizard:
+
+  [GUEST -> vfio-pci]  =  passed through to the VM
+                          (bound to vfio-pci, removed from the host)
+  [HOST -> desktop]    =  stays on your desktop
+                          (keeps its host driver)
+
+In the colored terminal output, GUEST is shown in RED and HOST in GREEN."
+  else
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}Color legend:${C_RESET}  $(_role_tag guest)  =  this device is passed through to the VM (bound to vfio-pci, removed from the host)"
+      say "                  $(_role_tag host)  =  this device stays on your desktop (keeps its host driver)"
+    else
+      say "Color legend:  [GUEST -> vfio-pci]  =  passed through to the VM (bound to vfio-pci, removed from the host)"
+      say "               [HOST -> desktop]  =  stays on your desktop (keeps its host driver)"
+    fi
+    say
+  fi
 
   # Discover GPUs (via sysfs; lspci is only used for human-readable descriptions)
   local -a gpu_bdfs=() gpu_descs=() gpu_vendor_ids=() gpu_audio_bdfs_csv=() gpu_audio_descs=()
@@ -22136,13 +22240,26 @@ user_selection() {
   done
 
   local guest_idx host_idx
-  hdr "Step 1/4: Select GUEST GPU (will be passed through)"
-  guest_idx="$(select_from_list "Which GPU should be the GUEST (vfio-pci / passthrough)?" "GPU selection" "${options[@]}")"
+  say
+  if (( ENABLE_COLOR )); then
+    say "${C_BOLD}==== Step 1/4: Select $(_role_tag guest) GPU (will be passed through) ====${C_RESET}"
+  else
+    say "==== Step 1/4: Select [GUEST] GPU (will be passed through) ===="
+  fi
+  note "Pick the GPU you want to PASS THROUGH to the VM. It will be bound to vfio-pci and removed from the host."
+  guest_idx="$(select_from_list "Which GPU should be the GUEST (vfio-pci / passthrough)? It will be removed from the host." "Step 1/4: GUEST -> vfio-pci" "${options[@]}")"
 
   if (( ${#gpu_bdfs[@]} == 2 )); then
     if (( guest_idx == 0 )); then host_idx=1; else host_idx=0; fi
   else
-    host_idx="$(select_from_list "Select the GPU to use for HOST display:" "Host GPU selection" "${options[@]}")"
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}==== Step 1b: Select $(_role_tag host) GPU (stays on host) ====${C_RESET}"
+    else
+      say "==== Step 1b: Select [HOST] GPU (stays on host) ===="
+    fi
+    note "Pick the GPU that will KEEP driving your host desktop (stays on its host driver)."
+    host_idx="$(select_from_list "Select the GPU to KEEP on the host (drives your desktop):" "Step 1b: HOST -> desktop" "${options[@]}")"
     (( host_idx != guest_idx )) || die "Host GPU and guest GPU cannot be the same."
   fi
 
@@ -22190,14 +22307,29 @@ user_selection() {
   guest_desc="${gpu_descs[$guest_idx]}"
   host_desc="${gpu_descs[$host_idx]}"
 
-  say
-  hdr "Selection summary so far"
-  say "Host GPU (stays on host):"
-  say "  ${CTX[host_gpu]}"
-  note "  $(short_gpu_desc "$host_desc")"
-  say "Guest GPU (passthrough / vfio-pci):"
-  say "  ${CTX[guest_gpu]}"
-  note "  $(short_gpu_desc "$guest_desc")"
+  # R38: GUI path shows the selection summary as a popup so a GUI-only
+  # operator sees the HOST/GUEST mapping before the apply step; plain-text
+  # path keeps the inline colored summary.
+  if (( HAS_TUI )); then
+    gui_msgbox "Selection summary" \
+"Selection so far:
+
+  [HOST -> desktop]    ${CTX[host_gpu]}  —  $(short_gpu_desc "$host_desc")
+  [GUEST -> vfio-pci]  ${CTX[guest_gpu]}  —  $(short_gpu_desc "$guest_desc")
+
+The GUEST GPU will be bound to vfio-pci and passed to the VM.
+The HOST GPU stays on your desktop."
+  else
+    say
+    hdr "Selection summary so far"
+    if (( ENABLE_COLOR )); then
+      say "$(_role_tag host)  ${CTX[host_gpu]}  —  $(short_gpu_desc "$host_desc")"
+      say "$(_role_tag guest)  ${CTX[guest_gpu]}  —  $(short_gpu_desc "$guest_desc")"
+    else
+      say "[HOST -> desktop]   ${CTX[host_gpu]}  —  $(short_gpu_desc "$host_desc")"
+      say "[GUEST -> vfio-pci]  ${CTX[guest_gpu]}  —  $(short_gpu_desc "$guest_desc")"
+    fi
+  fi
 
   assert_not_equal "${CTX[guest_gpu]}" "${CTX[host_gpu]}" "Host GPU and guest GPU are the same (refusing)."
   assert_pci_bdf_exists "${CTX[guest_gpu]}"
@@ -22207,7 +22339,12 @@ user_selection() {
   local guest_audio_csv="${gpu_audio_bdfs_csv[$guest_idx]}"
   if [[ -n "$guest_audio_csv" ]]; then
     say
-    hdr "Step 2/4: Guest GPU HDMI/DP Audio (strongly recommended)"
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}==== Step 2/4: $(_role_tag guest-audio) HDMI/DP Audio (strongly recommended) ====${C_RESET}"
+    else
+      say "==== Step 2/4: [GUEST AUDIO] HDMI/DP Audio (strongly recommended) ===="
+    fi
+    note "Pass through the GPU's HDMI/DP audio function too, so it works inside the VM (otherwise it stays on the host and can confuse PipeWire)."
     say "Guest GPU: ${CTX[guest_gpu]}"
     note "$(short_gpu_desc "$guest_desc")"
     say "Detected HDMI/DP audio PCI function(s) for this GPU: $guest_audio_csv"
@@ -22215,12 +22352,16 @@ user_selection() {
     note "Leaving the HDMI/DP audio on the host while the GPU is passed through can confuse PipeWire/PulseAudio and cause desktop hangs when the VM starts."
     note "Only skip this if you are sure you do NOT want the GPU's HDMI/DP audio in the guest and understand the risks."
 
-    if ! prompt_yn "Also passthrough HDMI/DP AUDIO for the guest GPU? (recommended)" Y "Guest HDMI/DP audio"; then
+    if ! prompt_yn "Also passthrough HDMI/DP AUDIO for the guest GPU? (recommended)" Y "Step 2/4: GUEST AUDIO -> vfio-pci"; then
       guest_audio_csv=""
     fi
   else
     say
-    hdr "Step 2/4: Guest GPU HDMI/DP Audio"
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}==== Step 2/4: $(_role_tag guest-audio) HDMI/DP Audio ====${C_RESET}"
+    else
+      say "==== Step 2/4: [GUEST AUDIO] HDMI/DP Audio ===="
+    fi
     note "No HDMI/DP audio device found in the same PCI slot as the selected guest GPU (${CTX[guest_gpu]})."
   fi
 
@@ -22262,7 +22403,12 @@ user_selection() {
   # scenario the script will not try to manage host audio PCI devices at all.
   if [[ -n "$guest_audio_csv" ]]; then
     say
-    hdr "Step 3/4: Select HOST audio device (must stay on host)"
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}==== Step 3/4: Select $(_role_tag host-audio) device (must stay on host) ====${C_RESET}"
+    else
+      say "==== Step 3/4: Select [HOST AUDIO] device (must stay on host) ===="
+    fi
+    note "Pick the audio device that KEEP working on your host desktop (for your sound). It is NOT passed through."
     say "Host GPU is: ${CTX[host_gpu]}"
     note "$(short_gpu_desc "$host_desc")"
     note "Pick the AUDIO device that should KEEP working on the host (for your desktop sound)."
@@ -22292,7 +22438,7 @@ user_selection() {
 
     if (( ${#aud_bdfs[@]} > 0 )); then
       local host_audio_idx
-      host_audio_idx="$(select_from_list "Which AUDIO device should stay on the HOST?" "Host audio selection" "${aud_opts[@]}")"
+      host_audio_idx="$(select_from_list "Which AUDIO device should KEEP working on the HOST (not passed through)?" "Step 3/4: HOST AUDIO -> desktop" "${aud_opts[@]}")"
       host_audio_bdfs_csv="${aud_bdfs[$host_audio_idx]}"
       [[ -n "$host_audio_bdfs_csv" ]] && assert_pci_bdf_exists "$host_audio_bdfs_csv"
     else
@@ -22309,7 +22455,11 @@ user_selection() {
     audio_slot_sanity "${CTX[host_gpu]}" "$host_audio_bdfs_csv"
   else
     say
-    hdr "Step 3/4: Host audio binding"
+    if (( ENABLE_COLOR )); then
+      say "${C_BOLD}==== Step 3/4: $(_role_tag host-audio) binding ====${C_RESET}"
+    else
+      say "==== Step 3/4: [HOST AUDIO] binding ===="
+    fi
     note "You chose not to passthrough any HDMI/DP audio for the guest. Skipping host audio PCI binding wizard."
     host_audio_bdfs_csv=""
   fi
@@ -22359,10 +22509,14 @@ user_selection() {
 
       if (( ${#sink_node_names[@]} > 0 )); then
         local sink_idx
-        hdr "Step 4/4: Choose default HOST audio output (PipeWire)"
-        note "This only sets your desktop's default sound output after login."
-        note "It does NOT change what gets passed through to the VM."
-        sink_idx="$(select_from_list "Which host audio OUTPUT should be default?" "Host audio output selection" "${sink_opts[@]}")"
+        say
+        if (( ENABLE_COLOR )); then
+          say "${C_BOLD}==== Step 4/4: Choose default $(_role_tag host-audio) output (PipeWire) ====${C_RESET}"
+        else
+          say "==== Step 4/4: Choose default [HOST AUDIO] output (PipeWire) ===="
+        fi
+        note "This only sets your desktop's default sound output after login (it does NOT change what gets passed through to the VM)."
+        sink_idx="$(select_from_list "Which host audio OUTPUT should be the default (stays on host)?" "Step 4/4: HOST AUDIO -> desktop" "${sink_opts[@]}")"
         host_audio_node_name="${sink_node_names[$sink_idx]}"
       else
         note "Could not enumerate PipeWire sinks (common if PipeWire isn't running for that user yet). Skipping."
@@ -22396,10 +22550,17 @@ apply_configuration() {
 
   say
   say "Summary:"
-  say "  Host GPU:   $host_gpu"
-  say "  Guest GPU:  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
-  say "  Host audio PCI:  ${host_audio_bdfs_csv:-<none>}"
-  say "  Guest audio PCI: ${guest_audio_csv:-<none>}"
+  if (( ENABLE_COLOR )); then
+    say "  $(_role_tag host)  $host_gpu"
+    say "  $(_role_tag guest) $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
+    say "  $(_role_tag host-audio)  ${host_audio_bdfs_csv:-<none>}"
+    say "  $(_role_tag guest-audio) ${guest_audio_csv:-<none>}"
+  else
+    say "  [HOST -> desktop]    $host_gpu"
+    say "  [GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
+    say "  [HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}"
+    say "  [GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}"
+  fi
   say "  Host default sink node.name: ${host_audio_node_name:-<not set>}"
   say "  Boot-VGA host-assisted policy: ${boot_vga_policy_mode}"
   if [[ -n "${BOOT_VGA_POLICY_OVERRIDE:-}" ]]; then
@@ -22615,13 +22776,20 @@ apply_configuration() {
     note "If you really want to uninstall the default kernel, type: REMOVE DEFAULT KERNEL"
     note "Or press ENTER to skip and keep both kernels."
 
+    # R38: GUI path so this advanced openSUSE confirm stays in the TUI too.
+    # Empty input or Cancel (Esc) = keep both kernels (skip); typing the exact
+    # phrase proceeds with the default-kernel removal. Plain-text fallback when
+    # there is no TUI or no tty.
     local in="/dev/stdin" out="/dev/stderr" ans
-    if [[ -r /dev/tty && -w /dev/tty ]]; then
-      in="/dev/tty"; out="/dev/tty"
+    if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
+      ans="$(whiptail --title "Advanced: remove default kernel" --inputbox "Type REMOVE DEFAULT KERNEL to uninstall the default kernel, or press Enter to keep both kernels." 10 70 "" 3>&1 1>&2 2>&3)" || ans=""
+    else
+      if [[ -r /dev/tty && -w /dev/tty ]]; then
+        in="/dev/tty"; out="/dev/tty"
+      fi
+      printf '%s' "> " >"$out"
+      read -r ans <"$in" || ans=""
     fi
-
-    printf '%s' "> " >"$out"
-    read -r ans <"$in" || ans=""
 
     if [[ "$ans" == "REMOVE DEFAULT KERNEL" ]]; then
       if have_cmd zypper; then

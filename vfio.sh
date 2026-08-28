@@ -176,6 +176,7 @@ DEBUG=0
 DRY_RUN=0
 JSON_OUTPUT=0
 RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completions (R37)
+RECOMMENDED_MODE=0   # 1=--recommended: auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (R39)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
 MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers
@@ -235,6 +236,41 @@ BACKUP_ENTRIES=()
 # Regression guard: tracks attempted writes to snapper-* BLS entries.
 VFIO_BLS_SNAPPER_WRITE_ATTEMPTS=0
 declare -ag VFIO_BLS_SNAPPER_WRITE_ATTEMPT_PATHS=()
+
+# R39: recommended-answer table for --recommended mode. Keyed by the prompt_yn
+# title (3rd arg). prompt_yn consults this when RECOMMENDED_MODE=1; titles NOT
+# present still prompt (fail-safe — an unknown prompt is never silently
+# auto-answered). Values are prompt_yn return codes: 0 = Yes, 1 = No. The
+# "Boot framebuffer mitigation" title is NOT here — it is computed live (Yes if
+# the guest GPU is boot VGA, else No) inside prompt_yn. "Recommended preset"
+# (the one confirmation gate) is deliberately absent so it cannot auto-answer
+# itself. "GPU binding mode" is handled via BINDING_MODE_OVERRIDE (the preset
+# engine), not this table.
+declare -Ag _RECOMMENDED_ANSWERS=()
+_RECOMMENDED_ANSWERS["Apply VFIO configuration"]=0
+_RECOMMENDED_ANSWERS["Step 2/4: GUEST AUDIO -> vfio-pci"]=0
+_RECOMMENDED_ANSWERS["Module load ordering"]=0
+_RECOMMENDED_ANSWERS["Seat isolation"]=0
+_RECOMMENDED_ANSWERS["Initramfs (dracut)"]=0
+_RECOMMENDED_ANSWERS["Initramfs update"]=0
+_RECOMMENDED_ANSWERS["Boot options"]=0
+_RECOMMENDED_ANSWERS["vBIOS ROM injection"]=0
+_RECOMMENDED_ANSWERS["Openbox monitor activation"]=0
+_RECOMMENDED_ANSWERS["Stealth/perf VM tuning"]=1
+_RECOMMENDED_ANSWERS["Ultimate-perf VM tuning"]=1
+_RECOMMENDED_ANSWERS["Boot log capture"]=1
+_RECOMMENDED_ANSWERS["USB mitigation"]=1
+_RECOMMENDED_ANSWERS["Driver blacklist"]=1
+_RECOMMENDED_ANSWERS["KDE Plasma session"]=1
+_RECOMMENDED_ANSWERS["Initramfs integration"]=1
+_RECOMMENDED_ANSWERS["USB/xHCI stability"]=1
+_RECOMMENDED_ANSWERS["Kernel security modules"]=1
+_RECOMMENDED_ANSWERS["Advanced (optional): ACS override"]=1
+_RECOMMENDED_ANSWERS["Boot verbosity"]=1
+_RECOMMENDED_ANSWERS["Boot target"]=1
+_RECOMMENDED_ANSWERS["Custom kernel parameters"]=1
+_RECOMMENDED_ANSWERS["Existing VFIO config"]=1
+_RECOMMENDED_ANSWERS["Host audio output"]=1
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
@@ -820,6 +856,7 @@ complete -c $cmd -l health-check-all -d 'Audit all detected GPUs'
 complete -c $cmd -l usb-health-check -d 'Audit USB/xHCI instability markers'
 complete -c $cmd -l reset -d 'Remove VFIO setup installed by this script'
 complete -c $cmd -l full -d 'With --reset: also remove the self-installed vfio CLI + completions (repo script untouched)'
+complete -c $cmd -l recommended -d 'Auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (still asks GUEST/HOST)'
 complete -c $cmd -l reset-usb-mitigation -d 'Remove only USB mitigation artifacts'
 complete -c $cmd -l disable-bootlog -d 'Disable/remove optional VFIO boot-log dumper'
 complete -c $cmd -l boot-remove -d 'Alias of --disable-bootlog'
@@ -843,7 +880,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -934,6 +971,7 @@ _vfio_sh_complete() {
     '--reset[Remove VFIO setup installed by this script]' \\
     '--full[With --reset: also remove the self-installed vfio CLI + completions (repo script untouched)]' \\
     '--reset-usb-mitigation[Remove only USB mitigation artifacts]' \\
+    '--recommended[Auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (still asks GUEST/HOST)]' \\
     '--disable-bootlog[Disable/remove optional VFIO boot-log dumper]' \\
     '--boot-remove[Alias of --disable-bootlog]' \\
     '--remove-bootlog[Alias of --disable-bootlog]' \
@@ -1496,6 +1534,30 @@ prompt_yn() {
   # prompt_yn "Question" default(Y/N) [title]
   local q="$1"; local def="${2:-Y}"; local title="${3:-Confirmation}"; local ans
 
+  # R39: --recommended mode auto-answers from the preset table (keyed by title).
+  # Fail-safe: a title NOT in the table still prompts. "Boot framebuffer
+  # mitigation" is computed live (Yes if the guest GPU is boot VGA, else No)
+  # rather than a static entry. The audit note goes to stderr so stdout stays
+  # clean for callers that capture it.
+  if (( RECOMMENDED_MODE )) && [[ -n "$title" ]]; then
+    local _rec_ans=""
+    if [[ "$title" == "Boot framebuffer mitigation" ]]; then
+      if [[ -n "${CTX[guest_gpu]:-}" && "$(pci_boot_vga_flag "${CTX[guest_gpu]}" 2>/dev/null || echo unknown)" == "1" ]]; then
+        _rec_ans=0
+      else
+        _rec_ans=1
+      fi
+    elif [[ -n "${_RECOMMENDED_ANSWERS[$title]+x}" ]]; then
+      _rec_ans="${_RECOMMENDED_ANSWERS[$title]}"
+    fi
+    if [[ -n "$_rec_ans" ]]; then
+      local _rec_word="No"
+      (( _rec_ans == 0 )) && _rec_word="Yes"
+      printf '  -> recommended: %s -- %s\n' "$_rec_word" "$title" >&2
+      return "$_rec_ans"
+    fi
+  fi
+
   # TUI path: use whiptail if available.
   if (( HAS_TUI )); then
     local exit_status
@@ -1548,7 +1610,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1620,6 +1682,15 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                     + the fish/bash/zsh shell completions for a true "remove everything this script
                     installed". Your repo copy of vfio.sh is NEVER touched — only the installed
                     command. Without --full, --reset stays scoped to VFIO config + stealth/perf backups.
+  --recommended     Auto-apply vendor-aware RECOMMENDED answers to every wizard prompt after the
+                    GPU pick (you still choose which GPU is GUEST/HOST). Tunes the preset per detected
+                    GPU family: AMD RX 9070/RDNA4 -> dynamic binding + runpm/noretry/portpm stability
+                    + vBIOS pin, skips disable_idle_d3 (Navi 48), skips stealth/perf/live-attach;
+                    NVIDIA/Intel -> early binding + vBIOS pin, skips stealth/perf/live-attach.
+                    Safe/recommended prompts auto-answer Yes; advanced/risky ones (blacklist, USB
+                    mitigation, SELinux off, ACS, boot-log, stealth/perf) auto-answer No. Destructive
+                    confirms (BLACKLIST, REMOVE DEFAULT KERNEL) STILL require typing. Explicit CLI
+                    flags (--no-vbios etc.) override the preset. Zero-click after the GPU pick.
   --reset-usb-mitigation
                    Reset/remove only USB mitigation artifacts (helper/unit/udev/match policy),
                    including USB Ethernet EEE-off mitigation config, while keeping core VFIO GPU setup.
@@ -1956,6 +2027,9 @@ parse_args() {
       --full)
         RESET_FULL=1
         ;;
+      --recommended)
+        RECOMMENDED_MODE=1
+        ;;
       --reset-usb-mitigation)
         MODE="reset-usb-mitigation"
         ;;
@@ -2201,6 +2275,15 @@ assert_not_equal() {
 confirm_phrase() {
   # confirm_phrase "Prompt" "PHRASE"
   local prompt="$1" phrase="$2" ans
+
+  # R39: --recommended auto-accepts ONLY acknowledgement phrases ("I UNDERSTAND"
+  # — ReBAR / hostile-kernel / in-use-GPU acks). Destructive phrases (BLACKLIST,
+  # REMOVE DEFAULT KERNEL, RESET VFIO, INSTALL/BUILD/SWITCH/CREATE/REPAIR/REMOVE
+  # ...) stay gated and still require typing — stupid-proof.
+  if (( RECOMMENDED_MODE )) && [[ "$phrase" == "I UNDERSTAND" ]]; then
+    printf '  -> recommended: accepted acknowledgement -- %s\n' "$phrase" >&2
+    return 0
+  fi
 
   # R38: GUI path so the destructive/safety confirmation stays in the TUI
   # (whiptail --inputbox) and the operator never has to drop to a plain CLI
@@ -8511,6 +8594,98 @@ _is_rx9070() {
   _device="${_cfg:6:2}${_cfg:4:2}"
   [[ "${_vendor,,}" == "1002" ]] || return 1
   [[ "${_device,,}" == "$_RX9070_DEVICE_ID" ]]
+}
+
+# R39: Detect the guest GPU family from LIVE config space (first 4 bytes), so
+# the recommended preset engine works even on a card that is mid-recovery (same
+# rationale as _is_rx9070: sysfs vendor is cached; live config space is real).
+# Returns a family token on stdout: amd-rdna4 | amd-other | nvidia | intel |
+# unknown. Used by _apply_recommended_overrides and the GUI preset preview.
+_guest_gpu_family() {
+  local _bdf="${1:-}" _sys _cfg _vendor _device
+  [[ -n "$_bdf" ]] || { echo unknown; return 0; }
+  _sys="/sys/bus/pci/devices/$_bdf"
+  if [[ ! -d "$_sys" ]]; then
+    echo unknown
+    return 0
+  fi
+  _cfg="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  if [[ -z "$_cfg" || "$_cfg" == "ffffffff" ]]; then
+    # Live config space unreadable / card off-bus: fall back to sysfs vendor.
+    _vendor="$(sysfs_read "$_bdf" vendor 2>/dev/null || true)"
+    _device=""
+  else
+    _vendor="${_cfg:2:2}${_cfg:0:2}"
+    _device="${_cfg:6:2}${_cfg:4:2}"
+  fi
+  case "${_vendor,,}" in
+    1002)
+      if [[ -n "$_device" && "${_device,,}" == "$_RX9070_DEVICE_ID" ]]; then
+        echo amd-rdna4
+      else
+        echo amd-other
+      fi
+      ;;
+    10de) echo nvidia ;;
+    8086) echo intel ;;
+    *) echo unknown ;;
+  esac
+  return 0
+}
+
+# R39: Preset engine — fill the knob-style OVERRIDE vars with vendor-aware
+# recommended values. Called once in user_selection right after the GPU pick,
+# BEFORE any prompt fires. Only sets a var if it is currently EMPTY, so explicit
+# CLI flags (--no-vbios, --binding-mode early, etc.) always beat the preset
+# (stupid-proof). The prompt-level answers (yes/no prompts) are handled by the
+# _RECOMMENDED_ANSWERS table in prompt_yn, NOT here.
+_apply_recommended_overrides() {
+  local _family="${1:-unknown}"
+  case "$_family" in
+    amd-rdna4)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=dynamic
+      [[ -z "${AMD_RUNPM_OVERRIDE:-}" ]]           && AMD_RUNPM_OVERRIDE=1
+      [[ -z "${AMD_NORETRY_OVERRIDE:-}" ]]         && AMD_NORETRY_OVERRIDE=1
+      [[ -z "${AMD_PORTPM_OVERRIDE:-}" ]]          && AMD_PORTPM_OVERRIDE=1
+      [[ -z "${AMD_D3_OVERRIDE:-}" ]]              && AMD_D3_OVERRIDE=0
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    amd-other)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=dynamic
+      [[ -z "${AMD_RUNPM_OVERRIDE:-}" ]]           && AMD_RUNPM_OVERRIDE=1
+      [[ -z "${AMD_NORETRY_OVERRIDE:-}" ]]         && AMD_NORETRY_OVERRIDE=1
+      [[ -z "${AMD_PORTPM_OVERRIDE:-}" ]]          && AMD_PORTPM_OVERRIDE=1
+      [[ -z "${AMD_D3_OVERRIDE:-}" ]]              && AMD_D3_OVERRIDE=1
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    nvidia)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=early
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    intel)
+      [[ -z "${BINDING_MODE_OVERRIDE:-}" ]]       && BINDING_MODE_OVERRIDE=early
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+    unknown)
+      # Binding left to the script's existing default logic (empty).
+      [[ -z "${VBIOS_INJECTION_OVERRIDE:-}" ]]     && VBIOS_INJECTION_OVERRIDE=1
+      [[ -z "${STEALTH_VM_TUNING_OVERRIDE:-}" ]]   && STEALTH_VM_TUNING_OVERRIDE=0
+      [[ -z "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" ]] && ULTIMATE_PERF_VM_TUNING_OVERRIDE=0
+      [[ -z "${LIVE_ATTACH_OVERRIDE:-}" ]]         && LIVE_ATTACH_OVERRIDE=0
+      ;;
+  esac
 }
 
 # Read a 16-bit PCI config word via setpci as a clean 4-hex-digit lowercase
@@ -22343,6 +22518,17 @@ In the colored terminal output, GUEST is shown in RED and HOST in GREEN."
   CTX[host_gpu]="${gpu_bdfs[$host_idx]}"
   CTX[guest_vendor]="${gpu_vendor_ids[$guest_idx]}"
 
+  # R39: --recommended — apply the vendor-aware preset + show a preview/gate
+  # AFTER the GPU pick (the one choice that can't be auto-made safely). Fills
+  # only currently-empty override vars so explicit CLI flags always win.
+  if (( RECOMMENDED_MODE )); then
+    local _rec_family _rec_desc
+    _rec_family="$(_guest_gpu_family "${CTX[guest_gpu]}")"
+    _apply_recommended_overrides "$_rec_family"
+    _rec_desc="$(short_gpu_desc "${gpu_descs[$guest_idx]}")"
+    _show_recommended_preset "$_rec_family" "${CTX[guest_gpu]}" "$_rec_desc"
+  fi
+
   # Resizable BAR status for the selected guest GPU. This is informational
   # but we make it explicit because on some platforms ReBAR being enabled
   # or disabled can be the difference between a black screen and a working
@@ -22605,6 +22791,75 @@ The HOST GPU stays on your desktop."
   CTX[guest_audio_csv]="$guest_audio_csv"
   CTX[host_audio_bdfs_csv]="$host_audio_bdfs_csv"
   CTX[host_audio_node_name]="$host_audio_node_name"
+}
+
+# R39: Preview the recommended preset for the detected GPU family and require one
+# confirmation (the single gate). GUI path = popup; CLI = framed card. The gate
+# prompt title "Recommended preset" is deliberately NOT in the auto-answer
+# table so it cannot auto-answer itself. If the user declines, abort (stupid-
+# proof: no silent mass-apply without consent).
+_show_recommended_preset() {
+  local _family="${1:-unknown}" _bdf="${2:-}" _desc="${3:-}"
+  local _fam_lbl
+  case "$_family" in
+    amd-rdna4) _fam_lbl="AMD RX 9070 / RDNA4 (Navi 48)" ;;
+    amd-other) _fam_lbl="AMD (other)" ;;
+    nvidia)    _fam_lbl="NVIDIA" ;;
+    intel)     _fam_lbl="Intel" ;;
+    *)         _fam_lbl="Unknown vendor" ;;
+  esac
+  # Human-readable override values (after the engine filled them).
+  local _bm="${BINDING_MODE_OVERRIDE:-auto}"
+  local _d3 _runpm _noretry _portpm _vbios _stealth _perf _la
+  case "${AMD_D3_OVERRIDE:-}"              in 1) _d3="on";;      0) _d3="off";;      *) _d3="skip";;  esac
+  case "${AMD_RUNPM_OVERRIDE:-}"           in 1) _runpm="on";;   0) _runpm="off";;   *) _runpm="skip";; esac
+  case "${AMD_NORETRY_OVERRIDE:-}"         in 1) _noretry="on";; 0) _noretry="off";; *) _noretry="skip";; esac
+  case "${AMD_PORTPM_OVERRIDE:-}"          in 1) _portpm="on";;  0) _portpm="off";;  *) _portpm="skip";; esac
+  case "${VBIOS_INJECTION_OVERRIDE:-}"     in 1) _vbios="on";;   0) _vbios="off";;   *) _vbios="prompt";; esac
+  case "${STEALTH_VM_TUNING_OVERRIDE:-}"   in 1) _stealth="on";;  0) _stealth="off";; *) _stealth="prompt";; esac
+  case "${ULTIMATE_PERF_VM_TUNING_OVERRIDE:-}" in 1) _perf="on";;  0) _perf="off";;  *) _perf="prompt";; esac
+  case "${LIVE_ATTACH_OVERRIDE:-}"         in 1) _la="on";;      0) _la="off";;      *) _la="prompt";;  esac
+
+  if (( HAS_TUI )); then
+    gui_msgbox "Recommended preset -- $_fam_lbl" \
+"Detected guest GPU: $_bdf
+Family: $_fam_lbl
+Model: $_desc
+
+Recommended settings that will be auto-applied:
+  Binding mode:        $_bm
+  vBIOS ROM pin:       $_vbios
+  stealth/perf tuning: $_stealth
+  ultimate-perf:       $_perf
+  live-attach:         $_la
+  amdgpu.runpm=0:      $_runpm
+  amdgpu.noretry=0:    $_noretry
+  pcie_port_pm=off:    $_portpm
+  disable_idle_d3=1:   $_d3
+
+Safe/recommended prompts auto-answer Yes; advanced/risky ones (blacklist,
+USB mitigation, SELinux off, ACS, boot-log, stealth/perf) auto-answer No.
+Destructive confirms (BLACKLIST, REMOVE DEFAULT KERNEL) STILL require typing."
+  else
+    _boxed_block "Recommended preset -- $_fam_lbl" \
+      "Detected guest GPU: $_bdf" \
+      "Family: $_fam_lbl" \
+      "Model: $_desc" \
+      "" \
+      "Binding mode:        $_bm" \
+      "vBIOS ROM pin:       $_vbios" \
+      "stealth/perf tuning: $_stealth" \
+      "ultimate-perf:       $_perf" \
+      "live-attach:         $_la" \
+      "amdgpu.runpm=0:      $_runpm" \
+      "amdgpu.noretry=0:    $_noretry" \
+      "pcie_port_pm=off:    $_portpm" \
+      "disable_idle_d3=1:   $_d3"
+  fi
+  # The single confirmation gate (title NOT in the auto-answer table).
+  if ! prompt_yn "Apply these recommended settings? (you already picked GUEST/HOST; everything else is auto)" Y "Recommended preset"; then
+    die "Aborted: --recommended preset declined by user."
+  fi
 }
 
 apply_configuration() {
@@ -23601,6 +23856,7 @@ vfio_menu() {
       "Reset everything (full cleanup, removes all VFIO config)"
       "Install vfio to /usr/local/bin (+ shell completions)"
       "Uninstall the self-installed vfio (+ completions)"
+      "Full configure (recommended defaults — auto-answers after GPU pick)"
       "Exit menu"
     )
     say
@@ -23773,6 +24029,16 @@ vfio_menu() {
         uninstall_self
         ;;
       14)
+        # Full configure with --recommended defaults (R39).
+        say
+        note "Starting full configure with recommended defaults..."
+        RECOMMENDED_MODE=1
+        require_systemd
+        detect_system
+        user_selection
+        apply_configuration
+        ;;
+      15)
         # Exit.
         say
         say "Exiting vfio.sh menu."

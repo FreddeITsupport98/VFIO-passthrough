@@ -161,6 +161,21 @@ VIRTIO_WIN_REPO_URL="https://fedorapeople.org/groups/virt/virtio-win/virtio-win.
 # Stable virtio-win RPM (for the openSUSE manual-install fallback when zypper has no
 # matching repo): download it and `sudo rpm -iv virtio-win.noarch.rpm`.
 VIRTIO_WIN_RPM_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm"
+# R40: Looking Glass (low-latency guest display mirror) host-side setup.
+# Absorbed from looking-glass-setup/look-setup.sh (VM-setup portion only;
+# vBIOS is NOT duplicated here -- vfio.sh already does vBIOS injection via
+# --vbios / install_vbios_romfile). The client binary is NOT auto-compiled;
+# --install-looking-glass sets up the shared memory + VM <shmem> device +
+# security context + user config, and prints distro-aware install hints if
+# /usr/local/bin/looking-glass-client is absent (the user installs the package
+# themselves). Removed by --remove-looking-glass and --reset.
+LG_SHMEM_TMPFILES="/etc/tmpfiles.d/10-looking-glass.conf"
+LG_SHMEM_NODE="/dev/shm/looking-glass"
+LG_SHMEM_NAME="looking-glass"
+LG_APPARMOR_LOCAL="/etc/apparmor.d/local/abstractions/libvirt-qemu"
+LG_USER_INI=".looking-glass-client.ini"
+LG_CLIENT_BIN="/usr/local/bin/looking-glass-client"
+LG_DEFAULT_SIZE=64
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
 # PATH for both root and users; the generated boot-time helpers stay in
 # /usr/local/sbin) and drops the
@@ -179,7 +194,7 @@ RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completion
 RECOMMENDED_MODE=0   # 1=--recommended: auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (R39)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | menu | install-self | uninstall-self | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -271,6 +286,8 @@ _RECOMMENDED_ANSWERS["Boot target"]=1
 _RECOMMENDED_ANSWERS["Custom kernel parameters"]=1
 _RECOMMENDED_ANSWERS["Existing VFIO config"]=1
 _RECOMMENDED_ANSWERS["Host audio unit"]=0
+_RECOMMENDED_ANSWERS["Looking Glass"]=1
+_RECOMMENDED_ANSWERS["Looking Glass ReBAR"]=1
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
@@ -826,6 +843,8 @@ complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-live-attach -d 'Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay'
 complete -c $cmd -l install-virtio-win-guest-agent -d 'Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)'
+complete -c $cmd -l install-looking-glass -d 'Set up Looking Glass host side: shared memory + <shmem> device on guest-GPU VMs + user config (client binary NOT auto-installed)'
+complete -c $cmd -l remove-looking-glass -d 'Remove Looking Glass host-side setup (detach shmem + shared-memory node + security rules + user config)'
 complete -c $cmd -l menu -d 'Interactive menu — pick what to do without running the whole wizard'
 complete -c $cmd -l install-self -d 'Install this script to /usr/local/sbin + shell completions (auto-load)'
 complete -c $cmd -l uninstall-self -d 'Remove the self-installed vfio.sh + completion files'
@@ -880,7 +899,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -940,6 +959,8 @@ _vfio_sh_complete() {
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-live-attach[Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay]' \\
     '--install-virtio-win-guest-agent[Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)]' \\
+    '--install-looking-glass[Set up Looking Glass host side: shared memory + shmem device on guest-GPU VMs + user config (client binary NOT auto-installed)]' \\
+    '--remove-looking-glass[Remove Looking Glass host-side setup (detach shmem + shared-memory node + security rules + user config)]' \\
     '--menu[Interactive menu — pick what to do without running the whole wizard]' \\
     '--install-self[Install this script to /usr/local/sbin + shell completions (auto-load)]' \\
     '--uninstall-self[Remove the self-installed vfio.sh + completion files]' \\
@@ -1620,7 +1641,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1759,6 +1780,21 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   fixed delay. Resolves the ISO via the distro virtio-win package (dnf/zypper) or
                   downloads the stable ISO from fedorapeople.org. Requires --install-live-attach to
                   be run first. The fixed-delay FALLBACK still works until the agent is installed.
+  --install-looking-glass
+                  Set up the Looking Glass host side for each shut-off guest-GPU VM: creates the
+                  /dev/shm/looking-glass shared-memory backing file (tmpfiles.d + perms +
+                  SELinux/AppArmor), attaches a <shmem name='looking-glass'> ivshmem-plain
+                  device to the VM XML, and writes ~/.looking-glass-client.ini (shmFile + spice +
+                  wayland). Optionally enables ReBAR 64-bit MMIO on the VM (opt-in sub-prompt).
+                  vBIOS is NOT touched (use --vbios for vBIOS injection). The looking-glass-client
+                  binary is NOT auto-installed — the script prints distro-aware install hints.
+                  Requires an existing $CONF_FILE and libvirt. Idempotent.
+  --remove-looking-glass
+                  Remove the Looking Glass host-side setup: detach the <shmem> device from each
+                  guest-GPU VM (and disable the ReBAR fw_cfg arg if present), remove the tmpfiles
+                  config + /dev/shm/looking-glass node + AppArmor/SELinux rules + the user
+                  ~/.looking-glass-client.ini. Best-effort. The looking-glass-client package, if
+                  you installed it, is left untouched (uninstall via your package manager).
   --menu
                   Interactive menu — pick what to do without running the whole wizard or
                   remembering individual flags. This is also the default when you run vfio
@@ -2072,6 +2108,12 @@ parse_args() {
         ;;
       --install-virtio-win-guest-agent)
         MODE="install-virtio-win-guest-agent"
+        ;;
+      --install-looking-glass)
+        MODE="install-looking-glass"
+        ;;
+      --remove-looking-glass)
+        MODE="remove-looking-glass"
         ;;
       --menu)
         MODE="menu"
@@ -14124,6 +14166,552 @@ _reconcile_perf_hugepages_owned() {
   done < "$PERF_HP_DIRS_FILE"
 }
 
+# ===================== R40: Looking Glass (host-side VM setup) =====================
+# Absorbed from looking-glass-setup/look-setup.sh. Sets up the shared-memory
+# backing file (/dev/shm/looking-glass via tmpfiles.d), SELinux/AppArmor
+# security context, attaches a <shmem name='looking-glass'><model
+# type='ivshmem-plain'/> device to each shut-off guest-GPU VM, generates the
+# user's ~/.looking-glass-client.ini, and optionally enables ReBAR 64-bit MMIO
+# on the VM. vBIOS is NOT handled here (vfio.sh already does vBIOS injection).
+# The client binary is NOT auto-compiled; install_looking_glass prints
+# distro-aware install hints if /usr/local/bin/looking-glass-client is absent.
+
+# Detect the desktop display server for the user-config fractionalScale knob.
+# Reuses vfio.sh's wayland_stack_status/xorg_stack_status (defined earlier).
+# Prints "wayland" | "x11" | "unknown".
+_lg_detect_display_server() {
+  if [[ "$(wayland_stack_status 2>/dev/null || echo NOT_PRESENT)" == "WORKS" ]]; then
+    echo wayland
+  elif [[ "$(xorg_stack_status 2>/dev/null || echo NOT_PRESENT)" == "WORKS" ]]; then
+    echo x11
+  else
+    echo unknown
+  fi
+}
+
+# Idempotent INI merge: ensure [section] key=value exists in $1. (Port of
+# look-setup.sh merge_ini_setting, DRY_RUN-aware.)
+_lg_merge_ini_setting() {
+  local file="$1" section="$2" key="$3" value="$4"
+  if (( DRY_RUN )); then
+    note "[DRY-RUN] would ensure [$section] $key=$value in $file"
+    return 0
+  fi
+  if [[ ! -f "$file" ]]; then
+    printf '[%s]\n%s=%s\n' "$section" "$key" "$value" >"$file"
+    return 0
+  fi
+  if ! grep -q "^\[${section}\]$" "$file" 2>/dev/null; then
+    printf '\n[%s]\n%s=%s\n' "$section" "$key" "$value" >>"$file"
+    return 0
+  fi
+  local in_section=0 key_exists=0 line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == "[$section]" ]]; then in_section=1; continue; fi
+    if (( in_section )) && [[ "$line" =~ ^\[.*\]$ ]]; then break; fi
+    if (( in_section )) && [[ "${line#"$key="}" != "$line" ]]; then key_exists=1; break; fi
+  done < "$file" || true
+  (( key_exists )) && return 0
+  local tmp_file orig_stat
+  orig_stat="$(stat -c '%u:%g' "$file" 2>/dev/null || true)"
+  tmp_file="$(mktemp)"
+  local inserted=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$line" >>"$tmp_file"
+    if (( ! inserted )) && [[ "$line" == "[$section]" ]]; then
+      printf '%s=%s\n' "$key" "$value" >>"$tmp_file"
+      inserted=1
+    fi
+  done < "$file"
+  cat "$tmp_file" >"$file"
+  rm -f "$tmp_file" || true
+  [[ -n "$orig_stat" ]] && chown "$orig_stat" "$file" 2>/dev/null || true
+}
+
+# Write /etc/tmpfiles.d/10-looking-glass.conf (idempotent) + create the node now.
+_lg_write_tmpfiles() {
+  local qemu_user="qemu" qemu_group="qemu"
+  if ! id -u "$qemu_user" >/dev/null 2>&1; then qemu_user="root"; fi
+  if ! getent group "$qemu_group" >/dev/null 2>&1; then qemu_group="root"; fi
+  local desired_line="f ${LG_SHMEM_NODE} 0666 ${qemu_user} ${qemu_group} -"
+  note "Configuring persistent shared memory (owner: ${qemu_user}:${qemu_group}, mode 0666)"
+  if [[ -f "$LG_SHMEM_TMPFILES" ]] && [[ "$(head -n1 "$LG_SHMEM_TMPFILES" 2>/dev/null)" == "$desired_line" ]]; then
+    say "  tmpfiles config already up to date."
+  else
+    if (( ! DRY_RUN )); then
+      printf '%s\n' "$desired_line" >"$LG_SHMEM_TMPFILES"
+    fi
+  fi
+  if (( ! DRY_RUN )) && command -v systemd-tmpfiles >/dev/null 2>&1; then
+    run systemd-tmpfiles --create "$LG_SHMEM_TMPFILES" 2>/dev/null || true
+  fi
+}
+
+# Recreate + resize the /dev/shm/looking-glass node to ${1}MB and fix perms +
+# SELinux context. Best-effort. (Port of resize_shared_memory.)
+_lg_resize_shmem() {
+  local size="${1:-$LG_DEFAULT_SIZE}"
+  local qemu_user="qemu" qemu_group="qemu"
+  if ! id -u "$qemu_user" >/dev/null 2>&1; then qemu_user="root"; fi
+  if ! getent group "$qemu_group" >/dev/null 2>&1; then qemu_group="root"; fi
+  note "Resizing shared-memory node to ${size}MB and fixing permissions..."
+  if (( DRY_RUN )); then
+    note "[DRY-RUN] would resize ${LG_SHMEM_NODE} to ${size}MB + set perms/SELinux."
+    return 0
+  fi
+  # A restrictive SELinux type on an existing node can give EPERM even to root;
+  # remove + recreate to get a clean writable tmpfs node, then re-chcon.
+  [[ -e "$LG_SHMEM_NODE" ]] && rm -f "$LG_SHMEM_NODE" 2>/dev/null || true
+  touch "$LG_SHMEM_NODE" 2>/dev/null || note "WARN: cannot create $LG_SHMEM_NODE as root."
+  local resized=false
+  if truncate -s "${size}M" "$LG_SHMEM_NODE" 2>/dev/null; then
+    resized=true
+  elif fallocate -l "${size}M" "$LG_SHMEM_NODE" 2>/dev/null; then
+    resized=true
+  elif command -v dd >/dev/null 2>&1 && dd if=/dev/zero of="$LG_SHMEM_NODE" bs=1M count="$size" conv=notrunc 2>/dev/null; then
+    resized=true
+    say "  Resized via dd fallback."
+  fi
+  if [[ -e "$LG_SHMEM_NODE" ]]; then
+    chown "$qemu_user:$qemu_group" "$LG_SHMEM_NODE" 2>/dev/null || true
+    chmod 666 "$LG_SHMEM_NODE" 2>/dev/null || true
+  fi
+  if command -v getenforce >/dev/null 2>&1 && command -v chcon >/dev/null 2>&1; then
+    if [[ "$(getenforce 2>/dev/null)" != "Disabled" ]]; then
+      chcon -t svirt_tmpfs_t "$LG_SHMEM_NODE" 2>/dev/null || true
+    fi
+  fi
+  if $resized; then
+    say "  ✔ Shared-memory node resized to ${size}MB."
+  else
+    note "WARN: shared-memory resize incomplete — VM may fail to start. Try: rm -f $LG_SHMEM_NODE && systemd-tmpfiles --create $LG_SHMEM_TMPFILES"
+  fi
+}
+
+# SELinux semanage fcontext + AppArmor local abstraction rule (idempotent).
+_lg_setup_security() {
+  if command -v getenforce >/dev/null 2>&1 && command -v chcon >/dev/null 2>&1; then
+    if [[ "$(getenforce 2>/dev/null)" != "Disabled" ]]; then
+      [[ -e "$LG_SHMEM_NODE" ]] && run chcon -t svirt_tmpfs_t "$LG_SHMEM_NODE" 2>/dev/null || true
+      if command -v semanage >/dev/null 2>&1 && (( ! DRY_RUN )); then
+        semanage fcontext -a -t svirt_tmpfs_t "$LG_SHMEM_NODE" 2>/dev/null \
+          || semanage fcontext -m -t svirt_tmpfs_t "$LG_SHMEM_NODE" 2>/dev/null || true
+      fi
+    fi
+  fi
+  if command -v aa-status >/dev/null 2>&1 && [[ -d "$(dirname "$LG_APPARMOR_LOCAL")" ]]; then
+    if [[ ! -f "$LG_APPARMOR_LOCAL" ]] && (( ! DRY_RUN )); then
+      touch "$LG_APPARMOR_LOCAL" 2>/dev/null || true
+    fi
+    if [[ -f "$LG_APPARMOR_LOCAL" ]] && ! grep -qF "${LG_SHMEM_NODE} rw," "$LG_APPARMOR_LOCAL" 2>/dev/null; then
+      if (( ! DRY_RUN )); then
+        printf '%s\n' "${LG_SHMEM_NODE} rw," >>"$LG_APPARMOR_LOCAL"
+        command -v systemctl >/dev/null 2>&1 && run systemctl reload apparmor 2>/dev/null || true
+      fi
+      say "  ✔ AppArmor rule added for $LG_SHMEM_NODE."
+    fi
+  fi
+}
+
+# Read a VM's existing looking-glass shmem size (MB) from its persistent XML.
+_lg_vm_shmem_size() {
+  local dom="$1"
+  virsh -c qemu:///system dumpxml --inactive "$dom" 2>/dev/null \
+    | grep -oE "<size unit='M'>[0-9]+" | grep -oE '[0-9]+$' | head -n1
+}
+
+# 0 if the VM persistent XML already has a looking-glass shmem device.
+_lg_vm_has_shmem() {
+  local dom="$1"
+  virsh -c qemu:///system dumpxml --inactive "$dom" 2>/dev/null \
+    | grep -q "model type='ivshmem-plain'"
+}
+
+# Attach (or replace) the <shmem name='looking-glass'> ivshmem-plain device.
+# Idempotent python3 patcher: exit 3 = already configured with the same size;
+# exit 0 = patched (caller validates + redefines). Dedups any leftover
+# duplicate looking-glass shmem devices from a prior swap.
+# $1 = path to a temp file holding the VM dumpxml, $2 = size MB.
+_lg_attach_shmem_to_vm() {
+  local _xml_file="$1" _size="$2"
+  python3 - "$_xml_file" "$_size" "$LG_SHMEM_NAME" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path, size, name = sys.argv[1], sys.argv[2], sys.argv[3]
+ET.register_namespace('qemu', 'http://libvirt.org/schemas/domain/qemu/1.0')
+tree = ET.parse(path); root = tree.getroot()
+devices = root.find('devices')
+if devices is None:
+    sys.exit(1)
+# Find existing looking-glass shmem devices (by name attribute).
+existing = [s for s in devices.findall('shmem') if s.get('name') == name]
+if existing:
+    # Check the first one's size; if it matches, idempotent no-op (exit 3).
+    sz_el = existing[0].find('size')
+    cur = sz_el.text.strip() if sz_el is not None and sz_el.text else ''
+    if cur == str(size) and len(existing) == 1:
+        sys.exit(3)
+    # Otherwise remove ALL existing looking-glass shmem (dedup) then re-add.
+    for s in existing:
+        devices.remove(s)
+shmem = ET.SubElement(devices, 'shmem', {'name': name})
+ET.SubElement(shmem, 'model', {'type': 'ivshmem-plain'})
+ET.SubElement(shmem, 'size', {'unit': 'M'}).text = str(size)
+tree.write(path)
+sys.exit(0)
+PYEOF
+}
+
+# Remove every looking-glass shmem device from a VM's persistent XML via virsh
+# detach-device (dedup loop, best-effort). $1 = dom.
+_lg_remove_shmem_from_vm() {
+  local dom="$1" attempt=0 max=10 removed=0
+  if (( DRY_RUN )); then
+    note "[DRY-RUN] would remove looking-glass shmem device(s) from '$dom'."
+    return 0
+  fi
+  local tmp_xml
+  while (( attempt < max )); do
+    if ! _lg_vm_has_shmem "$dom"; then break; fi
+    attempt=$((attempt + 1))
+    tmp_xml="$(mktemp)"
+    cat >"$tmp_xml" <<XMLEOF
+<shmem name='${LG_SHMEM_NAME}'>
+  <model type='ivshmem-plain'/>
+</shmem>
+XMLEOF
+    if virsh -c qemu:///system detach-device --config "$dom" "$tmp_xml" 2>/dev/null; then
+      removed=$((removed + 1))
+    elif (( attempt > 1 )); then
+      break
+    fi
+    rm -f "$tmp_xml"
+  done
+  (( removed )) && say "  ✔ Removed $removed looking-glass shmem device(s) from '$dom'."
+}
+
+# 0 if the VM persistent XML already has the ReBAR 64-bit MMIO fw_cfg arg.
+_lg_vm_has_rebar() {
+  local dom="$1"
+  virsh -c qemu:///system dumpxml --inactive "$dom" 2>/dev/null \
+    | grep -q 'opt/ovmf/X-PciMmio64Mb'
+}
+
+# Enable ReBAR 64-bit MMIO (64GB aperture) on a VM via qemu:commandline fw_cfg.
+# Idempotent: exit 3 = already present; exit 0 = patched (caller validates +
+# redefines). $1 = path to a temp file holding the VM dumpxml.
+_lg_enable_vm_rebar() {
+  local _xml_file="$1"
+  python3 - "$_xml_file" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+QEMU = 'http://libvirt.org/schemas/domain/qemu/1.0'
+ET.register_namespace('qemu', QEMU)
+path = sys.argv[1]
+tree = ET.parse(path); root = tree.getroot()
+# Find or create qemu:commandline (ElementTree auto-declares xmlns:qemu on write
+# via register_namespace — do NOT root.set('xmlns:qemu', ...) or it duplicates
+# the declaration and breaks re-parse with "duplicate attribute").
+cl = root.find('{%s}commandline' % QEMU)
+# Idempotent: already has the X-PciMmio64Mb arg?
+if cl is not None:
+    for arg in cl.findall('{%s}arg' % QEMU):
+        if 'X-PciMmio64Mb' in (arg.get('value', '') or ''):
+            sys.exit(3)
+if cl is None:
+    cl = ET.SubElement(root, '{%s}commandline' % QEMU)
+ET.SubElement(cl, '{%s}arg' % QEMU, {'value': '-fw_cfg'})
+ET.SubElement(cl, '{%s}arg' % QEMU, {'value': 'opt/ovmf/X-PciMmio64Mb,string=65536'})
+tree.write(path)
+sys.exit(0)
+PYEOF
+}
+
+# Disable ReBAR 64-bit MMIO on a VM: remove the fw_cfg X-PciMmio64Mb args (and
+# the qemu:commandline if it becomes empty). Idempotent: exit 3 = not present.
+# $1 = path to a temp file holding the VM dumpxml.
+_lg_disable_vm_rebar() {
+  local _xml_file="$1"
+  python3 - "$_xml_file" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+QEMU = 'http://libvirt.org/schemas/domain/qemu/1.0'
+ET.register_namespace('qemu', QEMU)
+path = sys.argv[1]
+tree = ET.parse(path); root = tree.getroot()
+cl = root.find('{%s}commandline' % QEMU)
+if cl is None:
+    sys.exit(3)
+# Find and remove the -fw_cfg pair carrying X-PciMmio64Mb (clean single pass;
+# the args list holds element refs so cl.remove works by identity).
+args = list(cl.findall('{%s}arg' % QEMU))
+removed = 0
+for i, a in enumerate(args):
+    if a.get('value') == '-fw_cfg' and i + 1 < len(args) and 'X-PciMmio64Mb' in (args[i+1].get('value', '') or ''):
+        cl.remove(args[i+1])
+        cl.remove(a)
+        removed += 1
+        break
+if removed == 0:
+    sys.exit(3)
+if len(list(cl)) == 0:
+    root.remove(cl)
+tree.write(path)
+sys.exit(0)
+PYEOF
+}
+
+# Generate/merge ~/.looking-glass-client.ini for $SUDO_USER: shmFile + spice
+# enable/audio + wayland fractionalScale (when the session is Wayland).
+_lg_generate_user_config() {
+  local user="${SUDO_USER:-}"
+  [[ -n "$user" && "$user" != "root" ]] || return 0
+  local home conf display_type
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$home" && -d "$home" ]] || return 0
+  conf="$home/$LG_USER_INI"
+  display_type="$(_lg_detect_display_server)"
+  note "Ensuring Looking Glass client config for $user (display: ${display_type})..."
+  if (( ! DRY_RUN )); then
+    [[ -f "$conf" ]] || touch "$conf" 2>/dev/null || true
+    chown "$user:$(id -gn "$user" 2>/dev/null || echo "$user")" "$conf" 2>/dev/null || true
+  fi
+  _lg_merge_ini_setting "$conf" "app" "shmFile" "$LG_SHMEM_NODE"
+  _lg_merge_ini_setting "$conf" "spice" "enable" "yes"
+  _lg_merge_ini_setting "$conf" "spice" "audio" "yes"
+  if [[ "$display_type" == "wayland" ]]; then
+    _lg_merge_ini_setting "$conf" "wayland" "fractionalScale" "yes"
+  fi
+  say "  ✔ Client config: $conf"
+}
+
+# Print distro-aware install hints for the looking-glass-client binary when it
+# is absent. Does NOT auto-compile (host-user package concern, out of scope).
+_lg_client_install_hints() {
+  if [[ -x "$LG_CLIENT_BIN" ]]; then
+    say "  ✔ looking-glass-client already installed: $LG_CLIENT_BIN"
+    return 0
+  fi
+  note "looking-glass-client binary not found at $LG_CLIENT_BIN."
+  note "Install it yourself (this script does NOT auto-compile):"
+  if have_cmd dnf; then
+    note "  Fedora/RHEL:  sudo dnf copr enable agnelo/looking-glass && sudo dnf install -y looking-glass-client"
+  elif have_cmd pacman; then
+    note "  Arch/CachyOS: yay -S looking-glass   (or: paru -S looking-glass)"
+  elif have_cmd apt-get; then
+    note "  Debian/Ubuntu: build from source — see https://looking-glass.io/docs/B6/install/"
+  else
+    note "  See https://looking-glass.io/docs/ for your distro's install method."
+  fi
+}
+
+# Install Looking Glass host-side setup for each shut-off guest-GPU VM.
+# Idempotent. Honors DRY_RUN. Optional ReBAR sub-prompt (default N).
+install_looking_glass() {
+  readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run the full installer or --install-dynamic-binding first."
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+  [[ -n "${GUEST_GPU_BDF:-}" ]] || die "No GUEST_GPU_BDF in $CONF_FILE."
+  have_cmd virsh || die "virsh not available."
+  have_cmd python3 || die "python3 not available (the XML patcher needs python3)."
+  if ! libvirt_runtime_ok; then
+    note "WARN: libvirt is not reachable; Looking Glass VM setup needs libvirt to dump/define VM XML."
+    if ! prompt_yn "Continue anyway?" N "Looking Glass"; then return 0; fi
+  fi
+
+  say
+  hdr "Looking Glass setup (shared-memory display mirror)"
+  note "This sets up the host side so the passed-through VM's display can be mirrored"
+  note "to the host with low latency via Looking Glass:"
+  note "  - /dev/shm/looking-glass backing file (tmpfiles.d + perms + SELinux/AppArmor)"
+  note "  - a <shmem name='looking-glass'> ivshmem-plain device attached to each shut-off guest-GPU VM"
+  note "  - ~/.looking-glass-client.ini for $SUDO_USER (shmFile + spice + wayland)"
+  note "  - optional ReBAR 64-bit MMIO on the VM (helps the GPU map large BARs)"
+  note "vBIOS is NOT touched here (use --vbios / the wizard for vBIOS injection)."
+  note "The client binary is NOT auto-installed; you install looking-glass-client yourself."
+  say
+
+  # Shmem size menu (64/128/256/512 MB by target resolution).
+  local -a size_opts=("64 MB  — Full HD / 1080p" "128 MB — 1440p / QHD" "256 MB — 4K / UHD" "512 MB — Ultrawide 4K / High Refresh")
+  local size_idx size
+  size_idx="$(select_from_list "Pick the shared-memory size for your target resolution" "Looking Glass shmem size" "${size_opts[@]}")"
+  case "$size_idx" in
+    0) size=64;; 1) size=128;; 2) size=256;; 3) size=512;; *) size="$LG_DEFAULT_SIZE";;
+  esac
+  say "  Shared-memory size: ${size}MB"
+
+  # Optional ReBAR sub-prompt (default N).
+  local do_rebar=0
+  if prompt_yn "Also enable ReBAR 64-bit MMIO (-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536) on each tuned VM? (helps the GPU map large BARs)" N "Looking Glass ReBAR"; then
+    do_rebar=1
+  fi
+
+  local _dom _xml _state _found=0 _updated=0 _skipped_running=0
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+    _found=1
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
+      _skipped_running=1
+      continue
+    fi
+    say "Setting up Looking Glass for VM '$_dom'..."
+    local _tmp _py_status=0
+    _tmp="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp"
+    _lg_attach_shmem_to_vm "$_tmp" "$size" || _py_status=$?
+    if (( _py_status == 3 )); then
+      say "  VM '$_dom' already has a ${size}MB looking-glass shmem device; skipping (idempotent)."
+      _updated=1
+    elif (( _py_status != 0 )); then
+      note "WARN: shmem attach XML patching failed for '$_dom' (python exit $_py_status); skipping."
+      rm -f "$_tmp"
+      continue
+    fi
+    if (( do_rebar )); then
+      local _rb_status=0
+      _lg_enable_vm_rebar "$_tmp" || _rb_status=$?
+      (( _rb_status == 3 )) && say "  VM '$_dom' already has ReBAR 64-bit MMIO; keeping it."
+      # exit 0 = patched; non-0/non-3 = warn but continue (shmem is the main goal)
+      if (( _rb_status != 0 && _rb_status != 3 )); then
+        note "WARN: ReBAR patching failed for '$_dom' (python exit $_rb_status); continuing without ReBAR."
+      fi
+    fi
+    if ! virt-xml-validate "$_tmp" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for '$_dom'; skipping redefine."
+      rm -f "$_tmp"
+      continue
+    fi
+    if (( ! DRY_RUN )); then
+      virsh -c qemu:///system define "$_tmp" 2>/dev/null || note "WARN: virsh define failed for '$_dom'."
+    fi
+    say "  ✔ Attached ${size}MB looking-glass shmem to '$_dom'${do_rebar:+ (+ ReBAR)}."
+    _updated=1
+    rm -f "$_tmp"
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+
+  if (( ! _found )); then
+    note "No shut-off guest-GPU VMs found; nothing to attach. Run the full installer / --install-dynamic-binding first."
+  elif (( _skipped_running )) && (( ! _updated )); then
+    note "No VMs were updated (running VMs must be shut off first)."
+  fi
+
+  # Host-side: backing file + security + user config (only if at least one VM
+  # was handled or already configured — avoids creating the node for nothing).
+  if (( _found )); then
+    _lg_write_tmpfiles
+    _lg_resize_shmem "$size"
+    _lg_setup_security
+    _lg_generate_user_config
+    _lg_client_install_hints
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}${C_BOLD}✔ Looking Glass host-side setup complete${C_RESET}"
+    else
+      say "✔ Looking Glass host-side setup complete"
+    fi
+    note "Reboot the VM (full shutdown, not restart) so the <shmem> device appears, then run: looking-glass-client"
+  fi
+}
+
+# Remove Looking Glass host-side setup: detach shmem (+ disable ReBAR) from each
+# guest-GPU VM, remove tmpfiles + /dev/shm node + AppArmor rule + user ini.
+# Best-effort.
+remove_looking_glass() {
+  if ! have_cmd virsh; then
+    note "virsh not available; skipping Looking Glass VM cleanup."
+  elif ! libvirt_runtime_ok; then
+    note "libvirt not reachable; skipping Looking Glass VM cleanup (host-side files still removed below)."
+  else
+    local _dom _xml _state _did_vm=0
+    while IFS= read -r _dom; do
+      [[ -n "$_dom" ]] || continue
+      _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+      [[ -n "$_xml" ]] || continue
+      _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+      _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+      if [[ "$_state" != "shut off" ]]; then
+        note "WARN: VM '$_dom' is '$_state' (not shut off); skipping Looking Glass cleanup. Shut it off and re-run."
+        continue
+      fi
+      _lg_remove_shmem_from_vm "$_dom"
+      # Disable ReBAR only if we likely added it (heuristic: VM has it).
+      if _lg_vm_has_rebar "$_dom"; then
+        local _tmp _rbs=0
+        _tmp="$(mktemp)"; printf '%s\n' "$_xml" >"$_tmp"
+        _lg_disable_vm_rebar "$_tmp" || _rbs=$?
+        if (( _rbs == 0 )) && virt-xml-validate "$_tmp" 2>/dev/null && (( ! DRY_RUN )); then
+          virsh -c qemu:///system define "$_tmp" 2>/dev/null || true
+          say "  ✔ Disabled ReBAR 64-bit MMIO on '$_dom'."
+        fi
+        rm -f "$_tmp"
+      fi
+      _did_vm=1
+    done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+    (( _did_vm )) || note "No guest-GPU VMs needed Looking Glass cleanup."
+  fi
+
+  # Host-side files.
+  if [[ -f "$LG_SHMEM_TMPFILES" ]]; then
+    run rm -f "$LG_SHMEM_TMPFILES"; say "  ✔ Removed $LG_SHMEM_TMPFILES"
+  fi
+  if [[ -e "$LG_SHMEM_NODE" ]]; then
+    run rm -f "$LG_SHMEM_NODE"; say "  ✔ Removed $LG_SHMEM_NODE"
+  fi
+  if [[ -f "$LG_APPARMOR_LOCAL" ]] && grep -qF "${LG_SHMEM_NODE} rw," "$LG_APPARMOR_LOCAL" 2>/dev/null; then
+    local _atmp
+    _atmp="$(mktemp)"
+    grep -vF "${LG_SHMEM_NODE} rw," "$LG_APPARMOR_LOCAL" 2>/dev/null >"$_atmp" || true
+    cat "$_atmp" >"$LG_APPARMOR_LOCAL" 2>/dev/null || true
+    rm -f "$_atmp"
+    command -v systemctl >/dev/null 2>&1 && run systemctl reload apparmor 2>/dev/null || true
+    say "  ✔ Removed AppArmor rule for $LG_SHMEM_NODE"
+  fi
+  if command -v semanage >/dev/null 2>&1; then
+    semanage fcontext -d -t svirt_tmpfs_t "$LG_SHMEM_NODE" 2>/dev/null || true
+  fi
+  local _user="${SUDO_USER:-}"
+  if [[ -n "$_user" && "$_user" != "root" ]]; then
+    local _home _conf
+    _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+    _conf="${_home:-/home/$_user}/$LG_USER_INI"
+    if [[ -f "$_conf" ]]; then
+      run rm -f "$_conf"; say "  ✔ Removed $_conf"
+    fi
+  fi
+  note "Looking Glass host-side setup removed. (The looking-glass-client package, if you installed it, is left untouched — uninstall it via your package manager.)"
+}
+
+# Report Looking Glass status for --detect/--verify: prints one line per guest-
+# GPU VM with its shmem size + ReBAR state.
+looking_glass_status() {
+  if ! readable_file "$CONF_FILE"; then return 0; fi
+  have_cmd virsh || return 0
+  local _guest_gpu _dom _xml _sz _has_shmem _has_rebar
+  _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  [[ -n "$_guest_gpu" ]] || return 0
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+    _sz="$(grep -oE "<size unit='M'>[0-9]+" <<<"$_xml" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)"
+    _has_shmem=0; _has_rebar=0
+    grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null && _has_shmem=1
+    grep -q 'opt/ovmf/X-PciMmio64Mb' <<<"$_xml" 2>/dev/null && _has_rebar=1
+    local _tag="not configured"
+    if (( _has_shmem )); then
+      _tag="looking-glass shmem ${_sz}MB${_has_rebar:+ + ReBAR}"
+    fi
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}✔${C_RESET}: VM '$_dom' Looking Glass: $_tag"
+    else
+      say "OK: VM '$_dom' Looking Glass: $_tag"
+    fi
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+}
+
 # R35: Ultimate-performance VM XML tuning (stealth-safe). A SEPARATE, more
 # aggressive perf layer than the basic perf subset bundled inside
 # install_stealth_vm_tuning(). Applies maximum-throughput knobs to each shut-off
@@ -17685,6 +18273,18 @@ install_dynamic_binding_from_existing_config() {
     else
       note "Skipping ultimate-performance VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning"
     fi
+  fi
+
+  # 3e2. Looking Glass (opt-in) — low-latency guest display mirror. Sets up the
+  #      host-side shared memory + attaches a <shmem name='looking-glass'>
+  #      ivshmem-plain device to each shut-off guest-GPU VM + user config. vBIOS
+  #      is NOT touched here (vfio.sh already does vBIOS injection). The client
+  #      binary is NOT auto-installed (install_looking_glass prints hints).
+  #      Default N. Run later with: sudo $SCRIPT_NAME --install-looking-glass.
+  if prompt_yn "Set up Looking Glass (shared-memory display mirror) for the guest-GPU VM now?" N "Looking Glass"; then
+    install_looking_glass
+  else
+    note "Skipping Looking Glass. You can set it up later with: sudo $SCRIPT_NAME --install-looking-glass"
   fi
 
   # 3b. Pin KDE/KWin Wayland to the HOST GPU so binding the (Boot VGA) guest
@@ -22157,6 +22757,10 @@ reset_vfio_all() {
   # timestamped). Must run before $CONF_FILE is deleted (reads the backup-dir
   # conf keys).
   _remove_vm_tuning_backups
+  # R40: remove Looking Glass host-side setup (shmem device + shared-memory node +
+  # security rules + user config). Must run before $CONF_FILE is deleted (it reads
+  # GUEST_GPU_BDF to find guest-GPU VMs). Best-effort.
+  remove_looking_glass
   # R39c: release any host hugepages pinned by a prior ultimate-perf run
   # (including an ORPHANED pool whose VM XML no longer carries <hugepages>,
   # which would starve the VM of normal memory). Unconditionally frees the
@@ -23510,6 +24114,15 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
         note "Skipping ultimate-performance VM tuning. You can apply it later with: sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning"
       fi
     fi
+    # Looking Glass (opt-in) — low-latency guest display mirror. Host-side
+    # shared memory + <shmem name='looking-glass'> ivshmem-plain device on each
+    # shut-off guest-GPU VM + user config. vBIOS NOT touched (vfio.sh already
+    # does vBIOS injection). Client binary NOT auto-installed. Default N.
+    if prompt_yn "Set up Looking Glass (shared-memory display mirror) for the guest-GPU VM now?" N "Looking Glass"; then
+      install_looking_glass
+    else
+      note "Skipping Looking Glass. You can set it up later with: sudo $SCRIPT_NAME --install-looking-glass"
+    fi
   fi
   if (( INSTALL_GRAPHICS_DAEMON )); then
     install_graphics_protocol_daemon "$graphics_daemon_interval"
@@ -24055,6 +24668,8 @@ vfio_menu() {
       "Reset everything (full cleanup, removes all VFIO config)"
       "Install vfio to /usr/local/bin (+ shell completions)"
       "Uninstall the self-installed vfio (+ completions)"
+      "Set up Looking Glass (shared-memory display mirror for the guest-GPU VM)"
+      "Remove Looking Glass (detach shmem + shared-memory node + user config)"
       "Exit menu"
     )
     say
@@ -24258,6 +24873,27 @@ vfio_menu() {
         uninstall_self
         ;;
       15)
+        # Set up Looking Glass (host-side VM setup).
+        say
+        note "Setting up Looking Glass..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 1 (Full configure) or option 3 (Switch to dynamic binding) first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; Looking Glass setup needs libvirt to dump/define VM XML."
+          if prompt_yn "Continue anyway?" N "Looking Glass"; then
+            install_looking_glass
+          fi
+        else
+          install_looking_glass
+        fi
+        ;;
+      16)
+        # Remove Looking Glass.
+        say
+        note "Removing Looking Glass host-side setup..."
+        remove_looking_glass
+        ;;
+      17)
         # Exit.
         say
         say "Exiting vfio.sh menu."
@@ -24564,6 +25200,29 @@ main() {
       fi
     fi
     install_virtio_win_guest_agent
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-looking-glass" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then
+      die "Missing $CONF_FILE. Run the full installer or --install-dynamic-binding first."
+    fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; Looking Glass setup needs libvirt to dump/define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Looking Glass"; then
+        die "Aborted by user"
+      fi
+    fi
+    install_looking_glass
+    exit 0
+  fi
+
+  if [[ "$MODE" == "remove-looking-glass" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    remove_looking_glass
     exit 0
   fi
 

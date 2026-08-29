@@ -711,12 +711,23 @@ assert_contains_file "boot unit WantedBy multi-user.target" 'WantedBy=multi-user
 assert_contains_file "boot unit is oneshot" 'Type=oneshot' "$VFIO_SCRIPT"
 assert_contains_file "boot unit ExecStart points at the boot script" 'ExecStart=$PERF_HP_BOOT_SCRIPT' "$VFIO_SCRIPT"
 
-# --- --reset leaves the boot-reserve service in place (does NOT break the VM) ---
-# --reset does NOT revert perf VM XMLs, so it must NOT remove the boot-reserve
-# service either (else a hugepages-backed VM fails to start across reboots).
-# Cleanup is via --reset-ultimate-perf-vm-tuning instead.
-assert_contains_file "reset note documents --reset leaves boot-reserve in place" "hugepages boot-reserve service in place" "$VFIO_SCRIPT"
-assert_contains_file "reset note points to --reset-ultimate-perf-vm-tuning" "boot-reserve service removal" "$VFIO_SCRIPT"
+# --- R39c: --reset now FREES hugepages + removes the boot-reserve service ---
+# Previously --reset deliberately left the hugepages pool + boot-reserve service
+# in place (R35 design), which could orphan a reserved pool whose VM XML lost
+# <hugepages> and starve the VM of normal memory. Now --reset calls
+# _reset_perf_hugepages_all: frees nr_hugepages, drops owned files + registry,
+# disables+removes the boot-reserve service. --reset-ultimate-perf-vm-tuning is
+# still the path to revert the perf VM XML itself from backup.
+assert_contains_file "reset calls _reset_perf_hugepages_all" '_reset_perf_hugepages_all' "$VFIO_SCRIPT"
+assert_contains_file "_reset_perf_hugepages_all helper defined" '_reset_perf_hugepages_all() {' "$VFIO_SCRIPT"
+assert_contains_file "reset note documents --reset frees hugepages" "--reset now ALSO releases host hugepages" "$VFIO_SCRIPT"
+assert_contains_file "_reset_perf_hugepages_all frees the pool" "0 >/proc/sys/vm/nr_hugepages" "$VFIO_SCRIPT"
+assert_contains_file "_reset_perf_hugepages_all removes owned files" '*_perf_hugepages_owned.txt' "$VFIO_SCRIPT"
+assert_contains_file "_reset_perf_hugepages_all removes boot service" 'remove_perf_hugepages_boot_service' "$VFIO_SCRIPT"
+# --- R39c: reconcile-on-enable drops stale owned files before reserving ---
+assert_contains_file "_reconcile_perf_hugepages_owned helper defined" '_reconcile_perf_hugepages_owned() {' "$VFIO_SCRIPT"
+assert_contains_file "install calls reconcile when hugepages enabled" 'if (( _hp_on )); then' "$VFIO_SCRIPT"
+assert_contains_file "reconcile drops stale owned files (VM XML no hugepages)" 'VM XML no longer has <hugepages>' "$VFIO_SCRIPT"
 
 # --- Functional: install generates a valid runtime boot script (bash -n) ---
 # Call install_perf_hugepages_boot_service with temp paths + a no-op systemctl +

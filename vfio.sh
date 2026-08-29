@@ -14045,6 +14045,85 @@ remove_perf_hugepages_boot_service() {
   run rm -f "$PERF_HP_BOOT_SCRIPT" "$PERF_HP_BOOT_UNIT" "$PERF_HP_DIRS_FILE" 2>/dev/null || true
 }
 
+# R39c: UNCONDITIONAL full hugepages cleanup for --reset. Frees the host
+# nr_hugepages pool (set 0), removes EVERY perf-hugepages owned file across
+# registered backup dirs + the legacy $HOME/Desktop default, unregisters all
+# dirs (drops PERF_HP_DIRS_FILE), and disables+removes the reboot-persistent
+# re-reserve boot service. Best-effort; never aborts the reset.
+# This is the orphaned-pool recovery --reset previously lacked: a reserved
+# pool whose VM XML lost its <memoryBacking><hugepages> (partial apply,
+# manual edit, or a strip that freed the XML element but not the pool) pins
+# GiB of host RAM for nothing and starves the VM of normal memory so it cannot
+# start. reset_ultimate_perf_vm_tuning only frees per-VM when it can find a
+# backup + a shut-off VM; this helper frees everything regardless of VM state.
+_reset_perf_hugepages_all() {
+  local _cur _d _f _legacy_dir
+  _cur="$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)"
+  [[ "$_cur" =~ ^[0-9]+$ ]] || _cur=0
+  if (( _cur > 0 )); then
+    note "Reset mode: freeing host nr_hugepages pool (was $_cur pages)."
+    if (( ! DRY_RUN )); then
+      printf '%s\n' 0 >/proc/sys/vm/nr_hugepages 2>/dev/null \
+        || note "WARN: failed to write /proc/sys/vm/nr_hugepages (left as-is)."
+    fi
+  fi
+  # Remove every owned file across registered dirs, then drop the registry.
+  if [[ -f "$PERF_HP_DIRS_FILE" ]]; then
+    while IFS= read -r _d; do
+      [[ -n "$_d" && -d "$_d" ]] || continue
+      for _f in "$_d"/*_perf_hugepages_owned.txt; do
+        [[ -f "$_f" ]] || continue
+        run rm -f "$_f" 2>/dev/null || true
+      done
+      _unregister_perf_hugepages_dir "$_d"
+    done < "$PERF_HP_DIRS_FILE"
+    run rm -f "$PERF_HP_DIRS_FILE" 2>/dev/null || true
+  fi
+  # Also sweep the legacy $HOME/Desktop default (pre-R37) for owned files.
+  _legacy_dir="${BACKUP_DIR:-$HOME/Desktop}"
+  if [[ -d "$_legacy_dir" ]]; then
+    for _f in "$_legacy_dir"/*_perf_hugepages_owned.txt; do
+      [[ -f "$_f" ]] || continue
+      run rm -f "$_f" 2>/dev/null || true
+    done
+    _unregister_perf_hugepages_dir "$_legacy_dir"
+  fi
+  remove_perf_hugepages_boot_service
+}
+
+# R39c: Reconcile the perf-hugepages owned-file registry to CURRENT VM state
+# before reserving. For each owned file, if the VM's on-disk libvirt XML
+# (/etc/libvirt/qemu/<dom>.xml) no longer carries <hugepages>, drop the stale
+# owned file (and unregister its dir when empty) so the upcoming reserve sums
+# only LIVE hugepages VMs. This makes enabling hugepages ADAPT to reality
+# instead of pinning host RAM for VMs that no longer demand it. Best-effort;
+# never aborts the install. Called from install_ultimate_perf_vm_tuning when
+# hugepages is enabled, before the per-VM reserve loop.
+_reconcile_perf_hugepages_owned() {
+  [[ -f "$PERF_HP_DIRS_FILE" ]] || return 0
+  local _d _f _dom _xml _left _lf
+  while IFS= read -r _d; do
+    [[ -n "$_d" && -d "$_d" ]] || continue
+    for _f in "$_d"/*_perf_hugepages_owned.txt; do
+      [[ -f "$_f" ]] || continue
+      _dom="${_f##*/}"
+      _dom="${_dom%_perf_hugepages_owned.txt}"
+      _xml="/etc/libvirt/qemu/${_dom}.xml"
+      if [[ ! -r "$_xml" ]] || ! grep -Fq '<hugepages' "$_xml" 2>/dev/null; then
+        note "Reconcile: dropping stale hugepages owned file for '$_dom' (VM XML no longer has <hugepages>)."
+        rm -f "$_f" 2>/dev/null || true
+      fi
+    done
+    # Unregister this dir if it now has no owned files (keeps the registry tidy
+    # so the boot oneshot's sum_all_owned does not count empty dirs).
+    _left=0
+    for _lf in "$_d"/*_perf_hugepages_owned.txt; do
+      [[ -f "$_lf" ]] && { _left=1; break; }
+    done
+    (( _left )) || _unregister_perf_hugepages_dir "$_d"
+  done < "$PERF_HP_DIRS_FILE"
+}
+
 # R35: Ultimate-performance VM XML tuning (stealth-safe). A SEPARATE, more
 # aggressive perf layer than the basic perf subset bundled inside
 # install_stealth_vm_tuning(). Applies maximum-throughput knobs to each shut-off
@@ -14153,6 +14232,14 @@ install_ultimate_perf_vm_tuning() {
   _hp_size="$(awk -F= '/^ULTIMATE_PERF_HUGEPAGES_SIZE=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _hp_size="$(trim "${_hp_size:-}")"
   [[ "$_hp_size" =~ ^[0-9]+$ ]] || _hp_size="2048"
+  # R39c: when hugepages is enabled, first reconcile the owned-file registry to
+  # current VM state — drop owned files for VMs whose on-disk libvirt XML no
+  # longer carries <hugepages> (stale files from a prior run / partial apply
+  # would inflate the reservation and pin host RAM for nothing). This makes the
+  # reservation ADAPT to the current VMs instead of stale owned counts.
+  if (( _hp_on )); then
+    _reconcile_perf_hugepages_owned
+  fi
 
   # RAM safety gate: read host MemTotal once + the max-VM-RAM percentage from
   # conf (ULTIMATE_PERF_MAX_VM_RAM_PCT, default 50). Per VM, if the VM <memory>
@@ -21970,11 +22057,10 @@ remove_user_audio_unit() {
 # fixed-name pristine backups (${_dom}_stealth.xml / ${_dom}_perf.xml in the
 # resolved backup dirs) AND the legacy timestamped ~/Desktop litter
 # (*_stealth_*.xml / *_perf_*.xml). Does NOT touch the hugepages owned files
-# (*_perf_hugepages_owned.txt — NOT backups; the reboot-persistent boot-reserve
-# service + owned files are left in place per the R35 design so hugepages-backed
-# VMs still start across reboots; use --reset-ultimate-perf-vm-tuning to revert
-# perf + release host nr_hugepages + remove the boot service). Must run BEFORE
-# $CONF_FILE is deleted (reads the backup-dir conf keys). Best-effort.
+# (*_perf_hugepages_owned.txt — NOT backups); those + the reboot-persistent
+# boot-reserve service are freed separately by _reset_perf_hugepages_all
+# (called right after this in reset_vfio_all). Must run BEFORE $CONF_FILE is
+# deleted (reads the backup-dir conf keys). Best-effort.
 _remove_vm_tuning_backups() {
   local _stealth_dir _perf_dir _legacy_dir _any=0 _f
   _stealth_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
@@ -22009,11 +22095,13 @@ reset_vfio_all() {
   note "NOTE: stealth/perf-tuned VM XMLs are NOT reverted by --reset. Use"
   note "      'sudo $SCRIPT_NAME --reset-stealth-vm-tuning' to restore them"
   note "      from their *_stealth_*.xml backups before or after this reset."
-  note "      For ultimate-perf (hugepages/iothreads/cputune) revert + host hugepages"
-  note "      release + boot-reserve service removal, run:"
-  note "      'sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning'. (--reset leaves the"
-  note "      hugepages boot-reserve service in place so hugepages-backed VMs still"
-  note "      start across reboots until you explicitly revert perf.)"
+  note "      For ultimate-perf (hugepages/iothreads/cputune) VM-XML revert, run:"
+  note "      'sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning' (redefines each"
+  note "      VM from its pre-perf backup)."
+  note "NOTE: --reset now ALSO releases host hugepages: it frees nr_hugepages,"
+  note "      removes every perf-hugepages owned file + the boot-reserve registry,"
+  note "      and disables+removes the reboot-persistent re-reserve service (so an"
+  note "      orphaned pool can no longer starve the VM of normal memory)."
   note "NOTE: --reset now ALSO removes ALL stealth/perf VM XML backup files"
   note "      (the fixed-name pristine backups + legacy ~/Desktop timestamped litter)"
   note "      for a clean slate. Revert VM XMLs from backup FIRST (the commands above)"
@@ -22067,9 +22155,13 @@ reset_vfio_all() {
   remove_live_attach
   # R37: remove ALL stealth/perf VM XML backups (fixed-name + legacy ~/Desktop
   # timestamped). Must run before $CONF_FILE is deleted (reads the backup-dir
-  # conf keys). Leaves the hugepages owned files + boot-reserve service in place
-  # (R35 design; use --reset-ultimate-perf-vm-tuning for those).
+  # conf keys).
   _remove_vm_tuning_backups
+  # R39c: release any host hugepages pinned by a prior ultimate-perf run
+  # (including an ORPHANED pool whose VM XML no longer carries <hugepages>,
+  # which would starve the VM of normal memory). Unconditionally frees the
+  # pool, drops owned files + registry, and removes the boot-reserve service.
+  _reset_perf_hugepages_all
 
   # Libvirt hook cleanup: restore pre-existing user-managed qemu hook or remove our managed entry.
   if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then

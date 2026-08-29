@@ -270,7 +270,7 @@ _RECOMMENDED_ANSWERS["Boot verbosity"]=1
 _RECOMMENDED_ANSWERS["Boot target"]=1
 _RECOMMENDED_ANSWERS["Custom kernel parameters"]=1
 _RECOMMENDED_ANSWERS["Existing VFIO config"]=1
-_RECOMMENDED_ANSWERS["Host audio output"]=1
+_RECOMMENDED_ANSWERS["Host audio unit"]=0
 
 say() { printf '%s\n' "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
@@ -22771,7 +22771,21 @@ The HOST GPU stays on your desktop."
 
   # PipeWire default sink selection (user-session)
   local host_audio_node_name=""
-  if command -v wpctl >/dev/null 2>&1; then
+  # R39c: --recommended auto-selects the host default sink (the PipeWire sink
+  # matching the host audio PCI device) so it is NOT skipped in recommended
+  # mode. Zero-click when a matching sink is found; otherwise fall back to the
+  # normal interactive prompt below. ("Host audio output" was removed from the
+  # _RECOMMENDED_ANSWERS table so the fallback prompt is a real question, not
+  # an auto-No that would leave the sink unset.)
+  if (( RECOMMENDED_MODE )) && [[ -n "$host_audio_bdfs_csv" ]] && command -v wpctl >/dev/null 2>&1; then
+    local _rec_sink_name
+    _rec_sink_name="$(pipewire_sinks_for_pci_bdf "$host_audio_bdfs_csv" 2>/dev/null | head -n1 | cut -f1)"
+    if [[ -n "$_rec_sink_name" ]]; then
+      host_audio_node_name="$_rec_sink_name"
+      printf '  -> recommended: auto-selected host default sink -- %s\n' "$_rec_sink_name" >&2
+    fi
+  fi
+  if [[ -z "$host_audio_node_name" ]] && command -v wpctl >/dev/null 2>&1; then
     # KDE Plasma users usually manage outputs via the Plasma volume applet. For
     # them we default this to NO so it behaves like an advanced helper instead
     # of a mandatory extra question.
@@ -22832,6 +22846,10 @@ The HOST GPU stays on your desktop."
   CTX[guest_audio_csv]="$guest_audio_csv"
   CTX[host_audio_bdfs_csv]="$host_audio_bdfs_csv"
   CTX[host_audio_node_name]="$host_audio_node_name"
+  # R39c: persist the gpu descriptions so apply_configuration's Summary + recap
+  # can show WHICH card was selected (model), not just the BDF.
+  CTX[guest_desc]="$guest_desc"
+  CTX[host_desc]="$host_desc"
 }
 
 # R39: Preview the recommended preset for the detected GPU family and require one
@@ -22910,12 +22928,25 @@ apply_configuration() {
   local guest_audio_csv="${CTX[guest_audio_csv]}"
   local host_audio_bdfs_csv="${CTX[host_audio_bdfs_csv]}"
   local host_audio_node_name="${CTX[host_audio_node_name]}"
+  local guest_desc="${CTX[guest_desc]:-}"
+  local host_desc="${CTX[host_desc]:-}"
   local boot_vga_policy_mode="${BOOT_VGA_POLICY_OVERRIDE:-AUTO}"
   boot_vga_policy_mode="${boot_vga_policy_mode^^}"
   case "$boot_vga_policy_mode" in
     AUTO|STRICT) ;;
     *) boot_vga_policy_mode="AUTO" ;;
   esac
+
+  # R39c: build "BDF — model" display strings for the Summary + end-of-config
+  # recap so the operator sees WHICH gpu was selected, not just the BDF.
+  # Falls back to the bare BDF when no description is available.
+  local _host_gpu_disp="$host_gpu"
+  local _guest_gpu_disp="$guest_gpu"
+  local _hd _gd
+  _hd="$(short_gpu_desc "${host_desc:-}")"
+  _gd="$(short_gpu_desc "${guest_desc:-}")"
+  [[ -n "$_hd" ]] && _host_gpu_disp="$host_gpu  —  $_hd"
+  [[ -n "$_gd" ]] && _guest_gpu_disp="$guest_gpu  —  $_gd"
 
   # Track whether we actually installed a dracut config for vfio modules
   # and whether we added rd.driver.pre=vfio-pci to the kernel cmdline.
@@ -22925,13 +22956,13 @@ apply_configuration() {
   say
   say "Summary:"
   if (( ENABLE_COLOR )); then
-    say "  $(_role_tag host)  $host_gpu"
-    say "  $(_role_tag guest) $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
+    say "  $(_role_tag host)  $_host_gpu_disp"
+    say "  $(_role_tag guest) $_guest_gpu_disp (vendor: $(vendor_name "$guest_vendor"))"
     say "  $(_role_tag host-audio)  ${host_audio_bdfs_csv:-<none>}"
     say "  $(_role_tag guest-audio) ${guest_audio_csv:-<none>}"
   else
-    say "  [HOST -> desktop]    $host_gpu"
-    say "  [GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))"
+    say "  [HOST -> desktop]    $_host_gpu_disp"
+    say "  [GUEST -> vfio-pci]  $_guest_gpu_disp (vendor: $(vendor_name "$guest_vendor"))"
     say "  [HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}"
     say "  [GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}"
   fi
@@ -23581,7 +23612,7 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
   fi
 
   say
-  if prompt_yn "Install a user systemd unit to set the host default audio sink after login?" Y "Host audio output"; then
+  if prompt_yn "Install a user systemd unit to set the host default audio sink after login?" Y "Host audio unit"; then
     install_audio_script
     install_user_audio_unit
   else
@@ -23598,8 +23629,8 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
     gui_msgbox "VFIO setup recap" \
 "Configuration applied:
 
-  [HOST -> desktop]    $host_gpu
-  [GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))
+  [HOST -> desktop]    $_host_gpu_disp
+  [GUEST -> vfio-pci]  $_guest_gpu_disp (vendor: $(vendor_name "$guest_vendor"))
 
   [HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}
   [GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}
@@ -23617,13 +23648,13 @@ Reboot to make the VFIO binding take effect."
     # style, no right-pad, so alignment survives the color escapes).
     local -a _recap_body=()
     if (( ENABLE_COLOR )); then
-      _recap_body+=("$(_role_tag host)   $host_gpu")
-      _recap_body+=("$(_role_tag guest)  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))")
+      _recap_body+=("$(_role_tag host)   $_host_gpu_disp")
+      _recap_body+=("$(_role_tag guest)  $_guest_gpu_disp (vendor: $(vendor_name "$guest_vendor"))")
       _recap_body+=("$(_role_tag host-audio)   ${host_audio_bdfs_csv:-<none>}")
       _recap_body+=("$(_role_tag guest-audio)  ${guest_audio_csv:-<none>}")
     else
-      _recap_body+=("[HOST -> desktop]    $host_gpu")
-      _recap_body+=("[GUEST -> vfio-pci]  $guest_gpu (vendor: $(vendor_name "$guest_vendor"))")
+      _recap_body+=("[HOST -> desktop]    $_host_gpu_disp")
+      _recap_body+=("[GUEST -> vfio-pci]  $_guest_gpu_disp (vendor: $(vendor_name "$guest_vendor"))")
       _recap_body+=("[HOST AUDIO -> desktop]   ${host_audio_bdfs_csv:-<none>}")
       _recap_body+=("[GUEST AUDIO -> vfio-pci] ${guest_audio_csv:-<none>}")
     fi
@@ -23884,6 +23915,7 @@ vfio_menu() {
 
     _menu_opts=(
       "Full configure (the guided wizard — pick GPUs, audio, binding mode)"
+      "Full configure (recommended defaults — auto-answers after GPU pick)"
       "Switch to dynamic binding (RX 9070 / RDNA4 recommended)"
       "Switch to early binding (boot-time, classic)"
       "Set up live-attach / hotswap (VM starts without GPU, then hot-attached)"
@@ -23897,7 +23929,6 @@ vfio_menu() {
       "Reset everything (full cleanup, removes all VFIO config)"
       "Install vfio to /usr/local/bin (+ shell completions)"
       "Uninstall the self-installed vfio (+ completions)"
-      "Full configure (recommended defaults — auto-answers after GPU pick)"
       "Exit menu"
     )
     say
@@ -23916,25 +23947,35 @@ vfio_menu() {
         apply_configuration
         ;;
       1)
+        # Full configure with --recommended defaults (R39).
+        say
+        note "Starting full configure with recommended defaults..."
+        RECOMMENDED_MODE=1
+        require_systemd
+        detect_system
+        user_selection
+        apply_configuration
+        ;;
+      2)
         # Switch to dynamic binding.
         say
         note "Switching to dynamic binding..."
         require_systemd
         install_dynamic_binding_from_existing_config
         ;;
-      2)
+      3)
         # Switch to early binding.
         say
         note "Switching to early binding..."
         require_systemd
         install_early_binding_from_existing_config
         ;;
-      3)
+      4)
         # Set up live-attach / hotswap.
         say
         note "Setting up live-attach / hotswap..."
         if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 (Full configure) or option 2 (Switch to dynamic binding) first."
+          note "Missing $CONF_FILE. Run option 1 (Full configure) or option 3 (Switch to dynamic binding) first."
         elif ! libvirt_runtime_ok; then
           note "WARN: libvirt is not reachable; live-attach needs libvirt to modify VM XML."
           if prompt_yn "Continue anyway?" N "Live-attach"; then
@@ -23944,12 +23985,12 @@ vfio_menu() {
           install_live_attach
         fi
         ;;
-      4)
+      5)
         # Attach virtio-win guest-agent ISO.
         say
         note "Attaching virtio-win guest-agent ISO..."
         if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 2 first."
+          note "Missing $CONF_FILE. Run option 1 or 3 first."
         elif ! libvirt_runtime_ok; then
           note "WARN: libvirt is not reachable; virtio-win guest-agent setup needs libvirt to attach the ISO to VM XML."
           if prompt_yn "Continue anyway?" N "virtio-win guest agent"; then
@@ -23959,12 +24000,12 @@ vfio_menu() {
           install_virtio_win_guest_agent
         fi
         ;;
-      5)
+      6)
         # Apply stealth/perf VM tuning.
         say
         note "Applying stealth/perf VM tuning..."
         if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 2 first."
+          note "Missing $CONF_FILE. Run option 1 or 3 first."
         elif ! libvirt_runtime_ok; then
           note "WARN: libvirt is not reachable; stealth/perf VM tuning needs libvirt to dump/define VM XML."
           if prompt_yn "Continue anyway?" N "Stealth/perf VM tuning"; then
@@ -23974,12 +24015,12 @@ vfio_menu() {
           install_stealth_vm_tuning
         fi
         ;;
-      6)
+      7)
         # Revert stealth/perf VM tuning.
         say
         note "Reverting stealth/perf VM tuning..."
         if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 2 first."
+          note "Missing $CONF_FILE. Run option 1 or 3 first."
         elif ! libvirt_runtime_ok; then
           note "WARN: libvirt is not reachable; stealth/perf VM revert needs libvirt to dump/define VM XML."
           if prompt_yn "Continue anyway?" N "Revert stealth/perf VM tuning"; then
@@ -23989,12 +24030,12 @@ vfio_menu() {
           reset_stealth_vm_tuning
         fi
         ;;
-      7)
+      8)
         # Apply ultimate-perf VM tuning (stealth-safe).
         say
         note "Applying ultimate-performance VM tuning..."
         if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 2 first."
+          note "Missing $CONF_FILE. Run option 1 or 3 first."
         elif ! libvirt_runtime_ok; then
           note "WARN: libvirt is not reachable; ultimate-perf VM tuning needs libvirt to dump/define VM XML."
           if prompt_yn "Continue anyway?" N "Ultimate-perf VM tuning"; then
@@ -24004,12 +24045,12 @@ vfio_menu() {
           install_ultimate_perf_vm_tuning
         fi
         ;;
-      8)
+      9)
         # Revert ultimate-perf VM tuning.
         say
         note "Reverting ultimate-performance VM tuning..."
         if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 2 first."
+          note "Missing $CONF_FILE. Run option 1 or 3 first."
         elif ! libvirt_runtime_ok; then
           note "WARN: libvirt is not reachable; ultimate-perf VM revert needs libvirt to dump/define VM XML."
           if prompt_yn "Continue anyway?" N "Revert ultimate-perf VM tuning"; then
@@ -24019,13 +24060,13 @@ vfio_menu() {
           reset_ultimate_perf_vm_tuning
         fi
         ;;
-      9)
+      10)
         # Verify setup (read-only).
         say
         note "Verifying setup..."
         verify_setup
         ;;
-      10)
+      11)
         # Detect / health check (read-only). Subshell isolates the conf source.
         say
         note "Running detect + health check..."
@@ -24042,7 +24083,7 @@ vfio_menu() {
           fi
         )
         ;;
-      11)
+      12)
         # Reset everything.
         say
         note "Resetting everything..."
@@ -24057,27 +24098,17 @@ vfio_menu() {
           note "Reset cancelled."
         fi
         ;;
-      12)
+      13)
         # Install vfio.sh to a stable PATH location + shell completions.
         say
         note "Installing vfio.sh to /usr/local/sbin + shell completions..."
         install_self
         ;;
-      13)
+      14)
         # Uninstall the self-installed vfio.sh + completions.
         say
         note "Uninstalling the self-installed vfio.sh + completions..."
         uninstall_self
-        ;;
-      14)
-        # Full configure with --recommended defaults (R39).
-        say
-        note "Starting full configure with recommended defaults..."
-        RECOMMENDED_MODE=1
-        require_systemd
-        detect_system
-        user_selection
-        apply_configuration
         ;;
       15)
         # Exit.

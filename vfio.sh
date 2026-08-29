@@ -4378,6 +4378,39 @@ _boxed_block() {
   say "${bc}${bl}${bottom_rule}${br}${rc}"
 }
 
+# R39c: end-of-action verdict popup so the GUI/menu operator gets a clear
+# success/fail dialog (or a framed CLI card) after a read-only verify/detect,
+# instead of the result scrolling away under the next menu render. Reusable:
+#   _verdict_popup "<title>" "<status_word>" "<one-line detail>"
+# status_word in {PASS,OK,COMPLETE} -> green check; WARN -> yellow warn;
+# FAIL/BAD -> red cross; anything else -> cyan dot. GUI path = whiptail
+# --msgbox (plain text + the mandatory 3>&1 1>&2 2>&3 fd dance so a caller
+# in command substitution stays clean); CLI path = _boxed_block with a colored
+# symbol line so the verdict is a clear terminal landmark.
+_verdict_popup() {
+  local title="${1:-vfio.sh}" status_word="${2:-COMPLETE}" detail="${3:-}"
+  local sym color
+  case "$status_word" in
+    PASS|OK|COMPLETE) sym='✔'; color="$C_GREEN" ;;
+    WARN)             sym='⚠'; color="$C_YELLOW" ;;
+    FAIL|BAD)         sym='✖'; color="$C_RED" ;;
+    *)                sym='•'; color="$C_CYAN" ;;
+  esac
+  if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
+    whiptail --title "$title" --msgbox "${sym} ${status_word}
+
+${detail}" 12 64 3>&1 1>&2 2>&3 || true
+  else
+    local _line
+    if (( ENABLE_COLOR )); then
+      _line="${color}${C_BOLD}${sym} ${status_word}${C_RESET}  ${C_DIM}${detail}${C_RESET}"
+    else
+      _line="${sym} ${status_word}  ${detail}"
+    fi
+    _boxed_block "$title" "$_line"
+  fi
+}
+
 hdr() {
   # Header line for steps.
   local title="$1"
@@ -24064,7 +24097,15 @@ vfio_menu() {
         # Verify setup (read-only).
         say
         note "Verifying setup..."
-        verify_setup
+        # Run in a subshell so verify_setup's die() (exit 1, e.g. on a missing
+        # $CONF_FILE) only ends the subshell and does NOT kill the whole menu.
+        ( verify_setup )
+        local _verify_rc=$?
+        if (( _verify_rc == 0 )); then
+          _verdict_popup "Verify setup" "PASS" "Guest devices are on vfio-pci and host audio is not. See the full report above."
+        else
+          _verdict_popup "Verify setup" "FAIL" "One or more checks failed (rc=$_verify_rc). See the full report above."
+        fi
         ;;
       11)
         # Detect / health check (read-only). Subshell isolates the conf source.
@@ -24082,6 +24123,19 @@ vfio_menu() {
             audit_vfio_health ""
           fi
         )
+        # R39c: verdict popup so the GUI operator sees a clear result instead
+        # of it scrolling away under the next menu render. vfio_config_health
+        # is the same read-only health grader the report itself uses.
+        local _det_hc _det_status
+        _det_hc="$(vfio_config_health 2>/dev/null || true)"
+        _det_status="$(printf '%s\n' "$_det_hc" | awk -F= '/^STATUS=/{print $2; exit}')"
+        _det_status="${_det_status:-UNKNOWN}"
+        case "$_det_status" in
+          OK)   _verdict_popup "Detect + health check" "OK"      "Detection complete. VFIO config health: OK." ;;
+          WARN) _verdict_popup "Detect + health check" "WARN"    "Detection complete. VFIO config health: WARN — review the reasons above." ;;
+          BAD)  _verdict_popup "Detect + health check" "BAD"     "Detection complete. VFIO config health: BAD — consider running Reset." ;;
+          *)    _verdict_popup "Detect + health check" "COMPLETE" "Detection complete. Health status could not be determined." ;;
+        esac
         ;;
       12)
         # Reset everything.

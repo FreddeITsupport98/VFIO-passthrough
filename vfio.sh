@@ -124,6 +124,28 @@ LIVE_ATTACH_HELPER="/usr/local/sbin/vfio-live-attach.sh"
 LIVE_ATTACH_GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
 LIVE_ATTACH_AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
 LIVE_ATTACH_VM_LIST="/var/lib/vfio-dynamic/live-attach-vms"
+# R41: live-attach on/off MODE switch (replaces the backup-restore toggle). A
+# world-readable fast-check file (single line "on"/"off") so the user-session
+# tray applet and the libvirt hook can read the mode WITHOUT root and WITHOUT
+# sourcing /etc/vfio-gpu-passthrough.conf. VFIO_DYNAMIC_LIVE_ATTACH keeps its
+# existing meaning ("live-attach infrastructure installed"); THIS file is the
+# on/off switch. mode=on  -> hotplug (VM boots without GPU, helper hot-attaches);
+# mode=off -> normal dynamic binding (VM boots WITH the GPU present).
+LIVE_ATTACH_MODE_FILE="/var/lib/vfio-dynamic/live-attach-mode"
+# R41: per-VM named mode configs (kept alongside the legacy backup). install_live-
+# attach saves BOTH VM XML variants so the toggle can virsh-define the right one
+# instantly and symmetrically (a positive mode switch, not a backup restore):
+#   live-attach-vm-with-gpu-<dom>.xml    = original dumpxml (GPU present)  -> mode=off
+#   live-attach-vm-without-gpu-<dom>.xml = stripped XML (GPU removed)      -> mode=on
+# The legacy live-attach-backup-<dom>.xml (= with-gpu) is kept as a READ fallback
+# for remove_live_attach on pre-R41 setups.
+# R41: PySide6 system-tray applet (on/off toggle w/ confirmation) + the polkit
+# policy that lets pkexec run the toggle without a terminal. KDE Plasma 6 uses
+# the StatusNotifierItem protocol natively (Qt6 QSystemTrayIcon), so the icon
+# actually appears (XEmbed/zenity --notification would be invisible on Plasma 6).
+LIVE_ATTACH_TRAY="/usr/local/bin/vfio-hotplug-tray"
+LIVE_ATTACH_POLKIT="/usr/share/polkit-1/actions/dev.vfio.live-attach-toggle.policy"
+LIVE_ATTACH_POLKIT_ACTION="dev.vfio.live-attach-toggle"
 # Reboot-persistent hugepages re-reserve (ultimate-perf only): after a host
 # reboot /proc/sys/vm/nr_hugepages resets to 0, but the per-VM ownership files
 # (*_perf_hugepages_owned.txt) persist in the perf backup dir. Without a
@@ -194,7 +216,7 @@ RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completion
 RECOMMENDED_MODE=0   # 1=--recommended: auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (R39)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | install-self | uninstall-self | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | usb-mitigation-status | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | install-self | uninstall-self | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -842,6 +864,10 @@ complete -c $cmd -l no-live-attach -d 'Dynamic-install: skip + revert live-attac
 complete -c $cmd -l install-dynamic-binding -d 'Switch existing setup to dynamic (libvirt hook) binding'
 complete -c $cmd -l install-early-binding -d 'Switch existing setup back to early (boot-time) binding'
 complete -c $cmd -l install-live-attach -d 'Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay'
+complete -c $cmd -l live-attach-on -d 'Turn live-attach hotplug ON: each shut-off guest-GPU VM redefined WITHOUT the GPU (helper hot-attaches it after Windows is up)'
+complete -c $cmd -l live-attach-off -d 'Turn live-attach hotplug OFF: each shut-off guest-GPU VM redefined WITH the GPU (normal dynamic binding)'
+complete -c $cmd -l live-attach-toggle -d 'Toggle live-attach hotplug on/off (flips the current mode; also used by the system-tray applet)'
+complete -c $cmd -l live-attach-status -d 'Print machine-readable live-attach mode + per-VM state (read-only; for the system-tray applet)'
 complete -c $cmd -l install-virtio-win-guest-agent -d 'Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)'
 complete -c $cmd -l install-looking-glass -d 'Set up Looking Glass host side: shared memory + <shmem> device on guest-GPU VMs + user config (client binary NOT auto-installed)'
 complete -c $cmd -l remove-looking-glass -d 'Remove Looking Glass host-side setup (detach shmem + shared-memory node + security rules + user config)'
@@ -901,7 +927,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -960,6 +986,10 @@ _vfio_sh_complete() {
     '--install-dynamic-binding[Switch existing setup to dynamic (libvirt hook) binding]' \\
     '--install-early-binding[Switch existing setup back to early (boot-time) binding]' \\
     '--install-live-attach[Set up live-attach (hotplug GPU) workflow: VM starts without GPU, then GPU is hot-attached after a delay]' \\
+    '--live-attach-on[Turn live-attach hotplug ON: shut-off guest-GPU VM redefined WITHOUT the GPU (helper hot-attaches after Windows is up)]' \\
+    '--live-attach-off[Turn live-attach hotplug OFF: shut-off guest-GPU VM redefined WITH the GPU (normal dynamic binding)]' \\
+    '--live-attach-toggle[Toggle live-attach hotplug on/off (flips the current mode; used by the system-tray applet)]' \\
+    '--live-attach-status[Print machine-readable live-attach mode + per-VM state (read-only; for the system-tray applet)]' \\
     '--install-virtio-win-guest-agent[Attach the virtio-win driver ISO to guest-GPU VMs so the live-attach guest-ping handoff works (agent installed inside Windows)]' \\
     '--install-looking-glass[Set up Looking Glass host side: shared memory + shmem device on guest-GPU VMs + user config (client binary NOT auto-installed)]' \\
     '--remove-looking-glass[Remove Looking Glass host-side setup (detach shmem + shared-memory node + security rules + user config)]' \\
@@ -1645,7 +1675,7 @@ prompt_yn() {
 
 usage() {
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -1776,6 +1806,22 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                   on RX 9070 / RDNA4. Requires --install-dynamic-binding to be run first,
                   and the AMD Windows driver MUST be installed in the guest VM.
                   To revert: sudo vfio.sh --install-dynamic-binding (restores the GPU to the VM XML from the per-VM backup)
+  --live-attach-on  Turn live-attach hotplug ON via a real mode switch (not the backup-restore
+                  dance): each shut-off guest-GPU VM is redefined from its saved WITHOUT-GPU
+                  variant so it boots on a virtual display and the helper hot-attaches the GPU
+                  once Windows is up. Idempotent. The helper/device-XMLs/VM-list stay installed.
+  --live-attach-off Turn live-attach hotplug OFF: each shut-off guest-GPU VM is redefined from its
+                  saved WITH-GPU variant so it boots normally under standard dynamic binding.
+                  Idempotent; toggle back on any time. Does NOT uninstall live-attach (use
+                  --install-dynamic-binding for a full revert).
+  --live-attach-toggle
+                  Toggle live-attach hotplug on/off (flips the current mode). This is what the
+                  system-tray applet (vfio-hotplug-tray) calls via pkexec. Same mode switch as
+                  --live-attach-on / --live-attach-off.
+  --live-attach-status
+                  Print machine-readable live-attach state (installed=0|1, mode=on|off, and one
+                  vm=<dom>:<state> line per guest-GPU VM). Read-only; consumed by the tray applet
+                  on launch. Does not require root.
   --install-virtio-win-guest-agent
                   Attach the virtio-win driver ISO to each guest-GPU VM as a CD-ROM (idempotent) so
                   you can run virtio-win-guest-tools.exe inside Windows to install the QEMU guest
@@ -2123,6 +2169,18 @@ parse_args() {
       --install-live-attach)
         MODE="install-live-attach"
         ;;
+      --live-attach-on)
+        MODE="live-attach-on"
+        ;;
+      --live-attach-off)
+        MODE="live-attach-off"
+        ;;
+      --live-attach-toggle)
+        MODE="live-attach-toggle"
+        ;;
+      --live-attach-status)
+        MODE="live-attach-status"
+        ;;
       --install-virtio-win-guest-agent)
         MODE="install-virtio-win-guest-agent"
         ;;
@@ -2219,7 +2277,7 @@ parse_args() {
   done
 
   # verify/detect/self-test/print-effective-config/completion modes imply dry-run
-  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "debug-cmdline-tokens" || "$MODE" == "verify-bls-sync" || "$MODE" == "verify-bls-nosnapper" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" || "$MODE" == "print-fish-completion" || "$MODE" == "print-bash-completion" || "$MODE" == "print-zsh-completion" || "$MODE" == "usb-mitigation-status" ]]; then
+  if [[ "$MODE" == "verify" || "$MODE" == "detect" || "$MODE" == "debug-cmdline-tokens" || "$MODE" == "verify-bls-sync" || "$MODE" == "verify-bls-nosnapper" || "$MODE" == "self-test" || "$MODE" == "print-effective-config" || "$MODE" == "print-fish-completion" || "$MODE" == "print-bash-completion" || "$MODE" == "print-zsh-completion" || "$MODE" == "usb-mitigation-status" || "$MODE" == "live-attach-status" ]]; then
     DRY_RUN=1
   fi
 
@@ -10443,10 +10501,21 @@ case "$PHASE" in
     # binds the GPU to vfio-pci and hot-attaches it to the running VM via
     # `virsh attach-device --live`. This sidesteps the parked-restart death.
     if [[ "${VFIO_DYNAMIC_LIVE_ATTACH:-0}" == "1" ]] && [[ -f "/var/lib/vfio-dynamic/live-attach-vms" ]]; then
-      if grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms 2>/dev/null; then
+      # R41: read the on/off mode file. Only launch the hotplug helper when
+      # mode=on; mode=off means the VM was toggled back to normal dynamic
+      # binding (GPU present in the XML), so fall through to vm_uses_guest_gpu
+      # bind-now below. A missing/unreadable/garbage file defaults to "on" (a
+      # pre-R41 install, or a deleted file = hotplug active, matching original
+      # behavior) so the mode switch fails safe toward hotplug.
+      _la_mode="on"
+      if [[ -r /var/lib/vfio-dynamic/live-attach-mode ]]; then
+        read -r _la_mode </var/lib/vfio-dynamic/live-attach-mode 2>/dev/null || true
+        case "$_la_mode" in on|off) ;; *) _la_mode="on" ;; esac
+      fi
+      if grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms 2>/dev/null && [[ "$_la_mode" == "on" ]]; then
         _la_delay="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
-        say "vfio-libvirt-hook: VM '$DOMAIN' is in live-attach list; launching background helper (delay=${_la_delay}s)."
-        hook_log "action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s"
+        say "vfio-libvirt-hook: VM '$DOMAIN' is in live-attach list (mode=on); launching background helper (delay=${_la_delay}s)."
+        hook_log "action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s mode=on"
         # Launch the helper FULLY DETACHED so it does NOT hold this hook's
         # stdout/stderr pipe open. libvirt waits for the hook's stdout/stderr
         # pipe to reach EOF before it starts qemu; a plain `&` child inherits
@@ -10751,6 +10820,465 @@ HELPEREOF
   say "Installed live-attach helper: $LIVE_ATTACH_HELPER"
 }
 
+# R41: read the live-attach on/off mode. Echoes "on" | "off" | "unknown".
+# Reads the world-readable mode file so the user-session tray applet and the
+# libvirt hook can query the mode WITHOUT root and WITHOUT sourcing the conf.
+_la_read_mode() {
+  local _f="$LIVE_ATTACH_MODE_FILE"
+  [[ -r "$_f" ]] || { echo unknown; return 0; }
+  local _v
+  read -r _v <"$_f" 2>/dev/null || true
+  case "$_v" in
+    on|off) echo "$_v" ;;
+    *) echo unknown ;;
+  esac
+}
+
+# R41: persist the live-attach mode. Writes the world-readable mode file AND
+# flips VFIO_LIVE_ATTACH_MODE in the conf (the conf key is the durable record;
+# the mode file is the fast-check the hook/tray read without root). $1=on|off.
+_la_write_mode() {
+  local _mode="$1"
+  case "$_mode" in
+    on|off) ;;
+    *) return 1 ;;
+  esac
+  local _dir
+  _dir="$(dirname "$LIVE_ATTACH_MODE_FILE")"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$_dir" 2>/dev/null || true
+    printf '%s\n' "$_mode" >"$LIVE_ATTACH_MODE_FILE" 2>/dev/null || true
+    chmod 0644 "$LIVE_ATTACH_MODE_FILE" 2>/dev/null || true
+  fi
+  if readable_file "$CONF_FILE"; then
+    rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "$_mode"
+  fi
+  return 0
+}
+
+# R41: toggle live-attach hotplug on/off via a REAL mode switch (not the
+# backup-restore dance). For each shut-off guest-GPU VM, virsh-define the named
+# VM XML variant matching the target mode (with-gpu for off = normal dynamic
+# binding; without-gpu for on = hotplug), then flip the mode file + conf key.
+# $1 = on | off | toggle (toggle flips the current mode). Idempotent: defining
+# the already-active variant is a no-op and the mode file is refreshed anyway.
+# Does NOT delete the helper/device-XMLs/VM-list — those stay installed so
+# toggling back is instant and symmetric. Running VMs are skipped (virsh define
+# needs shut-off). Requires live-attach to be installed (VFIO_DYNAMIC_LIVE_ATTACH=1).
+live_attach_toggle() {
+  local _req="$1"
+  local _target
+  case "$_req" in
+    on|off) _target="$_req" ;;
+    toggle)
+      local _cur
+      _cur="$(_la_read_mode)"
+      case "$_cur" in
+        on)  _target="off" ;;
+        off) _target="on" ;;
+        *)   _target="on" ;;  # unknown -> default to on (the hotplug workflow)
+      esac
+      ;;
+    *) die "live_attach_toggle: invalid request '$_req' (expected on|off|toggle)" ;;
+  esac
+
+  readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run --install-dynamic-binding + --install-live-attach first."
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+  [[ -n "${GUEST_GPU_BDF:-}" ]] || die "No GUEST_GPU_BDF in $CONF_FILE."
+  have_cmd virsh || die "virsh not available."
+  if ! grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+    note "Live-attach is not installed. Run: sudo $SCRIPT_NAME --install-live-attach (with the VM shut off)."
+    return 1
+  fi
+
+  say
+  hdr "Toggle live-attach hotplug: $_target"
+  if [[ "$_target" == "on" ]]; then
+    note "ON  (hotplug): each shut-off guest-GPU VM is redefined WITHOUT the GPU, so it boots"
+    note "on a virtual display and the helper hot-attaches the GPU after Windows is up."
+  else
+    note "OFF (normal): each shut-off guest-GPU VM is redefined WITH the GPU present, so it"
+    note "boots normally under standard dynamic binding (the hook binds at VM start)."
+  fi
+  note "The helper / device-XMLs / VM list are left installed — toggle back any time."
+  note "Running VMs are skipped (shut them off and re-run to apply)."
+  say
+
+  local _dom _xml _state _with_gpu _without_gpu _picked _found=0 _applied=0 _skipped=0
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+    _found=1
+    _with_gpu="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
+    _without_gpu="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"
+    if [[ "$_target" == "on" ]]; then
+      _picked="$_without_gpu"
+    else
+      _picked="$_with_gpu"
+    fi
+    if [[ ! -s "$_picked" ]]; then
+      note "WARN: VM '$_dom' is missing the '$_target'-mode XML ($_picked)."
+      note "      Re-run: sudo $SCRIPT_NAME --install-live-attach (VM shut off) to (re)create both variants."
+      _skipped=1
+      continue
+    fi
+    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+    if [[ "$_state" != "shut off" ]]; then
+      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
+      _skipped=1
+      continue
+    fi
+    if ! virt-xml-validate "$_picked" 2>/dev/null; then
+      note "WARN: virt-xml-validate failed for '$_dom' mode-XML $_picked; skipping."
+      _skipped=1
+      continue
+    fi
+    if (( ! DRY_RUN )); then
+      if virsh -c qemu:///system define "$_picked" 2>/dev/null; then
+        say "  ✔ '$_dom' -> mode=$_target"
+      else
+        note "WARN: virsh define failed for '$_dom' ($_picked); skipping."
+        _skipped=1
+        continue
+      fi
+    else
+      say "  (dry-run) '$_dom' -> mode=$_target"
+    fi
+    _applied=1
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+
+  if (( ! _found )); then
+    note "No guest-GPU VMs found; nothing to toggle."
+    return 0
+  fi
+
+  # Persist the mode regardless (even if all VMs were running/skipped, the mode
+  # file reflects intent and the hook honors it at the next VM start that CAN
+  # define). Only claim applied success if at least one VM was updated.
+  _la_write_mode "$_target"
+  if (( _applied )); then
+    say
+    if (( ENABLE_COLOR )); then
+      say "${C_GREEN}${C_BOLD}✔ Live-attach hotplug is now ${_target^^}${C_RESET}"
+    else
+      say "✔ Live-attach hotplug is now ${_target^^}"
+    fi
+    note "Shut-off guest-GPU VM(s) redefined for mode=$_target. Start the VM to apply."
+  elif (( _skipped )); then
+    note "Mode recorded as '$_target' but no VM was updated (running/missing-variant VMs were skipped)."
+  fi
+  return 0
+}
+
+# R41: machine-readable live-attach status for the tray applet (launch-time
+# state). Prints one KEY=value per line: installed=0|1, mode=on|off, and one
+# vm=<dom>:<state> line per guest-GPU VM. Read-only (DRY_RUN-safe). A pre-R41
+# install (mode file absent but VFIO_DYNAMIC_LIVE_ATTACH=1) reports mode=on
+# (hotplug active), matching its original behavior.
+live_attach_status() {
+  local _installed=0 _mode
+  if readable_file "$CONF_FILE" && grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
+    _installed=1
+  fi
+  _mode="$(_la_read_mode)"
+  if (( _installed )) && [[ "$_mode" == "unknown" ]]; then
+    _mode="on"
+  fi
+  printf 'installed=%s\n' "$_installed"
+  printf 'mode=%s\n' "$_mode"
+  if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
+    local _dom _xml _state
+    while IFS= read -r _dom; do
+      [[ -n "$_dom" ]] || continue
+      _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+      [[ -n "$_xml" ]] || continue
+      _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+      _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo unknown)"
+      printf 'vm=%s:%s\n' "$_dom" "$_state"
+    done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  fi
+}
+
+# R41: Install the system-tray on/off toggle applet for live-attach hotplug.
+# Generates a PySide6 QSystemTrayIcon applet (/usr/local/bin/vfio-hotplug-tray)
+# that reads the world-readable mode file, shows an icon + tooltip reflecting
+# on/off, and toggles via zenity --question confirmation -> pkexec vfio
+# --live-attach-toggle -> notify-send result. KDE Plasma 6 uses the
+# StatusNotifierItem protocol natively (Qt6 QSystemTrayIcon), so the icon
+# actually appears (XEmbed / zenity --notification would be invisible on
+# Plasma 6). Also installs a polkit policy (auth_admin_keep so repeated toggles
+# don't re-prompt) + a per-user autostart desktop file, and best-effort launches
+# one instance now. Best-effort / non-fatal: if PySide6 or the self-installed
+# CLI is absent, the install notes it and returns 0 (CLI toggle still works).
+install_live_attach_tray() {
+  # The tray toggles via pkexec /usr/local/bin/vfio --live-attach-toggle, so it
+  # needs the self-installed CLI at SELF_INSTALL_BIN. Without it, the tray would
+  # have nothing to call — note it and skip (CLI toggle still works).
+  if [[ ! -x "$SELF_INSTALL_BIN" ]]; then
+    note "Tray applet: $SELF_INSTALL_BIN not installed; run 'sudo $SCRIPT_NAME --install-self' to enable the system-tray toggle. (CLI --live-attach-toggle still works.)"
+    return 0
+  fi
+  # PySide6 is the tray toolkit (Qt6 -> native SNI on KDE Plasma 6). If it is
+  # not importable, the generated applet would just notify-and-exit at runtime,
+  # so skip installing it and tell the operator how to get it.
+  if ! python3 -c 'import PySide6.QtWidgets, PySide6.QtGui' >/dev/null 2>&1; then
+    note "Tray applet: PySide6 not available (python3-pyside6); skipping tray install. (CLI --live-attach-toggle still works.)"
+    if have_cmd dnf; then
+      note "  Install it with: sudo dnf install python3-pyside6"
+    fi
+    return 0
+  fi
+  if ! have_cmd zenity; then
+    note "Tray applet: zenity not available; skipping tray install (needed for the confirmation dialog)."
+    return 0
+  fi
+
+  # 1. The PySide6 tray applet. Quoted heredoc so bash does NOT expand the
+  #    Python's $ / % / quotes. The applet reads MODE_FILE (0644, no root),
+  #    polls every 2s, and toggles via pkexec + zenity + notify-send.
+  backup_file "$LIVE_ATTACH_TRAY"
+  write_file_atomic "$LIVE_ATTACH_TRAY" 0755 "root:root" <<'TRAYEOF'
+#!/usr/bin/env python3
+# Managed by vfio.sh — system-tray on/off toggle for live-attach GPU hotplug.
+# Do not edit; regenerated on reinstall. Removed by: sudo vfio.sh --reset
+# (or --install-early-binding). Requires PySide6 (Qt6 -> native SNI on KDE).
+import sys, os, subprocess
+
+MODE_FILE = "/var/lib/vfio-dynamic/live-attach-mode"
+CONF_FILE = "/etc/vfio-gpu-passthrough.conf"
+VFIO_BIN  = "/usr/local/bin/vfio"
+
+def installed():
+    try:
+        with open(CONF_FILE) as f:
+            return 'VFIO_DYNAMIC_LIVE_ATTACH="1"' in f.read()
+    except Exception:
+        return False
+
+def read_mode():
+    try:
+        with open(MODE_FILE) as f:
+            v = f.read().strip()
+        if v in ("on", "off"):
+            return v
+    except Exception:
+        pass
+    return "on" if installed() else "unknown"
+
+def notify(title, body, urgency="normal"):
+    try:
+        subprocess.run(["notify-send", "-u", urgency, "--icon", "video-display", title, body],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def confirm(title, text):
+    try:
+        return subprocess.call(["zenity", "--question", "--title", title, "--text", text]) == 0
+    except Exception:
+        return False
+
+def do_toggle():
+    cur = read_mode()
+    if cur == "unknown":
+        notify("VFIO hotplug", "Live-attach is not installed; nothing to toggle.", "critical")
+        return
+    nxt = "off" if cur == "on" else "on"
+    detail = ("ON: the VM boots WITHOUT the GPU and the helper hot-attaches it once Windows is up.\n"
+              "OFF: the VM boots normally WITH the GPU present (standard dynamic binding).")
+    if not confirm("VFIO hotplug toggle",
+                   "Toggle live-attach hotplug %s -> %s?\n\n%s" % (cur.upper(), nxt.upper(), detail)):
+        notify("VFIO hotplug", "Toggle cancelled.")
+        return
+    try:
+        rc = subprocess.call(["pkexec", VFIO_BIN, "--live-attach-toggle"])
+    except Exception as e:
+        notify("VFIO hotplug", "Failed to launch pkexec: %s" % e, "critical")
+        return
+    new = read_mode()
+    if rc == 0:
+        notify("VFIO hotplug", "Hotplug is now %s." % new.upper())
+    else:
+        notify("VFIO hotplug", "Toggle failed (rc=%s). Check: pkexec / polkit / journalctl." % rc, "critical")
+
+def show_status():
+    try:
+        out = subprocess.check_output([VFIO_BIN, "--live-attach-status"],
+                                       stderr=subprocess.DEVNULL).decode()
+    except Exception as e:
+        out = "status unavailable: %s" % e
+    try:
+        subprocess.run(["zenity", "--info", "--title", "VFIO hotplug status", "--text", out],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        sys.stderr.write(out + "\n")
+
+def main():
+    try:
+        from PySide6 import QtWidgets, QtGui, QtCore
+    except Exception as e:
+        sys.stderr.write("vfio-hotplug-tray: PySide6 unavailable: %s\n" % e)
+        notify("VFIO hotplug", "Tray applet needs PySide6 (python3-pyside6).", "critical")
+        sys.exit(1)
+    if not installed():
+        notify("VFIO hotplug", "Live-attach is not installed. Run: sudo vfio --install-live-attach")
+        sys.exit(0)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    tray = QtWidgets.QSystemTrayIcon()
+    sty = app.style()
+    _icon = QtGui.QIcon.fromTheme("video-display")
+    if _icon.isNull():
+        _icon = sty.standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
+    tray.setIcon(_icon)
+    tray.setVisible(True)
+    menu = QtWidgets.QMenu()
+    toggle_act = menu.addAction("Toggle hotplug")
+    status_act = menu.addAction("Status…")
+    menu.addSeparator()
+    quit_act = menu.addAction("Quit")
+    quit_act.triggered.connect(app.quit)
+    status_act.triggered.connect(show_status)
+    toggle_act.triggered.connect(do_toggle)
+    def refresh():
+        m = read_mode()
+        tray.setToolTip("VFIO hotplug: %s" % m.upper())
+        toggle_act.setText("Toggle hotplug (currently %s)" % m.upper())
+    tray.setContextMenu(menu)
+    refresh()
+    timer = QtCore.QTimer()
+    timer.timeout.connect(refresh)
+    timer.start(2000)
+    app.exec()
+
+if __name__ == "__main__":
+    main()
+TRAYEOF
+
+  # 2. Polkit policy: scopes pkexec to /usr/local/bin/vfio --live-attach-toggle
+  #    with auth_admin_keep (so repeated tray toggles don't re-prompt for a few
+  #    minutes) + a friendly KDE auth message. Without this, pkexec falls back
+  #    to the generic org.freedesktop.policykit.exec auth (still works, just
+  #    re-prompts every time + a generic message).
+  if [[ -d /usr/share/polkit-1/actions ]]; then
+    write_file_atomic "$LIVE_ATTACH_POLKIT" 0644 "root:root" <<'POLEOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="dev.vfio.live-attach-toggle">
+    <description>Toggle VFIO live-attach GPU hotplug on/off</description>
+    <message>Authentication is required to toggle the VFIO live-attach hotplug mode (VM boots without GPU vs with GPU)</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/vfio</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--live-attach-toggle</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>
+POLEOF
+    say "Installed polkit policy: $LIVE_ATTACH_POLKIT (action: $LIVE_ATTACH_POLKIT_ACTION)"
+  else
+    note "Tray applet: /usr/share/polkit-1/actions not present; skipping polkit policy (pkexec will use generic auth)."
+  fi
+
+  # 3. Per-user autostart desktop file so the tray launches on Plasma login.
+  local _user="${SUDO_USER:-}"
+  if [[ -n "$_user" && "$_user" != "root" ]]; then
+    local _home _auto_dir _auto_file
+    _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+    if [[ -n "$_home" && -d "$_home" ]]; then
+      _auto_dir="$_home/.config/autostart"
+      _auto_file="$_auto_dir/vfio-hotplug-tray.desktop"
+      if (( ! DRY_RUN )); then
+        mkdir -p "$_auto_dir" 2>/dev/null || true
+      fi
+      write_file_atomic "$_auto_file" 0644 "$_user:$(id -gn "$_user" 2>/dev/null || echo "$_user")" <<'DESKEOF'
+[Desktop Entry]
+Type=Application
+Name=VFIO Hotplug Toggle
+Comment=System-tray on/off toggle for live-attach GPU hotplug
+Exec=/usr/local/bin/vfio-hotplug-tray
+Icon=video-display
+Terminal=false
+NoDisplay=false
+X-KDE-autostart-after=panel
+Categories=System;
+DESKEOF
+      say "Installed autostart: $_auto_file (starts on next Plasma login)"
+      # Best-effort: launch one instance now so the icon appears immediately.
+      # Launching a Wayland GUI app as the desktop user from a root sudo context
+      # needs the user's XDG_RUNTIME_DIR + WAYLAND_DISPLAY; if they aren't in
+      # the inherited env, skip (the autostart covers it on next login).
+      local _rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u "$_user" 2>/dev/null || echo 0)}"
+      if (( ! DRY_RUN )) && [[ -d "$_rt" ]]; then
+        runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" \
+          ${WAYLAND_DISPLAY:+WAYLAND_DISPLAY="$WAYLAND_DISPLAY"} \
+          ${DISPLAY:+DISPLAY="$DISPLAY"} \
+          "$LIVE_ATTACH_TRAY" </dev/null >/dev/null 2>&1 &
+        say "Launched vfio-hotplug-tray for '$_user' (icon should appear in the system tray)."
+      fi
+    else
+      note "Tray applet: could not resolve home for '$_user'; skipping autostart (CLI toggle still works)."
+    fi
+  else
+    note "Tray applet: no SUDO_USER (running as root directly); skipping per-user autostart. Run vfio-hotplug-tray as your desktop user to see the icon."
+  fi
+
+  say "  ✔ Installed live-attach tray applet: $LIVE_ATTACH_TRAY"
+  note "Toggle hotplug on/off from the system tray (zenity confirmation + polkit auth), or CLI:"
+  note "  sudo $SCRIPT_NAME --live-attach-toggle   (or --live-attach-on / --live-attach-off)"
+  return 0
+}
+
+# R41: Remove the system-tray applet + polkit policy + per-user autostart, and
+# stop any running tray instance. Best-effort / never fatal (called by
+# remove_live_attach / --reset / --install-early-binding).
+remove_live_attach_tray() {
+  local _removed=0
+  if [[ -f "$LIVE_ATTACH_TRAY" ]]; then
+    run rm -f "$LIVE_ATTACH_TRAY" 2>/dev/null || true
+    _removed=1
+  fi
+  if [[ -f "$LIVE_ATTACH_POLKIT" ]]; then
+    run rm -f "$LIVE_ATTACH_POLKIT" 2>/dev/null || true
+    _removed=1
+  fi
+  # Per-user autostart desktop file (SUDO_USER + all /home users, best-effort).
+  local _user _home _auto_file _d _u
+  _user="${SUDO_USER:-}"
+  if [[ -n "$_user" && "$_user" != "root" ]]; then
+    _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+    if [[ -n "$_home" ]]; then
+      _auto_file="$_home/.config/autostart/vfio-hotplug-tray.desktop"
+      if [[ -f "$_auto_file" ]]; then
+        run rm -f "$_auto_file" 2>/dev/null || true
+        _removed=1
+      fi
+    fi
+  fi
+  for _d in /home/*; do
+    [[ -d "$_d" ]] || continue
+    _u="$(basename "$_d")"
+    _auto_file="$_d/.config/autostart/vfio-hotplug-tray.desktop"
+    if [[ -f "$_auto_file" ]]; then
+      run rm -f "$_auto_file" 2>/dev/null || true
+      _removed=1
+    fi
+  done
+  # Stop any running tray instance (best-effort; pkill by script name).
+  if have_cmd pkill; then
+    run pkill -f "vfio-hotplug-tray" 2>/dev/null || true
+  fi
+  (( _removed )) && note "Removed live-attach tray applet + polkit policy + autostart."
+  return 0
+}
+
 # Install the live-attach (hotplug GPU) workflow:
 # 1. Extract the GPU + audio hostdev blocks from each shut-off guest-GPU VM's
 #    XML into standalone device XML files.
@@ -10859,6 +11387,14 @@ install_live_attach() {
     local _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
     printf '%s\n' "$_xml" | write_file_atomic "$_backup_xml" 0644 "root:root"
     say "  Saved pre-live-attach VM XML backup (with GPU): $_backup_xml"
+    # R41: ALSO save the with-GPU variant as a named mode config so the toggle
+    # (live_attach_toggle mode=off) can virsh-define it directly. Same content
+    # as the legacy backup; kept as a separate named file so the toggle logic is
+    # symmetric (with-gpu / without-gpu) and the legacy backup stays a pure
+    # remove_live_attach fallback. Atomic for the same power-loss reason.
+    local _with_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
+    printf '%s\n' "$_xml" | write_file_atomic "$_with_gpu_xml" 0644 "root:root"
+    say "  Saved mode=off variant (VM with GPU): $_with_gpu_xml"
 
     python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || true
 import sys, xml.etree.ElementTree as ET
@@ -10974,12 +11510,19 @@ PYEOF
       say "  Saved audio device XML: $LIVE_ATTACH_AUDIO_XML"
     fi
 
-    # Validate and redefine the VM without the GPU.
+    # R41: save the without-GPU variant (the stripped XML) as the other named
+    # mode config so the toggle (live_attach_toggle mode=on) can re-define it
+    # directly. Saved from $_tmp_vm (the stripped temp) BEFORE define, and only
+    # when it validates (a variant that fails schema would break the toggle).
+    local _without_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"
     if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
+      write_file_atomic "$_without_gpu_xml" 0644 "root:root" <"$_tmp_vm"
+      say "  Saved mode=on variant (VM without GPU): $_without_gpu_xml"
+      # Validate and redefine the VM without the GPU.
       if (( ! DRY_RUN )); then
         virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null
       fi
-      say "  Redefined VM '$_dom' WITHOUT the GPU hostdev (backup in XML dump)"
+      say "  Redefined VM '$_dom' WITHOUT the GPU hostdev (mode=on; backup in XML dump)"
     else
       note "WARN: XML validation failed for '$_dom'; skipping VM XML modification."
     fi
@@ -11060,15 +11603,29 @@ PYEOF
   install_bind_script
   say "Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)"
 
+  # R41: deploy the system-tray on/off toggle applet + autostart + polkit
+  # policy (best-effort: if PySide6 is absent the install still succeeds — the
+  # CLI --live-attach-toggle / --live-attach-on/off flags work regardless).
+  install_live_attach_tray || note "WARN: live-attach tray applet setup incomplete (CLI toggle still works)."
+
+  # R41: set the on/off mode switch to ON (default after install = hotplug
+  # active, matching the original behavior). The hook reads this file to decide
+  # hotplug vs normal dynamic binding; the tray applet reads it for its icon.
+  _la_write_mode "on"
+  say "Set live-attach mode=on ($LIVE_ATTACH_MODE_FILE + VFIO_LIVE_ATTACH_MODE in $CONF_FILE)"
+
   say
   if (( ENABLE_COLOR )); then
-    say "${C_GREEN}${C_BOLD}✔ Live-attach is now active${C_RESET}"
+    say "${C_GREEN}${C_BOLD}✔ Live-attach is now active (mode=on)${C_RESET}"
   else
-    say "✔ Live-attach is now active"
+    say "✔ Live-attach is now active (mode=on)"
   fi
   note "The VM will start WITHOUT the GPU. After ${_delay_default}s, the GPU will be"
   note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
-  note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU from the per-VM backup)"
+  note "Toggle hotplug on/off any time from the system tray (vfio-hotplug-tray) or CLI:"
+  note "  sudo $SCRIPT_NAME --live-attach-toggle   (or --live-attach-on / --live-attach-off)"
+  note "To fully revert (restore the GPU to the VM XML + remove the helper/tray):"
+  note "  sudo $SCRIPT_NAME --install-dynamic-binding"
 }
 
 # Install the virtio-win guest-agent support so the live-attach helper's smart
@@ -11442,6 +11999,11 @@ remove_live_attach() {
     while IFS= read -r _dom; do
       [[ -n "$_dom" ]] || continue
       _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
+      # R41: prefer the named with-GPU mode variant if the legacy backup is gone
+      # (the toggle keeps both; remove should restore the GPU-present XML).
+      if [[ ! -f "$_backup_xml" ]]; then
+        _backup_xml="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
+      fi
       [[ -f "$_backup_xml" ]] || continue
       _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
       if [[ "$_state" != "shut off" ]]; then
@@ -11489,9 +12051,26 @@ remove_live_attach() {
     run rm -f "$_bxml" 2>/dev/null || true
     _removed=1
   done
+  # R41: remove the per-VM named mode configs (with-gpu / without-gpu variants)
+  # and the on/off mode file.
+  for _bxml in /var/lib/vfio-dynamic/live-attach-vm-with-gpu-*.xml /var/lib/vfio-dynamic/live-attach-vm-without-gpu-*.xml; do
+    [[ -f "$_bxml" ]] || continue
+    run rm -f "$_bxml" 2>/dev/null || true
+    _removed=1
+  done
+  if [[ -f "$LIVE_ATTACH_MODE_FILE" ]]; then
+    run rm -f "$LIVE_ATTACH_MODE_FILE" 2>/dev/null || true
+    _removed=1
+  fi
+  # R41: remove the system-tray applet + polkit policy + autostart.
+  remove_live_attach_tray
   # Flip the conf key back to 0.
   if readable_file "$CONF_FILE" && grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
     rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "0"
+    _removed=1
+  fi
+  if readable_file "$CONF_FILE" && grep -Eq '^VFIO_LIVE_ATTACH_MODE=' "$CONF_FILE" 2>/dev/null; then
+    rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "off"
     _removed=1
   fi
   (( _removed )) && note "Removed live-attach workflow (VM XML restored from pre-live-attach backups where the VM was shut off)."
@@ -22189,6 +22768,15 @@ verify_setup() {
     else
       say "Live-attach (hotswap) check:"
     fi
+    # R41: report the on/off mode (the real switch the hook + tray read).
+    local _la_vmode
+    _la_vmode="$(_la_read_mode)"
+    if [[ "$_la_vmode" == "unknown" ]]; then _la_vmode="on"; fi
+    if (( ENABLE_COLOR )); then
+      say "${C_BLUE}INFO${C_RESET}: Live-attach mode: $_la_vmode (on=hotplug [VM boots w/o GPU], off=normal dynamic binding; toggle: sudo $SCRIPT_NAME --live-attach-toggle)"
+    else
+      say "INFO: Live-attach mode: $_la_vmode (on=hotplug [VM boots w/o GPU], off=normal dynamic binding; toggle: sudo $SCRIPT_NAME --live-attach-toggle)"
+    fi
     if [[ -x "$LIVE_ATTACH_HELPER" ]]; then
       if (( ENABLE_COLOR )); then
         say "${C_GREEN}✔ OK${C_RESET}: Live-attach helper present: $LIVE_ATTACH_HELPER"
@@ -23153,6 +23741,7 @@ reset_vfio_all() {
            "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" "$PARK_KEEPALIVE_CHECK_UNIT" \
            "$PARK_KEEPALIVE_RESUME_HOOK" "$PARK_KEEPALIVE_UDEV_RULE" "$PARK_KEEPALIVE_STATE_FILE" \
            "$LIVE_ATTACH_HELPER" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" "$LIVE_ATTACH_VM_LIST" \
+           "$LIVE_ATTACH_MODE_FILE" "$LIVE_ATTACH_TRAY" "$LIVE_ATTACH_POLKIT" \
            "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
 
   remove_openbox_autostart_hook
@@ -25027,6 +25616,7 @@ vfio_menu() {
       "Remove Looking Glass (detach shmem + shared-memory node + user config)"
       "Install (compile) looking-glass-client binary"
       "Remove looking-glass-client binary"
+      "Toggle live-attach hotplug on/off (VM boots with vs without GPU)"
       "Exit menu"
     )
     say
@@ -25263,6 +25853,21 @@ vfio_menu() {
         remove_looking_glass_client
         ;;
       19)
+        # Toggle live-attach hotplug on/off (real mode switch, not backup-restore).
+        say
+        note "Toggling live-attach hotplug..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 4 (Set up live-attach) first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; the toggle needs libvirt to define VM XML."
+          if prompt_yn "Continue anyway?" N "Live-attach toggle"; then
+            live_attach_toggle toggle
+          fi
+        else
+          live_attach_toggle toggle
+        fi
+        ;;
+      20)
         # Exit.
         say
         say "Exiting vfio.sh menu."
@@ -25370,7 +25975,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" && "$MODE" != "live-attach-status" ]]; then
     need_cmd modprobe
   fi
 
@@ -25604,6 +26209,47 @@ main() {
       fi
     fi
     install_live_attach
+    exit 0
+  fi
+
+  if [[ "$MODE" == "live-attach-on" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then die "Missing $CONF_FILE. Run --install-dynamic-binding + --install-live-attach first."; fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; the toggle needs libvirt to define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Live-attach toggle"; then die "Aborted by user"; fi
+    fi
+    live_attach_toggle on
+    exit $?
+  fi
+
+  if [[ "$MODE" == "live-attach-off" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then die "Missing $CONF_FILE. Run --install-dynamic-binding + --install-live-attach first."; fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; the toggle needs libvirt to define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Live-attach toggle"; then die "Aborted by user"; fi
+    fi
+    live_attach_toggle off
+    exit $?
+  fi
+
+  if [[ "$MODE" == "live-attach-toggle" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    if ! readable_file "$CONF_FILE"; then die "Missing $CONF_FILE. Run --install-dynamic-binding + --install-live-attach first."; fi
+    if ! libvirt_runtime_ok; then
+      note "WARN: libvirt is not reachable; the toggle needs libvirt to define VM XML."
+      if ! prompt_yn "Continue anyway?" N "Live-attach toggle"; then die "Aborted by user"; fi
+    fi
+    live_attach_toggle toggle
+    exit $?
+  fi
+
+  if [[ "$MODE" == "live-attach-status" ]]; then
+    live_attach_status
     exit 0
   fi
 

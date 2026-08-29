@@ -442,7 +442,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R23 bash completion opts include --install-live-attach" \
-  '--install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  '--install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 # R27 inserted --install-virtio-win-guest-agent between --install-live-attach and
 # --install-stealth-vm-tuning in the bash opts string, so the ordered pattern above
@@ -651,7 +651,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 usage one-liner includes --install-virtio-win-guest-agent" \
-  '[--install-live-attach] [--install-virtio-win-guest-agent]' \
+  '[--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent]' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 fish completion includes --install-virtio-win-guest-agent" \
@@ -659,7 +659,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 bash completion opts include --install-virtio-win-guest-agent" \
-  '--install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  '--install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 zsh completion includes --install-virtio-win-guest-agent" \
@@ -1250,6 +1250,237 @@ assert_contains_text \
   "R36 remove_live_attach returns 0 (best-effort cleanup)" \
   '  return 0' \
   "$_rm_la_fn"
+
+# --- R41: system-tray on/off toggle + real mode switch (not backup-restore) ---
+# A persisted on/off mode (VFIO_LIVE_ATTACH_MODE conf key + world-readable
+# /var/lib/vfio-dynamic/live-attach-mode file) replaces the backup-restore
+# toggle. install_live_attach keeps BOTH VM XML variants (with-gpu / without-
+# gpu); live_attach_toggle virsh-defines the right one. A PySide6 QSystemTrayIcon
+# applet (native SNI on KDE Plasma 6) toggles via zenity --question + pkexec +
+# notify-send, with a polkit policy (auth_admin_keep) + per-user autostart.
+assert_contains_file \
+  "R41 LIVE_ATTACH_MODE_FILE constant defined" \
+  'LIVE_ATTACH_MODE_FILE="/var/lib/vfio-dynamic/live-attach-mode"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 LIVE_ATTACH_TRAY constant defined" \
+  'LIVE_ATTACH_TRAY="/usr/local/bin/vfio-hotplug-tray"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 LIVE_ATTACH_POLKIT constant defined" \
+  'LIVE_ATTACH_POLKIT="/usr/share/polkit-1/actions/dev.vfio.live-attach-toggle.policy"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 LIVE_ATTACH_POLKIT_ACTION constant defined" \
+  'LIVE_ATTACH_POLKIT_ACTION="dev.vfio.live-attach-toggle"' \
+  "$VFIO_SCRIPT"
+# Mode helpers + toggle + status + tray install/remove functions defined.
+assert_contains_file \
+  "R41 _la_read_mode helper defined" \
+  '_la_read_mode()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 _la_write_mode helper defined" \
+  '_la_write_mode()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 live_attach_toggle function defined" \
+  'live_attach_toggle()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 live_attach_status function defined" \
+  'live_attach_status()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 install_live_attach_tray function defined" \
+  'install_live_attach_tray()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 remove_live_attach_tray function defined" \
+  'remove_live_attach_tray()' \
+  "$VFIO_SCRIPT"
+# parse_args handles the 4 new toggle/status flags.
+assert_contains_file \
+  "R41 parse_args handles --live-attach-on" \
+  '--live-attach-on)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 parse_args handles --live-attach-off" \
+  '--live-attach-off)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 parse_args handles --live-attach-toggle" \
+  '--live-attach-toggle)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 parse_args handles --live-attach-status" \
+  '--live-attach-status)' \
+  "$VFIO_SCRIPT"
+# MODE comment lists the 4 new modes.
+assert_contains_file \
+  "R41 MODE comment lists live-attach-on/off/toggle/status" \
+  'install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent' \
+  "$VFIO_SCRIPT"
+# main dispatch wires the 4 new modes.
+assert_contains_file \
+  "R41 main dispatch wires live-attach-on" \
+  '[[ "$MODE" == "live-attach-on" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 main dispatch wires live-attach-off" \
+  '[[ "$MODE" == "live-attach-off" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 main dispatch wires live-attach-toggle" \
+  '[[ "$MODE" == "live-attach-toggle" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 main dispatch wires live-attach-status" \
+  '[[ "$MODE" == "live-attach-status" ]]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 main dispatch calls live_attach_toggle toggle" \
+  'live_attach_toggle toggle' \
+  "$VFIO_SCRIPT"
+# usage one-liner + help document the toggle.
+assert_contains_file \
+  "R41 usage one-liner includes --live-attach-toggle" \
+  '[--live-attach-toggle]' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 usage help documents --live-attach-toggle" \
+  'system-tray applet (vfio-hotplug-tray) calls via pkexec' \
+  "$VFIO_SCRIPT"
+# fish/bash/zsh completions cover the toggle/status flags.
+assert_contains_file \
+  "R41 fish completion includes --live-attach-toggle" \
+  'complete -c $cmd -l live-attach-toggle' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 fish completion includes --live-attach-status" \
+  'complete -c $cmd -l live-attach-status' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 bash completion opts include --live-attach-toggle" \
+  '--live-attach-on --live-attach-off --live-attach-toggle --live-attach-status' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 zsh completion includes --live-attach-toggle" \
+  "'--live-attach-toggle[" \
+  "$VFIO_SCRIPT"
+# install_live_attach saves BOTH named VM XML variants + sets mode=on + installs tray.
+assert_contains_text \
+  "R41 install_live_attach saves with-gpu variant" \
+  'live-attach-vm-with-gpu-$_dom.xml' \
+  "$_la_fn"
+assert_contains_text \
+  "R41 install_live_attach saves without-gpu variant" \
+  'live-attach-vm-without-gpu-$_dom.xml' \
+  "$_la_fn"
+assert_contains_text \
+  "R41 install_live_attach sets mode=on" \
+  '_la_write_mode "on"' \
+  "$_la_fn"
+assert_contains_text \
+  "R41 install_live_attach calls install_live_attach_tray" \
+  'install_live_attach_tray' \
+  "$_la_fn"
+# live_attach_toggle defines the right named variant per target mode.
+assert_contains_text \
+  "R41 live_attach_toggle picks without-gpu for on" \
+  '_without_gpu="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"' \
+  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R41 live_attach_toggle picks with-gpu for off" \
+  '_with_gpu="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"' \
+  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R41 live_attach_toggle flips the mode file" \
+  '_la_write_mode "$_target"' \
+  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+# remove_live_attach: restore prefers named with-gpu variant, removes variants + mode + tray.
+assert_contains_text \
+  "R41 remove_live_attach falls back to named with-gpu variant" \
+  'live-attach-vm-with-gpu-$_dom.xml' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R41 remove_live_attach removes named variants glob" \
+  'live-attach-vm-with-gpu-*.xml /var/lib/vfio-dynamic/live-attach-vm-without-gpu-*.xml' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R41 remove_live_attach removes the mode file" \
+  'run rm -f "$LIVE_ATTACH_MODE_FILE"' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R41 remove_live_attach calls remove_live_attach_tray" \
+  'remove_live_attach_tray' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R41 remove_live_attach flips VFIO_LIVE_ATTACH_MODE off" \
+  'rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "off"' \
+  "$_rm_la_fn"
+# Hook reads the mode file + gates the helper on mode=on.
+assert_contains_text \
+  "R41 hook reads the live-attach mode file" \
+  'read -r _la_mode </var/lib/vfio-dynamic/live-attach-mode' \
+  "$hook_block"
+assert_contains_text \
+  "R41 hook gates helper launch on mode=on" \
+  '&& [[ "$_la_mode" == "on" ]]' \
+  "$hook_block"
+# reset rm -f includes the new artifacts.
+assert_contains_text \
+  "R41 reset rm -f includes mode file + tray + polkit" \
+  '"$LIVE_ATTACH_MODE_FILE" "$LIVE_ATTACH_TRAY" "$LIVE_ATTACH_POLKIT"' \
+  "$_reset_fn"
+# Tray applet: PySide6 QSystemTrayIcon + zenity confirm + pkexec toggle + notify-send.
+assert_contains_file \
+  "R41 tray applet uses PySide6 QSystemTrayIcon" \
+  'QtWidgets.QSystemTrayIcon' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 tray applet confirms via zenity --question" \
+  'zenity", "--question"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 tray applet toggles via pkexec vfio --live-attach-toggle" \
+  '"pkexec", VFIO_BIN, "--live-attach-toggle"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 tray applet reports result via notify-send" \
+  'notify-send", "-u"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 tray applet reads the world-readable mode file (no root)" \
+  'MODE_FILE = "/var/lib/vfio-dynamic/live-attach-mode"' \
+  "$VFIO_SCRIPT"
+# Polkit policy: auth_admin_keep + scoped to /usr/local/bin/vfio --live-attach-toggle.
+assert_contains_file \
+  "R41 polkit policy uses auth_admin_keep" \
+  '<allow_active>auth_admin_keep</allow_active>' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 polkit policy scopes exec.path to the self-installed vfio" \
+  'org.freedesktop.policykit.exec.path">/usr/local/bin/vfio' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41 polkit policy scopes argv1 to --live-attach-toggle" \
+  'org.freedesktop.policykit.exec.argv1">--live-attach-toggle' \
+  "$VFIO_SCRIPT"
+# Autostart desktop file installed for SUDO_USER.
+assert_contains_file \
+  "R41 tray autostart desktop file installed" \
+  'vfio-hotplug-tray.desktop' \
+  "$VFIO_SCRIPT"
+# Menu offers the toggle + dispatches live_attach_toggle.
+assert_contains_text \
+  "R41 menu has a toggle hotplug entry" \
+  'Toggle live-attach hotplug on/off' \
+  "$_menu_fn"
+assert_contains_text \
+  "R41 menu dispatches live_attach_toggle" \
+  'live_attach_toggle toggle' \
+  "$_menu_fn"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

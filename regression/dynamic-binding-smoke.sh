@@ -2915,20 +2915,20 @@ fi
 if grep -Fq -- '--install-virtio-win-guest-agent)' "$VFIO_SCRIPT" \
   && grep -Fq 'MODE="install-virtio-win-guest-agent"' "$VFIO_SCRIPT" \
   && grep -Fq '[[ "$MODE" == "install-virtio-win-guest-agent" ]]' "$VFIO_SCRIPT" \
-  && grep -Fq 'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | menu | install-self | uninstall-self | completion printers' "$VFIO_SCRIPT"; then
+  && grep -Fq 'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | install-self | uninstall-self | completion printers' "$VFIO_SCRIPT"; then
   ok "R27 CLI parse_args + dispatch + MODE comment"
 else
   bad "R27 CLI parse_args/dispatch/MODE-comment wiring missing"
 fi
 if grep -Fq 'complete -c $cmd -l install-virtio-win-guest-agent' "$VFIO_SCRIPT" \
   && grep -Fq "'--install-virtio-win-guest-agent[" "$VFIO_SCRIPT" \
-  && grep -Fq -- '--install-live-attach --install-virtio-win-guest-agent --menu --install-self --uninstall-self --install-stealth-vm-tuning' "$VFIO_SCRIPT"; then
+  && grep -Fq -- '--install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' "$VFIO_SCRIPT"; then
   ok "R27 fish/bash/zsh completions cover --install-virtio-win-guest-agent"
 else
   bad "R27 completions missing --install-virtio-win-guest-agent"
 fi
 if grep -Fq 'Attach the virtio-win driver ISO to each guest-GPU VM' "$VFIO_SCRIPT" \
-  && grep -Fq '[--install-live-attach] [--install-virtio-win-guest-agent]' "$VFIO_SCRIPT"; then
+  && grep -Fq '[--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent]' "$VFIO_SCRIPT"; then
   ok "R27 usage help + one-liner cover --install-virtio-win-guest-agent"
 else
   bad "R27 usage help/one-liner missing --install-virtio-win-guest-agent"

@@ -28,6 +28,7 @@
 - [GPU binding mode (early vs dynamic) — CLI reference](#gpu-binding-mode-early-vs-dynamic)
 - [Unreleased / changelog](#unreleased)
 - [Live-attach (hotplug GPU) workflow — the recommended RDNA4 path](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path)
+- [System-tray hotplug on/off toggle (R41)](#system-tray-hotplug-onoff-toggle-r41)
 - [virtio-win guest-agent installer (smart handoff)](#virtio-win-guest-agent-installer-smart-handoff)
 - [SBR Phase-2 force-kill recovery (R24)](#sbr-phase-2-force-kill-recovery-r24)
 - [Park-keepalive monitor](#park-keepalive-monitor)
@@ -42,6 +43,7 @@
 - [What's new — RX 9070 / RDNA4 dynamic binding + Wayland render-device pinning](#whats-new--rx-9070--rdna4-dynamic-binding--wayland-render-device-pinning)
 - [Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card](#keeping-the-rx-9070-alive-soft-reboot-hard-kill-and-the-zombie-card)
 - [Live-attach (hotplug GPU) workflow — the recommended RDNA4 path](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path)
+- [System-tray hotplug on/off toggle (R41)](#system-tray-hotplug-onoff-toggle-r41)
 - [virtio-win guest-agent installer (smart handoff)](#virtio-win-guest-agent-installer-smart-handoff)
 - [SBR Phase-2 force-kill recovery (R24)](#sbr-phase-2-force-kill-recovery-r24)
 - [Park-keepalive monitor](#park-keepalive-monitor)
@@ -95,6 +97,8 @@ An **interactive installer menu** (`--menu`) lets you pick any of those actions 
 A **self-install** (`--install-self`) puts `vfio` on PATH at `/usr/local/bin/vfio` and drops the fish/bash/zsh completions into their vendor auto-load directories (no `source` step), so you can run `vfio ...` (no `.sh`) from anywhere with working completions; `--uninstall-self` removes both. And on a fresh install, if a prior run left a `/etc/vfio-gpu-passthrough.conf.bak.<ts>` backup (e.g. after `--reset`, or cloning the repo onto a host that already had VFIO) but the live config is missing, the wizard now **detects the backup and offers to pick up the same config** (restore the guest/host GPU BDFs + binding mode and re-apply the binding) instead of re-running the whole wizard. See [Self-install](#self-install).
 
 An **ultimate-performance VM tuning** installer (`--install-ultimate-perf-vm-tuning`) layers maximum-throughput knobs (disk `cache=none`/`io=native`/multiqueue, scaled iothreads, aggressive cputune/numatune pinning, CPU topology + cache passthrough, no startup balloon, S3/S4 disabled, optional hugepages) on each guest-GPU VM **without disturbing the stealth tuning** — the perf patcher never touches the stealth elements, and reverting perf restores a backup that still contains stealth. See [Ultimate-performance VM tuning (stealth-safe)](#ultimate-performance-vm-tuning-stealth-safe).
+
+A **system-tray on/off toggle** for the live-attach hotplug (`--live-attach-on` / `--live-attach-off` / `--live-attach-toggle` / `--live-attach-status`) flips a real persisted mode — not the backup-restore dance — so each shut-off guest-GPU VM is redefined from its saved with-GPU or without-GPU XML variant, and a **PySide6 system-tray applet** (native StatusNotifierItem on KDE Plasma 6) toggles it from the desktop with a zenity confirmation + pkexec auth + a notify-send result. Install the AMD Windows driver first, then enable hotplug from the tray. See [System-tray hotplug on/off toggle (R41)](#system-tray-hotplug-onoff-toggle-r41).
 
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
@@ -279,6 +283,33 @@ A systemd service (dynamic binding only, installed automatically) that periodica
 - `sudo ./vfio.sh --install-dynamic-binding` — restores normal binding + re-attaches the GPU from the per-VM backup + detaches the virtio-win ISO CD-ROM (the uninstaller only removes a cdrom whose source is one of the two script-managed ISO paths — a real optical drive or a different ISO is never touched).
 - `sudo ./vfio.sh --reset` — full cleanup (removes live-attach, the ISO CD-ROM, vBIOS pins, monitors, hook, conf).
 
+### System-tray hotplug on/off toggle (R41)
+
+vfio 7.2 adds a **real on/off switch** for the live-attach hotplug — a persisted mode you can flip without the per-VM XML backup-restore dance — exposed both on the CLI and from a **system-tray applet**. The workflow the user asked for: **install the AMD Windows driver first, then enable hotplug from the tray.**
+
+**The mode switch (not backup-restore).** `install_live_attach` now saves **both** per-VM XML variants up front:
+- `live-attach-vm-with-gpu-<dom>.xml` — the original dumpxml (GPU present) → used when mode = **off** (normal dynamic binding; the VM boots with the GPU);
+- `live-attach-vm-without-gpu-<dom>.xml` — the GPU-stripped XML → used when mode = **on** (the VM boots on a virtual display and the helper hot-attaches the GPU once Windows is up).
+
+Toggling just `virsh define`s the right saved variant and flips the mode — a positive, symmetric switch. The mode lives in a **world-readable** file `/var/lib/vfio-dynamic/live-attach-mode` (single line `on`/`off`, 0644) so the user-session tray applet and the libvirt hook can read it **without root** and without sourcing the root-owned conf, plus a `VFIO_LIVE_ATTACH_MODE` conf key. **Default-on fail-safe:** a missing or garbage mode file is treated as `on` (pre-R41 = hotplug active), so the hook and `--live-attach-status` never mis-report a pre-R41 setup as off. The hook launches the live-attach helper only when `mode=on` AND `VFIO_DYNAMIC_LIVE_ATTACH=1` AND the domain is in the live-attach VM list; otherwise it falls through to standard dynamic binding (`--bind-now`).
+
+**CLI flags:**
+- `--live-attach-on` / `--live-attach-off` — set the mode explicitly (idempotent).
+- `--live-attach-toggle` — flip the current mode (also what the tray calls).
+- `--live-attach-status` — machine-readable: `installed=0|1`, `mode=on|off`, one `vm=<dom>:<state>` line per guest-GPU VM. Read-only; does not require root (the tray consumes it on launch).
+
+```fish path=null start=null
+sudo vfio --live-attach-on       # hotplug ON  (VM boots without GPU; helper hot-attaches)
+sudo vfio --live-attach-off      # hotplug OFF (VM boots with the GPU; normal dynamic binding)
+sudo vfio --live-attach-toggle   # flip the current mode (the tray uses this)
+vfio --live-attach-status        # read-only state (no root needed)
+```
+
+**System-tray applet (`/usr/local/bin/vfio-hotplug-tray`).** A PySide6 `QSystemTrayIcon` app — KDE Plasma 6 uses the StatusNotifierItem protocol natively (Qt6), so the icon actually appears (XEmbed / `zenity --notification` would be invisible on Plasma 6). It reads the world-readable mode file (no root), refreshes its icon/tooltip every 2s, and the **Toggle hotplug** menu item runs a `zenity --question` confirmation → `pkexec vfio --live-attach-toggle` → `notify-send` with the result (normal urgency on success, critical on failure). A **Status…** menu item shows the full `--live-attach-status` output in a zenity info dialog. A per-user **autostart** desktop file (`~/.config/autostart/vfio-hotplug-tray.desktop`, installed for `SUDO_USER`) starts it on next Plasma login, and the installer best-effort launches one instance immediately.
+
+**Polkit policy.** A scoped policy (`/usr/share/polkit-1/actions/dev.vfio.live-attach-toggle.policy`, action `dev.vfio.live-attach-toggle`) allows `pkexec` to run **only** `/usr/local/bin/vfio --live-attach-toggle` with `auth_admin_keep` (so repeated tray toggles don't re-prompt every time) + a friendly KDE auth message + `allow_gui=true`. Without it pkexec falls back to the generic `org.freedesktop.policykit.exec` auth (still works, just re-prompts each time).
+
+**Requirements (best-effort install).** The tray needs PySide6 (`python3-pyside6`), `zenity`, `pkexec`/polkit, and the self-installed `vfio` CLI (`--install-self`). If any are absent, `install_live_attach` notes it and skips the tray (the CLI toggle still works); it prints the distro install hint (e.g. `sudo dnf install python3-pyside6`). The tray, polkit policy, and autostart file are removed by `--reset`, `--install-early-binding`, and `remove_live_attach`. Toggling does **not** uninstall live-attach — use `--install-dynamic-binding` for a full revert.
 
 ### Stealth/perf VM tuning (SMBIOS / CPU / NIC / disk serials / iothreads)
 
@@ -722,7 +753,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, with **no flag** it launches the **interactive menu** (`--menu`) — pick an action (full configure, switch binding, live-attach, verify, reset, install/uninstall `vfio`, …). The full guided wizard is menu option 1 (Full configure); or run any `--install-*` flag below to do one thing directly.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
 
 ### Interactive installer menu

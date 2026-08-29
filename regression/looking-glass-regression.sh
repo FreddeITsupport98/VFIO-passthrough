@@ -86,6 +86,29 @@ assert_contains_file "usage one-liner includes --install-looking-glass" '[--inst
 assert_contains_file "usage one-liner includes --remove-looking-glass" '[--remove-looking-glass]' "$VFIO_SCRIPT"
 assert_contains_file "usage help has --install-looking-glass block" '  --install-looking-glass' "$VFIO_SCRIPT"
 assert_contains_file "usage help has --remove-looking-glass block" '  --remove-looking-glass' "$VFIO_SCRIPT"
+# R40b: compile/remove client functions + flags + menu + completions.
+assert_contains_file "install_looking_glass_client function exists" 'install_looking_glass_client() {' "$VFIO_SCRIPT"
+assert_contains_file "remove_looking_glass_client function exists" 'remove_looking_glass_client() {' "$VFIO_SCRIPT"
+assert_contains_file "_lg_binary_valid helper exists" '_lg_binary_valid() {' "$VFIO_SCRIPT"
+assert_contains_file "_lg_compile_from_source helper exists" '_lg_compile_from_source() {' "$VFIO_SCRIPT"
+assert_contains_file "_lg_set_vm_display_none helper exists" '_lg_set_vm_display_none() {' "$VFIO_SCRIPT"
+assert_contains_file "_lg_restore_vm_display helper exists" '_lg_restore_vm_display() {' "$VFIO_SCRIPT"
+assert_contains_file "_vm_tuning_status_block function exists" '_vm_tuning_status_block() {' "$VFIO_SCRIPT"
+assert_contains_file "parse_args handles --install-looking-glass-client" '--install-looking-glass-client)' "$VFIO_SCRIPT"
+assert_contains_file "parse_args handles --remove-looking-glass-client" '--remove-looking-glass-client)' "$VFIO_SCRIPT"
+assert_contains_file "main dispatch install-looking-glass-client" '"install-looking-glass-client"' "$VFIO_SCRIPT"
+assert_contains_file "main dispatch remove-looking-glass-client" '"remove-looking-glass-client"' "$VFIO_SCRIPT"
+assert_contains_file "menu has Install (compile) looking-glass-client option" 'Install (compile) looking-glass-client' "$VFIO_SCRIPT"
+assert_contains_file "menu has Remove looking-glass-client option" 'Remove looking-glass-client binary' "$VFIO_SCRIPT"
+assert_contains_file "fish completion includes --install-looking-glass-client" 'complete -c $cmd -l install-looking-glass-client' "$VFIO_SCRIPT"
+assert_contains_file "fish completion includes --remove-looking-glass-client" 'complete -c $cmd -l remove-looking-glass-client' "$VFIO_SCRIPT"
+assert_contains_file "usage one-liner includes --install-looking-glass-client" '[--install-looking-glass-client]' "$VFIO_SCRIPT"
+assert_contains_file "usage one-liner includes --remove-looking-glass-client" '[--remove-looking-glass-client]' "$VFIO_SCRIPT"
+assert_contains_file "remove_looking_glass_client checks rpm -qf" 'rpm -qf' "$VFIO_SCRIPT"
+assert_contains_file "remove_looking_glass_client checks dpkg -S" 'dpkg -S' "$VFIO_SCRIPT"
+assert_contains_file "_vm_tuning_status_block called below menu" '_vm_tuning_status_block' "$VFIO_SCRIPT"
+assert_contains_file "install_looking_glass sets video=none" 'video=none' "$VFIO_SCRIPT"
+assert_contains_file "install_looking_glass sets spice local-only" 'spice local-only' "$VFIO_SCRIPT"
 # vBIOS is NOT duplicated in the LG path (vfio.sh already does vBIOS injection).
 assert_contains_file "install_looking_glass notes vBIOS NOT touched" 'vBIOS is NOT touched here' "$VFIO_SCRIPT"
 assert_contains_file "install_looking_glass notes client NOT auto-installed" 'client binary is NOT auto-installed' "$VFIO_SCRIPT"
@@ -236,6 +259,109 @@ set -e
 assert_eq "rebar-disable idempotent (exit 3 when not present)" "3" "$rc_reb4"
 # shmem device survives rebar toggle (rebar patcher must not drop shmem).
 assert_contains_file "shmem device survives rebar toggle" 'name="looking-glass"' "$tuned"
+
+# ===================== R40b: Functional display patcher =====================
+# _lg_set_vm_display_none: set <video><model type='none'/> + spice <listen type='none'/>.
+# _lg_restore_vm_display: restore <video><model type='virtio' heads='1' primary='yes'/>.
+lg_display_none_py="$tmp_dir/lg_display_none.py"
+awk '
+  /_lg_set_vm_display_none\(\)/ { in_fn=1 }
+  in_fn && /<<.PYEOF./ { grab=1; next }
+  grab && /^PYEOF$/ { grab=0; in_fn=0 }
+  grab { print }
+' "$VFIO_SCRIPT" > "$lg_display_none_py"
+
+lg_display_restore_py="$tmp_dir/lg_display_restore.py"
+awk '
+  /_lg_restore_vm_display\(\)/ { in_fn=1 }
+  in_fn && /<<.PYEOF./ { grab=1; next }
+  grab && /^PYEOF$/ { grab=0; in_fn=0 }
+  grab { print }
+' "$VFIO_SCRIPT" > "$lg_display_restore_py"
+
+if python3 -m py_compile "$lg_display_none_py" 2>/dev/null; then
+  printf 'PASS: LG display-none patcher python compiles\n'
+else
+  printf 'FAIL: LG display-none patcher python does not compile\n' >&2
+  record_failure "LG display-none patcher python compiles"
+fi
+if python3 -m py_compile "$lg_display_restore_py" 2>/dev/null; then
+  printf 'PASS: LG display-restore patcher python compiles\n'
+else
+  printf 'FAIL: LG display-restore patcher python does not compile\n' >&2
+  record_failure "LG display-restore patcher python compiles"
+fi
+
+# Mock XML with <video><model type='virtio'> and <graphics type='spice'><listen type='none'>.
+mock_display="$tmp_dir/mock_display.xml"
+cat >"$mock_display" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <devices>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+    </hostdev>
+    <graphics type="spice">
+      <listen type="address" address="127.0.0.1"/>
+    </graphics>
+    <video>
+      <model type="virtio" heads="1" primary="yes"/>
+    </video>
+  </devices>
+</domain>
+XEOF
+
+# --- Run 1: set video=none + spice local-only ---
+disp="$tmp_dir/disp.xml"
+cp "$mock_display" "$disp"
+set +e
+python3 - "$disp" <"$lg_display_none_py" >/dev/null 2>&1
+rc_dn1=$?
+set -e
+assert_eq "display-none exit 0 on first run" "0" "$rc_dn1"
+assert_contains_file "video model set to none" 'type="none"' "$disp"
+assert_contains_file "spice listen set to none" 'listen type="none"' "$disp"
+
+# --- Run 2: idempotent (already none+local) -> exit 3 ---
+set +e
+python3 - "$disp" <"$lg_display_none_py" >/dev/null 2>&1
+rc_dn2=$?
+set -e
+assert_eq "display-none idempotent (exit 3 on re-run)" "3" "$rc_dn2"
+
+# --- Run 3: restore video to virtio ---
+set +e
+python3 - "$disp" <"$lg_display_restore_py" >/dev/null 2>&1
+rc_dr1=$?
+set -e
+assert_eq "display-restore exit 0 after none" "0" "$rc_dr1"
+assert_contains_file "video model restored to virtio" 'type="virtio"' "$disp"
+assert_contains_file "video heads=1 preserved" 'heads="1"' "$disp"
+assert_contains_file "video primary=yes preserved" 'primary="yes"' "$disp"
+# spice listen stays none (restore does not re-expose spice).
+assert_contains_file "spice listen stays none after restore" 'listen type="none"' "$disp"
+
+# --- Run 4: restore idempotent (not currently 'none') -> exit 3 ---
+set +e
+python3 - "$disp" <"$lg_display_restore_py" >/dev/null 2>&1
+rc_dr2=$?
+set -e
+assert_eq "display-restore idempotent (exit 3 when not none)" "3" "$rc_dr2"
+
+# --- Run 5: validate the display-patched XML (if virt-xml-validate available) ---
+if command -v virt-xml-validate >/dev/null 2>&1; then
+  disp_val="$tmp_dir/disp_val.xml"
+  cp "$mock_display" "$disp_val"
+  python3 - "$disp_val" <"$lg_display_none_py" >/dev/null 2>&1 || true
+  if virt-xml-validate "$disp_val" >/dev/null 2>&1; then
+    printf 'PASS: display-none XML validates (virt-xml-validate)\n'
+  else
+    printf 'FAIL: display-none XML fails virt-xml-validate\n' >&2
+    record_failure "display-none XML validates"
+  fi
+fi
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

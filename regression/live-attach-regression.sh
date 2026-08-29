@@ -442,7 +442,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R23 bash completion opts include --install-live-attach" \
-  '--install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  '--install-early-binding --install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 # R27 inserted --install-virtio-win-guest-agent between --install-live-attach and
 # --install-stealth-vm-tuning in the bash opts string, so the ordered pattern above
@@ -643,7 +643,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 MODE comment lists install-virtio-win-guest-agent" \
-  'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | menu | install-self | uninstall-self | completion printers' \
+  'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | install-self | uninstall-self | completion printers' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 usage help documents --install-virtio-win-guest-agent" \
@@ -659,7 +659,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 bash completion opts include --install-virtio-win-guest-agent" \
-  '--install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  '--install-live-attach --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 zsh completion includes --install-virtio-win-guest-agent" \
@@ -699,7 +699,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R33 usage one-liner includes --menu" \
-  '[--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--menu]' \
+  '[--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu]' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R33 fish completion includes --menu" \
@@ -707,7 +707,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R33 bash completion opts include --menu" \
-  '--install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
+  '--install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R33 zsh completion includes --menu" \

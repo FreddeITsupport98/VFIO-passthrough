@@ -14060,11 +14060,13 @@ remove_perf_hugepages_boot_service() {
 # so the VM never fails to start); CPU topology matching vCPU count + <cache
 # mode='passthrough'/>; currentMemory=memory (no startup balloon, synergizes
 # with stealth's memballoon=none); <pm> S3/S4 disabled. Hugepages is the ONLY
-# host-touching knob and is OPT-IN (prompted default N, or --ultimate-perf-hugepages
-# / --no-ultimate-perf-hugepages): when opted in, adds <memoryBacking><hugepages>
-# and reserves the matching host nr_hugepages (prior value backed up, reverted by
-# --reset-ultimate-perf-vm-tuning). Idempotent (python exit 3 = no changes). Only
-# acts on shut-off VMs. AMD-gated (consistency with stealth tuning). Verifies the
+# host-touching knob and is OPT-IN but DISABLED by default (a plain run never
+# touches host RAM); enable ONLY with --ultimate-perf-hugepages. When enabled,
+# adds <memoryBacking><hugepages> and reserves the matching host nr_hugepages
+# (prior value backed up, reverted by --reset-ultimate-perf-vm-tuning). When
+# left OFF (the default), any existing hugepages are stripped so the VM no
+# longer pins host RAM. Idempotent (python exit 3 = no changes). Only acts on
+# shut-off VMs. AMD-gated (consistency with stealth tuning). Verifies the
 # tuned XML with virt-xml-validate + prompts per VM before redefine.
 install_ultimate_perf_vm_tuning() {
   if ! readable_file "$CONF_FILE"; then
@@ -14103,9 +14105,9 @@ install_ultimate_perf_vm_tuning() {
   note "  - CPU topology matching vCPU count + <cache mode='passthrough'/>"
   note "  - currentMemory=memory (no startup balloon; synergizes with stealth's memballoon=none)"
   note "  - <pm> S3/S4 disabled (faster boot; avoids guest suspend breaking passthrough)"
-  note "  - hugepages: OPT-IN (default N) — adds <memoryBacking> + reserves host nr_hugepages;"
-  note "    selecting NO removes any existing hugepages (frees host nr_hugepages) so the VM"
-  note "    no longer pins host RAM (the freeze root cause)"
+  note "  - hugepages: DISABLED by default (a plain run never touches host RAM)."
+  note "    Opt in ONLY with --ultimate-perf-hugepages. When OFF, any existing hugepages"
+  note "    are removed (frees host nr_hugepages) so the VM no longer pins host RAM"
   note "  - RAM safety gate: caps VM <memory> to ULTIMATE_PERF_MAX_VM_RAM_PCT (default 50)"
   note "    of host RAM; notifies + applies a smaller size if the VM is too large"
   note "STEALTH-SAFE: this NEVER touches vendor_id/kvm hidden/vmport/SMBIOS/e1000e NIC/"
@@ -14134,19 +14136,18 @@ install_ultimate_perf_vm_tuning() {
   fi
   note "Ultimate-perf VM XML backups: $_backup_dir"
 
-  # Hugepages opt-in decision. Default N (never touches host RAM on a plain run).
+  # Hugepages decision. DISABLED by default — a plain run never touches host RAM
+  # (orphaned-pool / host-RAM-starvation root cause: a reserved pool whose VM XML
+  # lost its <memoryBacking><hugepages> pins GiB of host RAM for nothing, starving
+  # the VM of normal memory so it cannot start). Only the explicit
+  # --ultimate-perf-hugepages flag enables it; users who want it opt in that way.
+  # --no-ultimate-perf-hugepages / empty both leave it OFF (the safe default).
   local _hp_on=0
   if [[ "${ULTIMATE_PERF_HUGEPAGES_OVERRIDE:-}" == "1" ]]; then
     _hp_on=1
-  elif [[ "${ULTIMATE_PERF_HUGEPAGES_OVERRIDE:-}" == "0" ]]; then
-    _hp_on=0
-  else
     say
-    note "Hugepages is the ONLY knob that touches host RAM (reserves nr_hugepages). It is opt-in."
-    note "With hugepages OFF, all the other perf knobs still apply and the VM stays startable."
-    if prompt_yn "Reserve host hugepages for each tuned VM (adds <memoryBacking> + reserves nr_hugepages)?" N "Ultimate-perf hugepages"; then
-      _hp_on=1
-    fi
+    note "Hugepages explicitly enabled (--ultimate-perf-hugepages): will add <memoryBacking>"
+    note "and reserve host nr_hugepages for each tuned VM. This pins host RAM."
   fi
   local _hp_size
   _hp_size="$(awk -F= '/^ULTIMATE_PERF_HUGEPAGES_SIZE=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"

@@ -857,7 +857,12 @@ assert_contains_file "strip frees reservation on success" "_hp_strip )) && (( ! 
 assert_contains_file "RAM cap notify message present" "exceeds" "$VFIO_SCRIPT"
 assert_contains_file "RAM cap applies smaller size" "capping to" "$VFIO_SCRIPT"
 assert_contains_file "boot service removed when all stripped" '(( ! _any_hp_reserved )) && ! [[ -f "$PERF_HP_DIRS_FILE" ]]' "$VFIO_SCRIPT"
-assert_contains_file "install intro notes NO removes hugepages" "selecting NO removes any existing hugepages" "$VFIO_SCRIPT"
+# R39c: hugepages is now DISABLED by default (no prompt; opt in via
+# --ultimate-perf-hugepages). The intro must still explain that with it OFF,
+# any existing hugepages are removed (frees host nr_hugepages) so the VM no
+# longer pins host RAM.
+assert_contains_file "install intro notes hugepages disabled by default" "hugepages: DISABLED by default" "$VFIO_SCRIPT"
+assert_contains_file "install intro notes OFF removes existing hugepages" "When OFF, any existing hugepages" "$VFIO_SCRIPT"
 assert_contains_file "install intro notes RAM safety gate" "RAM safety gate: caps VM" "$VFIO_SCRIPT"
 # The 5 skip-path inline restores must STILL be present (R35 contract intact);
 # the new strip-success restore is on a separate multi-line if (not 'then ' on

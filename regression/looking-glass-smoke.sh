@@ -92,11 +92,18 @@ if [[ "$rc_dn1" -eq 0 ]]; then ok "display-none run 1 exit 0"; else bad "display
 
 # ElementTree writes double-quoted attributes on the temp (pre-define) XML.
 if grep -Fq 'type="none"' "$disp"; then ok "video model set to none"; else bad "video model not set to none"; fi
-if grep -Fq 'listen type="none"' "$disp"; then ok "spice listen set to none"; else bad "spice listen not set to none"; fi
+# R42: spice normalized to the Looking Glass input block (local 127.0.0.1 port).
+if grep -Fq 'type="spice"' "$disp"; then ok "spice graphics type spice"; else bad "spice graphics not type spice"; fi
+if grep -Fq 'port="-1"' "$disp"; then ok "spice port=-1 (auto-alloc one insecure port)"; else bad "spice port not -1"; fi
+if grep -Fq 'autoport="no"' "$disp"; then ok "spice autoport=no"; else bad "spice autoport not no"; fi
+if grep -Fq 'listen type="address"' "$disp"; then ok "spice listen type=address (local 127.0.0.1)"; else bad "spice listen not type=address"; fi
+if grep -Fq 'compression="off"' "$disp"; then ok "spice image compression=off (LG does its own compression)"; else bad "spice image compression not off"; fi
 
-# BUG GUARD: the 'none' variants must NOT carry leftover active-variant attrs.
-# (Leftover heads/primary on model none, or address on listen none, make the
-# element fail its RNG branch -> 'Extra element devices in interleave'.)
+# BUG GUARD: the video 'none' model must NOT carry leftover active-variant
+# attrs (leftover heads/primary make the element fail its RNG branch ->
+# 'Extra element devices in interleave'). The R42 spice <listen type='address'/>
+# intentionally carries NO address attr (127.0.0.1 default) — that is correct,
+# not a leftover, so no bug guard is needed for it.
 if grep -Fq '<model type="none"' "$disp"; then
   if grep -Fq '<model type="none" heads' "$disp"; then
     bad "video model none still carries heads= (RNG-invalid)"
@@ -105,15 +112,6 @@ if grep -Fq '<model type="none"' "$disp"; then
   fi
 else
   bad "video model none element not found"
-fi
-if grep -Fq 'listen type="none"' "$disp"; then
-  if grep -Fq 'listen type="none" address' "$disp"; then
-    bad "spice listen none still carries address= (RNG-invalid)"
-  else
-    ok "spice listen none carries no leftover address"
-  fi
-else
-  bad "spice listen none element not found"
 fi
 
 if command -v virt-xml-validate >/dev/null 2>&1; then
@@ -142,8 +140,8 @@ if [[ "$rc_dr1" -eq 0 ]]; then ok "display-restore exit 0 after none"; else bad 
 if grep -Fq 'type="virtio"' "$disp"; then ok "video model restored to virtio"; else bad "video model not restored to virtio"; fi
 if grep -Fq 'heads="1"' "$disp"; then ok "video heads=1 preserved on restore"; else bad "video heads=1 lost on restore"; fi
 if grep -Fq 'primary="yes"' "$disp"; then ok "video primary=yes preserved on restore"; else bad "video primary=yes lost on restore"; fi
-# spice stays local-only (restore does not re-expose spice).
-if grep -Fq 'listen type="none"' "$disp"; then ok "spice listen stays none after restore"; else bad "spice listen changed after restore"; fi
+# spice input block stays after restore (restore only touches video, not spice).
+if grep -Fq 'listen type="address"' "$disp"; then ok "spice listen stays address after restore"; else bad "spice listen changed after restore"; fi
 if command -v virt-xml-validate >/dev/null 2>&1; then
   if virt-xml-validate "$disp" >/dev/null 2>&1; then
     ok "display-restored XML validates (virt-xml-validate)"

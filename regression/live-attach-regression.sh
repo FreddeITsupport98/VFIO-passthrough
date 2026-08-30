@@ -1526,6 +1526,114 @@ assert_contains_file \
   "R41+ tray applet uses a named single-instance socket" \
   'SOCK_NAME = "/tmp/vfio-hotplug-tray.sock"' \
   "$VFIO_SCRIPT"
+# R42: the tray probes guest-GPU liveness so a dead/zombie card (RX 9070/
+# RDNA4 reset bug, config space all 0xff / vendor 0xffff / sysfs dir gone)
+# surfaces as "GPU DEAD, needs host reboot" and the icon STAYS visible.
+assert_contains_file \
+  "R42 tray applet reads the guest GPU BDF from the conf" \
+  'def read_gpu_bdf():' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet has a gpu_state() liveness probe" \
+  'def gpu_state():' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet gpu_state treats vendor 0xffff as dead" \
+  '0xffff' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet dead tooltip says GPU DEAD, needs host reboot" \
+  'GPU DEAD, needs host reboot' \
+  "$VFIO_SCRIPT"
+# R42: the icon is color-coded by state — green=ON, red=OFF, yellow=DEAD card.
+assert_contains_file \
+  "R42 tray applet defines a _status_icon color helper" \
+  'def _status_icon(color):' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet tints the GPU glyph with the status color" \
+  'CompositionMode_DestinationIn' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet defines green/red/yellow status colors" \
+  '_GREEN, _RED, _YELLOW' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet uses a yellow icon when the GPU is dead" \
+  '_status_icon(_YELLOW)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray applet uses green when ON, red when OFF" \
+  '_GREEN if m == "on" else _RED' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 live_attach_status prints a gpu= liveness line" \
+  "printf 'gpu=%s\\n' \"\$_gpu\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 live_attach_status JSON emits a gpu field" \
+  '"gpu":' \
+  "$VFIO_SCRIPT"
+# R42: opting into hotplug auto-installs Looking Glass on BOTH VM XML variants
+# + the host side, persisting across reboots (the toggle virsh-defines the
+# variants, so LG survives every on/off flip; tmpfiles.d recreates the shm node).
+assert_contains_file \
+  "R42 _lg_apply_to_vm helper defined" \
+  '_lg_apply_to_vm() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 _install_looking_glass_defaults helper defined" \
+  '_install_looking_glass_defaults() {' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R42 install_live_attach applies LG to the with-gpu (mode=off) variant" \
+  '_lg_apply_to_vm "$_with_gpu_xml"' \
+  "$_la_fn"
+assert_contains_text \
+  "R42 install_live_attach applies LG to the without-gpu (mode=on) variant" \
+  '_lg_apply_to_vm "$_tmp_vm"' \
+  "$_la_fn"
+assert_contains_text \
+  "R42 install_live_attach installs the LG host-side defaults (success path)" \
+  '_install_looking_glass_defaults "$LG_DEFAULT_SIZE"' \
+  "$_la_fn"
+assert_contains_text \
+  "R42 install_live_attach refreshes LG host-side on the already-active path" \
+  '_install_looking_glass_defaults "$LG_DEFAULT_SIZE"' \
+  "$_la_fn"
+assert_contains_text \
+  "R42 _lg_apply_to_vm attaches the shmem device" \
+  '_lg_attach_shmem_to_vm "$_file" "$_size"' \
+  "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R42 _lg_apply_to_vm sets video=none + the LG spice block" \
+  '_lg_set_vm_display_none "$_file"' \
+  "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R42 _install_looking_glass_defaults writes the tmpfiles.d entry" \
+  '_lg_write_tmpfiles' \
+  "$(sed -n '/^_install_looking_glass_defaults()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R42 _install_looking_glass_defaults resizes the shm node" \
+  '_lg_resize_shmem "$_size"' \
+  "$(sed -n '/^_install_looking_glass_defaults()/,/^}/p' "$VFIO_SCRIPT")"
+# R41+: the icon itself is clickable (left-click toggles, middle-click status).
+assert_contains_file \
+  "R41+ tray applet wires an activated (click) handler" \
+  'def on_activated(reason):' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ tray applet connects the activated signal" \
+  'tray.activated.connect(on_activated)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ tray applet left-click (Trigger) toggles the hotplug" \
+  'QtWidgets.QSystemTrayIcon.Trigger' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ tray applet middle-click shows the status dialog" \
+  'QtWidgets.QSystemTrayIcon.MiddleClick' \
+  "$VFIO_SCRIPT"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

@@ -108,7 +108,7 @@ assert_contains_file "remove_looking_glass_client checks rpm -qf" 'rpm -qf' "$VF
 assert_contains_file "remove_looking_glass_client checks dpkg -S" 'dpkg -S' "$VFIO_SCRIPT"
 assert_contains_file "_vm_tuning_status_block called below menu" '_vm_tuning_status_block' "$VFIO_SCRIPT"
 assert_contains_file "install_looking_glass sets video=none" 'video=none' "$VFIO_SCRIPT"
-assert_contains_file "install_looking_glass sets spice local-only" 'spice local-only' "$VFIO_SCRIPT"
+assert_contains_file "install_looking_glass sets the LG spice input block" 'Looking Glass input block' "$VFIO_SCRIPT"
 # vBIOS is NOT duplicated in the LG path (vfio.sh already does vBIOS injection).
 assert_contains_file "install_looking_glass notes vBIOS NOT touched" 'vBIOS is NOT touched here' "$VFIO_SCRIPT"
 assert_contains_file "install_looking_glass notes client NOT auto-installed" 'client binary is NOT auto-installed' "$VFIO_SCRIPT"
@@ -260,8 +260,10 @@ assert_eq "rebar-disable idempotent (exit 3 when not present)" "3" "$rc_reb4"
 # shmem device survives rebar toggle (rebar patcher must not drop shmem).
 assert_contains_file "shmem device survives rebar toggle" 'name="looking-glass"' "$tuned"
 
-# ===================== R40b: Functional display patcher =====================
-# _lg_set_vm_display_none: set <video><model type='none'/> + spice <listen type='none'/>.
+# ===================== R40b/R42: Functional display patcher =====================
+# _lg_set_vm_display_none: set <video><model type='none'/> + normalize spice to
+# the Looking Glass input block (port=-1, autoport=no, <listen type='address'/>,
+# <image compression='off'/> — a local 127.0.0.1 port for LG's PureSpice input).
 # _lg_restore_vm_display: restore <video><model type='virtio' heads='1' primary='yes'/>.
 lg_display_none_py="$tmp_dir/lg_display_none.py"
 awk '
@@ -322,7 +324,12 @@ rc_dn1=$?
 set -e
 assert_eq "display-none exit 0 on first run" "0" "$rc_dn1"
 assert_contains_file "video model set to none" 'type="none"' "$disp"
-assert_contains_file "spice listen set to none" 'listen type="none"' "$disp"
+# R42: spice normalized to the Looking Glass input block (local 127.0.0.1 port).
+assert_contains_file "spice graphics type spice" 'type="spice"' "$disp"
+assert_contains_file "spice port=-1 (auto-alloc one insecure port)" 'port="-1"' "$disp"
+assert_contains_file "spice autoport=no" 'autoport="no"' "$disp"
+assert_contains_file "spice listen type=address (local 127.0.0.1)" 'listen type="address"' "$disp"
+assert_contains_file "spice image compression=off (LG does its own compression)" 'compression="off"' "$disp"
 
 # --- Run 2: idempotent (already none+local) -> exit 3 ---
 set +e
@@ -340,8 +347,8 @@ assert_eq "display-restore exit 0 after none" "0" "$rc_dr1"
 assert_contains_file "video model restored to virtio" 'type="virtio"' "$disp"
 assert_contains_file "video heads=1 preserved" 'heads="1"' "$disp"
 assert_contains_file "video primary=yes preserved" 'primary="yes"' "$disp"
-# spice listen stays none (restore does not re-expose spice).
-assert_contains_file "spice listen stays none after restore" 'listen type="none"' "$disp"
+# spice input block stays after restore (restore only touches video, not spice).
+assert_contains_file "spice listen stays address after restore" 'listen type="address"' "$disp"
 
 # --- Run 4: restore idempotent (not currently 'none') -> exit 3 ---
 set +e

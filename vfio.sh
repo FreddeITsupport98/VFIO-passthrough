@@ -10989,13 +10989,43 @@ live_attach_status() {
   if (( _installed )) && [[ "$_mode" == "unknown" ]]; then
     _mode="on"
   fi
-  # R41+: --json emits a machine-readable object (installed + mode + vms[])
+  # R42: probe the guest GPU liveness (mirrors _gpu_alive: sysfs dir present +
+  # vendor != 0xffff + config first 4 bytes != ffffffff). A dead/zombie card
+  # (RX 9070/RDNA4 reset bug, qemu "Unknown PCI header type 127") is reported
+  # as gpu=dead so the tray icon + status dialog can surface "needs host reboot"
+  # instead of a misleading mode=on. Reads GUEST_GPU_BDF from the conf (no
+  # sourcing) and sysfs (world-readable), so this needs no root.
+  local _gpu="unknown"
+  if (( _installed )); then
+    local _gbdf _gsys _gv _gc
+    _gbdf="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    if [[ -n "$_gbdf" ]]; then
+      _gsys="/sys/bus/pci/devices/$_gbdf"
+      if [[ ! -d "$_gsys" ]]; then
+        _gpu="dead"
+      else
+        _gv="$(cat "$_gsys/vendor" 2>/dev/null | tr -d '[:space:]')"
+        if [[ -z "$_gv" || "$_gv" == "0xffff" ]]; then
+          _gpu="dead"
+        else
+          _gc="$(head -c 4 "$_gsys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+          if [[ -z "$_gc" || "$_gc" == "ffffffff" ]]; then
+            _gpu="dead"
+          else
+            _gpu="alive"
+          fi
+        fi
+      fi
+    fi
+  fi
+  # R41+: --json emits a machine-readable object (installed + mode + gpu + vms[])
   # so other tooling/scripts — not just the zenity dialog — can consume state.
   if (( JSON_OUTPUT )); then
     local _first=1 _dom _xml _state
     printf '{\n'
     printf '  "installed": %s,\n' "$_installed"
     printf '  "mode": "%s",\n' "$(json_escape "$_mode")"
+    printf '  "gpu": "%s",\n' "$(json_escape "$_gpu")"
     printf '  "vms": ['
     if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
       while IFS= read -r _dom; do
@@ -11015,6 +11045,7 @@ live_attach_status() {
   fi
   printf 'installed=%s\n' "$_installed"
   printf 'mode=%s\n' "$_mode"
+  printf 'gpu=%s\n' "$_gpu"
   if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
     local _dom _xml _state
     while IFS= read -r _dom; do
@@ -11093,6 +11124,52 @@ def read_mode():
     except Exception:
         pass
     return "on" if installed() else "unknown"
+
+def read_gpu_bdf():
+    # Read GUEST_GPU_BDF="0000:0e:00.0" out of the (world-readable) conf so the
+    # tray can probe the guest GPU's liveness without root. Best-effort.
+    try:
+        with open(CONF_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GUEST_GPU_BDF="):
+                    v = line.split("=", 1)[1].strip()
+                    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                        v = v[1:-1]
+                    return v
+    except Exception:
+        pass
+    return ""
+
+def gpu_state():
+    # Mirrors vfio.sh _gpu_alive: a dead/zombie card (RX 9070 / RDNA4 reset bug)
+    # has its sysfs dir GONE, OR vendor == 0xffff, OR the first 4 config bytes
+    # are all 0xff (qemu surfaces this as "Unknown PCI header type 127"). The
+    # tray surfaces this so the icon shows "GPU DEAD, needs host reboot" instead
+    # of a misleading "ON" — and stays visible (never exits on a dead card).
+    # Returns "alive" | "dead" | "unknown". sysfs vendor/config are world-
+    # readable, so this works from the user session without root.
+    bdf = read_gpu_bdf()
+    if not bdf:
+        return "unknown"
+    sysfs = "/sys/bus/pci/devices/%s" % bdf
+    if not os.path.isdir(sysfs):
+        return "dead"
+    try:
+        with open(os.path.join(sysfs, "vendor")) as f:
+            vendor = f.read().strip()
+        if not vendor or vendor == "0xffff":
+            return "dead"
+    except Exception:
+        return "unknown"
+    try:
+        with open(os.path.join(sysfs, "config"), "rb") as f:
+            cfg = f.read(4)
+        if not cfg or cfg == b"\xff\xff\xff\xff":
+            return "dead"
+    except Exception:
+        return "unknown"
+    return "alive"
 
 def notify(title, body, urgency="normal"):
     try:
@@ -11189,7 +11266,27 @@ def main():
     _icon = QtGui.QIcon.fromTheme("video-display")
     if _icon.isNull():
         _icon = sty.standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
-    tray.setIcon(_icon)
+    # Tint the base GPU icon to a solid status color so the on/off/dead state is
+    # visible at a glance from the tray (green=ON, red=OFF, yellow=DEAD card),
+    # not just in the tooltip. Uses the base icon's alpha as the shape
+    # (CompositionMode_DestinationIn fills the icon's silhouette with one color)
+    # so the glyph stays recognizable as a GPU but is clearly color-coded. Falls
+    # back to a flat colored square if the base pixmap is null (no theme icon).
+    _GREEN, _RED, _YELLOW = "#2ecc40", "#ff4136", "#ffdc00"
+    def _status_icon(color):
+        pm = _icon.pixmap(22, 22)
+        if pm.isNull():
+            pm = QtGui.QPixmap(22, 22)
+            pm.fill(QtGui.QColor(color))
+            return QtGui.QIcon(pm)
+        out = QtGui.QPixmap(pm.size())
+        out.fill(QtGui.QColor(color))
+        p = QtGui.QPainter(out)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_DestinationIn)
+        p.drawPixmap(0, 0, pm)
+        p.end()
+        return QtGui.QIcon(out)
+    tray.setIcon(_status_icon(_GREEN))
     tray.setVisible(True)
     menu = QtWidgets.QMenu()
     toggle_act = menu.addAction("Toggle hotplug")
@@ -11199,9 +11296,37 @@ def main():
     quit_act.triggered.connect(app.quit)
     status_act.triggered.connect(show_status)
     toggle_act.triggered.connect(do_toggle)
+    # Make the icon itself clickable: left-click (Trigger) toggles the hotplug
+    # (do_toggle() pops a zenity --question confirmation first, so a stray click
+    # never changes anything silently), middle-click shows the status dialog.
+    # Right-click (Context) still pops the context menu automatically (Qt default).
+    def on_activated(reason):
+        if reason == QtWidgets.QSystemTrayIcon.Trigger:
+            do_toggle()
+        elif reason == QtWidgets.QSystemTrayIcon.MiddleClick:
+            show_status()
+    tray.activated.connect(on_activated)
+    _prev_gpu = [None]  # track alive->dead so the DEAD alert fires once per transition
     def refresh():
         m = read_mode()
-        tray.setToolTip("VFIO hotplug: %s" % m.upper())
+        g = gpu_state()
+        if g == "dead":
+            tray.setToolTip("VFIO hotplug: %s — GPU DEAD, needs host reboot" % m.upper())
+            # Yellow icon = the GPU is dead/zombie (needs a host reboot); the
+            # icon stays visible (the tray never exits on a dead card).
+            tray.setIcon(_status_icon(_YELLOW))
+            # One-time critical alert on the alive->dead transition (not every 2s poll).
+            if _prev_gpu[0] is not None and _prev_gpu[0] != "dead":
+                notify("VFIO hotplug",
+                       "Guest GPU is DEAD (config space unreadable — RX 9070/RDA4 zombie state). "
+                       "It needs a HOST REBOOT to come back on the bus.",
+                       "critical")
+        else:
+            tray.setToolTip("VFIO hotplug: %s%s" % (m.upper(), "" if g == "alive" else " (gpu unknown)"))
+            # Green icon = hotplug ON (VM boots without GPU, helper hot-attaches it);
+            # Red icon = hotplug OFF (VM boots normally with the GPU present).
+            tray.setIcon(_status_icon(_GREEN if m == "on" else _RED))
+        _prev_gpu[0] = g
         toggle_act.setText("Toggle hotplug (currently %s)" % m.upper())
     tray.setContextMenu(menu)
     refresh()
@@ -11372,6 +11497,13 @@ install_live_attach() {
   note ""
   note "The VM XML will be modified to REMOVE the GPU hostdev (so libvirt starts"
   note "without it). A full backup of the original XML (with the GPU) is saved per VM."
+  note ""
+  note "R42: opting into hotplug ALSO auto-installs Looking Glass (shared-memory display"
+  note "mirror) on BOTH VM XML variants (with-gpu / without-gpu) + the host side"
+  note "(/dev/shm/looking-glass + tmpfiles.d + security + client config), so the"
+  note "passed-through GPU is mirrored to the host with low latency. Persistent across"
+  note "reboots (tmpfiles.d recreates the shm node; the variants carry the shmem +"
+  note "spice input block). The client binary is NOT auto-compiled (install hint printed)."
   note "To revert, run:"
   note "  sudo $SCRIPT_NAME --install-dynamic-binding"
   note "  (restores normal binding AND re-attaches the GPU to the VM XML from the backup)"
@@ -11453,6 +11585,16 @@ install_live_attach() {
     local _with_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
     printf '%s\n' "$_xml" | write_file_atomic "$_with_gpu_xml" 0644 "root:root"
     say "  Saved mode=off variant (VM with GPU): $_with_gpu_xml"
+    # R42: auto-install Looking Glass on the with-gpu (mode=off) variant too, so
+    # the toggle's mode=off path (VM boots WITH the GPU, normal dynamic binding)
+    # still mirrors the display via LG. Persisted in the saved variant file; the
+    # toggle re-validates before defining, so a validate-fail here is just a warn.
+    _lg_apply_to_vm "$_with_gpu_xml" "$LG_DEFAULT_SIZE"
+    if virt-xml-validate "$_with_gpu_xml" 2>/dev/null; then
+      say "  Applied Looking Glass to mode=off variant (with GPU): $_with_gpu_xml"
+    else
+      note "WARN: Looking Glass-patched with-gpu variant failed virt-xml-validate for '$_dom'; the toggle will re-validate before defining."
+    fi
 
     python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || true
 import sys, xml.etree.ElementTree as ET
@@ -11573,6 +11715,11 @@ PYEOF
     # directly. Saved from $_tmp_vm (the stripped temp) BEFORE define, and only
     # when it validates (a variant that fails schema would break the toggle).
     local _without_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"
+    # R42: auto-install Looking Glass on the without-gpu (mode=on) variant: the
+    # VM boots on the virtual display (spice input block) and the helper hot-
+    # attaches the GPU, which LG then captures. Applied BEFORE validate so the
+    # variant that gets defined + saved carries LG (survives on/off + reboot).
+    _lg_apply_to_vm "$_tmp_vm" "$LG_DEFAULT_SIZE"
     if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
       write_file_atomic "$_without_gpu_xml" 0644 "root:root" <"$_tmp_vm"
       say "  Saved mode=on variant (VM without GPU): $_without_gpu_xml"
@@ -11633,6 +11780,8 @@ PYEOF
       install_live_attach_helper
       install_libvirt_hook
       install_bind_script
+      # R42: refresh the Looking Glass host-side defaults on a re-run too (idempotent).
+      _install_looking_glass_defaults "$LG_DEFAULT_SIZE"
       say "Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)"
       return 0
     fi
@@ -11671,6 +11820,11 @@ PYEOF
   # hotplug vs normal dynamic binding; the tray applet reads it for its icon.
   _la_write_mode "on"
   say "Set live-attach mode=on ($LIVE_ATTACH_MODE_FILE + VFIO_LIVE_ATTACH_MODE in $CONF_FILE)"
+
+  # R42: auto-install the Looking Glass HOST-side (shared memory + client config)
+  # so opting into hotplug gets LG too — persistent (tmpfiles.d recreates the
+  # /dev/shm node at boot; the VM XML variants carry the shmem + spice block).
+  _install_looking_glass_defaults "$LG_DEFAULT_SIZE"
 
   say
   if (( ENABLE_COLOR )); then
@@ -15337,10 +15491,13 @@ remove_looking_glass_client() {
   fi
 }
 
-# R40b: Set the VM's <video> model to 'none' (no virtual video card — the
-# passed-through GPU is the only display via Looking Glass) and ensure the
-# spice <graphics> is local-only (<listen type='none'/>). Idempotent: exit 3
-# if already none+local. $1 = path to a temp file holding the VM dumpxml.
+# R40b/R42: Set the VM's <video> model to 'none' (no virtual video card — the
+# passed-through GPU is the only display via Looking Glass) and normalize the
+# spice <graphics> to the Looking Glass input block (port=-1, autoport=no,
+# <listen type='address'/>, <image compression='off'/> — a local 127.0.0.1
+# port for LG's PureSpice input client; the old <listen type='none'/> listened
+# nowhere so LG input could not connect). Idempotent: exit 3 if already in the
+# target state. $1 = path to a temp file holding the VM dumpxml.
 _lg_set_vm_display_none() {
   local _xml_file="$1"
   python3 - "$_xml_file" <<'PYEOF'
@@ -15376,15 +15533,48 @@ if video is not None:
 else:
     video = ET.SubElement(devices, 'video')
     ET.SubElement(video, 'model', {'type': 'none'}); changed = True
-# --- <graphics type='spice'><listen type='none'/> ---
+# --- <graphics> normalized to the Looking Glass spice input block: ---
+#   <graphics type='spice' port='-1' autoport='no'>
+#     <listen type='address'/>
+#     <image compression='off'/>
+#   </graphics>
+# port=-1 + autoport=no => libvirt auto-allocates ONE insecure port (no TLS
+# port, avoiding the "spice TLS port auto-alloc but TLS disabled" qemu error).
+# <listen type='address'/> (no address attr = 127.0.0.1) gives LG's PureSpice
+# input client a local TCP socket; the prior <listen type='none'/> listened
+# NOWHERE so LG input could not connect. <image compression='off'/> because LG
+# does its own framebuffer compression. Converts whatever <graphics> exists
+# (VNC/etc) to spice so LG can catch the display.
+def _setattr(el, k, v):
+    if el.get(k) != v:
+        el.set(k, v); return True
+    return False
 graphics = devices.find('graphics')
-if graphics is not None and graphics.get('type') == 'spice':
-    listen = graphics.find('listen')
-    if listen is None:
-        ET.SubElement(graphics, 'listen', {'type': 'none'}); changed = True
-    else:
-        if _to_none(listen):
-            changed = True
+if graphics is None:
+    graphics = ET.SubElement(devices, 'graphics'); changed = True
+if _setattr(graphics, 'type', 'spice'): changed = True
+if _setattr(graphics, 'port', '-1'): changed = True
+if _setattr(graphics, 'autoport', 'no'): changed = True
+for _k in ('tlsPort', 'tlsport', 'passwd', 'passwdValidTo', 'defaultMode', 'listen', 'address'):
+    if _k in graphics.attrib:
+        del graphics.attrib[_k]; changed = True
+listen = graphics.find('listen')
+if listen is None:
+    ET.SubElement(graphics, 'listen', {'type': 'address'}); changed = True
+else:
+    if _setattr(listen, 'type', 'address'): changed = True
+    for _k in ('address', 'network', 'socket', 'from'):
+        if _k in listen.attrib:
+            del listen.attrib[_k]; changed = True
+    for _extra in graphics.findall('listen')[1:]:
+        graphics.remove(_extra); changed = True
+image = graphics.find('image')
+if image is None:
+    ET.SubElement(graphics, 'image', {'compression': 'off'}); changed = True
+else:
+    if _setattr(image, 'compression', 'off'): changed = True
+    for _extra in graphics.findall('image')[1:]:
+        graphics.remove(_extra); changed = True
 if not changed:
     sys.exit(3)
 tree.write(path)
@@ -15463,6 +15653,53 @@ _lg_client_install_hints() {
   fi
 }
 
+# R42: Apply the Looking Glass VM-side setup (ivshmem shmem + video=none + the
+# LG spice input block) to ONE VM XML file. Used by install_live_attach so that
+# opting into hotplug auto-installs Looking Glass on BOTH the with-gpu (mode=off)
+# and without-gpu (mode=on) variants, persisting in the saved variant files (the
+# toggle virsh-defines them, so LG survives every on/off flip + a reboot). Best-
+# effort + idempotent (exit 3 from either patcher = already configured = success).
+# $1 = path to a VM XML file, $2 = shmem size MB (default LG_DEFAULT_SIZE).
+_lg_apply_to_vm() {
+  local _file="$1" _size="${2:-$LG_DEFAULT_SIZE}"
+  [[ -s "$_file" ]] || return 0
+  local _sh=0 _vd=0
+  _lg_attach_shmem_to_vm "$_file" "$_size" || _sh=$?
+  # exit 3 = shmem already attached at this size; 0 = attached; other = warn.
+  if (( _sh != 0 && _sh != 3 )); then
+    note "WARN: Looking Glass shmem attach failed (python exit $_sh) for $_file; continuing."
+  fi
+  _lg_set_vm_display_none "$_file" || _vd=$?
+  if (( _vd != 0 && _vd != 3 )); then
+    note "WARN: Looking Glass video/spice patch failed (python exit $_vd) for $_file; continuing."
+  fi
+  return 0
+}
+
+# R42: Install the Looking Glass HOST-side defaults (no prompts, 64MB) so the
+# hotplug opt-in auto-installs LG alongside the tray toggle. Writes the tmpfiles.d
+# entry + resizes /dev/shm/looking-glass + AppArmor/SELinux perms + the user
+# ~/.looking-glass-client.ini + prints the client-binary install hints. All
+# idempotent. Persistent: tmpfiles.d recreates the /dev/shm node at every boot.
+# $1 = shmem size MB (default LG_DEFAULT_SIZE).
+_install_looking_glass_defaults() {
+  local _size="${1:-$LG_DEFAULT_SIZE}"
+  say
+  note "Auto-installing Looking Glass host-side (shared memory + client config) so the hotplug"
+  note "workflow mirrors the passed-through GPU to the host with low latency..."
+  _lg_write_tmpfiles
+  _lg_resize_shmem "$_size"
+  _lg_setup_security
+  _lg_generate_user_config
+  _lg_client_install_hints
+  if (( ENABLE_COLOR )); then
+    say "${C_GREEN}${C_BOLD}✔ Looking Glass host-side setup complete${C_RESET}"
+  else
+    say "✔ Looking Glass host-side setup complete"
+  fi
+  note "Reboot the VM (full shutdown, not restart) so the <shmem> device appears, then run: looking-glass-client"
+}
+
 # Install Looking Glass host-side setup for each shut-off guest-GPU VM.
 # Idempotent. Honors DRY_RUN. Optional ReBAR sub-prompt (default N).
 install_looking_glass() {
@@ -15484,7 +15721,7 @@ install_looking_glass() {
   note "  - /dev/shm/looking-glass backing file (tmpfiles.d + perms + SELinux/AppArmor)"
   note "  - a <shmem name='looking-glass'> ivshmem-plain device attached to each shut-off guest-GPU VM"
   note "  - <video> model set to 'none' (no virtual video card — the passed-through GPU is the display)"
-  note "  - spice <graphics> set to local-only (<listen type='none'/> — not network-exposed)"
+  note "  - spice <graphics> set to the Looking Glass input block (<listen type='address'/> port=-1, image compression=off — local 127.0.0.1 port for LG's PureSpice input)"
   note "  - ~/.looking-glass-client.ini for $SUDO_USER (shmFile + spice + wayland)"
   note "  - optional ReBAR 64-bit MMIO on the VM (helps the GPU map large BARs)"
   note "vBIOS is NOT touched here (use --vbios / the wizard for vBIOS injection)."
@@ -15686,10 +15923,15 @@ looking_glass_status() {
     # R40b: also report video=none + spice local-only state.
     local _has_video_none=0 _has_spice_local=0
     grep -q "<model type='none'" <<<"$_xml" 2>/dev/null && _has_video_none=1
-    # R40b: spice is local-only when a spice graphics carries <listen type='none'/>.
-    # (Previously a `grep -qA1 ... | grep -q` pipe that never matched: -q suppresses
-    # the context lines so -A1 emitted nothing and the second grep saw empty input.)
-    if grep -q "type='spice'" <<<"$_xml" 2>/dev/null && grep -q "listen type='none'" <<<"$_xml" 2>/dev/null; then
+    # R40b/R42: spice is local-only when a spice graphics carries <listen
+    # type='none'/> (R40b) OR the R42 Looking Glass input block <listen
+    # type='address'/> (local 127.0.0.1 port for LG's PureSpice input).
+    # (Previously a `grep -qA1 ... | grep -q` pipe that never matched: -q
+    # suppresses the context lines so -A1 emitted nothing and the second grep
+    # saw empty input.)
+    if grep -q "type='spice'" <<<"$_xml" 2>/dev/null \
+      && { grep -q "listen type='none'" <<<"$_xml" 2>/dev/null \
+           || grep -q "listen type='address'" <<<"$_xml" 2>/dev/null; }; then
       _has_spice_local=1
     fi
     local _tag="not configured"
@@ -25659,7 +25901,7 @@ vfio_menu() {
       "Full configure (recommended defaults — auto-answers after GPU pick)"
       "Switch to dynamic binding (RX 9070 / RDNA4 recommended)"
       "Switch to early binding (boot-time, classic)"
-      "Set up live-attach / hotswap (VM starts without GPU, then hot-attached)"
+      "Set up live-attach / hotswap (VM starts without GPU, then hot-attached + auto-installs Looking Glass)"
       "Attach virtio-win guest-agent ISO (smart handoff via guest-ping)"
       "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials)"
       "Revert stealth/perf VM tuning (from backup XML)"

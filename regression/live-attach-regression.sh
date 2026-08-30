@@ -200,11 +200,11 @@ assert_contains_text \
   "$helper_block"
 assert_contains_text \
   "R23 helper times out the GPU attach-device (anti-hang)" \
-  'timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live' \
+  'timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$_xml" --live' \
   "$helper_block"
 assert_contains_text \
   "R23 helper times out the audio attach-device (anti-hang)" \
-  'timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live' \
+  'timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$_xml" --live' \
   "$helper_block"
 # The helper MUST use [[ -s ]] (non-empty), not [[ -f ]] (exists), for the GPU
 # and audio XML — an empty/stale file makes virsh attach-device hang on empty
@@ -238,11 +238,24 @@ assert_contains_text \
   "$helper_block"
 assert_contains_text \
   "R23 helper hot-attaches the GPU via virsh attach-device --live" \
-  'virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live' \
+  'virsh -c qemu:///system attach-device "$DOMAIN" "$_xml" --live' \
   "$helper_block"
 assert_contains_text \
   "R23 helper hot-attaches the audio function via virsh attach-device --live" \
-  'attach-device "$DOMAIN" "$AUDIO_XML" --live' \
+  'attach-device "$DOMAIN" "$_xml" --live' \
+  "$helper_block"
+# R44/IOMMU-group fix: the helper MUST hot-attach the AUDIO BEFORE the GPU so qemu
+# owns the audio's IOMMU group before the GPU attach fires its bus reset (on
+# boards where GPU+audio sit in separate IOMMU groups, a GPU-first attach
+# leaves the audio group not owned by qemu -> partial single-function reset
+# -> Windows display init silently fails / black screen).
+assert_contains_text \
+  "R23 helper hot-attaches the AUDIO BEFORE the GPU (IOMMU group ownership fix)" \
+  '_hot_attach_one "audio" "$AUDIO_XML" "audio"' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper hot-attaches the GPU AFTER the audio (IOMMU group ownership fix)" \
+  '_hot_attach_one "GPU" "$GPU_XML" "GPU"' \
   "$helper_block"
 # The helper MUST capture and log the bind script's full output on failure so a
 # bind-script bug surfaces in the journal instead of being swallowed (a swallowed

@@ -10875,16 +10875,50 @@ _la_timeout="${VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT:-60}"
 if ! [[ "$_la_timeout" =~ ^[0-9]+$ ]] || (( 10#$_la_timeout < 10 )); then
   _la_timeout=60
 fi
+# R44/IOMMU-group fix: hot-attach the AUDIO FIRST, then the GPU. On boards
+# where the GPU + its audio sibling sit in SEPARATE IOMMU groups (e.g. the
+# ASUS TUF X570-PLUS PLX switch whose downstream port has real hardware ACS),
+# qemu's attach-time bus reset on the GPU requires ALL devices in the GPU's
+# IOMMU group to be owned by qemu. If the GPU is hot-attached first (qemu
+# owns group 30) while the audio (group 31) is not yet attached to qemu,
+# qemu surfaces "vfio: Cannot reset device <gpu>, depends on group <N> which is
+# not owned" and does a PARTIAL single-function reset — the GPU enters the
+# VM in an uninitialized state and Windows display init silently fails (black
+# screen). Attaching the audio FIRST makes qemu own group 31 before the GPU
+# attach fires, so the GPU reset sees both groups owned and can reset the
+# card as a unit (the same reason cold-attach works: both GPU+audio are in
+# the persistent XML at boot, so qemu owns both atomically). The audio
+# attach is non-fatal and was already happening second, so swapping the order
+# only changes which one gets the partial-reset risk — the audio is NOT the
+# display, so a partial reset on the audio does not cause a black screen.
+_hot_attach_one() {
+  local _dev="$1" _xml="$2" _label="$3" _rc=0
+  [[ -s "$_xml" ]] || { jlog "live-attach: $_label device XML missing or empty; skipping"; return 0; }
+  jlog "live-attach: attaching $_label to domain '$DOMAIN' via virsh attach-device --live (timeout ${_la_timeout}s)"
+  timeout "$_la_timeout" virsh -c qemu:///system detach-device "$DOMAIN" "$_xml" --live >/dev/null 2>&1 || true
+  if timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$_xml" --live 2>&1; then
+    jlog "live-attach: $_label attached successfully to '$DOMAIN'"
+    return 0
+  else
+    _rc=$?
+    if (( _rc == 124 )); then
+      jlog "live-attach: FAILED to attach $_label — virsh attach-device timed out after ${_la_timeout}s"
+    else
+      jlog "live-attach: FAILED to attach $_label to '$DOMAIN' (rc=$_rc)"
+    fi
+    return "$_rc"
+  fi
+}
+# Step 2: hot-attach the AUDIO FIRST so qemu owns the audio's IOMMU group before
+# the GPU attach fires its bus reset (fixes the partial-reset black screen on
+# boards where GPU+audio sit in separate IOMMU groups).
+if [[ -s "$AUDIO_XML" ]]; then
+  _hot_attach_one "audio" "$AUDIO_XML" "audio" || true   # non-fatal
+fi
+# Step 3: hot-attach the GPU (now qemu owns both IOMMU groups, so the GPU
+# reset can be a full-card reset instead of a partial single-function reset).
 if [[ -s "$GPU_XML" ]]; then
-  jlog "live-attach: attaching GPU to domain '$DOMAIN' via virsh attach-device --live (timeout ${_la_timeout}s)"
-  # Best-effort detach FIRST: a rapid stop/start can leave a stale vfio lock
-  # (the kernel still thinks the device is owned by the previous qemu process),
-  # which makes attach-device fail with "device used by QEMU / driver". A
-  # detach-device --live clears that stale lock (no-op if the device isn't
-  # attached — the || true swallows the error). Then attach cleanly.
-  timeout "$_la_timeout" virsh -c qemu:///system detach-device "$DOMAIN" "$GPU_XML" --live >/dev/null 2>&1 || true
-  if timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$GPU_XML" --live 2>&1; then
-    jlog "live-attach: GPU attached successfully to '$DOMAIN'"
+  if _hot_attach_one "GPU" "$GPU_XML" "GPU"; then
     _notify_desktop "GPU hot-plug ready" "The GPU has been hot-attached to VM '$DOMAIN' — ready to use." normal
   else
     _rc=$?
@@ -10896,18 +10930,6 @@ if [[ -s "$GPU_XML" ]]; then
     _notify_desktop "GPU hot-plug failed" "Failed to hot-attach the GPU to VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach" critical
     exit 1
   fi
-else
-  jlog "live-attach: FAILED — GPU fragment missing or empty (checked $_PROF_GPU and $_GPU_SRC); the device XML was not saved at install time. Re-run 'sudo vfio.sh --install-live-attach' with the VM shut off."
-  _notify_desktop "GPU hot-plug failed" "The GPU device XML is missing for VM '$DOMAIN'. Re-run: sudo vfio.sh --install-live-attach (VM shut off)" critical
-  exit 1
-fi
-
-# Step 3: hot-attach the audio function (if configured and XML is non-empty).
-if [[ -s "$AUDIO_XML" ]]; then
-  jlog "live-attach: attaching audio to domain '$DOMAIN'"
-  timeout "$_la_timeout" virsh -c qemu:///system detach-device "$DOMAIN" "$AUDIO_XML" --live >/dev/null 2>&1 || true
-  timeout "$_la_timeout" virsh -c qemu:///system attach-device "$DOMAIN" "$AUDIO_XML" --live 2>&1 || \
-    jlog "live-attach: WARN audio attach failed or timed out (non-fatal)"
 fi
 
 jlog "live-attach: complete for domain '$DOMAIN'"

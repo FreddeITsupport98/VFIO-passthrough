@@ -1617,6 +1617,43 @@ assert_contains_text \
   "R42 _install_looking_glass_defaults resizes the shm node" \
   '_lg_resize_shmem "$_size"' \
   "$(sed -n '/^_install_looking_glass_defaults()/,/^}/p' "$VFIO_SCRIPT")"
+# R42 foolproof: install_live_attach_tray kills any ALREADY-running tray
+# instance BEFORE regenerating the applet (so the new code actually loads —
+# the old process holds stale in-memory code), then relaunches with setsid +
+# verifies the fresh PID. remove_live_attach_tray uses the same end-anchored
+# pattern (no self-match). End-anchored "python3 <path>$" so the pkiller's
+# own cmdline (substring) is never matched.
+assert_contains_file \
+  "R42 tray install kills stale instance before regenerating (end-anchored)" \
+  'pkill -f "python3 ${LIVE_ATTACH_TRAY}\$"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray install SIGKILLs any survivor before relaunch" \
+  'pkill -9 -f "python3 ${LIVE_ATTACH_TRAY}\$"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray install relaunches with setsid-detach (survives sudo exit)" \
+  'setsid runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 tray install verifies the fresh instance stayed up" \
+  'pgrep -u "$_user" -f "python3 ${LIVE_ATTACH_TRAY}\$"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R42 remove_live_attach_tray uses the end-anchored pattern (no self-match)" \
+  'run pkill -f "python3 ${LIVE_ATTACH_TRAY}\$"' \
+  "$VFIO_SCRIPT"
+# The kill MUST come before the regenerate (write_file_atomic of the applet).
+# Assert by checking the kill line appears before the write_file_atomic line.
+# grep -Fn (fixed strings + line numbers) so the $ regex anchor is literal.
+_kill_line=$(grep -Fn 'pkill -f "python3 ${LIVE_ATTACH_TRAY}\$"' "$VFIO_SCRIPT" | head -1 | cut -d: -f1)
+_write_line=$(grep -Fn 'write_file_atomic "$LIVE_ATTACH_TRAY" 0755' "$VFIO_SCRIPT" | head -1 | cut -d: -f1)
+if (( _kill_line > 0 && _write_line > _kill_line )); then
+  printf 'PASS: R42 tray install kills stale instance before regenerating the applet (line %d < %d)\n' "$_kill_line" "$_write_line"
+else
+  printf 'FAIL: R42 tray install does NOT kill the stale instance before regenerating (kill=%s write=%s)\n' "$_kill_line" "$_write_line" >&2
+  record_failure "R42 tray install kills stale instance before regenerating"
+fi
 # R41+: the icon itself is clickable (left-click toggles, middle-click status).
 assert_contains_file \
   "R41+ tray applet wires an activated (click) handler" \

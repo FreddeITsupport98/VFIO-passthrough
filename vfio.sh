@@ -11093,6 +11093,24 @@ install_live_attach_tray() {
     return 0
   fi
 
+  # FOOLPROOF: kill any ALREADY-running tray instance BEFORE regenerating the
+  # applet file. The old process holds the OLD code in memory; without this the
+  # freshly-written file is ignored and the operator keeps clicking the stale
+  # applet (observed live: icon did not recolor + clicks did nothing after a
+  # reinstall, because the running process predates the new file). The
+  # end-anchored pattern ("python3 <path>$") matches ONLY a process whose
+  # cmdline ENDS with the applet path — the pkiller's own cmdline contains this
+  # string as a substring but does NOT end with it, so it never self-matches.
+  # Best-effort; never fatal. SIGKILL any survivor stuck in a modal
+  # zenity/pkexec, then wait for the single-instance socket to free up before
+  # the relaunch below reclaims it.
+  if have_cmd pkill; then
+    pkill -f "python3 ${LIVE_ATTACH_TRAY}\$" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "python3 ${LIVE_ATTACH_TRAY}\$" 2>/dev/null || true
+    sleep 1
+  fi
+
   # 1. The PySide6 tray applet. Quoted heredoc so bash does NOT expand the
   #    Python's $ / % / quotes. The applet reads MODE_FILE (0644, no root),
   #    polls every 2s, and toggles via pkexec + zenity + notify-send.
@@ -11102,7 +11120,15 @@ install_live_attach_tray() {
 # Managed by vfio.sh — system-tray on/off toggle for live-attach GPU hotplug.
 # Do not edit; regenerated on reinstall. Removed by: sudo vfio.sh --reset
 # (or --install-early-binding). Requires PySide6 (Qt6 -> native SNI on KDE).
-import sys, os, subprocess
+import sys, os, subprocess, datetime
+
+LOG = "/tmp/vfio-hotplug-tray.log"
+def _log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (datetime.datetime.now().strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
 
 MODE_FILE = "/var/lib/vfio-dynamic/live-attach-mode"
 CONF_FILE = "/etc/vfio-gpu-passthrough.conf"
@@ -11185,21 +11211,30 @@ def confirm(title, text):
         return False
 
 def do_toggle():
+    _log("do_toggle entry")
     cur = read_mode()
+    _log("do_toggle cur=%s" % cur)
     if cur == "unknown":
         notify("VFIO hotplug", "Live-attach is not installed; nothing to toggle.", "critical")
+        _log("do_toggle: unknown mode, aborted")
         return
     nxt = "off" if cur == "on" else "on"
     detail = ("ON: the VM boots WITHOUT the GPU and the helper hot-attaches it once Windows is up.\n"
               "OFF: the VM boots normally WITH the GPU present (standard dynamic binding).")
-    if not confirm("VFIO hotplug toggle",
-                   "Toggle live-attach hotplug %s -> %s?\n\n%s" % (cur.upper(), nxt.upper(), detail)):
+    ok = confirm("VFIO hotplug toggle",
+                 "Toggle live-attach hotplug %s -> %s?\n\n%s" % (cur.upper(), nxt.upper(), detail))
+    _log("do_toggle confirm=%s" % ok)
+    if not ok:
         notify("VFIO hotplug", "Toggle cancelled.")
+        _log("do_toggle cancelled by user")
         return
     try:
+        _log("do_toggle launching pkexec vfio --live-attach-toggle")
         rc = subprocess.call(["pkexec", VFIO_BIN, "--live-attach-toggle"])
+        _log("do_toggle pkexec rc=%s" % rc)
     except Exception as e:
         notify("VFIO hotplug", "Failed to launch pkexec: %s" % e, "critical")
+        _log("do_toggle pkexec exception=%s" % e)
         return
     new = read_mode()
     if rc == 0:
@@ -11300,12 +11335,19 @@ def main():
     # (do_toggle() pops a zenity --question confirmation first, so a stray click
     # never changes anything silently), middle-click shows the status dialog.
     # Right-click (Context) still pops the context menu automatically (Qt default).
+    _reasons = {QtWidgets.QSystemTrayIcon.Trigger: "Trigger(left)",
+                QtWidgets.QSystemTrayIcon.DoubleClick: "DoubleClick",
+                QtWidgets.QSystemTrayIcon.MiddleClick: "MiddleClick",
+                QtWidgets.QSystemTrayIcon.Context: "Context(right)",
+                QtWidgets.QSystemTrayIcon.Unknown: "Unknown"}
     def on_activated(reason):
+        _log("on_activated reason=%s" % _reasons.get(reason, reason))
         if reason == QtWidgets.QSystemTrayIcon.Trigger:
             do_toggle()
         elif reason == QtWidgets.QSystemTrayIcon.MiddleClick:
             show_status()
     tray.activated.connect(on_activated)
+    _log("tray started; visible=%s; isSystemTrayAvailable=%s" % (tray.isVisible(), tray.isSystemTrayAvailable()))
     _prev_gpu = [None]  # track alive->dead so the DEAD alert fires once per transition
     def refresh():
         m = read_mode()
@@ -11400,11 +11442,20 @@ DESKEOF
       # the inherited env, skip (the autostart covers it on next login).
       local _rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u "$_user" 2>/dev/null || echo 0)}"
       if (( ! DRY_RUN )) && [[ -d "$_rt" ]]; then
-        runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" \
+        # setsid-detach so the tray survives this sudo/install process exiting
+        # (a bare & child would get SIGHUP when the controlling tty closes).
+        setsid runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" \
           ${WAYLAND_DISPLAY:+WAYLAND_DISPLAY="$WAYLAND_DISPLAY"} \
           ${DISPLAY:+DISPLAY="$DISPLAY"} \
           "$LIVE_ATTACH_TRAY" </dev/null >/dev/null 2>&1 &
-        say "Launched vfio-hotplug-tray for '$_user' (icon should appear in the system tray)."
+        # Verify the fresh instance stayed up (it loads the just-regenerated
+        # code; if it died on launch, the autostart covers it on next login).
+        sleep 1
+        if pgrep -u "$_user" -f "python3 ${LIVE_ATTACH_TRAY}\$" >/dev/null 2>&1; then
+          say "Launched vfio-hotplug-tray for '$_user' (fresh instance running the latest code)."
+        else
+          note "WARN: vfio-hotplug-tray did not stay running for '$_user'; the autostart will start it on next Plasma login."
+        fi
       fi
     else
       note "Tray applet: could not resolve home for '$_user'; skipping autostart (CLI toggle still works)."
@@ -11454,9 +11505,14 @@ remove_live_attach_tray() {
       _removed=1
     fi
   done
-  # Stop any running tray instance (best-effort; pkill by script name).
+  # Stop any running tray instance (best-effort). End-anchored pattern so the
+  # pkiller never self-matches (its own cmdline contains this string as a
+  # substring but does NOT end with it) — see install_live_attach_tray for the
+  # full rationale. SIGKILL any survivor stuck in a modal zenity/pkexec.
   if have_cmd pkill; then
-    run pkill -f "vfio-hotplug-tray" 2>/dev/null || true
+    run pkill -f "python3 ${LIVE_ATTACH_TRAY}\$" 2>/dev/null || true
+    sleep 1
+    run pkill -9 -f "python3 ${LIVE_ATTACH_TRAY}\$" 2>/dev/null || true
   fi
   (( _removed )) && note "Removed live-attach tray applet + polkit policy + autostart."
   return 0

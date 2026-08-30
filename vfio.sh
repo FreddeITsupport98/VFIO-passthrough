@@ -2860,7 +2860,7 @@ grub_has_vfio_params() {
   local cmd
   cmd="$(grub_cmdline_value 2>/dev/null || true)"
   [[ -n "$cmd" ]] || return 1
-  grep -Eq '(^|[[:space:]])(amd_iommu=on|intel_iommu=on|iommu=pt|pcie_acs_override=downstream,multifunction)([[:space:]]|$)' <<<"$cmd"
+  grep -Eq '(^|[[:space:]])(amd_iommu=on|intel_iommu=on|iommu=pt|pcie_acs_override=[^[:space:]]+)([[:space:]]|$)' <<<"$cmd"
 }
 
 # CPU virtualization / Secure Boot helpers (non-fatal diagnostics)
@@ -5529,7 +5529,7 @@ maybe_offer_kernel_longterm() {
 }
 
 # On Fedora systems, the stock Fedora kernel does not ship the ACS override patch.
-# This means pcie_acs_override=downstream,multifunction is silently ignored,
+# This means pcie_acs_override=downstream (the recommended default) is silently ignored,
 # which can leave the guest GPU in the same IOMMU group as other devices (for
 # example the PCIe bridge or xHCI controller). Under sustained VFIO passthrough
 # load this can destabilize the shared PCIe root complex and cause USB/xHCI
@@ -5581,7 +5581,7 @@ maybe_offer_fedora_cachyos_kernel() {
   say
   hdr "Optional: install CachyOS kernel for ACS override support"
   note "The stock Fedora kernel does NOT include the ACS override patch."
-  note "When pcie_acs_override=downstream,multifunction is present in the kernel cmdline but the patch is missing, the parameter is silently ignored."
+  note "When pcie_acs_override=downstream (the recommended default) is present in the kernel cmdline but the patch is missing, the parameter is silently ignored."
   note "This can leave the guest GPU in the same IOMMU group as other devices (for example the PCIe bridge or xHCI controller), which may destabilize the shared PCIe root complex during long VFIO passthrough sessions and cause USB/xHCI crashes."
   note "The CachyOS kernel (package: kernel-cachyos, COPR: bieszczaders/kernel-cachyos) includes ACS override support and has been observed to properly isolate devices into separate IOMMU groups."
   note "Installing kernel-cachyos keeps your current kernel installed; at boot you can pick either the default Fedora kernel or the CachyOS kernel from the menu."
@@ -8044,9 +8044,20 @@ systemd_boot_add_kernel_params() {
     new_cmdline="$(add_param_once "$new_cmdline" "systemd.unit=multi-user.target")"
   fi
     
-    # ACS Override check for cmdline file
-    if prompt_yn "Enable ACS override in /etc/kernel/cmdline (persistence)?" N "Boot options (persistence)"; then
-      new_cmdline="$(add_param_once "$new_cmdline" "pcie_acs_override=downstream,multifunction")"
+    # ACS Override check for cmdline file. Recommended default is downstream
+    # (splits at each downstream bridge — enough for most boards, and keeps a
+    # multifunction GPU + its audio sibling in ONE group so qemu can reset the
+    # card as a unit on hot-attach). The stronger downstream,multifunction ALSO
+    # splits multifunction PCI devices into separate groups, which on cards
+    # like the RX 9070 (GPU fn0 + HDMI/DP audio fn1) breaks qemu's reset-as-a-unit
+    # on hot-attach ("depends on group N which is not owned"); it is therefore
+    # NOT the default. Operators who genuinely need the extra split can add it
+    # manually: pcie_acs_override=downstream,multifunction
+    say
+    note "Recommended ACS override: pcie_acs_override=downstream (splits at each downstream bridge)."
+    note "Stronger variant pcie_acs_override=downstream,multifunction ALSO splits multifunction PCI devices (e.g. a GPU + its audio sibling) into SEPARATE IOMMU groups — on cards like the RX 9070 that breaks qemu's reset-as-a-unit on hot-attach, so it is NOT the default. Add it manually only if you have a different isolation need."
+    if prompt_yn "Enable ACS override in /etc/kernel/cmdline (pcie_acs_override=downstream)?" N "Boot options (persistence)"; then
+      new_cmdline="$(add_param_once "$new_cmdline" "pcie_acs_override=downstream")"
     fi
     new_cmdline="$(add_custom_kernel_params_interactive "$new_cmdline" "/etc/kernel/cmdline (persistence)")"
     # Preserve current persisted boot metadata unless explicitly unavailable.
@@ -8315,8 +8326,10 @@ systemd_boot_add_kernel_params() {
   
   say
   hdr "Advanced (optional): ACS override (systemd-boot)"
-  if prompt_yn "Enable ACS override (pcie_acs_override=downstream,multifunction) in this entry?" N "Boot options (systemd-boot)"; then
-    new_opts="$(add_param_once "$new_opts" "pcie_acs_override=downstream,multifunction")"
+  note "Recommended ACS override: pcie_acs_override=downstream (splits at each downstream bridge; enough for most boards)."
+  note "Stronger variant pcie_acs_override=downstream,multifunction ALSO splits multifunction PCI devices (e.g. a GPU + its audio sibling) into SEPARATE IOMMU groups — on cards like the RX 9070 that breaks qemu's reset-as-a-unit on hot-attach, so it is NOT the default. Add it manually only if you have a different isolation need."
+  if prompt_yn "Enable ACS override (pcie_acs_override=downstream) in this entry?" N "Boot options (systemd-boot)"; then
+    new_opts="$(add_param_once "$new_opts" "pcie_acs_override=downstream")"
   fi
   new_opts="$(add_custom_kernel_params_interactive "$new_opts" "systemd-boot entry")"
 
@@ -8356,9 +8369,12 @@ print_manual_iommu_instructions() {
   say "    - Keeps the vfio-pci-bound GPU out of D3hot idle to avoid D3 entry/exit races during VM start/stop reset."
   say "  pcie_port_pm=off"
   say "    - Disables PCIe port power management to prevent link drops on the guest GPU path."
-  say "Advanced (usually NOT recommended): pcie_acs_override=downstream,multifunction"
+  say "Advanced (usually NOT recommended): pcie_acs_override=downstream"
   say "  - Only consider this if your IOMMU groups are not isolated."
   say "  - It can reduce PCIe isolation and may cause instability on some systems."
+  say "  - Stronger variant pcie_acs_override=downstream,multifunction ALSO splits multifunction"
+  say "    PCI devices (e.g. a GPU + its audio sibling) into separate groups; on cards like"
+  say "    the RX 9070 that breaks qemu's reset-as-a-unit on hot-attach, so use it only if you need it."
 }
 
 grub_add_kernel_params() {
@@ -8517,10 +8533,11 @@ grub_add_kernel_params() {
   note "ACS override can sometimes split up IOMMU groups on motherboards that don't expose proper isolation."
   note "This may help GPU passthrough if your guest GPU shares an IOMMU group with other devices."
   note "Downsides: weaker PCIe isolation/security and possible instability."
-  note "Recommended: NO unless you know you need it."
+  note "Recommended default: pcie_acs_override=downstream (splits at each downstream bridge — enough for most boards, and keeps a multifunction GPU + its audio sibling in ONE group so qemu can reset the card as a unit on hot-attach)."
+  note "Stronger variant pcie_acs_override=downstream,multifunction ALSO splits multifunction PCI devices (e.g. a GPU + its audio sibling) into SEPARATE IOMMU groups — on cards like the RX 9070 (GPU fn0 + HDMI/DP audio fn1) that breaks qemu's reset-as-a-unit on hot-attach (\"depends on group N which is not owned\"), so it is NOT the default. Use it only if you have a different isolation need."
 
-  if prompt_yn "Enable ACS override in GRUB (pcie_acs_override=downstream,multifunction)?" N "Boot options (GRUB)"; then
-    new="$(add_param_once "$new" "pcie_acs_override=downstream,multifunction")"
+  if prompt_yn "Enable ACS override in GRUB (pcie_acs_override=downstream)?" N "Boot options (GRUB)"; then
+    new="$(add_param_once "$new" "pcie_acs_override=downstream")"
   fi
 
   # Optional: disable quiet/splash and show verbose boot logs while testing VFIO.
@@ -24684,6 +24701,7 @@ reset_vfio_all() {
     new="$(remove_param_all "$new" "intel_iommu=on")"
     new="$(remove_param_all "$new" "iommu=pt")"
     new="$(remove_param_all "$new" "pcie_acs_override=downstream,multifunction")"
+    new="$(remove_param_all "$new" "pcie_acs_override=downstream")"
     # Optional USB/xHCI stability workarounds
     new="$(remove_param_all "$new" "usbcore.autosuspend=-1")"
     new="$(remove_param_all "$new" "pcie_aspm=off")"
@@ -24734,6 +24752,7 @@ reset_vfio_all() {
     knew="$(remove_param_all "$knew" "intel_iommu=on")"
     knew="$(remove_param_all "$knew" "iommu=pt")"
     knew="$(remove_param_all "$knew" "pcie_acs_override=downstream,multifunction")"
+    knew="$(remove_param_all "$knew" "pcie_acs_override=downstream")"
     # Optional USB/xHCI stability workarounds
     knew="$(remove_param_all "$knew" "usbcore.autosuspend=-1")"
     knew="$(remove_param_all "$knew" "pcie_aspm=off")"

@@ -162,7 +162,7 @@ maybe_offer_fedora_cachyos_kernel_testable() {
   say ""
   hdr "Optional: install CachyOS kernel for ACS override support"
   note "The stock Fedora kernel does NOT include the ACS override patch."
-  note "When pcie_acs_override=downstream,multifunction is present in the kernel cmdline but the patch is missing, the parameter is silently ignored."
+  note "When pcie_acs_override=downstream (the recommended default) is present in the kernel cmdline but the patch is missing, the parameter is silently ignored."
   note "This can leave the guest GPU in the same IOMMU group as other devices (for example the PCIe bridge or xHCI controller), which may destabilize the shared PCIe root complex during long VFIO passthrough sessions and cause USB/xHCI crashes."
   note "The CachyOS kernel (package: kernel-cachyos, COPR: bieszczaders/kernel-cachyos) includes ACS override support and has been observed to properly isolate devices into separate IOMMU groups."
   note "Installing kernel-cachyos keeps your current kernel installed; at boot you can pick either the default Fedora kernel or the CachyOS kernel from the menu."
@@ -219,7 +219,7 @@ assert_eq "non-fedora returns immediately with no output" "0" "$CAPTURED_PROMPT_
 assert_eq "non-fedora returns immediately with no text" "" "$CAPTURED_OUTPUT"
 
 # Test 6: AMD guest, Fedora-like, but pcie_acs_override already active → no prompt.
-VFIO_TEST_CMDLINE="quiet amd_iommu=on pcie_acs_override=downstream,multifunction"
+VFIO_TEST_CMDLINE="quiet amd_iommu=on pcie_acs_override=downstream"
 VFIO_TEST_KREL="generic"
 VFIO_TEST_RPM_INSTALLED="0"
 cat >"$VFIO_TEST_OS_RELEASE" <<EOF

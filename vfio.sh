@@ -10657,13 +10657,21 @@ BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
 # R44: resolve the GPU/audio device fragments. Prefer the per-domain profile
 # fragment (profiles/<DOMAIN>/devices/*.xml); fall back to the legacy flat
 # path (a symlink to the active VM's fragment under R44, or the pre-R44
-# stripped file). The fragment KEEPS the guest PCI address (the toggle/define
-# path wants the original slot); for `attach-device --live` on a RUNNING VM we
-# strip the fixed guest <address type='pci'> at runtime into a temp so libvirt
-# auto-assigns a free guest address (a fixed address can collide with an
-# existing device in the running VM and hang attach-device — observed).
-# Best-effort: if python3 is unavailable, use the raw fragment (the address is
-# usually free in the common single-GPU-VM case).
+# stripped file). The fragment KEEPS the guest PCI address and the <rom file=...>
+# line (the toggle/define path wants the original slot + rom); for `attach-device --live`
+# on a RUNNING VM we strip the fixed guest <address type='pci'> at runtime into a
+# temp so libvirt auto-assigns a free guest address (a fixed address can
+# collide with an existing device in the running VM and hang attach-device —
+# observed). We ALSO strip a <rom file='...'/> when the referenced romfile is
+# missing on disk (e.g. deleted / wiped by --reset / never re-dumped after a
+# reboot) — virsh attach-device --live otherwise fails with "failed to find
+# romfile". The rom is optional for a hot-attach (the card was already
+# initialized by amdgpu at host boot, so qemu does not need to re-POST from
+# the file); a working rom is still passed through so the OVMF logo / GOP path
+# benefits from it.
+# Best-effort: if python3 is unavailable, use the raw fragment (the address
+# is usually free in the common single-GPU-VM case; a missing rom is rarer but
+# the attach would fail with the same rc=1, so the python path is strongly preferred).
 _GPU_SRC="/var/lib/vfio-dynamic/live-attach-gpu.xml"
 _AUDIO_SRC="/var/lib/vfio-dynamic/live-attach-audio.xml"
 _PROF_GPU="/var/lib/vfio-dynamic/profiles/$DOMAIN/devices/gpu.xml"
@@ -10685,12 +10693,24 @@ _strip_guest_addr() {
   # STRIPYEOF terminator); the THEN body follows the terminator. So the Python
   # program is the heredoc body, and `printf '%s' "$_tmp"` is the success path.
   if python3 - "$_src" "$_tmp" <<'STRIPYEOF'; then
-import sys, xml.etree.ElementTree as ET
+import sys, os, xml.etree.ElementTree as ET
 src, dst = sys.argv[1], sys.argv[2]
 root = ET.parse(src).getroot()
+# R44: drop a <rom file='...'/> when the referenced romfile is missing on disk.
+# virsh attach-device --live fails with "failed to find romfile" if the
+# fragment keeps a <rom> line for a file that was deleted / wiped by --reset
+# / never re-dumped after a reboot. The rom is OPTIONAL for a hot-attach
+# (the card was already initialized by amdgpu at host boot, so qemu does not
+# need to re-POST from the file); strip it only when missing so a working rom
+# still gets passed through (the OVMF logo / GOP path benefits from it).
 def _strip(hd):
     for a in list(hd.findall('address')):
         if a.get('type') == 'pci': hd.remove(a)
+    rom = hd.find('rom')
+    if rom is not None:
+        rf = rom.get('file', '')
+        if rf and not os.path.isfile(rf):
+            hd.remove(rom)
 if root.tag == 'hostdev':
     _strip(root)
 else:

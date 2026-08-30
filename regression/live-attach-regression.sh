@@ -257,6 +257,27 @@ assert_contains_text \
   "R23 helper hot-attaches the GPU AFTER the audio (IOMMU group ownership fix)" \
   '_hot_attach_one "GPU" "$GPU_XML" "GPU"' \
   "$helper_block"
+# R44/rom-inject fix: the helper MUST pass the expected vBIOS romfile path to
+# _strip_guest_addr for the GPU so the python can INJECT a <rom file='...'/> when
+# the fragment has no <rom> but the romfile exists (cold-attach carries the rom so
+# OVMF reads the UEFI GOP at boot; hot-attach was shipping a romless GPU
+# -> Windows had no firmware display driver -> silent display-init failure).
+assert_contains_text \
+  "R23 helper passes the GPU romfile path to _strip_guest_addr (rom inject)" \
+  '_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM"' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper passes an empty rom path for the audio (no rom for audio)" \
+  '_strip_guest_addr "$_AUDIO_SRC" ""' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper resolves the GPU romfile path from the GPU BDF (live-<BDF>.rom)" \
+  '_GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"' \
+  "$helper_block"
+assert_contains_text \
+  "R23 helper python injects <rom> when the fragment has no rom but the romfile exists" \
+  "elif rom is None and rom_path and os.path.isfile(rom_path):" \
+  "$helper_block"
 # The helper MUST capture and log the bind script's full output on failure so a
 # bind-script bug surfaces in the journal instead of being swallowed (a swallowed
 # stderr left us blind to the say() semicolon bug for an entire session — the

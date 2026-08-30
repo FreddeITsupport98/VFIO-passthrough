@@ -10665,24 +10665,35 @@ BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
 # observed). We ALSO strip a <rom file='...'/> when the referenced romfile is
 # missing on disk (e.g. deleted / wiped by --reset / never re-dumped after a
 # reboot) — virsh attach-device --live otherwise fails with "failed to find
-# romfile". The rom is optional for a hot-attach (the card was already
-# initialized by amdgpu at host boot, so qemu does not need to re-POST from
-# the file); a working rom is still passed through so the OVMF logo / GOP path
-# benefits from it.
-# Best-effort: if python3 is unavailable, use the raw fragment (the address
-# is usually free in the common single-GPU-VM case; a missing rom is rarer but
-# the attach would fail with the same rc=1, so the python path is strongly preferred).
+# romfile". AND we INJECT a <rom file='...'/> when the fragment has NO <rom>
+# line but the romfile EXISTS on disk (the R44 fragment can lose the <rom> line
+# if it was saved from a stripped state; the romfile is restored later by
+# --install-dynamic-binding --vbios / the live-ROM fallback). Cold-attach works
+# partly BECAUSE the persistent VM XML carries <rom file=.../> so OVMF reads
+# the UEFI GOP from the file at boot and POSTs the display; hot-attach was
+# shipping a romless GPU, so Windows had no firmware display driver to init
+# -> silent display-init failure -> black screen. Injecting the <rom> when
+# the romfile exists makes the hot-attached GPU carry the UEFI GOP like
+# cold-attach, so Windows can init the display. $2 = expected romfile path
+# (empty for the audio fragment, which has no rom). Best-effort: if python3
+# is unavailable, use the raw fragment (no inject; a missing rom is rarer but the
+# attach would fail with the same rc=1, so the python path is strongly preferred).
 _GPU_SRC="/var/lib/vfio-dynamic/live-attach-gpu.xml"
 _AUDIO_SRC="/var/lib/vfio-dynamic/live-attach-audio.xml"
 _PROF_GPU="/var/lib/vfio-dynamic/profiles/$DOMAIN/devices/gpu.xml"
 _PROF_AUDIO="/var/lib/vfio-dynamic/profiles/$DOMAIN/devices/gpu-audio.xml"
 [[ -s "$_PROF_GPU" ]]   && _GPU_SRC="$_PROF_GPU"
 [[ -s "$_PROF_AUDIO" ]] && _AUDIO_SRC="$_PROF_AUDIO"
+# R44: the expected vBIOS romfile path for the GPU (VBIOS_RUNTIME_DIR/live-<BDF>.rom,
+# mirroring install_vbios_romfile's live-ROM fallback naming). Injected into the
+# GPU fragment below when the fragment has no <rom> but this file exists.
+_VBIOS_DIR="/var/lib/libvirt/vbios"
+_GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"
 _LA_TMP=()
 _la_cleanup() { [[ ${#_LA_TMP[@]} -gt 0 ]] && rm -f "${_LA_TMP[@]}" 2>/dev/null || true; }
 trap _la_cleanup EXIT
 _strip_guest_addr() {
-  local _src="$1" _tmp
+  local _src="$1" _rom="$2" _tmp
   [[ -s "$_src" ]] || return 0
   if ! command -v python3 >/dev/null 2>&1; then
     printf '%s' "$_src"; return 0
@@ -10692,17 +10703,26 @@ _strip_guest_addr() {
   # NOTE: with `if cmd <<EOF; then`, the heredoc body is read first (up to the
   # STRIPYEOF terminator); the THEN body follows the terminator. So the Python
   # program is the heredoc body, and `printf '%s' "$_tmp"` is the success path.
-  if python3 - "$_src" "$_tmp" <<'STRIPYEOF'; then
+  if python3 - "$_src" "$_tmp" "$_rom" <<'STRIPYEOF'; then
 import sys, os, xml.etree.ElementTree as ET
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, rom_path = sys.argv[1], sys.argv[2], sys.argv[3]
 root = ET.parse(src).getroot()
 # R44: drop a <rom file='...'/> when the referenced romfile is missing on disk.
 # virsh attach-device --live fails with "failed to find romfile" if the
 # fragment keeps a <rom> line for a file that was deleted / wiped by --reset
-# / never re-dumped after a reboot. The rom is OPTIONAL for a hot-attach
-# (the card was already initialized by amdgpu at host boot, so qemu does not
-# need to re-POST from the file); strip it only when missing so a working rom
+# / never re-dumped after a reboot. Strip it only when missing so a working rom
 # still gets passed through (the OVMF logo / GOP path benefits from it).
+#
+# R44: INJECT a <rom file='...'/> when the fragment has NO <rom> line but the
+# romfile EXISTS on disk (the fragment can lose the <rom> line if it was saved
+# from a stripped state and the romfile was restored later). Cold-attach works
+# partly because the persistent VM XML carries <rom file=.../> so OVMF reads
+# the UEFI GOP from the file at boot and POSTs the display; hot-attach was
+# shipping a romless GPU, so Windows had no firmware display driver to init
+# -> silent display-init failure -> black screen. Injecting the <rom> when
+# the romfile exists makes the hot-attached GPU carry the UEFI GOP like
+# cold-attach, so Windows can init the display. rom_path is empty for the
+# audio fragment (no rom for audio).
 def _strip(hd):
     for a in list(hd.findall('address')):
         if a.get('type') == 'pci': hd.remove(a)
@@ -10711,6 +10731,12 @@ def _strip(hd):
         rf = rom.get('file', '')
         if rf and not os.path.isfile(rf):
             hd.remove(rom)
+    elif rom is None and rom_path and os.path.isfile(rom_path):
+        # Schema order inside <hostdev> is source, rom, address (guest-side) —
+        # insert right after <source>.
+        src = hd.find('source')
+        if src is not None:
+            hd.insert(list(hd).index(src) + 1, ET.Element('rom', {'file': rom_path}))
 if root.tag == 'hostdev':
     _strip(root)
 else:
@@ -10723,8 +10749,8 @@ STRIPYEOF
     printf '%s' "$_src"; return 0
   fi
 }
-GPU_XML="$(_strip_guest_addr "$_GPU_SRC")"
-AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC")"
+GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM")"
+AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "")"
 
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*" 2>/dev/null || true; }
 

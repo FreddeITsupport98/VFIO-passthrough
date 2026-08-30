@@ -1717,6 +1717,75 @@ assert_contains_file \
   'QtWidgets.QSystemTrayIcon.MiddleClick' \
   "$VFIO_SCRIPT"
 
+# --- R43b: toggle OFF must detect the GPU via awk reconstruction, not a literal BDF grep ---
+# Root cause of "tray toggle still removes the GPU from virt-manager": libvirt splits
+# the PCI address across domain=/bus=/slot=/function= attributes, so a LITERAL
+# grep for the BDF string (e.g. "0000:0e:00.0") NEVER matches a real dumpxml.
+# _la_ensure_with_gpu_variant's fast path + rebuild sources 1/2 used that broken
+# grep, so the fast path always failed and the rebuild could skip the VM (leaving
+# the GPU stripped) when the saved device XMLs were missing. R43b routes all three
+# checks through _xml_has_gpu_hostdev, which reconstructs the BDF with awk (same
+# parser the install path uses) before the membership grep.
+assert_contains_file \
+  "R43b _xml_has_gpu_hostdev helper defined" \
+  '_xml_has_gpu_hostdev() {' \
+  "$VFIO_SCRIPT"
+# The ensure helper must route ALL THREE GPU-presence checks through the helper.
+_la_ensure_fn="$(sed -n '/^_la_ensure_with_gpu_variant()/,/^}/p' "$VFIO_SCRIPT")"
+_la_helper_calls="$(printf '%s\n' "$_la_ensure_fn" | grep -cF '_xml_has_gpu_hostdev "$_gpu_bdf"')"
+if (( _la_helper_calls >= 3 )); then
+  printf 'PASS: R43b ensure helper routes all 3 GPU checks through _xml_has_gpu_hostdev (%d calls)\n' "$_la_helper_calls"
+else
+  printf 'FAIL: R43b ensure helper routes only %d GPU check(s) through _xml_has_gpu_hostdev (expected >= 3)\n' "$_la_helper_calls" >&2
+  record_failure "R43b ensure helper uses _xml_has_gpu_hostdev for all 3 GPU checks"
+fi
+# The old broken literal-BDF grep must be gone from the ensure helper.
+if printf '%s\n' "$_la_ensure_fn" | grep -Fq 'grep -Fixq "$_gpu_bdf"'; then
+  printf 'FAIL: R43b ensure helper still uses the broken literal-BDF grep\n' >&2
+  record_failure "R43b ensure helper no longer uses literal grep -Fixq \"\$_gpu_bdf\""
+else
+  printf 'PASS: R43b ensure helper no longer uses the broken literal-BDF grep\n'
+fi
+# Functional proof: on a real libvirt VM XML (split attributes) the OLD literal
+# grep fails but the NEW helper succeeds — this is the exact failure that made
+# toggle OFF skip the VM and leave the GPU removed from virt-manager.
+_mock_xml="<domain type='kvm'><name>win11</name><devices>  <hostdev mode='subsystem' type='pci' managed='yes'>    <source>      <address type='pci' domain='0x0000' bus='0x0e' slot='0x00' function='0x0'/>    </source>  </hostdev></devices></domain>"
+# The helper must find the GPU hostdev (BDF reconstructed from the split attrs).
+if printf '%s' "$_mock_xml" | _xml_has_gpu_hostdev "0000:0e:00.0" 2>/dev/null; then
+  printf 'PASS: R43b helper detects the GPU in split-attribute XML (0000:0e:00.0)\n'
+else
+  printf 'FAIL: R43b helper did NOT detect the GPU in split-attribute XML\n' >&2
+  record_failure "R43b helper detects GPU in split-attribute XML"
+fi
+# The OLD literal grep must FAIL on the same XML (proves the bug it fixed).
+if printf '%s' "$_mock_xml" | grep -Fixq "0000:0e:00.0" 2>/dev/null; then
+  printf 'FAIL: R43b a literal BDF grep unexpectedly matched split-attribute XML (the bug premise is wrong)\n' >&2
+  record_failure "R43b literal grep fails on split-attribute XML (bug premise)"
+else
+  printf 'PASS: R43b a literal BDF grep does NOT match split-attribute XML (the bug the helper fixes)\n'
+fi
+# Negative: a different BDF must not be detected.
+if printf '%s' "$_mock_xml" | _xml_has_gpu_hostdev "0000:0f:00.0" 2>/dev/null; then
+  printf 'FAIL: R43b helper falsely detected an absent BDF (0000:0f:00.0)\n' >&2
+  record_failure "R43b helper rejects an absent BDF"
+else
+  printf 'PASS: R43b helper rejects an absent BDF (0000:0f:00.0)\n'
+fi
+# Negative: XML with no hostdev must not be detected.
+if printf '%s' "<domain type='kvm'><devices></devices></domain>" | _xml_has_gpu_hostdev "0000:0e:00.0" 2>/dev/null; then
+  printf 'FAIL: R43b helper falsely detected the GPU in a hostdev-less XML\n' >&2
+  record_failure "R43b helper rejects hostdev-less XML"
+else
+  printf 'PASS: R43b helper rejects a hostdev-less XML\n'
+fi
+# Negative: an empty needle is a safe non-match (returns 1, no match).
+if printf '%s' "$_mock_xml" | _xml_has_gpu_hostdev "" 2>/dev/null; then
+  printf 'FAIL: R43b helper matched on an empty needle\n' >&2
+  record_failure "R43b helper rejects an empty needle"
+else
+  printf 'PASS: R43b helper rejects an empty needle\n'
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

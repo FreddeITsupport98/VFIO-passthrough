@@ -10858,6 +10858,37 @@ _la_write_mode() {
   return 0
 }
 
+# R43b: does the libvirt VM XML on stdin contain a PCI hostdev whose <source>
+# address reconstructs to $1 (a domain:bus:slot.function BDF)? libvirt splits
+# the PCI address across domain=/bus=/slot=/function= attributes, so a LITERAL
+# grep for the BDF string (e.g. "0000:0e:00.0") NEVER matches a real dumpxml —
+# the awk reconstruction (the same parser _vm_is_guest_gpu_vm /
+# install_live_attach / install_virtio_win_guest_agent use) is required.
+# Returns 0 if a hostdev sources that BDF, 1 otherwise. $1 = BDF.
+_xml_has_gpu_hostdev() {
+  local _needle="$1" _bdfs
+  [[ -n "$_needle" ]] || return 1
+  _bdfs="$(awk '
+    /<hostdev/ { in_hostdev=1; is_pci=0 }
+    in_hostdev && /type=.pci./ { is_pci=1 }
+    in_hostdev && is_pci && /<address/ {
+      line=$0; dom=""; bus=""; slot=""; fn=""
+      if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+      if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+      if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+      if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+      if (dom != "" && bus != "" && slot != "" && fn != "") {
+        while (length(dom) < 4) dom = "0" dom
+        while (length(bus) < 2) bus = "0" bus
+        while (length(slot) < 2) slot = "0" slot
+        printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+      }
+    }
+    /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
+  ')"
+  grep -Fixq "$_needle" <<<"$_bdfs" 2>/dev/null
+}
+
 # R42: ensure the with-GPU (mode=off) variant for <dom> exists and actually
 # contains the GPU hostdev, so toggling hotplug OFF ALWAYS restores the GPU to
 # virt-manager — the operator never has to re-add it by hand. If the named
@@ -10879,14 +10910,19 @@ _la_ensure_with_gpu_variant() {
   local _gpu_bdf="${GUEST_GPU_BDF:-}"
   [[ -n "$_gpu_bdf" ]] || return 1
   # Fast path: the named variant already exists and carries the GPU hostdev.
-  if [[ -s "$_with_gpu" ]] && grep -Fixq "$_gpu_bdf" "$_with_gpu" 2>/dev/null \
+  # R43b: use the awk-reconstructing helper — a LITERAL grep for the BDF never
+  # matches libvirt's split domain=/bus=/slot=/function= attributes, so the old
+  # grep always failed and the rebuild ran every toggle (and could SKIP the VM,
+  # leaving the GPU stripped in virt-manager, if the saved device XMLs were also
+  # missing). The helper reconstructs the BDF the same way the install path does.
+  if [[ -s "$_with_gpu" ]] && _xml_has_gpu_hostdev "$_gpu_bdf" <"$_with_gpu" \
      && virt-xml-validate "$_with_gpu" 2>/dev/null; then
     printf '%s\n' "$_with_gpu"
     return 0
   fi
   note "Rebuilding the with-GPU (mode=off) variant for '$_dom' (it was missing or had no GPU hostdev)..."
   # Source 1: the legacy pre-live-attach backup (a full VM XML with the GPU).
-  if [[ -s "$_legacy" ]] && grep -Fixq "$_gpu_bdf" "$_legacy" 2>/dev/null \
+  if [[ -s "$_legacy" ]] && _xml_has_gpu_hostdev "$_gpu_bdf" <"$_legacy" \
      && virt-xml-validate "$_legacy" 2>/dev/null; then
     if (( ! DRY_RUN )); then
       cp -f "$_legacy" "$_with_gpu" 2>/dev/null || true
@@ -10899,7 +10935,7 @@ _la_ensure_with_gpu_variant() {
   local _xml
   _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
   [[ -n "$_xml" ]] || return 1
-  if grep -Fixq "$_gpu_bdf" <<<"$_xml" 2>/dev/null; then
+  if _xml_has_gpu_hostdev "$_gpu_bdf" <<<"$_xml" 2>/dev/null; then
     # Source 2: the current XML already has the GPU (e.g. re-added in virt-manager).
     printf '%s\n' "$_xml" | write_file_atomic "$_with_gpu" 0644 "root:root"
     say "  Rebuilt with-GPU variant for '$_dom' from the current persistent XML (GPU already present)."

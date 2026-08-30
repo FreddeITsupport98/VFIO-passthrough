@@ -1654,6 +1654,44 @@ else
   printf 'FAIL: R42 tray install does NOT kill the stale instance before regenerating (kill=%s write=%s)\n' "$_kill_line" "$_write_line" >&2
   record_failure "R42 tray install kills stale instance before regenerating"
 fi
+# R42: toggle OFF always restores the GPU to virt-manager. If the with-GPU
+# variant is missing/stale, _la_ensure_with_gpu_variant rebuilds it from the
+# legacy backup / current XML / saved device XMLs (3 sources), so the operator
+# never has to re-add the GPU by hand after turning hotplug off.
+assert_contains_file \
+  "R42 _la_ensure_with_gpu_variant helper defined" \
+  '_la_ensure_with_gpu_variant() {' \
+  "$VFIO_SCRIPT"
+_la_ensure_fn="$(sed -n '/^_la_ensure_with_gpu_variant()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R42 ensure helper rebuilds from the legacy backup (source 1)" \
+  'live-attach-backup-$_dom.xml' \
+  "$_la_ensure_fn"
+assert_contains_text \
+  "R42 ensure helper rebuilds from the current XML when it already has the GPU (source 2)" \
+  'dumpxml --inactive' \
+  "$_la_ensure_fn"
+assert_contains_text \
+  "R42 ensure helper re-injects the saved GPU device XML (source 3)" \
+  'LIVE_ATTACH_GPU_XML' \
+  "$_la_ensure_fn"
+assert_contains_text \
+  "R42 ensure helper saves the rebuilt variant atomically" \
+  'write_file_atomic "$_with_gpu" 0644 "root:root"' \
+  "$_la_ensure_fn"
+assert_contains_text \
+  "R42 ensure helper validates the rebuilt XML before saving" \
+  'virt-xml-validate "$_tmp"' \
+  "$_la_ensure_fn"
+assert_contains_text \
+  "R42 live_attach_toggle off calls the ensure helper" \
+  '_la_ensure_with_gpu_variant "$_dom"' \
+  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R42 live_attach_toggle off rebuild is gated on the VM being shut off" \
+  '[[ "$_state" == "shut off" ]]' \
+  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+
 # R41+: the icon itself is clickable (left-click toggles, middle-click status).
 assert_contains_file \
   "R41+ tray applet wires an activated (click) handler" \

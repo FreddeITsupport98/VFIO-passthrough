@@ -10858,6 +10858,126 @@ _la_write_mode() {
   return 0
 }
 
+# R42: ensure the with-GPU (mode=off) variant for <dom> exists and actually
+# contains the GPU hostdev, so toggling hotplug OFF ALWAYS restores the GPU to
+# virt-manager — the operator never has to re-add it by hand. If the named
+# variant is missing or doesn't carry the GPU, rebuild it from the best
+# available source, in priority order:
+#   1. the legacy live-attach-backup-<dom>.xml (full original VM XML w/ GPU),
+#   2. the current persistent dumpxml if it already has the GPU hostdev (e.g.
+#      the GPU was re-added in virt-manager since the install),
+#   3. the current dumpxml with the GPU (+ audio) hostdev re-injected from the
+#      saved standalone device XMLs (LIVE_ATTACH_GPU_XML / LIVE_ATTACH_AUDIO_XML).
+# Saves the result as the named with-gpu variant (so future toggles are instant
+# and symmetric) and echoes the variant path. Returns 1 if no source could
+# produce a valid with-GPU XML (caller warns + skips). Best-effort + idempotent.
+# $1 = dom. Uses $GUEST_GPU_BDF (sourced from the conf by the caller).
+_la_ensure_with_gpu_variant() {
+  local _dom="$1"
+  local _with_gpu="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
+  local _legacy="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
+  local _gpu_bdf="${GUEST_GPU_BDF:-}"
+  [[ -n "$_gpu_bdf" ]] || return 1
+  # Fast path: the named variant already exists and carries the GPU hostdev.
+  if [[ -s "$_with_gpu" ]] && grep -Fixq "$_gpu_bdf" "$_with_gpu" 2>/dev/null \
+     && virt-xml-validate "$_with_gpu" 2>/dev/null; then
+    printf '%s\n' "$_with_gpu"
+    return 0
+  fi
+  note "Rebuilding the with-GPU (mode=off) variant for '$_dom' (it was missing or had no GPU hostdev)..."
+  # Source 1: the legacy pre-live-attach backup (a full VM XML with the GPU).
+  if [[ -s "$_legacy" ]] && grep -Fixq "$_gpu_bdf" "$_legacy" 2>/dev/null \
+     && virt-xml-validate "$_legacy" 2>/dev/null; then
+    if (( ! DRY_RUN )); then
+      cp -f "$_legacy" "$_with_gpu" 2>/dev/null || true
+    fi
+    say "  Rebuilt with-GPU variant for '$_dom' from the legacy pre-live-attach backup."
+    printf '%s\n' "$_with_gpu"
+    return 0
+  fi
+  # Source 2/3 need the current persistent dumpxml.
+  local _xml
+  _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
+  [[ -n "$_xml" ]] || return 1
+  if grep -Fixq "$_gpu_bdf" <<<"$_xml" 2>/dev/null; then
+    # Source 2: the current XML already has the GPU (e.g. re-added in virt-manager).
+    printf '%s\n' "$_xml" | write_file_atomic "$_with_gpu" 0644 "root:root"
+    say "  Rebuilt with-GPU variant for '$_dom' from the current persistent XML (GPU already present)."
+    printf '%s\n' "$_with_gpu"
+    return 0
+  fi
+  # Source 3: re-inject the GPU (+ audio) hostdev from the saved device XMLs.
+  [[ -s "$LIVE_ATTACH_GPU_XML" ]] || return 1
+  local _tmp
+  _tmp="$(mktemp)"
+  printf '%s\n' "$_xml" >"$_tmp"
+  python3 - "$_tmp" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" <<'PYEOF' || true
+import sys, xml.etree.ElementTree as ET
+vm_path, gpu_dev_path, audio_dev_path = sys.argv[1], sys.argv[2], sys.argv[3]
+def _src_bdf(hd):
+    src = hd.find('source')
+    if src is None: return ''
+    a = src.find('address')
+    if a is None: return ''
+    def s(x): return (x[2:] if x.startswith('0x') else x) if x else ''
+    try:
+        d=s(a.get('domain','')); b=s(a.get('bus','')); sl=s(a.get('slot','')); f=s(a.get('function',''))
+        if d and b and sl and f:
+            return "%s:%s:%s.%s" % (d.zfill(4), b.zfill(2), sl.zfill(2), f)
+    except Exception:
+        pass
+    return ''
+tree = ET.parse(vm_path); root = tree.getroot()
+devices = root.find('devices')
+if devices is None: sys.exit(1)
+existing = set()
+for hd in devices.findall('hostdev'):
+    b = _src_bdf(hd)
+    if b: existing.add(b.lower())
+added = 0
+for dev_path in (gpu_dev_path, audio_dev_path):
+    if not dev_path: continue
+    try:
+        sub = ET.parse(dev_path).getroot()
+    except Exception:
+        continue
+    if sub.tag != 'hostdev': continue
+    b = _src_bdf(sub)
+    if b and b.lower() in existing:
+        continue  # already present, skip (dedup)
+    devices.append(sub)
+    added += 1
+    if b: existing.add(b.lower())
+if added == 0:
+    sys.exit(3)  # nothing to inject (device XMLs empty/duplicate)
+tree.write(vm_path)
+sys.exit(0)
+PYEOF
+  local _py_rc=$?
+  if (( _py_rc == 3 )); then
+    rm -f "$_tmp" 2>/dev/null || true
+    note "WARN: could not rebuild the with-GPU variant for '$_dom' (no saved GPU device XML to re-inject)."
+    return 1
+  fi
+  if (( _py_rc != 0 )); then
+    rm -f "$_tmp" 2>/dev/null || true
+    note "WARN: re-injecting the GPU hostdev failed for '$_dom' (python exit $_py_rc)."
+    return 1
+  fi
+  if ! virt-xml-validate "$_tmp" 2>/dev/null; then
+    rm -f "$_tmp" 2>/dev/null || true
+    note "WARN: rebuilt with-GPU XML for '$_dom' failed virt-xml-validate; not saving."
+    return 1
+  fi
+  if (( ! DRY_RUN )); then
+    write_file_atomic "$_with_gpu" 0644 "root:root" <"$_tmp"
+  fi
+  rm -f "$_tmp" 2>/dev/null || true
+  say "  Rebuilt with-GPU variant for '$_dom' by re-injecting the saved GPU (+ audio) device XML."
+  printf '%s\n' "$_with_gpu"
+  return 0
+}
+
 # R41: toggle live-attach hotplug on/off via a REAL mode switch (not the
 # backup-restore dance). For each shut-off guest-GPU VM, virsh-define the named
 # VM XML variant matching the target mode (with-gpu for off = normal dynamic
@@ -10920,6 +11040,22 @@ live_attach_toggle() {
       _picked="$_without_gpu"
     else
       _picked="$_with_gpu"
+      # R42: toggle OFF must ALWAYS restore the GPU to virt-manager. If the
+      # with-GPU variant is missing or no longer carries the GPU hostdev
+      # (e.g. a prior install ran when the GPU was already stripped, or the
+      # variant was deleted), rebuild it from the legacy backup / current XML /
+      # saved device XMLs so the operator never has to re-add the GPU by hand.
+      # Only attempt the rebuild for shut-off VMs (the domstate check below
+      # gates the define anyway; doing it first avoids a rebuild-then-skip).
+      _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+      if [[ "$_state" == "shut off" ]]; then
+        if ! _picked="$(_la_ensure_with_gpu_variant "$_dom" 2>/dev/null)"; then
+          note "WARN: VM '$_dom' is missing the with-GPU (mode=off) XML and it could not be rebuilt."
+          note "      Re-run: sudo $SCRIPT_NAME --install-live-attach (VM shut off with the GPU in its XML) to recreate both variants."
+          _skipped=1
+          continue
+        fi
+      fi
     fi
     if [[ ! -s "$_picked" ]]; then
       note "WARN: VM '$_dom' is missing the '$_target'-mode XML ($_picked)."

@@ -395,9 +395,14 @@ assert_contains_text \
   "R23 install_live_attach saves per-VM pre-live-attach XML backup" \
   'live-attach-backup-$_dom.xml' \
   "$_la_fn"
+# R43: the pristine pre-live-attach backup is now written through the shared
+# once-only _save_pristine_vm_backup helper (write-if-absent; atomic inside the
+# helper) so a re-run KEEPS the original pristine snapshot instead of overwriting
+# it — matching the stealth/perf once-only rule. The bare write_file_atomic call
+# was replaced by the helper routing.
 assert_contains_text \
-  "R23 install_live_attach writes backup atomically (write_file_atomic)" \
-  'write_file_atomic "$_backup_xml"' \
+  "R43 install_live_attach routes legacy backup through once-only helper" \
+  '| _save_pristine_vm_backup "$_backup_xml"' \
   "$_la_fn"
 # remove_live_attach must restore each VM's XML from the backup BEFORE deleting
 # it (only shut-off VMs; virsh define requires it), then clean up the backups.
@@ -899,27 +904,29 @@ assert_contains_text \
   "R34 reset hints at --uninstall-self" \
   '--uninstall-self' \
   "$_reset_fn2"
-# --- R37: --reset removes ALL stealth/perf backups + --full also removes the CLI ---
-# reset_vfio_all now calls _remove_vm_tuning_backups (wipes fixed-name + legacy
-# ~/Desktop timestamped stealth/perf XML backups) and accepts a 'full' arg that
-# also removes the self-installed vfio CLI + completions (repo script untouched).
+# --- R37/R43: --reset removes ALL stage backups + --full also removes the CLI ---
+# reset_vfio_all now calls _wipe_vm_stage_backups (R43: unifies + supersedes the
+# R37 _remove_vm_tuning_backups — wipes fixed-name + legacy ~/Desktop timestamped
+# stealth/perf XML backups AND the live-attach stage XML variants) and accepts a
+# 'full' arg that also removes the self-installed vfio CLI + completions (repo
+# script untouched).
 assert_contains_file \
-  "R37 _remove_vm_tuning_backups helper defined" \
-  '_remove_vm_tuning_backups()' \
+  "R43 _wipe_vm_stage_backups helper defined (replaces R37 _remove_vm_tuning_backups)" \
+  '_wipe_vm_stage_backups()' \
   "$VFIO_SCRIPT"
 assert_contains_text \
-  "R37 reset calls _remove_vm_tuning_backups" \
-  '_remove_vm_tuning_backups' \
+  "R43 reset calls _wipe_vm_stage_backups" \
+  '_wipe_vm_stage_backups' \
   "$_reset_fn2"
-# The backup-removal globs live in _remove_vm_tuning_backups (called by reset),
-# so extract that helper and assert the legacy ~/Desktop globs are present.
-_rm_bak_fn="$(sed -n '/^_remove_vm_tuning_backups()/,/^}/p' "$VFIO_SCRIPT")"
+# The backup-removal globs live in _wipe_vm_stage_backups (called by reset), so
+# extract that helper and assert the legacy ~/Desktop globs are still present.
+_rm_bak_fn="$(sed -n '/^_wipe_vm_stage_backups()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "R37 reset helper removes legacy ~/Desktop timestamped stealth backups" \
+  "R43 reset helper removes legacy ~/Desktop timestamped stealth backups" \
   '*_stealth_*.xml' \
   "$_rm_bak_fn"
 assert_contains_text \
-  "R37 reset helper removes legacy ~/Desktop timestamped perf backups" \
+  "R43 reset helper removes legacy ~/Desktop timestamped perf backups" \
   '*_perf_*.xml' \
   "$_rm_bak_fn"
 assert_contains_text \

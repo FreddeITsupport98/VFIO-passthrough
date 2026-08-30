@@ -11759,24 +11759,26 @@ install_live_attach() {
     _tmp_audio="$(mktemp)"
     printf '%s\n' "$_xml" >"$_tmp_vm"
 
-    # Save a full pre-live-attach XML backup (the VM XML WITH the GPU still
-    # attached) so remove_live_attach can restore the GPU hostdev on revert.
-    # One backup per VM; saved before python3 strips the hostdev below.
-    # Atomic (write_file_atomic: temp file + install/rename) so a power loss or
-    # full disk mid-write cannot leave a truncated backup on disk — the backup
-    # either appears complete or not at all (remove_live_attach still validates
-    # it before defining, as a second line of defense).
+    # R43: ONE pristine pre-live-attach backup per VM, taken the FIRST time
+    # live-attach touches the VM and never re-backed-up. Both the legacy backup
+    # (a remove_live_attach READ fallback) and the R41 with-GPU mode variant are
+    # the SAME pristine with-GPU content; both go through the shared
+    # _save_pristine_vm_backup helper, which writes ONLY when no backup yet
+    # exists — so a re-run keeps the original pristine snapshot (one backup per
+    # stage) and revert always restores the real pre-live-attach XML instead of
+    # an already-modified copy. Atomic (write_file_atomic: temp + install/rename)
+    # so a power loss / full disk mid-write cannot leave a truncated backup
+    # (remove_live_attach still validates before defining, as a second line of
+    # defense). The without-GPU variant below is the STRIPPED (modified) state,
+    # not a pristine backup, so it is regenerated each run the VM is (re)processed.
     local _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
-    printf '%s\n' "$_xml" | write_file_atomic "$_backup_xml" 0644 "root:root"
-    say "  Saved pre-live-attach VM XML backup (with GPU): $_backup_xml"
+    printf '%s\n' "$_xml" | _save_pristine_vm_backup "$_backup_xml"
     # R41: ALSO save the with-GPU variant as a named mode config so the toggle
-    # (live_attach_toggle mode=off) can virsh-define it directly. Same content
-    # as the legacy backup; kept as a separate named file so the toggle logic is
-    # symmetric (with-gpu / without-gpu) and the legacy backup stays a pure
-    # remove_live_attach fallback. Atomic for the same power-loss reason.
+    # (live_attach_toggle mode=off) can virsh-define it directly. Same pristine
+    # content as the legacy backup; once-only via the shared helper so the
+    # toggle's mode=off definition always matches the original pre-live-attach VM.
     local _with_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
-    printf '%s\n' "$_xml" | write_file_atomic "$_with_gpu_xml" 0644 "root:root"
-    say "  Saved mode=off variant (VM with GPU): $_with_gpu_xml"
+    printf '%s\n' "$_xml" | _save_pristine_vm_backup "$_with_gpu_xml"
     # R42: auto-install Looking Glass on the with-gpu (mode=off) variant too, so
     # the toggle's mode=off path (VM boots WITH the GPU, normal dynamic binding)
     # still mirrors the display via LG. Persisted in the saved variant file; the
@@ -14664,6 +14666,38 @@ _vm_is_perf_tuned() {
   grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && \
   grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && \
   grep -Fq '<cputune>' <<<"$_xml" 2>/dev/null
+}
+
+# R43: Canonical ONCE-ONLY VM-XML stage-backup writer shared by every stage that
+# snapshots a VM's pristine pre-modification XML (stealth / perf / live-attach).
+# Writes stdin to $1 ONLY when no backup yet exists at $1 — so each VM keeps
+# exactly ONE pristine backup per stage, taken the first time that stage touches
+# it, never re-backed-up (a re-run keeps the original pristine snapshot, so
+# revert always restores the real pre-stage XML instead of an already-modified
+# copy). Atomic (write_file_atomic: temp file + install/rename) so a power loss
+# or full disk mid-write cannot leave a truncated backup on disk. Dry-run safe
+# (write_file_atomic skips the write under DRY_RUN, so a dry run never creates a
+# fake backup). Best-effort: returns 0 always (the caller still has the live
+# dumpxml to fall back on). Stealth/perf keep their richer _vm_is_*_tuned guard
+# (which also blocks fabricating a "pristine" backup from already-tuned XML in
+# the orphaned case); live-attach uses this helper directly since its install
+# loop already skips already-stripped VMs.
+_save_pristine_vm_backup() {
+  local _bak="$1" _dir
+  [[ -n "$_bak" ]] || return 0
+  if [[ -f "$_bak" ]]; then
+    note "Keeping existing pristine stage backup $_bak (one backup per stage; not overwriting with a fresh snapshot)."
+    return 0
+  fi
+  _dir="$(dirname "$_bak")"
+  mkdir -p "$_dir" 2>/dev/null || true
+  if (( DRY_RUN )); then
+    note "[DRY-RUN] would save pristine pre-stage VM XML backup: $_bak"
+  else
+    write_file_atomic "$_bak" 0644 "root:root"
+    say "Saved pristine pre-stage VM XML backup: $_bak"
+  fi
+  return 0
 }
 
 # R35: Read the VM's <memory> (KiB) from a dumpxml. $1 = xml. Prints the
@@ -24088,16 +24122,23 @@ remove_user_audio_unit() {
   fi
 }
 
-# R37: Remove ALL stealth/perf VM-XML backup files for a clean --reset: the
-# fixed-name pristine backups (${_dom}_stealth.xml / ${_dom}_perf.xml in the
-# resolved backup dirs) AND the legacy timestamped ~/Desktop litter
-# (*_stealth_*.xml / *_perf_*.xml). Does NOT touch the hugepages owned files
-# (*_perf_hugepages_owned.txt — NOT backups); those + the reboot-persistent
-# boot-reserve service are freed separately by _reset_perf_hugepages_all
-# (called right after this in reset_vfio_all). Must run BEFORE $CONF_FILE is
-# deleted (reads the backup-dir conf keys). Best-effort.
-_remove_vm_tuning_backups() {
-  local _stealth_dir _perf_dir _legacy_dir _any=0 _f
+# R43: Fresh-start wipe of EVERY VM-XML stage backup this script creates, so
+# --reset clears the slate in one place and a re-install rebuilds each stage's
+# single pristine backup from the live VM XML. Unifies + supersedes the R37
+# _remove_vm_tuning_backups (stealth/perf only) by ALSO covering the live-attach
+# stage backups, so all three stages are wiped by a single call. Locations:
+#   stealth     : $STEALTH_VM_BACKUP_DIR/${dom}_stealth.xml (+ legacy ~/Desktop ${dom}_stealth_*.xml)
+#   perf        : $ULTIMATE_PERF_VM_BACKUP_DIR/${dom}_perf.xml (+ legacy ~/Desktop ${dom}_perf_*.xml)
+#   live-attach : $(dirname $LIVE_ATTACH_GPU_XML)/live-attach-backup-${dom}.xml +
+#                 live-attach-vm-with-gpu-${dom}.xml + live-attach-vm-without-gpu-${dom}.xml
+# The live-attach dir is derived from $LIVE_ATTACH_GPU_XML (not hardcoded) so a
+# regression test can redirect it to a temp dir without root. Does NOT touch the
+# hugepages owned files (*_perf_hugepages_owned.txt — NOT backups; they are
+# hugepage accounting freed separately by _reset_perf_hugepages_all, called right
+# after this in reset_vfio_all). Must run BEFORE $CONF_FILE is deleted (reads the
+# backup-dir conf keys). Best-effort.
+_wipe_vm_stage_backups() {
+  local _stealth_dir _perf_dir _legacy_dir _la_dir _any=0 _f
   _stealth_dir="$(awk -F= '/^STEALTH_VM_BACKUP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _stealth_dir="$(trim "${_stealth_dir:-}")"
   [[ -n "$_stealth_dir" ]] || _stealth_dir="/var/lib/vfio-stealth-vm/backups"
@@ -24105,13 +24146,23 @@ _remove_vm_tuning_backups() {
   _perf_dir="$(trim "${_perf_dir:-}")"
   [[ -n "$_perf_dir" ]] || _perf_dir="/var/lib/vfio-perf-vm/backups"
   _legacy_dir="${BACKUP_DIR:-$HOME/Desktop}"
-  for _f in "$_stealth_dir"/*_stealth*.xml "$_perf_dir"/*_perf*.xml "$_legacy_dir"/*_stealth_*.xml "$_legacy_dir"/*_perf_*.xml; do
+  _la_dir="$(dirname "$LIVE_ATTACH_GPU_XML" 2>/dev/null || printf '/var/lib/vfio-dynamic')"
+  # Quick existence probe across every glob so an empty slate is a silent no-op
+  # (and we only emit a removal note when there is actually something to wipe).
+  for _f in "$_stealth_dir"/*_stealth*.xml "$_perf_dir"/*_perf*.xml \
+            "$_legacy_dir"/*_stealth_*.xml "$_legacy_dir"/*_perf_*.xml \
+            "$_la_dir"/live-attach-backup-*.xml \
+            "$_la_dir"/live-attach-vm-with-gpu-*.xml \
+            "$_la_dir"/live-attach-vm-without-gpu-*.xml; do
     [[ -f "$_f" ]] && { _any=1; break; }
   done
   (( _any )) || return 0
   run rm -f "$_stealth_dir"/*_stealth*.xml "$_perf_dir"/*_perf*.xml \
-            "$_legacy_dir"/*_stealth_*.xml "$_legacy_dir"/*_perf_*.xml 2>/dev/null || true
-  note "Removed ALL stealth/perf VM XML backups (fixed-name in $_stealth_dir / $_perf_dir + legacy $_legacy_dir timestamped litter). The VM XMLs themselves are NOT reverted — run --reset-stealth-vm-tuning / --reset-ultimate-perf-vm-tuning to revert them (before --reset, since the backups are deleted here)."
+            "$_legacy_dir"/*_stealth_*.xml "$_legacy_dir"/*_perf_*.xml \
+            "$_la_dir"/live-attach-backup-*.xml \
+            "$_la_dir"/live-attach-vm-with-gpu-*.xml \
+            "$_la_dir"/live-attach-vm-without-gpu-*.xml 2>/dev/null || true
+  note "Removed ALL VM-XML stage backups (stealth/perf/live-attach) for a fresh start: $_stealth_dir, $_perf_dir, $_la_dir live-attach variants + legacy $_legacy_dir. The VM XMLs themselves are NOT reverted — run --reset-stealth-vm-tuning / --reset-ultimate-perf-vm-tuning / --install-dynamic-binding (reverts live-attach) to revert them BEFORE --reset, since the backups are deleted here."
 }
 
 reset_vfio_all() {
@@ -24137,10 +24188,11 @@ reset_vfio_all() {
   note "      removes every perf-hugepages owned file + the boot-reserve registry,"
   note "      and disables+removes the reboot-persistent re-reserve service (so an"
   note "      orphaned pool can no longer starve the VM of normal memory)."
-  note "NOTE: --reset now ALSO removes ALL stealth/perf VM XML backup files"
-  note "      (the fixed-name pristine backups + legacy ~/Desktop timestamped litter)"
-  note "      for a clean slate. Revert VM XMLs from backup FIRST (the commands above)"
-  note "      if you need to restore a pre-tuning VM — the backups are deleted by --reset."
+  note "NOTE: --reset now ALSO removes ALL VM-XML stage backups (stealth/perf/"
+  note "      live-attach: fixed-name pristine + legacy ~/Desktop timestamped litter)"
+  note "      for a clean slate (one pristine backup per stage, rebuilt from the live"
+  note "      VM XML on re-install). Revert VM XMLs from backup FIRST (the commands"
+  note "      above) — the backups are deleted by --reset."
   if [[ "$_full" == "full" ]]; then
     note "NOTE: full --reset ALSO removes the installed 'vfio' CLI + completions."
     note "      If you want to re-run vfio afterward, invoke the repo script directly"
@@ -24188,10 +24240,12 @@ reset_vfio_all() {
   # Remove the live-attach (hotplug GPU) workflow artifacts. Must run before
   # $CONF_FILE is deleted (it reads VFIO_DYNAMIC_LIVE_ATTACH from it).
   remove_live_attach
-  # R37: remove ALL stealth/perf VM XML backups (fixed-name + legacy ~/Desktop
-  # timestamped). Must run before $CONF_FILE is deleted (reads the backup-dir
-  # conf keys).
-  _remove_vm_tuning_backups
+  # R43: wipe ALL VM-XML stage backups (stealth/perf/live-attach) for a fresh
+  # start so a re-install rebuilds each stage's single pristine backup from the
+  # live VM XML. Must run before $CONF_FILE is deleted (reads the backup-dir
+  # conf keys). Live-attach artifacts are also removed by remove_live_attach
+  # above; this is the defense-in-depth fresh-start sweep for every stage.
+  _wipe_vm_stage_backups
   # R40: remove Looking Glass host-side setup (shmem device + shared-memory node +
   # security rules + user config). Must run before $CONF_FILE is deleted (it reads
   # GUEST_GPU_BDF to find guest-GPU VMs). Best-effort.

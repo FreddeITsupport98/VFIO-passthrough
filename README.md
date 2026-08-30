@@ -100,6 +100,8 @@ An **ultimate-performance VM tuning** installer (`--install-ultimate-perf-vm-tun
 
 A **system-tray on/off toggle** for the live-attach hotplug (`--live-attach-on` / `--live-attach-off` / `--live-attach-toggle` / `--live-attach-status`) flips a real persisted mode — not the backup-restore dance — so each shut-off guest-GPU VM is redefined from its saved with-GPU or without-GPU XML variant, and a **PySide6 system-tray applet** (native StatusNotifierItem on KDE Plasma 6) toggles it from the desktop with a zenity confirmation + pkexec auth + a notify-send result. Install the AMD Windows driver first, then enable hotplug from the tray. See [System-tray hotplug on/off toggle (R41)](#system-tray-hotplug-onoff-toggle-r41).
 
+A **one-pristine-backup-per-stage + reset fresh-start** model (R43) governs every VM-XML stage backup (stealth, ultimate-perf, live-attach): each VM keeps exactly ONE pristine pre-stage snapshot — taken the first time that stage touches it and never overwritten on a re-run (so a revert always restores the real pre-stage XML) — and `--reset` wipes ALL stage backups in one pass for a clean fresh start (a re-install rebuilds them from the live VM XML). See [Stealth/perf VM tuning](#stealthperf-vm-tuning-smbios--cpu--nic--disk-serials--iothreads).
+
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
 > **The practical result — on an RX 9070 / 9070 XT / 9070 GRE passed through to a Windows guest:**
@@ -343,6 +345,8 @@ sudo ./vfio.sh --verify
 ```
 
 Backups go to `STEALTH_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-stealth-vm/backups`). `--reset` does NOT revert VM XMLs — use `--reset-stealth-vm-tuning` for that. This is cosmetic realism + perf tuning, **not** an anti-cheat bypass.
+
+**VM XML backups — one pristine per stage + reset fresh-start (R43).** Every stage that modifies a guest-GPU VM's XML (stealth, ultimate-perf, live-attach) keeps exactly ONE pristine pre-stage backup per VM — taken the first time that stage touches the VM and never overwritten on a re-run, so a revert always restores the real pre-stage XML instead of an already-modified copy. The shared once-only writer (`_save_pristine_vm_backup`) skips the write when a backup already exists; stealth/perf additionally skip writing when the VM is already tuned, so a "pristine" backup is never fabricated from already-tuned XML. `--reset` wipes every stage backup in one pass (`_wipe_vm_stage_backups`) for a clean fresh start — a re-install then rebuilds each stage's single pristine backup from the live VM XML (the hugepages owned-count files are NOT backups and are freed separately). Backups are taken at every trigger point: the standalone `--install-*` flags, the `--menu` GUI, and the dynamic install flow all route through the same `install_*` functions that snapshot the pristine XML.
 
 ### Ultimate-performance VM tuning (stealth-safe)
 

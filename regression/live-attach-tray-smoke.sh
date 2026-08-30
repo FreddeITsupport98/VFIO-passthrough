@@ -48,6 +48,9 @@ if grep -Fq '"pkexec", VFIO_BIN, "--live-attach-toggle"' "$tray_py"; then ok "tr
 if grep -Fq '"zenity", "--question"' "$tray_py"; then ok "tray confirms via zenity --question"; else bad "tray missing zenity confirmation"; fi
 if grep -Fq '"notify-send"' "$tray_py"; then ok "tray reports via notify-send"; else bad "tray missing notify-send"; fi
 if grep -Fq 'VFIO_BIN  = "/usr/local/bin/vfio"' "$tray_py"; then ok "tray calls the self-installed vfio CLI"; else bad "tray missing VFIO_BIN"; fi
+if grep -Fq 'def ensure_single_instance():' "$tray_py"; then ok "tray has a single-instance guard (ensure_single_instance)"; else bad "tray missing single-instance guard"; fi
+if grep -Fq 'QLocalServer' "$tray_py"; then ok "tray single-instance guard uses QLocalServer"; else bad "tray missing QLocalServer single-instance guard"; fi
+if grep -Fq 'SOCK_NAME = "/tmp/vfio-hotplug-tray.sock"' "$tray_py"; then ok "tray uses a named single-instance socket"; else bad "tray missing named single-instance socket"; fi
 
 # Non-GUI import sanity: the module imports PySide6 symbols the tray uses, but
 # we do NOT exec the tray (that would try to show a Qt window). Importing the
@@ -94,6 +97,11 @@ status_out3="$tmp/status3.txt"
 # shellcheck disable=SC1090
 DRY_RUN=1 bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; CONF_FILE='$fake_conf' LIVE_ATTACH_MODE_FILE='$mode_dir/live-attach-mode' MODE=live-attach-status live_attach_status" >"$status_out3" 2>/dev/null || true
 if grep -Fxq 'mode=off' "$status_out3"; then ok "status reads mode=off from the mode file"; else bad "status did not read mode=off from the mode file"; fi
+
+# --live-attach-status --json emits a machine-readable object (installed + mode + vms[]).
+status_json="$tmp/status.json"
+DRY_RUN=1 bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; CONF_FILE='$fake_conf' JSON_OUTPUT=1 MODE=live-attach-status live_attach_status" >"$status_json" 2>/dev/null || true
+if grep -Fq '{' "$status_json" && grep -Fq '"installed":' "$status_json" && grep -Fq '"mode":' "$status_json" && grep -Fq '"vms":' "$status_json"; then ok "status --json emits an installed + mode + vms object"; else bad "status --json did not emit the expected JSON object (got: $(tr '\n' ' ' < "$status_json"))"; fi
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

@@ -1482,6 +1482,51 @@ assert_contains_text \
   'live_attach_toggle toggle' \
   "$_menu_fn"
 
+# --- R41+ hardening: atomic mode-file write, polkit action-id DRY, --json status, tray single-instance ---
+assert_contains_file \
+  "R41+ _la_write_mode writes the mode file atomically via write_file_atomic" \
+  'write_file_atomic "$LIVE_ATTACH_MODE_FILE" 0644 "root:root"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ polkit heredoc is unquoted so the action id expands" \
+  '<<POLEOF' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ polkit action id is single-sourced from LIVE_ATTACH_POLKIT_ACTION" \
+  '<action id="$LIVE_ATTACH_POLKIT_ACTION">' \
+  "$VFIO_SCRIPT"
+if grep -Fq '<action id="dev.vfio.live-attach-toggle">' "$VFIO_SCRIPT"; then
+  printf 'FAIL: R41+ polkit still hardcodes the action id instead of $LIVE_ATTACH_POLKIT_ACTION\n' >&2
+  record_failure "R41+ polkit action id is DRY (no hardcoded action id)"
+else
+  printf 'PASS: R41+ polkit action id is DRY (no hardcoded action id)\n'
+fi
+assert_contains_file \
+  "R41+ parse_args allows --json with --live-attach-status" \
+  '"$MODE" != "live-attach-status"' \
+  "$VFIO_SCRIPT"
+_la_status_fn="$(sed -n '/^live_attach_status()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R41+ live_attach_status has a --json branch" \
+  'if (( JSON_OUTPUT )); then' \
+  "$_la_status_fn"
+assert_contains_text \
+  "R41+ live_attach_status JSON emits an installed + mode + vms object" \
+  '"vms": [' \
+  "$_la_status_fn"
+assert_contains_file \
+  "R41+ tray applet defines ensure_single_instance" \
+  'def ensure_single_instance():' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ tray applet single-instance guard uses QLocalServer" \
+  'QLocalServer' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R41+ tray applet uses a named single-instance socket" \
+  'SOCK_NAME = "/tmp/vfio-hotplug-tray.sock"' \
+  "$VFIO_SCRIPT"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

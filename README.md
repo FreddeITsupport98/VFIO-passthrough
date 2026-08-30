@@ -763,18 +763,26 @@ The script supports several modes controlled by flags. By default, with **no fla
 Menu options:
 
 1. **Full configure** — the existing guided wizard (pick GPUs, audio, binding mode).
-2. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
-3. **Switch to early binding** — boot-time, classic.
-4. **Set up live-attach / hotswap** — VM starts without the GPU, then it is hot-attached.
-5. **Attach virtio-win guest-agent ISO** — smart handoff via `guest-ping`.
-6. **Apply stealth/perf VM tuning** — SMBIOS / CPU / NIC / disk serials.
-7. **Revert stealth/perf VM tuning** — from the backup XML.
-8. **Verify setup** — read-only check.
-9. **Detect / health check** — read-only report.
-10. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
-11. **Install vfio** to /usr/local/bin (+ shell completions).
-12. **Uninstall the self-installed vfio** (+ completions).
-13. **Exit menu**.
+2. **Full configure (recommended defaults)** — auto-answers every wizard prompt after the GPU pick (R39 `--recommended`).
+3. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
+4. **Switch to early binding** — boot-time, classic.
+5. **Set up live-attach / hotswap** — VM starts without the GPU, then it is hot-attached.
+6. **Attach virtio-win guest-agent ISO** — smart handoff via `guest-ping`.
+7. **Apply stealth/perf VM tuning** — SMBIOS / CPU / NIC / disk serials.
+8. **Revert stealth/perf VM tuning** — from the backup XML.
+9. **Apply ultimate-perf VM tuning** — stealth-safe: disk I/O, iothreads, pinning, hugepages opt-in.
+10. **Revert ultimate-perf VM tuning** — from the backup XML (restores `nr_hugepages`).
+11. **Verify setup** — read-only check.
+12. **Detect / health check** — read-only report.
+13. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
+14. **Install vfio** to /usr/local/bin (+ shell completions).
+15. **Uninstall the self-installed vfio** (+ completions).
+16. **Set up Looking Glass** — shared-memory display mirror for the guest-GPU VM.
+17. **Remove Looking Glass** — detach shmem + shared-memory node + user config.
+18. **Install (compile) looking-glass-client binary**.
+19. **Remove looking-glass-client binary**.
+20. **Toggle live-attach hotplug on/off** — VM boots with vs without the GPU (R41).
+21. **Exit menu**.
 
 ```fish path=null start=null
 sudo ./vfio.sh --menu
@@ -830,6 +838,7 @@ This wires into the existing preflight gate, so it covers both the default wizar
 - `--json`
   - Valid with `--detect` to output machine-readable JSON only.
   - Also valid with `--debug-cmdline-tokens` to emit machine-readable trace output (`mode`, `entry_filter`, `exit_code`, `lines`).
+  - Also valid with `--live-attach-status` to emit a JSON object (`installed` + `mode` + `vms[]`) instead of the `KEY=value` lines, for other tooling/scripts.
   - In detect JSON mode, remediation prompts are skipped to keep output non-interactive and parser-safe.
 
 ### Operational modes

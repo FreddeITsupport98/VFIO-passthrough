@@ -904,8 +904,8 @@ assert_contains_file \
   "die \"--entry is supported only with --debug-cmdline-tokens\"" \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "--json validation allows debug-cmdline-tokens mode" \
-  "die \"--json is currently supported only with --detect or --debug-cmdline-tokens\"" \
+  "--json validation allows debug-cmdline-tokens + live-attach-status modes" \
+  "die \"--json is currently supported only with --detect, --debug-cmdline-tokens, or --live-attach-status\"" \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "debug token JSON formatter helper exists" \

@@ -1734,7 +1734,7 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
                    Read-only report of effective Boot-VGA policy and runtime decision path
                    using $CONF_FILE plus current sysfs topology.
   --json            With --detect, print machine-readable JSON only (tri-state values: WORKS / NOT_WORK / NOT_PRESENT).
-                   With --debug-cmdline-tokens, emit machine-readable JSON debug lines.
+                   With --debug-cmdline-tokens, emit machine-readable JSON debug lines. With --live-attach-status, emit a JSON object (installed + mode + vms[]) instead of the KEY=value lines.
   --self-test       Run automated checks for common issues (awk compatibility, PipeWire access) and exit.
   --health-check    Audit the running kernel and logs for VFIO-friendliness (no changes made) and exit.
   --health-check-previous
@@ -1821,7 +1821,7 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
   --live-attach-status
                   Print machine-readable live-attach state (installed=0|1, mode=on|off, and one
                   vm=<dom>:<state> line per guest-GPU VM). Read-only; consumed by the tray applet
-                  on launch. Does not require root.
+                  on launch. Does not require root. With --json, emits a JSON object (installed + mode + vms[]) instead of the KEY=value lines, for other tooling/scripts.
   --install-virtio-win-guest-agent
                   Attach the virtio-win driver ISO to each guest-GPU VM as a CD-ROM (idempotent) so
                   you can run virtio-win-guest-tools.exe inside Windows to install the QEMU guest
@@ -2281,8 +2281,8 @@ parse_args() {
     DRY_RUN=1
   fi
 
-  if (( JSON_OUTPUT )) && [[ "$MODE" != "detect" && "$MODE" != "debug-cmdline-tokens" ]]; then
-    die "--json is currently supported only with --detect or --debug-cmdline-tokens"
+  if (( JSON_OUTPUT )) && [[ "$MODE" != "detect" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "live-attach-status" ]]; then
+    die "--json is currently supported only with --detect, --debug-cmdline-tokens, or --live-attach-status"
   fi
   if [[ -n "${DEBUG_CMDLINE_TOKENS_ENTRY_FILTER:-}" ]] && [[ "$MODE" != "debug-cmdline-tokens" ]]; then
     die "--entry is supported only with --debug-cmdline-tokens"
@@ -10847,8 +10847,10 @@ _la_write_mode() {
   _dir="$(dirname "$LIVE_ATTACH_MODE_FILE")"
   if (( ! DRY_RUN )); then
     mkdir -p "$_dir" 2>/dev/null || true
-    printf '%s\n' "$_mode" >"$LIVE_ATTACH_MODE_FILE" 2>/dev/null || true
-    chmod 0644 "$LIVE_ATTACH_MODE_FILE" 2>/dev/null || true
+    # write_file_atomic builds the content in a temp file first, then installs
+    # it (mode 0644 root:root = world-readable) so a crash mid-toggle can't
+    # leave a partial/empty mode file the default-on fail-safe would mask.
+    printf '%s\n' "$_mode" | write_file_atomic "$LIVE_ATTACH_MODE_FILE" 0644 "root:root" 2>/dev/null || true
   fi
   if readable_file "$CONF_FILE"; then
     rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "$_mode"
@@ -10987,6 +10989,30 @@ live_attach_status() {
   if (( _installed )) && [[ "$_mode" == "unknown" ]]; then
     _mode="on"
   fi
+  # R41+: --json emits a machine-readable object (installed + mode + vms[])
+  # so other tooling/scripts — not just the zenity dialog — can consume state.
+  if (( JSON_OUTPUT )); then
+    local _first=1 _dom _xml _state
+    printf '{\n'
+    printf '  "installed": %s,\n' "$_installed"
+    printf '  "mode": "%s",\n' "$(json_escape "$_mode")"
+    printf '  "vms": ['
+    if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
+      while IFS= read -r _dom; do
+        [[ -n "$_dom" ]] || continue
+        _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+        [[ -n "$_xml" ]] || continue
+        _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+        _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo unknown)"
+        if (( _first )); then printf '\n'; _first=0; else printf ',\n'; fi
+        printf '    {"domain": "%s", "state": "%s"}' "$(json_escape "$_dom")" "$(json_escape "$_state")"
+      done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+      (( _first )) || printf '\n  '
+    fi
+    printf ']\n'
+    printf '}\n'
+    return 0
+  fi
   printf 'installed=%s\n' "$_installed"
   printf 'mode=%s\n' "$_mode"
   if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
@@ -11116,6 +11142,30 @@ def show_status():
     except Exception:
         sys.stderr.write(out + "\n")
 
+SOCK_NAME = "/tmp/vfio-hotplug-tray.sock"
+
+def ensure_single_instance():
+    # Qt local-socket single-instance guard: if another tray is already
+    # running, connecting to its named socket succeeds -> exit quietly so we
+    # never show two icons (e.g. autostart + manual launch). Returns the
+    # QLocalServer (keep it alive for the app lifetime), False if another
+    # instance owns the socket, or None if QtNetwork is unavailable (skip the
+    # guard, best-effort). QLocalServer.removeServer cleans any stale socket
+    # left by a crashed previous instance; Qt removes the socket on exit.
+    try:
+        from PySide6 import QtNetwork
+    except Exception:
+        return None
+    sock = QtNetwork.QLocalSocket()
+    sock.connectToServer(SOCK_NAME)
+    if sock.waitForConnected(150):
+        sock.disconnectFromServer()
+        return False
+    srv = QtNetwork.QLocalServer()
+    QtNetwork.QLocalServer.removeServer(SOCK_NAME)
+    srv.listen(SOCK_NAME)
+    return srv
+
 def main():
     try:
         from PySide6 import QtWidgets, QtGui, QtCore
@@ -11126,8 +11176,14 @@ def main():
     if not installed():
         notify("VFIO hotplug", "Live-attach is not installed. Run: sudo vfio --install-live-attach")
         sys.exit(0)
+    _srv = ensure_single_instance()
+    if _srv is False:
+        # Another tray instance is already running; exit quietly (no second icon).
+        sys.exit(0)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    if _srv is not None:
+        _srv.setParent(app)  # keep the single-instance socket alive for the app lifetime
     tray = QtWidgets.QSystemTrayIcon()
     sty = app.style()
     _icon = QtGui.QIcon.fromTheme("video-display")
@@ -11164,11 +11220,13 @@ TRAYEOF
   #    to the generic org.freedesktop.policykit.exec auth (still works, just
   #    re-prompts every time + a generic message).
   if [[ -d /usr/share/polkit-1/actions ]]; then
-    write_file_atomic "$LIVE_ATTACH_POLKIT" 0644 "root:root" <<'POLEOF'
+    # Unquoted heredoc so the action id is single-sourced from the constant
+    # (the rest of the XML has no $/backtick, so expansion is safe here).
+    write_file_atomic "$LIVE_ATTACH_POLKIT" 0644 "root:root" <<POLEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <policyconfig>
-  <action id="dev.vfio.live-attach-toggle">
+  <action id="$LIVE_ATTACH_POLKIT_ACTION">
     <description>Toggle VFIO live-attach GPU hotplug on/off</description>
     <message>Authentication is required to toggle the VFIO live-attach hotplug mode (VM boots without GPU vs with GPU)</message>
     <defaults>

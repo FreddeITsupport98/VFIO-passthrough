@@ -10512,9 +10512,18 @@ case "$PHASE" in
         read -r _la_mode </var/lib/vfio-dynamic/live-attach-mode 2>/dev/null || true
         case "$_la_mode" in on|off) ;; *) _la_mode="on" ;; esac
       fi
-      if grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms 2>/dev/null && [[ "$_la_mode" == "on" ]]; then
+      # R44 recognition guard: only launch the hotplug helper when mode=on AND
+      # the domain is in the live-attach list AND the VM XML does NOT already
+      # carry the GPU hostdev. If mode=on but the XML still has the GPU (the
+      # toggle did not strip it yet, e.g. the VM was running at toggle time, or a
+      # fresh install where the strip is pending), launching the helper would
+      # hot-plug a SECOND copy. Instead fall through to vm_uses_guest_gpu ->
+      # bind-now (the GPU is present, so bind it normally; no double attach).
+      if grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms 2>/dev/null \
+        && [[ "$_la_mode" == "on" ]] \
+        && ! printf '%s' "$DOMAIN_XML" | vm_uses_guest_gpu; then
         _la_delay="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
-        say "vfio-libvirt-hook: VM '$DOMAIN' is in live-attach list (mode=on); launching background helper (delay=${_la_delay}s)."
+        say "vfio-libvirt-hook: VM '$DOMAIN' is in live-attach list (mode=on, GPU absent from XML); launching background helper (delay=${_la_delay}s)."
         hook_log "action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s mode=on"
         # Launch the helper FULLY DETACHED so it does NOT hold this hook's
         # stdout/stderr pipe open. libvirt waits for the hook's stdout/stderr
@@ -10628,8 +10637,57 @@ DOMAIN="${1:-}"
 DELAY="${2:-30}"
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
 BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
-GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
-AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
+# R44: resolve the GPU/audio device fragments. Prefer the per-domain profile
+# fragment (profiles/<DOMAIN>/devices/*.xml); fall back to the legacy flat
+# path (a symlink to the active VM's fragment under R44, or the pre-R44
+# stripped file). The fragment KEEPS the guest PCI address (the toggle/define
+# path wants the original slot); for `attach-device --live` on a RUNNING VM we
+# strip the fixed guest <address type='pci'> at runtime into a temp so libvirt
+# auto-assigns a free guest address (a fixed address can collide with an
+# existing device in the running VM and hang attach-device — observed).
+# Best-effort: if python3 is unavailable, use the raw fragment (the address is
+# usually free in the common single-GPU-VM case).
+_GPU_SRC="/var/lib/vfio-dynamic/live-attach-gpu.xml"
+_AUDIO_SRC="/var/lib/vfio-dynamic/live-attach-audio.xml"
+_PROF_GPU="/var/lib/vfio-dynamic/profiles/$DOMAIN/devices/gpu.xml"
+_PROF_AUDIO="/var/lib/vfio-dynamic/profiles/$DOMAIN/devices/gpu-audio.xml"
+[[ -s "$_PROF_GPU" ]]   && _GPU_SRC="$_PROF_GPU"
+[[ -s "$_PROF_AUDIO" ]] && _AUDIO_SRC="$_PROF_AUDIO"
+_LA_TMP=()
+_la_cleanup() { [[ ${#_LA_TMP[@]} -gt 0 ]] && rm -f "${_LA_TMP[@]}" 2>/dev/null || true; }
+trap _la_cleanup EXIT
+_strip_guest_addr() {
+  local _src="$1" _tmp
+  [[ -s "$_src" ]] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$_src"; return 0
+  fi
+  _tmp="$(mktemp)" || { printf '%s' "$_src"; return 0; }
+  _LA_TMP+=("$_tmp")
+  # NOTE: with `if cmd <<EOF; then`, the heredoc body is read first (up to the
+  # STRIPYEOF terminator); the THEN body follows the terminator. So the Python
+  # program is the heredoc body, and `printf '%s' "$_tmp"` is the success path.
+  if python3 - "$_src" "$_tmp" <<'STRIPYEOF'; then
+import sys, xml.etree.ElementTree as ET
+src, dst = sys.argv[1], sys.argv[2]
+root = ET.parse(src).getroot()
+def _strip(hd):
+    for a in list(hd.findall('address')):
+        if a.get('type') == 'pci': hd.remove(a)
+if root.tag == 'hostdev':
+    _strip(root)
+else:
+    for hd in root.findall('hostdev'): _strip(hd)
+ET.ElementTree(root).write(dst)
+STRIPYEOF
+    printf '%s' "$_tmp"; return 0
+  else
+    rm -f "$_tmp" 2>/dev/null || true
+    printf '%s' "$_src"; return 0
+  fi
+}
+GPU_XML="$(_strip_guest_addr "$_GPU_SRC")"
+AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC")"
 
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*" 2>/dev/null || true; }
 
@@ -10802,7 +10860,7 @@ if [[ -s "$GPU_XML" ]]; then
     exit 1
   fi
 else
-  jlog "live-attach: FAILED — $GPU_XML missing or empty; the GPU device XML was not saved at install time. Re-run 'sudo vfio.sh --install-live-attach' with the VM shut off."
+  jlog "live-attach: FAILED — GPU fragment missing or empty (checked $_PROF_GPU and $_GPU_SRC); the device XML was not saved at install time. Re-run 'sudo vfio.sh --install-live-attach' with the VM shut off."
   _notify_desktop "GPU hot-plug failed" "The GPU device XML is missing for VM '$DOMAIN'. Re-run: sudo vfio.sh --install-live-attach (VM shut off)" critical
   exit 1
 fi
@@ -10852,8 +10910,12 @@ _la_write_mode() {
     # leave a partial/empty mode file the default-on fail-safe would mask.
     printf '%s\n' "$_mode" | write_file_atomic "$LIVE_ATTACH_MODE_FILE" 0644 "root:root" 2>/dev/null || true
   fi
+  # Best-effort conf key flip: a non-writable $CONF_FILE (e.g. a non-root
+  # regression run, where sourcing this script reset CONF_FILE to the real
+  # /etc path) MUST NOT abort the caller — profile_recognize is documented as
+  # "never aborts the caller" and the durable record is the mode file above.
   if readable_file "$CONF_FILE"; then
-    rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "$_mode"
+    rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "$_mode" 2>/dev/null || true
   fi
   return 0
 }
@@ -10889,156 +10951,441 @@ _xml_has_gpu_hostdev() {
   grep -Fixq "$_needle" <<<"$_bdfs" 2>/dev/null
 }
 
-# R42: ensure the with-GPU (mode=off) variant for <dom> exists and actually
-# contains the GPU hostdev, so toggling hotplug OFF ALWAYS restores the GPU to
-# virt-manager — the operator never has to re-add it by hand. If the named
-# variant is missing or doesn't carry the GPU, rebuild it from the best
-# available source, in priority order:
-#   1. the legacy live-attach-backup-<dom>.xml (full original VM XML w/ GPU),
-#   2. the current persistent dumpxml if it already has the GPU hostdev (e.g.
-#      the GPU was re-added in virt-manager since the install),
-#   3. the current dumpxml with the GPU (+ audio) hostdev re-injected from the
-#      saved standalone device XMLs (LIVE_ATTACH_GPU_XML / LIVE_ATTACH_AUDIO_XML).
-# Saves the result as the named with-gpu variant (so future toggles are instant
-# and symmetric) and echoes the variant path. Returns 1 if no source could
-# produce a valid with-GPU XML (caller warns + skips). Best-effort + idempotent.
-# $1 = dom. Uses $GUEST_GPU_BDF (sourced from the conf by the caller).
-_la_ensure_with_gpu_variant() {
-  local _dom="$1"
-  local _with_gpu="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
-  local _legacy="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
-  local _gpu_bdf="${GUEST_GPU_BDF:-}"
-  [[ -n "$_gpu_bdf" ]] || return 1
-  # Fast path: the named variant already exists and carries the GPU hostdev.
-  # R43b: use the awk-reconstructing helper — a LITERAL grep for the BDF never
-  # matches libvirt's split domain=/bus=/slot=/function= attributes, so the old
-  # grep always failed and the rebuild ran every toggle (and could SKIP the VM,
-  # leaving the GPU stripped in virt-manager, if the saved device XMLs were also
-  # missing). The helper reconstructs the BDF the same way the install path does.
-  if [[ -s "$_with_gpu" ]] && _xml_has_gpu_hostdev "$_gpu_bdf" <"$_with_gpu" \
-     && virt-xml-validate "$_with_gpu" 2>/dev/null; then
-    printf '%s\n' "$_with_gpu"
-    return 0
-  fi
-  note "Rebuilding the with-GPU (mode=off) variant for '$_dom' (it was missing or had no GPU hostdev)..."
-  # Source 1: the legacy pre-live-attach backup (a full VM XML with the GPU).
-  if [[ -s "$_legacy" ]] && _xml_has_gpu_hostdev "$_gpu_bdf" <"$_legacy" \
-     && virt-xml-validate "$_legacy" 2>/dev/null; then
-    if (( ! DRY_RUN )); then
-      cp -f "$_legacy" "$_with_gpu" 2>/dev/null || true
-    fi
-    say "  Rebuilt with-GPU variant for '$_dom' from the legacy pre-live-attach backup."
-    printf '%s\n' "$_with_gpu"
-    return 0
-  fi
-  # Source 2/3 need the current persistent dumpxml.
-  local _xml
-  _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
-  [[ -n "$_xml" ]] || return 1
-  if _xml_has_gpu_hostdev "$_gpu_bdf" <<<"$_xml" 2>/dev/null; then
-    # Source 2: the current XML already has the GPU (e.g. re-added in virt-manager).
-    printf '%s\n' "$_xml" | write_file_atomic "$_with_gpu" 0644 "root:root"
-    say "  Rebuilt with-GPU variant for '$_dom' from the current persistent XML (GPU already present)."
-    printf '%s\n' "$_with_gpu"
-    return 0
-  fi
-  # Source 3: re-inject the GPU (+ audio) hostdev from the saved device XMLs.
-  [[ -s "$LIVE_ATTACH_GPU_XML" ]] || return 1
-  local _tmp
+# ===================== R44: live-attach recognition + device fragments =====================
+# R44 replaces the R41/R42 frozen-full-domain-XML mode switch with recognition
+# + device fragments. The CURRENT libvirt domain XML (virsh dumpxml) is the
+# source of truth; the only on-disk state is small device fragments
+# (profiles/<dom>/devices/{gpu,gpu-audio}.xml) + a derived manifest. A mode
+# switch edits the live XML by inserting/removing ONLY the GPU (+ audio)
+# hostdevs — RAM/CPU/disk/Looking Glass/stealth/perf edits the user made since
+# the install are never wiped (a frozen full dumpxml would wipe them).
+# Reuses R43b's _xml_has_gpu_hostdev as the recognition primitive.
+
+# R44: per-domain profile directory. $1 = dom. Echoes the absolute path.
+# VFIO_LA_PROFILES_DIR (env) overrides the root so a regression test can
+# redirect the profile dir to a temp dir without root (mirrors the
+# VFIO_LIVE_ATTACH_VM_LIST override pattern used by _vm_is_guest_gpu_vm).
+_la_profile_dir() {
+  printf '%s/%s' "${VFIO_LA_PROFILES_DIR:-/var/lib/vfio-dynamic/profiles}" "${1:-}"
+}
+
+# R44: read a manifest key. $1 = dom, $2 = key. Echoes the value (empty if the
+# manifest or key is missing). Manifest is plain KEY=value, one per line.
+_la_manifest_read() {
+  local _dom="$1" _key="$2" _f
+  _f="$(_la_profile_dir "$_dom")/manifest"
+  [[ -r "$_f" ]] || return 0
+  awk -F= -v k="$_key" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$_f" 2>/dev/null || true
+}
+
+# R44: write/update manifest keys. $1 = dom; remaining args are KEY=value lines.
+# Atomic (temp + install). Preserves keys not in the update set. Best-effort.
+_la_manifest_write() {
+  local _dom="$1"; shift
+  local _dir _f _tmp _kv _k _line _skip
+  _dir="$(_la_profile_dir "$_dom")"
+  _f="$_dir/manifest"
+  [[ -d "$_dir" ]] || mkdir -p "$_dir" 2>/dev/null || true
   _tmp="$(mktemp)"
-  printf '%s\n' "$_xml" >"$_tmp"
-  python3 - "$_tmp" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" <<'PYEOF' || true
+  if [[ -r "$_f" ]]; then
+    while IFS= read -r _line; do
+      [[ -n "$_line" ]] || continue
+      _k="${_line%%=*}"
+      _skip=0
+      for _kv in "$@"; do [[ "${_kv%%=*}" == "$_k" ]] && { _skip=1; break; }; done
+      (( _skip )) || printf '%s\n' "$_line"
+    done <"$_f" >"$_tmp"
+  fi
+  for _kv in "$@"; do
+    [[ -n "$_kv" ]] && printf '%s\n' "$_kv" >>"$_tmp"
+  done
+  if (( ! DRY_RUN )); then
+    install -m 0644 "$_tmp" "$_f" 2>/dev/null || cp -f "$_tmp" "$_f" 2>/dev/null || true
+  fi
+  rm -f "$_tmp" 2>/dev/null || true
+}
+
+# R44: echo GUEST_AUDIO_BDFS_CSV one BDF per line. $1 overrides the CSV.
+_la_audio_bdfs() {
+  local _csv="${1:-${GUEST_AUDIO_BDFS_CSV:-}}"
+  printf '%s\n' "$_csv" | tr ',' '\n'
+}
+
+# R44: extract ONE PCI hostdev (a bare <hostdev>) from VM XML on stdin whose
+# <source> address reconstructs to $1 (a domain:bus:slot.function BDF), and
+# write it to $2. Keeps the real guest bus/slot/function, rom file=, and any
+# existing tweaks (does NOT invent a new address; does NOT strip the guest
+# address — the toggle/define path wants the original slot; the live-attach
+# helper strips the guest address at runtime before attach-device --live).
+# Returns 0 if a hostdev was written, 1 on no match / parse error.
+# NOTE: the XML is read from stdin, but `python3 - <<'PYEOF'` feeds the PROGRAM
+# on stdin (the heredoc), so the XML must be saved to a temp file first and
+# passed as a path arg (sys.stdin is exhausted by the program loader).
+_la_extract_hostdev_fragment() {
+  local _needle="$1" _out="$2" _in _rc
+  [[ -n "$_needle" && -n "$_out" ]] || return 1
+  _in="$(mktemp)"
+  cat >"$_in"
+  python3 - "$_needle" "$_in" "$_out" <<'PYEOF'
 import sys, xml.etree.ElementTree as ET
-vm_path, gpu_dev_path, audio_dev_path = sys.argv[1], sys.argv[2], sys.argv[3]
+needle = sys.argv[1].lower()
+in_path = sys.argv[2]
+out = sys.argv[3]
 def _src_bdf(hd):
-    src = hd.find('source')
-    if src is None: return ''
-    a = src.find('address')
+    src = hd.find('source'); a = src.find('address') if src is not None else None
     if a is None: return ''
     def s(x): return (x[2:] if x.startswith('0x') else x) if x else ''
     try:
-        d=s(a.get('domain','')); b=s(a.get('bus','')); sl=s(a.get('slot','')); f=s(a.get('function',''))
-        if d and b and sl and f:
-            return "%s:%s:%s.%s" % (d.zfill(4), b.zfill(2), sl.zfill(2), f)
+        return "%s:%s:%s.%s" % (s(a.get('domain','')).zfill(4), s(a.get('bus','')).zfill(2), s(a.get('slot','')).zfill(2), s(a.get('function','')))
     except Exception:
-        pass
-    return ''
-tree = ET.parse(vm_path); root = tree.getroot()
+        return ''
+try:
+    root = ET.parse(in_path).getroot()
+except Exception:
+    sys.exit(1)
 devices = root.find('devices')
 if devices is None: sys.exit(1)
-existing = set()
 for hd in devices.findall('hostdev'):
-    b = _src_bdf(hd)
-    if b: existing.add(b.lower())
-added = 0
-for dev_path in (gpu_dev_path, audio_dev_path):
-    if not dev_path: continue
+    if hd.get('type') != 'pci': continue
+    if _src_bdf(hd).lower() == needle:
+        ET.ElementTree(hd).write(out)
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+  _rc=$?
+  rm -f "$_in" 2>/dev/null || true
+  return "$_rc"
+}
+
+# R44: stable fingerprint of every <devices> child EXCEPT PCI hostdevs whose
+# <source> BDF is in the exclude list ($1 = comma-separated BDFs). The toggle
+# only adds/removes the GPU/audio hostdevs, so the signature of everything ELSE
+# must be identical before vs after — the safety invariant that proves no
+# unrelated device (disk, controller, shmem, interface, input, ...) was lost.
+# Reads VM XML on stdin; prints sorted serializations, one line per kept child.
+# NOTE: saves stdin to a temp file (see _la_extract_hostdev_fragment for why:
+# `python3 - <<'PYEOF'` feeds the program on stdin, exhausting it for data).
+_la_devices_signature() {
+  local _exclude="$1" _in
+  _in="$(mktemp)"
+  cat >"$_in"
+  python3 - "$_exclude" "$_in" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+exclude = set()
+for e in (sys.argv[1] or '').split(','):
+    e = e.strip()
+    if e: exclude.add(e.lower())
+def _src_bdf(hd):
+    src = hd.find('source'); a = src.find('address') if src is not None else None
+    if a is None: return ''
+    def s(x): return (x[2:] if x.startswith('0x') else x) if x else ''
     try:
-        sub = ET.parse(dev_path).getroot()
+        return "%s:%s:%s.%s" % (s(a.get('domain','')).zfill(4), s(a.get('bus','')).zfill(2), s(a.get('slot','')).zfill(2), s(a.get('function','')))
     except Exception:
-        continue
-    if sub.tag != 'hostdev': continue
-    b = _src_bdf(sub)
-    if b and b.lower() in existing:
-        continue  # already present, skip (dedup)
-    devices.append(sub)
-    added += 1
-    if b: existing.add(b.lower())
-if added == 0:
-    sys.exit(3)  # nothing to inject (device XMLs empty/duplicate)
-tree.write(vm_path)
+        return ''
+try:
+    root = ET.parse(sys.argv[2]).getroot()
+except Exception:
+    sys.exit(0)
+# Strip whitespace-only text/tail so the signature is formatting-independent
+# (virsh dumpxml and ET.write produce different whitespace, which would make
+# the same device serialize differently and falsely trip the safety invariant).
+for elem in root.iter():
+    if elem.text is not None and elem.text.strip() == '':
+        elem.text = None
+    if elem.tail is not None and elem.tail.strip() == '':
+        elem.tail = None
+devices = root.find('devices')
+if devices is None: sys.exit(0)
+lines = []
+for child in list(devices):
+    if child.tag == 'hostdev' and child.get('type') == 'pci':
+        b = _src_bdf(child)
+        if b and b.lower() in exclude:
+            continue
+    lines.append(ET.tostring(child, encoding='unicode'))
+lines.sort()
+print('\n'.join(lines))
+PYEOF
+  local _rc=$?
+  rm -f "$_in" 2>/dev/null || true
+  return "$_rc"
+}
+
+# R44: recognize a guest-GPU VM's live-attach state from the CURRENT libvirt
+# XML (the source of truth), write/update its manifest, and reconcile the mode
+# file. $1 = dom. Sets globals: _LA_REC_MODE (on|off|unknown), _LA_REC_HAS_GPU,
+# _LA_REC_HAS_FRAG, _LA_REC_HAS_LG, _LA_REC_HAS_STEALTH, _LA_REC_HAS_PERF.
+# Echoes recognized_mode. Live XML wins over manifest/mode file; if the mode
+# file disagrees with a non-unknown recognized mode, print a mismatch and
+# rewrite the mode file. Best-effort (never aborts the caller).
+profile_recognize() {
+  local _dom="$1" _xml _gpu_bdf _dir _has_gpu=0 _has_frag=0 _has_lg=0 _has_stealth=0 _has_perf=0 _mode _rec
+  _gpu_bdf="${GUEST_GPU_BDF:-}"
+  if [[ -z "$_dom" || -z "$_gpu_bdf" ]]; then
+    _LA_REC_MODE=unknown; _LA_REC_HAS_GPU=0; _LA_REC_HAS_FRAG=0
+    _LA_REC_HAS_LG=0; _LA_REC_HAS_STEALTH=0; _LA_REC_HAS_PERF=0
+    echo unknown; return 0
+  fi
+  _dir="$(_la_profile_dir "$_dom")"
+  _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
+  if [[ -n "$_xml" ]] && printf '%s' "$_xml" | _xml_has_gpu_hostdev "$_gpu_bdf" 2>/dev/null; then
+    _has_gpu=1
+  fi
+  if [[ -s "$_dir/devices/gpu.xml" ]]; then
+    _has_frag=1
+  fi
+  if [[ -n "$_xml" ]] && grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null; then
+    _has_lg=1
+  fi
+  if [[ -n "$_xml" ]] && _vm_is_stealth_tuned "$_dom" "$_xml" 2>/dev/null; then
+    _has_stealth=1
+  fi
+  if [[ -n "$_xml" ]] && _vm_is_perf_tuned "$_dom" "$_xml" 2>/dev/null; then
+    _has_perf=1
+  fi
+  if (( _has_gpu )); then
+    _rec=off
+  elif (( _has_frag )); then
+    _rec=on
+  else
+    _rec=unknown
+  fi
+  _LA_REC_MODE="$_rec"; _LA_REC_HAS_GPU="$_has_gpu"; _LA_REC_HAS_FRAG="$_has_frag"
+  _LA_REC_HAS_LG="$_has_lg"; _LA_REC_HAS_STEALTH="$_has_stealth"; _LA_REC_HAS_PERF="$_has_perf"
+  if (( ! DRY_RUN )); then
+    _la_manifest_write "$_dom" \
+      "domain=$_dom" "guest_gpu=$_gpu_bdf" \
+      "has_gpu_hostdev=$_has_gpu" "has_gpu_fragment=$_has_frag" \
+      "has_lg=$_has_lg" "has_stealth=$_has_stealth" "has_perf=$_has_perf" \
+      "mode=$_rec" "updated=$(date -Is 2>/dev/null || echo unknown)"
+  fi
+  _mode="$(_la_read_mode)"
+  if [[ "$_rec" != "unknown" && "$_mode" != "$_rec" ]]; then
+    note "MISMATCH: live-attach-mode file says '$_mode' but VM '$_dom' recognized mode is '$_rec' (live XML is truth). Rewriting the mode file to '$_rec'."
+    _la_write_mode "$_rec"
+  fi
+  printf '%s' "$_rec"
+}
+
+# R44: apply a live-attach mode to <dom> by editing the CURRENT live domain XML
+# — add/remove ONLY the GPU (+ audio) hostdevs, never touching anything else.
+# $1 = dom, $2 = on|off. Calls profile_recognize IN-SHELL first (so the
+# _LA_REC_* globals are set in THIS shell — a subshell'd recognize would leave
+# them unset and trip `set -u`). Safety: shut-off only; virt-xml-validate before
+# define; device-diff invariant (only GPU/audio hostdevs may differ). Returns 0
+# if the VM is now in the target mode (defined or already was), 1 if refused/skipped.
+profile_apply_mode() {
+  local _dom="$1" _target="$2" _gpu_bdf="${GUEST_GPU_BDF:-}" _dir _xml _state _excl _sig_before _sig_after _tmp _py_rc _new_gpu _abdf _fb _legacy _wg
+  _dir="$(_la_profile_dir "$_dom")"
+  [[ -n "$_dom" && -n "$_gpu_bdf" ]] || return 1
+  case "$_target" in on|off) ;; *) return 1 ;; esac
+  # Recognize IN-SHELL so _LA_REC_* globals are set here (not in a subshell).
+  # Default them to 0 first so `set -u` never trips if recognize is skipped.
+  _LA_REC_HAS_GPU=0; _LA_REC_HAS_FRAG=0; _LA_REC_MODE=unknown
+  profile_recognize "$_dom" >/dev/null 2>&1 || true
+  _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+  if [[ "$_state" != "shut off" ]]; then
+    note "WARN: VM '$_dom' is '$_state' (not shut off); skipping live-attach mode apply. Shut it off and re-run."
+    return 1
+  fi
+  _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
+  [[ -n "$_xml" ]] || { note "WARN: could not dump XML for '$_dom'; skipping."; return 1; }
+  _excl="$_gpu_bdf,${GUEST_AUDIO_BDFS_CSV:-}"
+  _sig_before="$(printf '%s' "$_xml" | _la_devices_signature "$_excl" 2>/dev/null || true)"
+  _tmp=""
+  if [[ "$_target" == "on" ]]; then
+    if (( _LA_REC_HAS_GPU )); then
+      # Extract GPU (+ first audio) fragments from the CURRENT live XML
+      # (overwrite so they stay current with rom file=/address tweaks made
+      # in virt-manager since the last install), then remove ONLY those
+      # hostdevs from a working copy.
+      mkdir -p "$_dir/devices" 2>/dev/null || true
+      if (( ! DRY_RUN )); then
+        printf '%s' "$_xml" | _la_extract_hostdev_fragment "$_gpu_bdf" "$_dir/devices/gpu.xml" || {
+          note "WARN: could not extract the GPU hostdev fragment for '$_dom'; not stripping. Refusing to toggle on."
+          return 1
+        }
+        # Audio: save the FIRST audio hostdev as a valid single-<hostdev>
+        # fragment (virsh attach-device takes one device per call; the helper
+        # attaches one audio). Strip ALL audio BDFs below so none leaks.
+        _abdf=""
+        for _abdf in $(_la_audio_bdfs); do
+          [[ -n "$_abdf" ]] || continue
+          if printf '%s' "$_xml" | _la_extract_hostdev_fragment "$_abdf" "$_dir/devices/gpu-audio.xml" 2>/dev/null; then
+            break
+          fi
+        done
+      fi
+      _tmp="$(mktemp)"; printf '%s\n' "$_xml" >"$_tmp"
+      _py_rc=0
+      python3 - "$_tmp" "$_gpu_bdf" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || _py_rc=$?
+import sys, xml.etree.ElementTree as ET
+path, gpu_bdf, audio_csv = sys.argv[1], sys.argv[2], sys.argv[3]
+def _src_bdf(hd):
+    src = hd.find('source'); a = src.find('address') if src is not None else None
+    if a is None: return ''
+    def s(x): return (x[2:] if x.startswith('0x') else x) if x else ''
+    try:
+        return "%s:%s:%s.%s" % (s(a.get('domain','')).zfill(4), s(a.get('bus','')).zfill(2), s(a.get('slot','')).zfill(2), s(a.get('function','')))
+    except Exception: return ''
+audio = set()
+for e in audio_csv.split(','):
+    e = e.strip()
+    if e: audio.add(e.lower())
+root = ET.parse(path).getroot(); devices = root.find('devices')
+if devices is None: sys.exit(1)
+removed = 0
+for hd in list(devices.findall('hostdev')):
+    if hd.get('type') != 'pci': continue
+    b = _src_bdf(hd).lower()
+    if b == gpu_bdf.lower() or b in audio:
+        devices.remove(hd); removed += 1
+if removed == 0: sys.exit(3)
+ET.ElementTree(root).write(path)
 sys.exit(0)
 PYEOF
-  local _py_rc=$?
-  if (( _py_rc == 3 )); then
-    rm -f "$_tmp" 2>/dev/null || true
-    note "WARN: could not rebuild the with-GPU variant for '$_dom' (no saved GPU device XML to re-inject)."
-    return 1
+      if (( _py_rc == 3 )); then
+        note "WARN: no GPU/audio hostdev found to remove from '$_dom' (already stripped?). Refusing to toggle on."
+        rm -f "$_tmp" 2>/dev/null || true; return 1
+      fi
+      if (( _py_rc != 0 )); then
+        note "WARN: failed to strip GPU hostdev from '$_dom' (python exit $_py_rc). Refusing to toggle on."
+        rm -f "$_tmp" 2>/dev/null || true; return 1
+      fi
+    fi
+    # else: already has_gpu_hostdev=0 (recognized=on) -> no edit needed.
+  else
+    # target = off: put the GPU (+ audio) back into the CURRENT live XML from
+    # the saved fragments. Never define an old full-domain backup.
+    if (( _LA_REC_HAS_GPU )); then
+      : # Already present; no insert needed.
+    else
+      if [[ ! -s "$_dir/devices/gpu.xml" ]]; then
+        # One-release fallback: extract a fragment from an old full backup,
+        # once, then never read that backup for switching again. The legacy
+        # backup dir is overridable via VFIO_LA_LEGACY_DIR (default
+        # /var/lib/vfio-dynamic) so a non-root regression run can redirect the
+        # lookup to an empty temp dir and exercise the REFUSE path without a
+        # real system backup matching the mock BDF.
+        _legacy="${VFIO_LA_LEGACY_DIR:-/var/lib/vfio-dynamic}/live-attach-backup-$_dom.xml"
+        _wg="${VFIO_LA_LEGACY_DIR:-/var/lib/vfio-dynamic}/live-attach-vm-with-gpu-$_dom.xml"
+        for _fb in "$_legacy" "$_wg"; do
+          [[ -s "$_fb" ]] || continue
+          mkdir -p "$_dir/devices" 2>/dev/null || true
+          if (( ! DRY_RUN )) && _la_extract_hostdev_fragment "$_gpu_bdf" <"$_fb" "$_dir/devices/gpu.xml" 2>/dev/null; then
+            note "Recovered the GPU fragment for '$_dom' from the old full backup $_fb (one-release fallback). This backup will no longer be used for switching."
+            break
+          fi
+          _fb=""
+        done
+        if [[ ! -s "$_dir/devices/gpu.xml" ]]; then
+          note "REFUSE: no GPU fragment for '$_dom' and the GPU is not in the live XML. Cannot toggle off safely (will not invent a hostdev from vendor:device IDs)."
+          note "       Put the GPU back in virt-manager once, or re-run: sudo $SCRIPT_NAME --install-live-attach (VM shut off with the GPU in its XML)."
+          return 1
+        fi
+      fi
+      _tmp="$(mktemp)"; printf '%s\n' "$_xml" >"$_tmp"
+      _py_rc=0
+      python3 - "$_tmp" "$_dir/devices/gpu.xml" "$_dir/devices/gpu-audio.xml" "$_gpu_bdf" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || _py_rc=$?
+import sys, xml.etree.ElementTree as ET
+path, gpu_path, audio_path, gpu_bdf, audio_csv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+def _src_bdf(hd):
+    src = hd.find('source'); a = src.find('address') if src is not None else None
+    if a is None: return ''
+    def s(x): return (x[2:] if x.startswith('0x') else x) if x else ''
+    try:
+        return "%s:%s:%s.%s" % (s(a.get('domain','')).zfill(4), s(a.get('bus','')).zfill(2), s(a.get('slot','')).zfill(2), s(a.get('function','')))
+    except Exception: return ''
+root = ET.parse(path).getroot(); devices = root.find('devices')
+if devices is None: sys.exit(1)
+existing = set(_src_bdf(hd).lower() for hd in devices.findall('hostdev') if hd.get('type')=='pci')
+added = 0
+def _want_bdfs(csv):
+    out = set()
+    for e in (csv or '').split(','):
+        e = e.strip()
+        if e: out.add(e.lower())
+    return out
+for frag_path, csv in ((gpu_path, gpu_bdf), (audio_path, audio_csv)):
+    if not frag_path: continue
+    try:
+        raw = open(frag_path).read()
+    except Exception:
+        continue
+    want = _want_bdfs(csv)
+    # Parse as a single <hostdev>; if that fails (concatenated hostdevs), wrap
+    # in <devices>. First successful parse wins.
+    parsed = None
+    for chunk in (raw, '<devices>' + raw + '</devices>'):
+        try:
+            parsed = ET.fromstring(chunk); break
+        except Exception:
+            parsed = None
+    if parsed is None: continue
+    kids = [parsed] if parsed.tag == 'hostdev' else list(parsed.findall('hostdev'))
+    for hd in kids:
+        if hd.tag != 'hostdev' or hd.get('type') != 'pci': continue
+        b = _src_bdf(hd).lower()
+        if not b or b not in want or b in existing:
+            continue
+        devices.append(hd); existing.add(b); added += 1
+if added == 0: sys.exit(3)
+ET.ElementTree(root).write(path)
+sys.exit(0)
+PYEOF
+      if (( _py_rc == 3 )); then
+        note "WARN: no new GPU/audio hostdev inserted for '$_dom' (fragment BDFs already present?). Refusing to toggle off."
+        rm -f "$_tmp" 2>/dev/null || true; return 1
+      fi
+      if (( _py_rc != 0 )); then
+        note "WARN: failed to insert GPU fragment into '$_dom' (python exit $_py_rc). Refusing to toggle off."
+        rm -f "$_tmp" 2>/dev/null || true; return 1
+      fi
+    fi
   fi
-  if (( _py_rc != 0 )); then
-    rm -f "$_tmp" 2>/dev/null || true
-    note "WARN: re-injecting the GPU hostdev failed for '$_dom' (python exit $_py_rc)."
-    return 1
+  # If no edit was needed (_tmp empty), the VM is already in the target mode.
+  if [[ -z "$_tmp" ]]; then
+    if [[ "$_target" == "off" ]]; then _new_gpu=1; else _new_gpu=0; fi
+    _la_manifest_write "$_dom" "mode=$_target" "has_gpu_hostdev=$_new_gpu" "updated=$(date -Is 2>/dev/null || echo unknown)"
+    return 0
+  fi
+  # Device-diff safety invariant: only the GPU/audio hostdevs may differ.
+  _sig_after="$(_la_devices_signature "$_excl" <"$_tmp" 2>/dev/null || true)"
+  if [[ "$_sig_before" != "$_sig_after" ]]; then
+    note "REFUSE: toggling '$_dom' to mode=$_target would change devices other than the GPU/audio hostdevs (safety invariant). NOT defining. Inspect $_tmp."
+    rm -f "$_tmp" 2>/dev/null || true; return 1
   fi
   if ! virt-xml-validate "$_tmp" 2>/dev/null; then
-    rm -f "$_tmp" 2>/dev/null || true
-    note "WARN: rebuilt with-GPU XML for '$_dom' failed virt-xml-validate; not saving."
-    return 1
+    note "WARN: virt-xml-validate failed for '$_dom' (mode=$_target); NOT defining. Inspect $_tmp."
+    rm -f "$_tmp" 2>/dev/null || true; return 1
   fi
   if (( ! DRY_RUN )); then
-    write_file_atomic "$_with_gpu" 0644 "root:root" <"$_tmp"
+    if ! virsh -c qemu:///system define "$_tmp" 2>/dev/null; then
+      note "ERROR: virsh define failed for '$_dom' (mode=$_target). NOT applied. Inspect $_tmp."
+      rm -f "$_tmp" 2>/dev/null || true; return 1
+    fi
   fi
   rm -f "$_tmp" 2>/dev/null || true
-  say "  Rebuilt with-GPU variant for '$_dom' by re-injecting the saved GPU (+ audio) device XML."
-  printf '%s\n' "$_with_gpu"
+  if [[ "$_target" == "off" ]]; then _new_gpu=1; else _new_gpu=0; fi
+  _la_manifest_write "$_dom" "mode=$_target" "has_gpu_hostdev=$_new_gpu" "updated=$(date -Is 2>/dev/null || echo unknown)"
   return 0
 }
 
-# R41: toggle live-attach hotplug on/off via a REAL mode switch (not the
-# backup-restore dance). For each shut-off guest-GPU VM, virsh-define the named
-# VM XML variant matching the target mode (with-gpu for off = normal dynamic
-# binding; without-gpu for on = hotplug), then flip the mode file + conf key.
-# $1 = on | off | toggle (toggle flips the current mode). Idempotent: defining
-# the already-active variant is a no-op and the mode file is refreshed anyway.
-# Does NOT delete the helper/device-XMLs/VM-list — those stay installed so
-# toggling back is instant and symmetric. Running VMs are skipped (virsh define
-# needs shut-off). Requires live-attach to be installed (VFIO_DYNAMIC_LIVE_ATTACH=1).
+# R44: toggle live-attach hotplug on/off via RECOGNITION + device fragments
+# (replaces the R41/R42 frozen-full-domain-XML switch). For each shut-off
+# guest-GPU VM: profile_recognize the CURRENT live XML (source of truth), then
+# profile_apply_mode the target — which edits the live XML by adding/removing
+# ONLY the GPU (+ audio) hostdevs (never a frozen full dumpxml, so RAM/CPU/disk/
+# Looking Glass/stealth/perf edits survive). `toggle` flips the RECOGNIZED mode
+# per VM (not the mode file); `on`/`off` force the target. The global mode file
+# is updated ONLY if at least one shut-off VM was actually redefined (so a
+# running-VM-only run does not silently claim success). Running VMs are skipped.
+# Requires live-attach to be installed (VFIO_DYNAMIC_LIVE_ATTACH=1).
+# $1 = on | off | toggle.
 live_attach_toggle() {
   local _req="$1"
-  local _target
-  case "$_req" in
-    on|off) _target="$_req" ;;
-    toggle)
-      local _cur
-      _cur="$(_la_read_mode)"
-      case "$_cur" in
-        on)  _target="off" ;;
-        off) _target="on" ;;
-        *)   _target="on" ;;  # unknown -> default to on (the hotplug workflow)
-      esac
-      ;;
-    *) die "live_attach_toggle: invalid request '$_req' (expected on|off|toggle)" ;;
-  esac
+  case "$_req" in on|off|toggle) ;; *) die "live_attach_toggle: invalid request '$_req' (expected on|off|toggle)" ;; esac
 
   readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run --install-dynamic-binding + --install-live-attach first."
   # shellcheck disable=SC1090
@@ -11051,77 +11398,45 @@ live_attach_toggle() {
   fi
 
   say
-  hdr "Toggle live-attach hotplug: $_target"
-  if [[ "$_target" == "on" ]]; then
-    note "ON  (hotplug): each shut-off guest-GPU VM is redefined WITHOUT the GPU, so it boots"
-    note "on a virtual display and the helper hot-attaches the GPU after Windows is up."
-  else
-    note "OFF (normal): each shut-off guest-GPU VM is redefined WITH the GPU present, so it"
-    note "boots normally under standard dynamic binding (the hook binds at VM start)."
-  fi
-  note "The helper / device-XMLs / VM list are left installed — toggle back any time."
-  note "Running VMs are skipped (shut them off and re-run to apply)."
+  hdr "Toggle live-attach hotplug: $_req"
+  note "Recognition + device fragments: the live VM XML is the source of truth. Each shut-off"
+  note "guest-GPU VM is edited in place — only the GPU (+ audio) hostdev is added/removed;"
+  note "RAM/CPU/disk/Looking Glass/stealth/perf edits are preserved (no frozen full backup)."
+  note "Running VMs are skipped (shut them off and re-run). Unknown (no fragment + no GPU) -> refuse."
   say
 
-  local _dom _xml _state _with_gpu _without_gpu _picked _found=0 _applied=0 _skipped=0
+  local _dom _xml _rec _target _found=0 _applied=0 _skipped=0 _refused=0
   while IFS= read -r _dom; do
     [[ -n "$_dom" ]] || continue
     _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
     _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
     _found=1
-    _with_gpu="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
-    _without_gpu="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"
-    if [[ "$_target" == "on" ]]; then
-      _picked="$_without_gpu"
+    # Recognize the CURRENT live XML IN-SHELL (sets _LA_REC_*; reconciles the
+    # mode file if it disagrees with a non-unknown recognized mode). A subshell
+    # capture would lose the globals; call it directly and capture the echo via
+    # a temp var pattern that keeps the globals.
+    profile_recognize "$_dom" >/dev/null 2>&1 || true
+    _rec="${_LA_REC_MODE:-unknown}"
+    # Resolve the target for THIS VM.
+    case "$_req" in
+      on|off) _target="$_req" ;;
+      toggle)
+        case "$_rec" in
+          on)  _target="off" ;;
+          off) _target="on" ;;
+          *)   # unknown -> refuse to guess.
+            note "REFUSE: VM '$_dom' recognized mode is unknown (no GPU hostdev and no saved fragment). Shut it off and run: sudo $SCRIPT_NAME --install-live-attach (with the GPU in its XML) so the fragment can be created."
+            _refused=1; _skipped=1; continue ;;
+        esac ;;
+    esac
+    note "  '$_dom': recognized=$_rec -> requested=$_target"
+    if profile_apply_mode "$_dom" "$_target"; then
+      _applied=1
+      say "  ✔ '$_dom' -> mode=$_target (live XML redefined from current state)"
     else
-      _picked="$_with_gpu"
-      # R42: toggle OFF must ALWAYS restore the GPU to virt-manager. If the
-      # with-GPU variant is missing or no longer carries the GPU hostdev
-      # (e.g. a prior install ran when the GPU was already stripped, or the
-      # variant was deleted), rebuild it from the legacy backup / current XML /
-      # saved device XMLs so the operator never has to re-add the GPU by hand.
-      # Only attempt the rebuild for shut-off VMs (the domstate check below
-      # gates the define anyway; doing it first avoids a rebuild-then-skip).
-      _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
-      if [[ "$_state" == "shut off" ]]; then
-        if ! _picked="$(_la_ensure_with_gpu_variant "$_dom" 2>/dev/null)"; then
-          note "WARN: VM '$_dom' is missing the with-GPU (mode=off) XML and it could not be rebuilt."
-          note "      Re-run: sudo $SCRIPT_NAME --install-live-attach (VM shut off with the GPU in its XML) to recreate both variants."
-          _skipped=1
-          continue
-        fi
-      fi
-    fi
-    if [[ ! -s "$_picked" ]]; then
-      note "WARN: VM '$_dom' is missing the '$_target'-mode XML ($_picked)."
-      note "      Re-run: sudo $SCRIPT_NAME --install-live-attach (VM shut off) to (re)create both variants."
       _skipped=1
-      continue
     fi
-    _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
-    if [[ "$_state" != "shut off" ]]; then
-      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
-      _skipped=1
-      continue
-    fi
-    if ! virt-xml-validate "$_picked" 2>/dev/null; then
-      note "WARN: virt-xml-validate failed for '$_dom' mode-XML $_picked; skipping."
-      _skipped=1
-      continue
-    fi
-    if (( ! DRY_RUN )); then
-      if virsh -c qemu:///system define "$_picked" 2>/dev/null; then
-        say "  ✔ '$_dom' -> mode=$_target"
-      else
-        note "WARN: virsh define failed for '$_dom' ($_picked); skipping."
-        _skipped=1
-        continue
-      fi
-    else
-      say "  (dry-run) '$_dom' -> mode=$_target"
-    fi
-    _applied=1
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
 
   if (( ! _found )); then
@@ -11129,11 +11444,12 @@ live_attach_toggle() {
     return 0
   fi
 
-  # Persist the mode regardless (even if all VMs were running/skipped, the mode
-  # file reflects intent and the hook honors it at the next VM start that CAN
-  # define). Only claim applied success if at least one VM was updated.
-  _la_write_mode "$_target"
+  # Update the global mode file ONLY if at least one shut-off VM was actually
+  # redefined. If every VM was running/refused/missing, do NOT silently flip
+  # the mode file — print a clear mismatch instead so the tray/hook reflect
+  # reality, not intent.
   if (( _applied )); then
+    _la_write_mode "$_target"
     say
     if (( ENABLE_COLOR )); then
       say "${C_GREEN}${C_BOLD}✔ Live-attach hotplug is now ${_target^^}${C_RESET}"
@@ -11141,37 +11457,38 @@ live_attach_toggle() {
       say "✔ Live-attach hotplug is now ${_target^^}"
     fi
     note "Shut-off guest-GPU VM(s) redefined for mode=$_target. Start the VM to apply."
-  elif (( _skipped )); then
-    note "Mode recorded as '$_target' but no VM was updated (running/missing-variant VMs were skipped)."
+  else
+    note "MISMATCH: no shut-off VM was redefined (running/refused/missing); mode file NOT updated."
+    if (( _refused )); then
+      note "One or more VMs were REFUSED (unknown mode). Resolve above and re-run."
+    fi
   fi
   return 0
 }
 
-# R41: machine-readable live-attach status for the tray applet (launch-time
-# state). Prints one KEY=value per line: installed=0|1, mode=on|off, and one
-# vm=<dom>:<state> line per guest-GPU VM. Read-only (DRY_RUN-safe). A pre-R41
-# install (mode file absent but VFIO_DYNAMIC_LIVE_ATTACH=1) reports mode=on
-# (hotplug active), matching its original behavior.
+# R44: machine-readable live-attach status built on RECOGNITION (not just
+# the mode file). Prints: installed, mode_file, gpu (alive|dead|unknown), and
+# per guest-GPU VM: recognized mode, xml_has_gpu, gpu_fragment, vm=<dom>:<state>.
+# The tray/hook read mode_file for a fast check; recognized is the truth (live
+# XML). A mismatch (mode_file != recognized) means the XML was not updated yet
+# (e.g. the VM was running at toggle time) — the tray surfaces that. Read-only
+# (DRY_RUN-safe). --json emits the same fields. A pre-R44 install (mode file
+# absent but VFIO_DYNAMIC_LIVE_ATTACH=1) reports mode_file=on (hotplug active).
 live_attach_status() {
-  local _installed=0 _mode
+  local _installed=0 _mode_file _gpu="unknown" _gbdf
   if readable_file "$CONF_FILE" && grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
     _installed=1
   fi
-  _mode="$(_la_read_mode)"
-  if (( _installed )) && [[ "$_mode" == "unknown" ]]; then
-    _mode="on"
+  _mode_file="$(_la_read_mode)"
+  if (( _installed )) && [[ "$_mode_file" == "unknown" ]]; then
+    _mode_file="on"
   fi
-  # R42: probe the guest GPU liveness (mirrors _gpu_alive: sysfs dir present +
-  # vendor != 0xffff + config first 4 bytes != ffffffff). A dead/zombie card
-  # (RX 9070/RDNA4 reset bug, qemu "Unknown PCI header type 127") is reported
-  # as gpu=dead so the tray icon + status dialog can surface "needs host reboot"
-  # instead of a misleading mode=on. Reads GUEST_GPU_BDF from the conf (no
-  # sourcing) and sysfs (world-readable), so this needs no root.
-  local _gpu="unknown"
+  # Probe the guest GPU liveness (mirrors _gpu_alive). Reads GUEST_GPU_BDF from
+  # the conf (no sourcing) and world-readable sysfs, so this needs no root.
   if (( _installed )); then
-    local _gbdf _gsys _gv _gc
     _gbdf="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
     if [[ -n "$_gbdf" ]]; then
+      local _gsys _gv _gc
       _gsys="/sys/bus/pci/devices/$_gbdf"
       if [[ ! -d "$_gsys" ]]; then
         _gpu="dead"
@@ -11190,13 +11507,19 @@ live_attach_status() {
       fi
     fi
   fi
-  # R41+: --json emits a machine-readable object (installed + mode + gpu + vms[])
-  # so other tooling/scripts — not just the zenity dialog — can consume state.
+
+  # Per-VM recognition. Source the conf so profile_recognize can read
+  # GUEST_GPU_BDF / GUEST_AUDIO_BDFS_CSV without each call re-parsing.
+  if (( _installed )) && readable_file "$CONF_FILE"; then
+    # shellcheck disable=SC1090
+    . "$CONF_FILE"
+  fi
+
   if (( JSON_OUTPUT )); then
-    local _first=1 _dom _xml _state
+    local _first=1 _dom _xml _rec _state
     printf '{\n'
     printf '  "installed": %s,\n' "$_installed"
-    printf '  "mode": "%s",\n' "$(json_escape "$_mode")"
+    printf '  "mode_file": "%s",\n' "$(json_escape "$_mode_file")"
     printf '  "gpu": "%s",\n' "$(json_escape "$_gpu")"
     printf '  "vms": ['
     if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
@@ -11205,9 +11528,11 @@ live_attach_status() {
         _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
         [[ -n "$_xml" ]] || continue
         _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+        _rec="$(profile_recognize "$_dom" 2>/dev/null || echo unknown)"
         _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo unknown)"
         if (( _first )); then printf '\n'; _first=0; else printf ',\n'; fi
-        printf '    {"domain": "%s", "state": "%s"}' "$(json_escape "$_dom")" "$(json_escape "$_state")"
+        printf '    {"domain": "%s", "state": "%s", "recognized": "%s", "xml_has_gpu": %s, "gpu_fragment": %s}' \
+          "$(json_escape "$_dom")" "$(json_escape "$_state")" "$(json_escape "$_rec")" "${_LA_REC_HAS_GPU:-0}" "${_LA_REC_HAS_FRAG:-0}"
       done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
       (( _first )) || printf '\n  '
     fi
@@ -11215,18 +11540,21 @@ live_attach_status() {
     printf '}\n'
     return 0
   fi
+
   printf 'installed=%s\n' "$_installed"
-  printf 'mode=%s\n' "$_mode"
+  printf 'mode_file=%s\n' "$_mode_file"
   printf 'gpu=%s\n' "$_gpu"
   if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
-    local _dom _xml _state
+    local _dom _xml _rec _state
     while IFS= read -r _dom; do
       [[ -n "$_dom" ]] || continue
       _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
       [[ -n "$_xml" ]] || continue
       _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+      _rec="$(profile_recognize "$_dom" 2>/dev/null || echo unknown)"
       _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo unknown)"
       printf 'vm=%s:%s\n' "$_dom" "$_state"
+      printf '  recognized=%s xml_has_gpu=%s gpu_fragment=%s\n' "$_rec" "${_LA_REC_HAS_GPU:-0}" "${_LA_REC_HAS_FRAG:-0}"
     done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
   fi
 }
@@ -11314,6 +11642,9 @@ def installed():
         return False
 
 def read_mode():
+    # The mode FILE (a fast-check the hook reads). R44: the truth is the
+    # RECOGNIZED mode (live XML); use read_status() for display, this is the
+    # fallback when status is unavailable.
     try:
         with open(MODE_FILE) as f:
             v = f.read().strip()
@@ -11322,6 +11653,39 @@ def read_mode():
     except Exception:
         pass
     return "on" if installed() else "unknown"
+
+def read_status():
+    # R44: parse `vfio --live-attach-status` (KEY=value) for the RECOGNIZED mode
+    # (live XML is truth) + gpu liveness + the mode file. Returns a dict with
+    # mode_file, gpu, recognized (from the first guest-GPU VM). Best-effort: on
+    # any failure falls back to the mode file + gpu_state(). No root needed
+    # (--live-attach-status is read-only and reads world-readable files).
+    d = {"mode_file": None, "gpu": None, "recognized": None}
+    try:
+        out = subprocess.check_output([VFIO_BIN, "--live-attach-status"],
+                                       stderr=subprocess.DEVNULL, timeout=5).decode()
+    except Exception:
+        d["mode_file"] = read_mode()
+        d["gpu"] = gpu_state()
+        d["recognized"] = d["mode_file"]
+        return d
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("mode_file="):
+            d["mode_file"] = line.split("=", 1)[1].strip()
+        elif line.startswith("gpu="):
+            d["gpu"] = line.split("=", 1)[1].strip()
+        elif line.startswith("recognized="):
+            v = line.split("=", 1)[1].split()[0] if line.split("=", 1)[1] else ""
+            if d["recognized"] is None:
+                d["recognized"] = v
+    if d["mode_file"] is None:
+        d["mode_file"] = read_mode()
+    if d["gpu"] is None:
+        d["gpu"] = gpu_state()
+    if d["recognized"] is None:
+        d["recognized"] = d["mode_file"]
+    return d
 
 def read_gpu_bdf():
     # Read GUEST_GPU_BDF="0000:0e:00.0" out of the (world-readable) conf so the
@@ -11384,11 +11748,16 @@ def confirm(title, text):
 
 def do_toggle():
     _log("do_toggle entry")
-    cur = read_mode()
-    _log("do_toggle cur=%s" % cur)
-    if cur == "unknown":
-        notify("VFIO hotplug", "Live-attach is not installed; nothing to toggle.", "critical")
-        _log("do_toggle: unknown mode, aborted")
+    # R44: use the RECOGNIZED mode (live XML is truth), not just the mode file.
+    # --live-attach-toggle does its own per-VM recognition; the tray just calls
+    # it, but the confirmation dialog shows the recognized state so the operator
+    # sees what will actually flip.
+    st = read_status()
+    cur = st["recognized"] or st["mode_file"]
+    _log("do_toggle recognized=%s mode_file=%s" % (st["recognized"], st["mode_file"]))
+    if cur not in ("on", "off"):
+        notify("VFIO hotplug", "Live-attach state is unknown (no GPU hostdev and no saved fragment). Run: sudo vfio --install-live-attach with the VM shut off and the GPU in its XML.", "critical")
+        _log("do_toggle: unknown recognized mode, aborted")
         return
     nxt = "off" if cur == "on" else "on"
     detail = ("ON: the VM boots WITHOUT the GPU and the helper hot-attaches it once Windows is up.\n"
@@ -11408,9 +11777,12 @@ def do_toggle():
         notify("VFIO hotplug", "Failed to launch pkexec: %s" % e, "critical")
         _log("do_toggle pkexec exception=%s" % e)
         return
-    new = read_mode()
-    if rc == 0:
+    nst = read_status()
+    new = nst["recognized"] or nst["mode_file"]
+    if rc == 0 and new in ("on", "off"):
         notify("VFIO hotplug", "Hotplug is now %s." % new.upper())
+    elif rc == 0:
+        notify("VFIO hotplug", "Toggle ran but the VM was not redefined (running/unknown). Shut it off and re-run.", "critical")
     else:
         notify("VFIO hotplug", "Toggle failed (rc=%s). Check: pkexec / polkit / journalctl." % rc, "critical")
 
@@ -11522,8 +11894,15 @@ def main():
     _log("tray started; visible=%s; isSystemTrayAvailable=%s" % (tray.isVisible(), tray.isSystemTrayAvailable()))
     _prev_gpu = [None]  # track alive->dead so the DEAD alert fires once per transition
     def refresh():
-        m = read_mode()
-        g = gpu_state()
+        # R44: show the RECOGNIZED mode (live XML is truth). If mode_file !=
+        # recognized, the XML was not updated yet (e.g. the VM was running at
+        # toggle time) — show a yellow "XML not updated yet" instead of a
+        # misleading green/red success.
+        st = read_status()
+        m = st["recognized"] or st["mode_file"]
+        g = st["gpu"]
+        mf = st["mode_file"]
+        mismatch = (m in ("on", "off") and mf in ("on", "off") and mf != m)
         if g == "dead":
             tray.setToolTip("VFIO hotplug: %s — GPU DEAD, needs host reboot" % m.upper())
             # Yellow icon = the GPU is dead/zombie (needs a host reboot); the
@@ -11535,6 +11914,12 @@ def main():
                        "Guest GPU is DEAD (config space unreadable — RX 9070/RDA4 zombie state). "
                        "It needs a HOST REBOOT to come back on the bus.",
                        "critical")
+        elif mismatch:
+            tray.setToolTip("VFIO hotplug: %s — XML not updated yet (mode file %s; shut off + re-run)" % (m.upper(), mf.upper()))
+            # Yellow icon = the mode file and the live XML disagree; the last
+            # toggle did not redefine the VM (it was running/refused). Not a
+            # healthy green/red until they reconcile.
+            tray.setIcon(_status_icon(_YELLOW))
         else:
             tray.setToolTip("VFIO hotplug: %s%s" % (m.upper(), "" if g == "alive" else " (gpu unknown)"))
             # Green icon = hotplug ON (VM boots without GPU, helper hot-attaches it);
@@ -11690,17 +12075,24 @@ remove_live_attach_tray() {
   return 0
 }
 
-# Install the live-attach (hotplug GPU) workflow:
-# 1. Extract the GPU + audio hostdev blocks from each shut-off guest-GPU VM's
-#    XML into standalone device XML files.
-# 2. Remove the GPU + audio hostdev blocks from the VM's persistent XML (so
-#    libvirt starts the VM WITHOUT the GPU).
-# 3. Write the VM name(s) to the live-attach VM list.
-# 4. Install the live-attach helper script.
-# 5. Flip VFIO_DYNAMIC_LIVE_ATTACH=1 in the conf.
-# 6. Regenerate the bind script (deploys the updated hook with live-attach logic).
-# Prerequisites: dynamic binding must already be installed (conf + hook exist).
-# The AMD Windows driver MUST be installed first (the card dies without it).
+# Install the live-attach (hotplug GPU) workflow (R44: recognition + device
+# fragments — replaces the R41/R42 frozen-full-domain-XML switch):
+# 1. For each shut-off guest-GPU VM that has the GPU in its XML (OR an existing
+#    valid gpu.xml fragment), extract the GPU + audio hostdevs into per-domain
+#    device fragments (profiles/<dom>/devices/{gpu,gpu-audio}.xml) + write a
+#    manifest from recognition. The CURRENT live XML is the source of truth.
+# 2. Auto-inject the qemu guest-agent channel + Looking Glass into the live XML.
+# 3. Default mode=on: strip the GPU (+ audio) hostdevs from the live XML (via
+#    profile_apply_mode) so libvirt starts the VM WITHOUT the GPU. The fragment
+#    stays on disk so toggling back (mode=off) re-inserts ONLY the GPU/audio —
+#    RAM/CPU/disk/LG/stealth/perf edits made since the install are preserved.
+# 4. Compat: symlink the old flat LIVE_ATTACH_GPU_XML/AUDIO_XML to this VM's
+#    fragments so a not-yet-reinstalled helper keeps working.
+# 5. Install the helper, libvirt hook, bind script, tray; flip the conf; mode=on.
+# Old full-domain backups (live-attach-vm-with-gpu/without-gpu/backup-*.xml) are
+# NO LONGER WRITTEN; existing ones are left as a one-release read-only fallback
+# (used only to recover a missing gpu.xml fragment). Prerequisites: dynamic
+# binding installed (conf + hook exist). AMD Windows driver MUST be installed.
 install_live_attach() {
   readable_file "$CONF_FILE" || die "Missing $CONF_FILE. Run the full installer or --install-dynamic-binding first."
   # shellcheck disable=SC1090
@@ -11715,6 +12107,11 @@ install_live_attach() {
   note "boots on a virtual display, and after a delay the GPU is hot-attached to the"
   note "running VM. This sidesteps the parked-restart card death on RX 9070 / RDNA4."
   note ""
+  note "R44: the mode switch is RECOGNITION + device fragments, NOT frozen full-domain"
+  note "backups. The live VM XML is the source of truth; only the GPU (+ audio) hostdev"
+  note "is saved as a small fragment (profiles/<dom>/devices/) and added/removed on"
+  note "toggle. RAM/CPU/disk/Looking Glass/stealth/perf edits survive a mode switch."
+  note ""
   note "The VM XML is also auto-injected with a qemu guest-agent channel, and the"
   note "helper polls guest-ping so the GPU hot-attaches the MOMENT Windows is up"
   note "(not after a blind fixed wait). For the smart early-bind path, install the"
@@ -11723,18 +12120,14 @@ install_live_attach() {
   note "PREREQUISITE: the AMD Windows driver MUST already be installed inside the VM."
   note "Without the driver, the card dies ~25s into the session regardless of method."
   note ""
-  note "The VM XML will be modified to REMOVE the GPU hostdev (so libvirt starts"
-  note "without it). A full backup of the original XML (with the GPU) is saved per VM."
-  note ""
   note "R42: opting into hotplug ALSO auto-installs Looking Glass (shared-memory display"
-  note "mirror) on BOTH VM XML variants (with-gpu / without-gpu) + the host side"
-  note "(/dev/shm/looking-glass + tmpfiles.d + security + client config), so the"
-  note "passed-through GPU is mirrored to the host with low latency. Persistent across"
-  note "reboots (tmpfiles.d recreates the shm node; the variants carry the shmem +"
-  note "spice input block). The client binary is NOT auto-compiled (install hint printed)."
+  note "mirror) on the live VM XML + the host side (/dev/shm/looking-glass + tmpfiles.d"
+  note "+ security + client config), so the passed-through GPU is mirrored to the host"
+  note "with low latency. Persistent across reboots (tmpfiles.d recreates the shm node;"
+  note "the device-diff safety invariant preserves the shmem through toggles)."
   note "To revert, run:"
   note "  sudo $SCRIPT_NAME --install-dynamic-binding"
-  note "  (restores normal binding AND re-attaches the GPU to the VM XML from the backup)"
+  note "  (restores normal binding AND re-attaches the GPU to the VM XML via the fragment)"
   say
 
   local _delay_default="${VFIO_DYNAMIC_LIVE_ATTACH_DELAY:-30}"
@@ -11747,219 +12140,131 @@ install_live_attach() {
     mkdir -p "$_la_dir"
   fi
 
-  # Find shut-off VMs with the guest GPU and set up live-attach for each.
-  local _dom _xml _bdfs _state _found=0
-  local _gpu_bdf="$GUEST_GPU_BDF"
-  local _audio_csv="${GUEST_AUDIO_BDFS_CSV:-}"
+  # R44: per-VM recognition + fragment extraction. The CURRENT live XML is the
+  # source of truth; only the GPU (+ audio) hostdev is saved as a small fragment
+  # (profiles/<dom>/devices/) and the manifest is derived from recognition.
+  local _dom _xml _state _found=0 _gpu_bdf="$GUEST_GPU_BDF"
 
   while IFS= read -r _dom; do
     [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
     [[ -n "$_xml" ]] || continue
-    # Parse PCI hostdev BDFs (same awk parser as the hook).
-    _bdfs="$(printf '%s' "$_xml" | awk '
-      /<hostdev/ { in_hostdev=1; is_pci=0 }
-      in_hostdev && /type=.pci./ { is_pci=1 }
-      in_hostdev && is_pci && /<address/ {
-        line=$0; dom=""; bus=""; slot=""; fn=""
-        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
-        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
-        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
-        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
-        if (dom != "" && bus != "" && slot != "" && fn != "") {
-          while (length(dom) < 4) dom = "0" dom
-          while (length(bus) < 2) bus = "0" bus
-          while (length(slot) < 2) slot = "0" slot
-          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
-        }
-      }
-      /<\/hostdev>/ { in_hostdev=0; is_pci=0 }
-    ')"
-    if ! grep -Fixq "$_gpu_bdf" <<<"$_bdfs" 2>/dev/null; then
-      continue
-    fi
-    # Check VM state — can only define shut-off VMs.
+    # Guest-GPU VM by current rules (BDF in XML OR in the live-attach VM list —
+    # live-attach strips the GPU hostdev, so a stripped VM still qualifies).
+    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
       continue
     fi
     _found=1
-    say "Setting up live-attach for VM '$_dom'..."
+    local _pdir _has_gpu_now=0 _abdf _tmp_vm _ga_rc
+    _pdir="$(_la_profile_dir "$_dom")"
+    if printf '%s' "$_xml" | _xml_has_gpu_hostdev "$_gpu_bdf" 2>/dev/null; then
+      _has_gpu_now=1
+    fi
+    # Require GPU present in the live XML OR an existing valid gpu.xml fragment
+    # (a re-run after a prior install stripped the GPU but saved the fragment).
+    if (( ! _has_gpu_now )) && [[ ! -s "$_pdir/devices/gpu.xml" ]]; then
+      note "REFUSE: VM '$_dom' has no GPU hostdev in its XML and no saved fragment. Put the GPU back in virt-manager once, or re-run --install-live-attach with the GPU in its XML."
+      continue
+    fi
+    say "Setting up live-attach profile for VM '$_dom'..."
+    mkdir -p "$_pdir/devices" 2>/dev/null || true
 
-    # Use python to extract the GPU + audio hostdev blocks into standalone XML
-    # and remove them from the VM XML.
-    local _tmp_vm _tmp_gpu _tmp_audio
-    _tmp_vm="$(mktemp)"
-    _tmp_gpu="$(mktemp)"
-    _tmp_audio="$(mktemp)"
-    printf '%s\n' "$_xml" >"$_tmp_vm"
-
-    # R43: ONE pristine pre-live-attach backup per VM, taken the FIRST time
-    # live-attach touches the VM and never re-backed-up. Both the legacy backup
-    # (a remove_live_attach READ fallback) and the R41 with-GPU mode variant are
-    # the SAME pristine with-GPU content; both go through the shared
-    # _save_pristine_vm_backup helper, which writes ONLY when no backup yet
-    # exists — so a re-run keeps the original pristine snapshot (one backup per
-    # stage) and revert always restores the real pre-live-attach XML instead of
-    # an already-modified copy. Atomic (write_file_atomic: temp + install/rename)
-    # so a power loss / full disk mid-write cannot leave a truncated backup
-    # (remove_live_attach still validates before defining, as a second line of
-    # defense). The without-GPU variant below is the STRIPPED (modified) state,
-    # not a pristine backup, so it is regenerated each run the VM is (re)processed.
-    local _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
-    printf '%s\n' "$_xml" | _save_pristine_vm_backup "$_backup_xml"
-    # R41: ALSO save the with-GPU variant as a named mode config so the toggle
-    # (live_attach_toggle mode=off) can virsh-define it directly. Same pristine
-    # content as the legacy backup; once-only via the shared helper so the
-    # toggle's mode=off definition always matches the original pre-live-attach VM.
-    local _with_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
-    printf '%s\n' "$_xml" | _save_pristine_vm_backup "$_with_gpu_xml"
-    # R42: auto-install Looking Glass on the with-gpu (mode=off) variant too, so
-    # the toggle's mode=off path (VM boots WITH the GPU, normal dynamic binding)
-    # still mirrors the display via LG. Persisted in the saved variant file; the
-    # toggle re-validates before defining, so a validate-fail here is just a warn.
-    _lg_apply_to_vm "$_with_gpu_xml" "$LG_DEFAULT_SIZE"
-    if virt-xml-validate "$_with_gpu_xml" 2>/dev/null; then
-      say "  Applied Looking Glass to mode=off variant (with GPU): $_with_gpu_xml"
-    else
-      note "WARN: Looking Glass-patched with-gpu variant failed virt-xml-validate for '$_dom'; the toggle will re-validate before defining."
+    # Extract/refresh the GPU (+ first audio) fragments from the CURRENT live
+    # XML. Overwrite so the fragment stays current with any rom file=/address
+    # tweaks the user made in virt-manager since the last install. The fragment
+    # KEEPS the real guest bus/slot/function (the toggle/define path wants the
+    # original slot; the live-attach helper strips the guest address at runtime
+    # before attach-device --live). Best-effort on audio (common case: one fn).
+    if (( _has_gpu_now )); then
+      if (( ! DRY_RUN )); then
+        if printf '%s' "$_xml" | _la_extract_hostdev_fragment "$_gpu_bdf" "$_pdir/devices/gpu.xml"; then
+          say "  Saved GPU fragment: $_pdir/devices/gpu.xml"
+        else
+          note "ERROR: could not extract the GPU hostdev fragment for '$_dom'. Re-run --install-live-attach."
+          continue
+        fi
+        _abdf=""
+        for _abdf in $(_la_audio_bdfs); do
+          [[ -n "$_abdf" ]] || continue
+          if printf '%s' "$_xml" | _la_extract_hostdev_fragment "$_abdf" "$_pdir/devices/gpu-audio.xml" 2>/dev/null; then
+            say "  Saved audio fragment: $_pdir/devices/gpu-audio.xml"
+            break
+          fi
+        done
+      fi
     fi
 
-    python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF" "${GUEST_AUDIO_BDFS_CSV:-}" <<'PYEOF' || true
+    # Auto-inject the qemu guest-agent channel (idempotent) + Looking Glass into
+    # a working copy of the live XML, then define once. LG is idempotent too; the
+    # device-diff safety invariant preserves the shmem through later toggles.
+    _tmp_vm="$(mktemp)"
+    printf '%s\n' "$_xml" >"$_tmp_vm"
+    _ga_rc=0
+    python3 - "$_tmp_vm" <<'GAPYEOF' || _ga_rc=$?
 import sys, xml.etree.ElementTree as ET
-# Strip a leading 0x prefix. Do NOT use the str.lstrip form with 0x — that
-# strips ALL leading 0/x chars, so function 0x0 becomes empty and the BDF match
-# silently fails (the GPU is never extracted from the VM XML and qemu attaches
-# it at boot anyway, defeating live-attach entirely).
-def _strip0x(v):
-    return v[2:] if v.startswith('0x') else v
-# Strip the fixed GUEST PCI address (<address type='pci'> directly under the
-# hostdev, NOT the <address> inside <source> which carries the host BDF and has
-# no type= attribute) so libvirt AUTO-assigns a free guest address on hot-
-# attach. A fixed guest address can collide with an existing device in the
-# running VM and make virsh attach-device hang (observed: attach-device held
-# libvirt's VM lock for minutes on a colliding guest address).
-def _strip_guest_addr(hd):
-    for a in list(hd.findall('address')):
-        if a.get('type') == 'pci':
-            hd.remove(a)
-vm_path, gpu_path, audio_path, gpu_bdf, audio_csv = sys.argv[1:6]
-tree = ET.parse(vm_path); root = tree.getroot()
-device_type = root.tag.replace('domain', 'devices')
+path = sys.argv[1]
+root = ET.parse(path).getroot()
 devices = root.find('devices')
 if devices is None: sys.exit(1)
-# Parse the GPU BDF into domain/bus/slot/function hex components.
-parts = gpu_bdf.split(':')
-gpu_dom = parts[0]; gpu_bus = parts[1]; gpu_slot_fn = parts[2]
-gpu_slot, gpu_func = gpu_slot_fn.split('.')
-# Parse audio BDFs (comma-separated).
-audio_bdfs = []
-for a in audio_csv.split(','):
-    a = a.strip()
-    if not a: continue
-    p = a.split(':')
-    if len(p) == 3:
-        sf = p[2].split('.')
-        audio_bdfs.append((p[0], p[1], sf[0], sf[1] if len(sf) > 1 else '0'))
-gpu_hostdev = None
-audio_hostdevs = []
-for hd in list(devices.findall('hostdev')):
-    if hd.get('type') != 'pci': continue
-    src = hd.find('source')
-    if src is None: continue
-    addr = src.find('address')
-    if addr is None: continue
-    ad = addr.get('domain', ''); ab = addr.get('bus', ''); asl = addr.get('slot', ''); af = addr.get('function', '')
-    # Normalize to 4-digit domain, 2-digit bus/slot.
-    ad = _strip0x(ad).zfill(4) if ad else ''
-    ab = _strip0x(ab).zfill(2) if ab else ''
-    asl = _strip0x(asl).zfill(2) if asl else ''
-    bdf = f"{ad}:{ab}:{asl}.{_strip0x(af)}"
-    if bdf.lower() == gpu_bdf.lower():
-        gpu_hostdev = hd
-    elif any(bdf.lower() == f"{d}:{b}:{s}.{f}".lower() for d,b,s,f in audio_bdfs):
-        audio_hostdevs.append(hd)
-# Write the GPU device XML. virsh attach-device wants a BARE <hostdev>
-# element, NOT wrapped in <devices> — a <devices> root makes attach-device
-# reject it with "unsupported configuration: unknown device type 'devices'"
-# (observed: instant rc=1 failure). Write the hostdev directly as the root.
-if gpu_hostdev is not None:
-    _strip_guest_addr(gpu_hostdev)
-    ET.ElementTree(gpu_hostdev).write(gpu_path)
-    devices.remove(gpu_hostdev)
-# Write the audio device XML (a bare <hostdev> — same rationale). attach-device
-# takes one device element per call; write the first audio hostdev (the common
-# case is a single audio function). If there are extras they are still removed
-# from the VM XML below so libvirt does not attach them at boot.
-if audio_hostdevs:
-    for ah in audio_hostdevs:
-        _strip_guest_addr(ah)
-    ET.ElementTree(audio_hostdevs[0]).write(audio_path)
-    for ah in audio_hostdevs:
-        devices.remove(ah)
-# Auto-inject the qemu guest-agent channel (virtio-serial + unix channel) so the
-# live-attach helper can poll guest-ping to detect when Windows userspace is
-# actually up, instead of a blind fixed delay. Idempotent: skipped if a
-# guest-agent channel already exists. The virtio-win guest agent must still be
-# installed inside Windows (via the virtio-win guest-tools ISO) for guest-ping
-# to respond; until then the helper falls back to the fixed delay.
 _has_ga = any(
     (ch.find('target') is not None and ch.find('target').get('name') == 'org.qemu.guest_agent.0')
     for ch in devices.findall('channel')
 )
-if not _has_ga:
-    if not any(c.get('type') == 'virtio-serial' for c in devices.findall('controller')):
-        _vs = ET.Element('controller', {'type': 'virtio-serial', 'index': '0'})
-        devices.append(_vs)
-    _ch = ET.Element('channel', {'type': 'unix'})
-    ET.SubElement(_ch, 'target', {'type': 'virtio', 'name': 'org.qemu.guest_agent.0'})
-    devices.append(_ch)
-tree.write(vm_path)
-PYEOF
-
-    # Fail loudly if the GPU was NOT extracted: the awk gate above matched the
-    # GPU BDF in the VM XML, so python3 should have written a non-empty GPU
-    # device XML. An empty file means the extractor silently failed (e.g. a
-    # BDF normalization bug) and the helper would have nothing to hot-attach —
-    # better to abort the install here than ship a broken live-attach.
-    if [[ ! -s "$_tmp_gpu" ]]; then
-      note "ERROR: python3 failed to extract the GPU hostdev for '$_dom' (device XML is empty)."
-      note "       The VM XML has the GPU BDF but the extractor wrote nothing. Re-run --install-live-attach."
-      rm -f "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" 2>/dev/null || true
-      die "GPU device XML extraction failed for '$_dom' — aborting live-attach install."
+if _has_ga: sys.exit(3)  # already present (idempotent no-op)
+if not any(c.get('type') == 'virtio-serial' for c in devices.findall('controller')):
+    devices.append(ET.Element('controller', {'type': 'virtio-serial', 'index': '0'}))
+_ch = ET.Element('channel', {'type': 'unix'})
+ET.SubElement(_ch, 'target', {'type': 'virtio', 'name': 'org.qemu.guest_agent.0'})
+devices.append(_ch)
+ET.ElementTree(root).write(path)
+sys.exit(0)
+GAPYEOF
+    # exit 3 = GA already present (no-op); 0 = injected; other = warn+continue.
+    if (( _ga_rc != 0 && _ga_rc != 3 )); then
+      note "WARN: guest-agent channel injection failed for '$_dom' (python exit $_ga_rc); continuing."
     fi
-
-    # Save the device XMLs to the runtime location.
-    if [[ -s "$_tmp_gpu" ]]; then
-      cp -f "$_tmp_gpu" "$LIVE_ATTACH_GPU_XML" 2>/dev/null || true
-      say "  Saved GPU device XML: $LIVE_ATTACH_GPU_XML"
-    fi
-    if [[ -s "$_tmp_audio" ]]; then
-      cp -f "$_tmp_audio" "$LIVE_ATTACH_AUDIO_XML" 2>/dev/null || true
-      say "  Saved audio device XML: $LIVE_ATTACH_AUDIO_XML"
-    fi
-
-    # R41: save the without-GPU variant (the stripped XML) as the other named
-    # mode config so the toggle (live_attach_toggle mode=on) can re-define it
-    # directly. Saved from $_tmp_vm (the stripped temp) BEFORE define, and only
-    # when it validates (a variant that fails schema would break the toggle).
-    local _without_gpu_xml="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"
-    # R42: auto-install Looking Glass on the without-gpu (mode=on) variant: the
-    # VM boots on the virtual display (spice input block) and the helper hot-
-    # attaches the GPU, which LG then captures. Applied BEFORE validate so the
-    # variant that gets defined + saved carries LG (survives on/off + reboot).
-    _lg_apply_to_vm "$_tmp_vm" "$LG_DEFAULT_SIZE"
+    # Looking Glass (best-effort, idempotent): apply to the working copy so the
+    # live VM carries the shmem regardless of mode; survives toggles.
+    _lg_apply_to_vm "$_tmp_vm" "$LG_DEFAULT_SIZE" 2>/dev/null || true
     if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
-      write_file_atomic "$_without_gpu_xml" 0644 "root:root" <"$_tmp_vm"
-      say "  Saved mode=on variant (VM without GPU): $_without_gpu_xml"
-      # Validate and redefine the VM without the GPU.
       if (( ! DRY_RUN )); then
-        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null
+        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null || note "WARN: virsh define (GA+LG) failed for '$_dom'; continuing with the live XML as-is."
       fi
-      say "  Redefined VM '$_dom' WITHOUT the GPU hostdev (mode=on; backup in XML dump)"
     else
-      note "WARN: XML validation failed for '$_dom'; skipping VM XML modification."
+      note "WARN: GA+LG-patched XML failed virt-xml-validate for '$_dom'; defining the unpatched live XML as-is."
+      if (( ! DRY_RUN )); then
+        virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null || true
+      fi
+    fi
+    rm -f "$_tmp_vm" 2>/dev/null || true
+
+    # Recognize the now-defined live XML (writes the manifest from facts;
+    # reconciles the mode file if it disagrees with a non-unknown mode).
+    profile_recognize "$_dom" >/dev/null
+
+    # Default mode=on (hotplug active): strip the GPU (+ audio) from the live
+    # XML via profile_apply_mode, which enforces the device-diff safety
+    # invariant. No-op if the GPU is already absent (re-run after a prior strip).
+    if (( _has_gpu_now )); then
+      if profile_apply_mode "$_dom" on; then
+        say "  Redefined '$_dom' WITHOUT the GPU hostdev (mode=on; fragment saved for toggle-back)"
+      else
+        note "WARN: could not strip the GPU from '$_dom' (mode=on apply failed); the VM still has the GPU. Toggle or re-run after resolving the warning above."
+      fi
+    fi
+
+    # R44 compat: symlink the old flat LIVE_ATTACH_GPU_XML/AUDIO_XML to this
+    # VM's fragments so a not-yet-reinstalled helper keeps working. First guest-
+    # GPU VM with a fragment wins (the common single-VM case).
+    if [[ ! -e "$LIVE_ATTACH_GPU_XML" && -s "$_pdir/devices/gpu.xml" ]]; then
+      run ln -sf "$_pdir/devices/gpu.xml" "$LIVE_ATTACH_GPU_XML" 2>/dev/null || true
+      say "  Linked $LIVE_ATTACH_GPU_XML -> $_pdir/devices/gpu.xml (compat for the helper)"
+    fi
+    if [[ ! -e "$LIVE_ATTACH_AUDIO_XML" && -s "$_pdir/devices/gpu-audio.xml" ]]; then
+      run ln -sf "$_pdir/devices/gpu-audio.xml" "$LIVE_ATTACH_AUDIO_XML" 2>/dev/null || true
     fi
 
     # Add the VM to the live-attach list.
@@ -11967,8 +12272,6 @@ PYEOF
       grep -Fixq "$_dom" "$LIVE_ATTACH_VM_LIST" 2>/dev/null || printf '%s\n' "$_dom" >>"$LIVE_ATTACH_VM_LIST"
     fi
     say "  Added '$_dom' to live-attach VM list"
-
-    rm -f "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" 2>/dev/null || true
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
 
   if (( ! _found )); then
@@ -11997,7 +12300,7 @@ PYEOF
       fi
       note "The VM(s) will start WITHOUT the GPU. After ${_delay_default}s the GPU is"
       note "hot-attached to the running VM. Ensure the AMD driver is installed in Windows."
-      note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU from the per-VM backup)"
+      note "To revert: sudo $SCRIPT_NAME --install-dynamic-binding (restores normal binding + re-attaches the GPU via the per-VM fragment)"
       # Still deploy the latest helper/hook/bind-script code even on a re-run of an
       # already-active setup. The VM-XML surgery above was correctly skipped (the
       # GPU hostdev was already stripped by the prior install), but these three
@@ -12053,7 +12356,8 @@ PYEOF
 
   # R42: auto-install the Looking Glass HOST-side (shared memory + client config)
   # so opting into hotplug gets LG too — persistent (tmpfiles.d recreates the
-  # /dev/shm node at boot; the VM XML variants carry the shmem + spice block).
+  # /dev/shm node at boot; the live VM XML carries the shmem, preserved through
+  # toggles by the device-diff safety invariant).
   _install_looking_glass_defaults "$LG_DEFAULT_SIZE"
 
   say
@@ -12423,42 +12727,43 @@ DETACHEOF
 }
 
 # Remove the live-attach workflow (called by --install-dynamic-binding to restore
-# normal binding, and by --reset).
+# normal binding, and by --reset). R44: restores the GPU via the device FRAGMENT
+# (profile_apply_mode off — re-inserts ONLY the GPU/audio hostdev into the
+# CURRENT live XML), NEVER by virsh-defining an old full-domain backup. Then
+# deletes the per-domain profile dirs + managed artifacts + old full backups.
 remove_live_attach() {
   local _removed=0
+  # Source the conf so profile_apply_mode/profile_recognize can read
+  # GUEST_GPU_BDF / GUEST_AUDIO_BDFS_CSV (best-effort: if the conf is gone,
+  # skip the per-VM restore and just delete artifacts).
+  if readable_file "$CONF_FILE"; then
+    # shellcheck disable=SC1090
+    . "$CONF_FILE"
+  fi
 
-  # Restore the GPU hostdev to each VM's XML from the pre-live-attach backup
-  # BEFORE deleting the backup + VM list. install_live_attach removed the GPU
-  # hostdev from each VM's persistent XML so the VM boots on a virtual display;
-  # this re-defines the VM from the saved backup (with the GPU re-attached),
-  # undoing that modification so --install-dynamic-binding / --reset leave the
-  # VM with its GPU back. Only restores shut-off VMs (virsh define requires it);
-  # a running VM is skipped with a note so the user can shut it off and re-run.
-  # Best-effort: missing backup / failed validation / no virsh are skipped so
-  # cleanup still completes.
-  if [[ -f "$LIVE_ATTACH_VM_LIST" ]] && have_cmd virsh; then
-    local _dom _backup_xml _state
+  # R44: put the GPU back into each shut-off guest-GPU VM via the FRAGMENT
+  # (profile_apply_mode off). This re-inserts ONLY the GPU (+ audio) hostdev
+  # into the CURRENT live XML, preserving any RAM/CPU/disk/Looking
+  # Glass/stealth/perf edits the user made since the install. If the fragment is
+  # missing, profile_apply_mode off tries the one-release fallback (extract from
+  # an old full backup) and refuses if that also fails (GPU stays stripped + a
+  # WARN so the operator can re-add it in virt-manager). Best-effort: cleanup
+  # still completes. Running VMs are skipped (virsh define needs shut-off).
+  if [[ -f "$LIVE_ATTACH_VM_LIST" ]] && have_cmd virsh && [[ -n "${GUEST_GPU_BDF:-}" ]]; then
+    local _dom _state
     while IFS= read -r _dom; do
       [[ -n "$_dom" ]] || continue
-      _backup_xml="/var/lib/vfio-dynamic/live-attach-backup-$_dom.xml"
-      # R41: prefer the named with-GPU mode variant if the legacy backup is gone
-      # (the toggle keeps both; remove should restore the GPU-present XML).
-      if [[ ! -f "$_backup_xml" ]]; then
-        _backup_xml="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"
-      fi
-      [[ -f "$_backup_xml" ]] || continue
       _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
       if [[ "$_state" != "shut off" ]]; then
-        note "WARN: VM '$_dom' is '$_state' (not shut off); skipping XML restore. Shut it off and re-run to restore the GPU hostdev."
+        note "WARN: VM '$_dom' is '$_state' (not shut off); skipping GPU restore. Shut it off and re-run to restore the GPU hostdev."
         continue
       fi
-      if virt-xml-validate "$_backup_xml" 2>/dev/null; then
-        if (( ! DRY_RUN )) && virsh -c qemu:///system define "$_backup_xml" 2>/dev/null; then
-          say "Restored GPU hostdev to VM '$_dom' from pre-live-attach backup."
-          _removed=1
-        fi
+      profile_recognize "$_dom" >/dev/null 2>&1 || true
+      if profile_apply_mode "$_dom" off; then
+        say "Restored GPU hostdev to VM '$_dom' via the device fragment (mode=off)."
+        _removed=1
       else
-        note "WARN: pre-live-attach backup for '$_dom' failed validation; skipping XML restore (backup left in place)."
+        note "WARN: could not restore the GPU to '$_dom' via the fragment (missing fragment + no fallback?). The VM may be left GPU-less; re-run --install-live-attach with the GPU in its XML, or add the GPU back in virt-manager."
       fi
     done < "$LIVE_ATTACH_VM_LIST"
   fi
@@ -12469,16 +12774,18 @@ remove_live_attach() {
   # script-managed ISO paths — never a real optical drive or a different ISO.
   remove_virtio_win_guest_agent
 
-  # Remove the managed artifacts.
+  # Remove the managed artifacts. -e (not -f) for the device XMLs: under R44 they
+  # are symlinks to the per-domain fragments, and -f does not match a dangling
+  # symlink while -e matches the symlink itself (rm -f removes the symlink).
   if [[ -f "$LIVE_ATTACH_HELPER" ]]; then
     run rm -f "$LIVE_ATTACH_HELPER" 2>/dev/null || true
     _removed=1
   fi
-  if [[ -f "$LIVE_ATTACH_GPU_XML" ]]; then
+  if [[ -e "$LIVE_ATTACH_GPU_XML" ]]; then
     run rm -f "$LIVE_ATTACH_GPU_XML" 2>/dev/null || true
     _removed=1
   fi
-  if [[ -f "$LIVE_ATTACH_AUDIO_XML" ]]; then
+  if [[ -e "$LIVE_ATTACH_AUDIO_XML" ]]; then
     run rm -f "$LIVE_ATTACH_AUDIO_XML" 2>/dev/null || true
     _removed=1
   fi
@@ -12486,17 +12793,23 @@ remove_live_attach() {
     run rm -f "$LIVE_ATTACH_VM_LIST" 2>/dev/null || true
     _removed=1
   fi
-  # Remove per-VM pre-live-attach XML backups (glob: one backup per VM).
+  # R44: delete the per-domain profile dirs (device fragments + manifests).
+  local _pdir
+  if [[ -d /var/lib/vfio-dynamic/profiles ]]; then
+    for _pdir in /var/lib/vfio-dynamic/profiles/*; do
+      [[ -d "$_pdir" ]] || continue
+      run rm -rf "$_pdir" 2>/dev/null || true
+      _removed=1
+    done
+    run rmdir /var/lib/vfio-dynamic/profiles 2>/dev/null || true
+  fi
+  # Old full-domain backups (one-release fallback; cleaned on a deliberate
+  # revert so the slate is clear for a re-install).
   local _bxml
-  for _bxml in /var/lib/vfio-dynamic/live-attach-backup-*.xml; do
-    [[ -f "$_bxml" ]] || continue
-    run rm -f "$_bxml" 2>/dev/null || true
-    _removed=1
-  done
-  # R41: remove the per-VM named mode configs (with-gpu / without-gpu variants)
-  # and the on/off mode file.
-  for _bxml in /var/lib/vfio-dynamic/live-attach-vm-with-gpu-*.xml /var/lib/vfio-dynamic/live-attach-vm-without-gpu-*.xml; do
-    [[ -f "$_bxml" ]] || continue
+  for _bxml in /var/lib/vfio-dynamic/live-attach-backup-*.xml \
+               /var/lib/vfio-dynamic/live-attach-vm-with-gpu-*.xml \
+               /var/lib/vfio-dynamic/live-attach-vm-without-gpu-*.xml; do
+    [[ -e "$_bxml" ]] || continue
     run rm -f "$_bxml" 2>/dev/null || true
     _removed=1
   done
@@ -12515,7 +12828,7 @@ remove_live_attach() {
     rewrite_conf_key "VFIO_LIVE_ATTACH_MODE" "off"
     _removed=1
   fi
-  (( _removed )) && note "Removed live-attach workflow (VM XML restored from pre-live-attach backups where the VM was shut off)."
+  (( _removed )) && note "Removed live-attach workflow (VM XML restored via the device fragment where the VM was shut off)."
   # Best-effort cleanup: always return 0 so bare callers (the dynamic-install
   # opt-out, --install-early-binding, --reset) under `set -e` are not aborted
   # when live-attach was never active (nothing to remove -> _removed=0 would

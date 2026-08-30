@@ -97,16 +97,24 @@ assert_contains_file \
   '[DRY-RUN] would save pristine pre-stage VM XML backup' \
   "$VFIO_SCRIPT"
 
-# install_live_attach routes BOTH pristine with-GPU snapshots through the helper
-# (the legacy backup + the R41 with-GPU mode variant), instead of bare
-# write_file_atomic calls that overwrote on every run.
-assert_contains_file \
-  "R43 live-attach legacy backup routed through once-only helper" \
+# R44: install_live_attach no longer writes the old full-domain live-attach
+# backups (live-attach-backup-*.xml / with-gpu / without-gpu) via
+# _save_pristine_vm_backup — it now extracts device FRAGMENTS
+# (profiles/<dom>/devices/*.xml) + uses profile_apply_mode. The old full
+# backups are at most a one-release read-only fallback; --reset's
+# _wipe_vm_stage_backups still sweeps them (asserted below).
+assert_absent_file \
+  "R44 install_live_attach does not route the legacy backup through _save_pristine_vm_backup" \
   '| _save_pristine_vm_backup "$_backup_xml"' \
   "$VFIO_SCRIPT"
-assert_contains_file \
-  "R43 live-attach with-GPU variant routed through once-only helper" \
+assert_absent_file \
+  "R44 install_live_attach does not route a with-gpu variant through _save_pristine_vm_backup" \
   '| _save_pristine_vm_backup "$_with_gpu_xml"' \
+  "$VFIO_SCRIPT"
+# R44: install_live_attach extracts device fragments instead of full backups.
+assert_contains_file \
+  "R44 install_live_attach extracts the GPU fragment via _la_extract_hostdev_fragment" \
+  '_la_extract_hostdev_fragment' \
   "$VFIO_SCRIPT"
 
 # The old per-layer wipe is gone (definition + call); the unified one is defined

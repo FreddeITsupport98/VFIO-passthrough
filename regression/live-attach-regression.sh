@@ -272,78 +272,61 @@ else
   printf 'PASS: R23 bind script say() does not use semicolon form\n'
 fi
 
-# --- Static wiring: install_live_attach extracts hostdevs + flips conf + regenerates ---
+# --- Static wiring: install_live_attach (R44: recognition + device fragments) ---
 assert_contains_file \
   "R23 install_live_attach requires python3" \
   'have_cmd python3 || die "python3 not available (needed to extract hostdev XML)."' \
   "$VFIO_SCRIPT"
+# R44: install extracts the GPU (+ audio) hostdevs into per-domain FRAGMENTS
+# (profiles/<dom>/devices/*.xml) via the shared _la_extract_hostdev_fragment
+# helper — NOT the old inline python that wrote flat LIVE_ATTACH_GPU_XML +
+# full-domain with/without-gpu dumps. The fragment keeps the guest address
+# (the helper strips it at runtime before attach-device --live).
 assert_contains_file \
-  "R23 install_live_attach extracts hostdev XML via python3" \
-  'python3 - "$_tmp_vm" "$_tmp_gpu" "$_tmp_audio" "$GUEST_GPU_BDF"' \
+  "R44 _la_extract_hostdev_fragment helper defined" \
+  '_la_extract_hostdev_fragment() {' \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "R23 install_live_attach validates VM XML before redefine" \
-  'virt-xml-validate "$_tmp_vm"' \
-  "$VFIO_SCRIPT"
-# The python3 hostdev extractor must use _strip0x (strips only the '0x' prefix),
-# NOT lstrip('0x') (strips ALL leading 0/x chars — function='0x0' becomes '',
-# the BDF becomes '0000:0e:00.' and the GPU never matches, so it is never
-# extracted from the VM XML and qemu attaches it at boot anyway, defeating
-# live-attach entirely).
-assert_contains_file \
-  "R23 python extractor uses _strip0x helper" \
-  'def _strip0x(v):' \
-  "$VFIO_SCRIPT"
-if grep -Fq "lstrip('0x')" "$VFIO_SCRIPT"; then
-  printf 'FAIL: R23 python extractor still uses lstrip(0x0) (strips all 0/x chars, breaks function=0x0 match)\n' >&2
-  record_failure "R23 python extractor does not use lstrip(0x0)"
-else
-  printf 'PASS: R23 python extractor does not use lstrip(0x0)\n'
-fi
-# The python extractor MUST strip the fixed GUEST PCI address (<address type='pci'>
-# directly under the hostdev) so libvirt auto-assigns a free guest address on
-# hot-attach — a fixed guest address can collide with an existing device in the
-# running VM and make virsh attach-device hang (the libvirt-lock-hang root cause).
-assert_contains_file \
-  "R23 python extractor strips fixed guest PCI address" \
-  'def _strip_guest_addr(hd):' \
+  "R44 install_live_attach extracts the GPU fragment via the helper" \
+  '| _la_extract_hostdev_fragment "$_gpu_bdf" "$_pdir/devices/gpu.xml"' \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "R23 python extractor calls _strip_guest_addr on the GPU hostdev" \
-  '_strip_guest_addr(gpu_hostdev)' \
+  "R44 install_live_attach recognizes each VM (writes the manifest)" \
+  'profile_recognize "$_dom"' \
   "$VFIO_SCRIPT"
-# virsh attach-device wants a BARE <hostdev> element as the XML root, NOT
-# wrapped in <devices>. A <devices> root makes attach-device reject it with
-# "unsupported configuration: unknown device type 'devices'" (observed: instant
-# rc=1 failure). The python extractor MUST write the hostdev directly.
 assert_contains_file \
-  "R23 python writes bare GPU hostdev (no <devices> wrapper)" \
-  'ET.ElementTree(gpu_hostdev).write(gpu_path)' \
+  "R44 install_live_attach strips the GPU via profile_apply_mode on" \
+  'profile_apply_mode "$_dom" on' \
   "$VFIO_SCRIPT"
-if grep -Fq "gpu_el = ET.Element('devices')" "$VFIO_SCRIPT"; then
-  printf 'FAIL: R23 python still wraps GPU XML in <devices> (virsh attach-device rejects it)\n' >&2
-  record_failure "R23 python does not wrap GPU XML in <devices>"
-else
-  printf 'PASS: R23 python does not wrap GPU XML in <devices>\n'
-fi
-# The install MUST fail loudly when the GPU device XML extraction produces an
-# empty file instead of silently shipping a broken live-attach with nothing to
-# hot-attach (the helper would then hang or abort at VM start time).
 assert_contains_file \
-  "R23 install_live_attach fails loudly on empty GPU extraction" \
-  'GPU device XML extraction failed' \
+  "R44 install_live_attach creates the per-domain profile devices dir" \
+  'profiles/$DOMAIN/devices/gpu.xml' \
   "$VFIO_SCRIPT"
-# install_live_attach must auto-inject the qemu guest-agent channel (virtio-serial
-# + unix channel) into the VM XML so the live-attach helper has a transport for
-# guest-ping (smart Windows-readiness detection). Without it the helper can
-# only fall back to the blind fixed delay. Idempotent: skipped if already present.
+# R44: install MUST NOT write the R41/R42 full-domain variant dumps as the
+# switch mechanism (they go stale and wipe user edits). They are at most a
+# one-release read-only fallback, never the switch path.
+assert_contains_file \
+  "R44 _la_profile_dir helper defined" \
+  '_la_profile_dir() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R44 profile_recognize helper defined" \
+  'profile_recognize() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R44 profile_apply_mode helper defined" \
+  'profile_apply_mode() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R44 _la_devices_signature safety-invariant helper defined" \
+  '_la_devices_signature() {' \
+  "$VFIO_SCRIPT"
+# install_live_attach must auto-inject the qemu guest-agent channel (idempotent)
+# so the live-attach helper can poll guest-ping. R44 injects it in its own
+# GAPYEOF heredoc (separate from the fragment extraction).
 assert_contains_file \
   "R23 python injector adds guest-agent channel target" \
   "'org.qemu.guest_agent.0'" \
-  "$VFIO_SCRIPT"
-assert_contains_file \
-  "R23 python injector adds virtio-serial controller" \
-  "'virtio-serial'" \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R23 python injector is idempotent (checks existing channel first)" \
@@ -357,11 +340,14 @@ assert_contains_file \
   "R23 install_live_attach flips VFIO_DYNAMIC_LIVE_ATTACH=1" \
   'rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "1"' \
   "$VFIO_SCRIPT"
-# install_live_attach must reinstall the libvirt hook (deploys the live-attach
-# branch + recreates the /etc/libvirt/hooks/qemu entry point) AND regenerate the
-# bind script (the helper calls --bind-now). Without the hook reinstall, a hook
-# written by an older vfio.sh would lack the live-attach branch, and a missing
-# qemu entry would mean libvirt never invokes the hook at all.
+# R44 compat: install symlinks the old flat LIVE_ATTACH_GPU_XML to the fragment
+# so a not-yet-reinstalled helper keeps working.
+assert_contains_file \
+  "R44 install_live_attach symlinks the flat GPU XML to the fragment" \
+  'ln -sf "$_pdir/devices/gpu.xml" "$LIVE_ATTACH_GPU_XML"' \
+  "$VFIO_SCRIPT"
+# install_live_attach must reinstall the libvirt hook AND regenerate the bind
+# script (the helper calls --bind-now).
 _la_fn="$(sed -n '/^install_live_attach()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
   "R23 install_live_attach calls install_libvirt_hook (deploys live-attach hook)" \
@@ -376,7 +362,7 @@ assert_contains_file \
   'Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)' \
   "$VFIO_SCRIPT"
 
-# --- Static wiring: remove_live_attach cleans up + flips conf back ---
+# --- Static wiring: remove_live_attach (R44: restores via FRAGMENT, not backup) ---
 assert_contains_file \
   "R23 remove_live_attach removes the helper script" \
   'run rm -f "$LIVE_ATTACH_HELPER"' \
@@ -385,44 +371,33 @@ assert_contains_file \
   "R23 remove_live_attach flips VFIO_DYNAMIC_LIVE_ATTACH=0" \
   'rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "0"' \
   "$VFIO_SCRIPT"
-
-# --- Static wiring: install saves a per-VM XML backup; remove restores it ---
-# install_live_attach removes the GPU hostdev from each VM's persistent XML so
-# the VM boots on a virtual display; it MUST save a full pre-live-attach backup
-# (with the GPU) per VM so the revert path can re-attach the GPU automatically
-# instead of leaving the VM permanently GPU-less.
-assert_contains_text \
-  "R23 install_live_attach saves per-VM pre-live-attach XML backup" \
-  'live-attach-backup-$_dom.xml' \
-  "$_la_fn"
-# R43: the pristine pre-live-attach backup is now written through the shared
-# once-only _save_pristine_vm_backup helper (write-if-absent; atomic inside the
-# helper) so a re-run KEEPS the original pristine snapshot instead of overwriting
-# it — matching the stealth/perf once-only rule. The bare write_file_atomic call
-# was replaced by the helper routing.
-assert_contains_text \
-  "R43 install_live_attach routes legacy backup through once-only helper" \
-  '| _save_pristine_vm_backup "$_backup_xml"' \
-  "$_la_fn"
-# remove_live_attach must restore each VM's XML from the backup BEFORE deleting
-# it (only shut-off VMs; virsh define requires it), then clean up the backups.
 _rm_la_fn="$(sed -n '/^remove_live_attach()/,/^}/p' "$VFIO_SCRIPT")"
+# R44: remove_live_attach puts the GPU back via profile_apply_mode off (re-
+# inserts ONLY the GPU/audio hostdev into the CURRENT live XML), NEVER by
+# virsh-defining an old full-domain backup.
 assert_contains_text \
-  "R23 remove_live_attach restores VM XML from pre-live-attach backup" \
-  'virsh -c qemu:///system define "$_backup_xml"' \
+  "R44 remove_live_attach restores the GPU via profile_apply_mode off" \
+  'profile_apply_mode "$_dom" off' \
   "$_rm_la_fn"
 assert_contains_text \
-  "R23 remove_live_attach validates backup before restore" \
-  'virt-xml-validate "$_backup_xml"' \
+  "R44 remove_live_attach recognizes before restoring" \
+  'profile_recognize "$_dom"' \
   "$_rm_la_fn"
 assert_contains_text \
-  "R23 remove_live_attach only restores shut-off VMs" \
+  "R44 remove_live_attach deletes per-domain profile dirs" \
+  'rm -rf "$_pdir"' \
+  "$_rm_la_fn"
+assert_contains_text \
+  "R44 remove_live_attach only restores shut-off VMs" \
   '[[ "$_state" != "shut off" ]]' \
   "$_rm_la_fn"
-assert_contains_text \
-  "R23 remove_live_attach removes per-VM backup files (glob)" \
-  'live-attach-backup-*.xml' \
-  "$_rm_la_fn"
+# R44: remove_live_attach must NOT virsh-define an old full-domain backup.
+if printf '%s\n' "$_rm_la_fn" | grep -Fq 'virsh -c qemu:///system define "$_backup_xml"'; then
+  printf 'FAIL: R44 remove_live_attach still virsh-defines an old full backup\n' >&2
+  record_failure "R44 remove_live_attach does not define an old full backup"
+else
+  printf 'PASS: R44 remove_live_attach does not define an old full backup\n'
+fi
 
 # --- Static wiring: reset + early-binding call remove_live_attach ---
 _reset_fn="$(sed -n '/^reset_vfio_all()/,/^}/p' "$VFIO_SCRIPT")"
@@ -1375,15 +1350,8 @@ assert_contains_file \
   "R41 zsh completion includes --live-attach-toggle" \
   "'--live-attach-toggle[" \
   "$VFIO_SCRIPT"
-# install_live_attach saves BOTH named VM XML variants + sets mode=on + installs tray.
-assert_contains_text \
-  "R41 install_live_attach saves with-gpu variant" \
-  'live-attach-vm-with-gpu-$_dom.xml' \
-  "$_la_fn"
-assert_contains_text \
-  "R41 install_live_attach saves without-gpu variant" \
-  'live-attach-vm-without-gpu-$_dom.xml' \
-  "$_la_fn"
+# R44: install sets mode=on + installs tray. It does NOT save the R41/R42 full-
+# domain with-gpu/without-gpu variant dumps (replaced by recognition + fragments).
 assert_contains_text \
   "R41 install_live_attach sets mode=on" \
   '_la_write_mode "on"' \
@@ -1392,28 +1360,52 @@ assert_contains_text \
   "R41 install_live_attach calls install_live_attach_tray" \
   'install_live_attach_tray' \
   "$_la_fn"
-# live_attach_toggle defines the right named variant per target mode.
+# R44: install MUST NOT write the full-domain variant dumps as the switch path.
+if printf '%s\n' "$_la_fn" | grep -Fq 'live-attach-vm-with-gpu-$_dom.xml'; then
+  printf 'FAIL: R44 install_live_attach still writes the with-gpu full-domain dump\n' >&2
+  record_failure "R44 install_live_attach does not write the with-gpu full-domain dump"
+else
+  printf 'PASS: R44 install_live_attach does not write the with-gpu full-domain dump\n'
+fi
+if printf '%s\n' "$_la_fn" | grep -Fq 'live-attach-vm-without-gpu-$_dom.xml'; then
+  printf 'FAIL: R44 install_live_attach still writes the without-gpu full-domain dump\n' >&2
+  record_failure "R44 install_live_attach does not write the without-gpu full-domain dump"
+else
+  printf 'PASS: R44 install_live_attach does not write the without-gpu full-domain dump\n'
+fi
+# R44: live_attach_toggle recognizes per VM then applies the mode via fragments
+# (it does NOT pick a named full-domain variant).
+_toggle_fn="$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "R41 live_attach_toggle picks without-gpu for on" \
-  '_without_gpu="/var/lib/vfio-dynamic/live-attach-vm-without-gpu-$_dom.xml"' \
-  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+  "R44 live_attach_toggle recognizes each VM" \
+  'profile_recognize "$_dom"' \
+  "$_toggle_fn"
 assert_contains_text \
-  "R41 live_attach_toggle picks with-gpu for off" \
-  '_with_gpu="/var/lib/vfio-dynamic/live-attach-vm-with-gpu-$_dom.xml"' \
-  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+  "R44 live_attach_toggle applies the mode via fragments" \
+  'profile_apply_mode "$_dom" "$_target"' \
+  "$_toggle_fn"
 assert_contains_text \
-  "R41 live_attach_toggle flips the mode file" \
+  "R44 live_attach_toggle flips the mode file on success" \
   '_la_write_mode "$_target"' \
-  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
-# remove_live_attach: restore prefers named with-gpu variant, removes variants + mode + tray.
+  "$_toggle_fn"
 assert_contains_text \
-  "R41 remove_live_attach falls back to named with-gpu variant" \
-  'live-attach-vm-with-gpu-$_dom.xml' \
-  "$_rm_la_fn"
-assert_contains_text \
-  "R41 remove_live_attach removes named variants glob" \
-  'live-attach-vm-with-gpu-*.xml /var/lib/vfio-dynamic/live-attach-vm-without-gpu-*.xml' \
-  "$_rm_la_fn"
+  "R44 live_attach_toggle prints a mismatch when no VM was redefined" \
+  'MISMATCH: no shut-off VM was redefined' \
+  "$_toggle_fn"
+# R44: toggle MUST NOT reference the old named full-domain variant paths.
+if printf '%s\n' "$_toggle_fn" | grep -Fq 'live-attach-vm-without-gpu-$_dom.xml'; then
+  printf 'FAIL: R44 live_attach_toggle still picks the without-gpu full-domain variant\n' >&2
+  record_failure "R44 live_attach_toggle does not pick the without-gpu full-domain variant"
+else
+  printf 'PASS: R44 live_attach_toggle does not pick the without-gpu full-domain variant\n'
+fi
+if printf '%s\n' "$_toggle_fn" | grep -Fq 'live-attach-vm-with-gpu-$_dom.xml'; then
+  printf 'FAIL: R44 live_attach_toggle still picks the with-gpu full-domain variant\n' >&2
+  record_failure "R44 live_attach_toggle does not pick the with-gpu full-domain variant"
+else
+  printf 'PASS: R44 live_attach_toggle does not pick the with-gpu full-domain variant\n'
+fi
+# remove_live_attach: removes the mode file + tray + flips the conf (kept from R41).
 assert_contains_text \
   "R41 remove_live_attach removes the mode file" \
   'run rm -f "$LIVE_ATTACH_MODE_FILE"' \
@@ -1592,14 +1584,20 @@ assert_contains_file \
   "R42 _install_looking_glass_defaults helper defined" \
   '_install_looking_glass_defaults() {' \
   "$VFIO_SCRIPT"
+# R44: install applies LG to the LIVE VM XML working copy once (not to two
+# frozen full-domain variants). The device-diff safety invariant preserves the
+# shmem through later toggles.
 assert_contains_text \
-  "R42 install_live_attach applies LG to the with-gpu (mode=off) variant" \
-  '_lg_apply_to_vm "$_with_gpu_xml"' \
-  "$_la_fn"
-assert_contains_text \
-  "R42 install_live_attach applies LG to the without-gpu (mode=on) variant" \
+  "R44 install_live_attach applies LG to the live XML working copy" \
   '_lg_apply_to_vm "$_tmp_vm"' \
   "$_la_fn"
+# R44: install MUST NOT apply LG to a with-gpu full-domain variant dump (gone).
+if printf '%s\n' "$_la_fn" | grep -Fq '_lg_apply_to_vm "$_with_gpu_xml"'; then
+  printf 'FAIL: R44 install_live_attach still applies LG to a with-gpu variant dump\n' >&2
+  record_failure "R44 install_live_attach does not apply LG to a with-gpu variant dump"
+else
+  printf 'PASS: R44 install_live_attach does not apply LG to a with-gpu variant dump\n'
+fi
 assert_contains_text \
   "R42 install_live_attach installs the LG host-side defaults (success path)" \
   '_install_looking_glass_defaults "$LG_DEFAULT_SIZE"' \
@@ -1661,43 +1659,38 @@ else
   printf 'FAIL: R42 tray install does NOT kill the stale instance before regenerating (kill=%s write=%s)\n' "$_kill_line" "$_write_line" >&2
   record_failure "R42 tray install kills stale instance before regenerating"
 fi
-# R42: toggle OFF always restores the GPU to virt-manager. If the with-GPU
-# variant is missing/stale, _la_ensure_with_gpu_variant rebuilds it from the
-# legacy backup / current XML / saved device XMLs (3 sources), so the operator
-# never has to re-add the GPU by hand after turning hotplug off.
-assert_contains_file \
-  "R42 _la_ensure_with_gpu_variant helper defined" \
-  '_la_ensure_with_gpu_variant() {' \
-  "$VFIO_SCRIPT"
-_la_ensure_fn="$(sed -n '/^_la_ensure_with_gpu_variant()/,/^}/p' "$VFIO_SCRIPT")"
+# R44: toggle OFF always restores the GPU to virt-manager — via profile_apply_mode
+# off (re-inserts ONLY the GPU/audio hostdev from the fragment into the CURRENT
+# live XML). If the fragment is missing, profile_apply_mode off tries the one-
+# release fallback (extract from an old full backup) and refuses if that fails.
+# The R42 _la_ensure_with_gpu_variant helper is GONE (replaced by recognition +
+# fragments); the toggle calls profile_recognize + profile_apply_mode instead.
+if grep -Fq '_la_ensure_with_gpu_variant()' "$VFIO_SCRIPT"; then
+  printf 'FAIL: R44 _la_ensure_with_gpu_variant helper still defined (replaced by profile_apply_mode)\n' >&2
+  record_failure "R44 _la_ensure_with_gpu_variant helper removed"
+else
+  printf 'PASS: R44 _la_ensure_with_gpu_variant helper removed (replaced by profile_apply_mode)\n'
+fi
+_pam_fn="$(sed -n '/^profile_apply_mode()/,/^}/p' "$VFIO_SCRIPT")"
+# profile_apply_mode off must refuse (not guess) when there is no fragment AND no live GPU.
 assert_contains_text \
-  "R42 ensure helper rebuilds from the legacy backup (source 1)" \
+  "R44 profile_apply_mode off refuses when the fragment is missing" \
+  'REFUSE: no GPU fragment for' \
+  "$_pam_fn"
+# profile_apply_mode off must try the one-release fallback from an old full backup.
+assert_contains_text \
+  "R44 profile_apply_mode off tries the old-backup fallback" \
   'live-attach-backup-$_dom.xml' \
-  "$_la_ensure_fn"
+  "$_pam_fn"
+# profile_apply_mode must enforce the device-diff safety invariant (only GPU/audio may differ).
 assert_contains_text \
-  "R42 ensure helper rebuilds from the current XML when it already has the GPU (source 2)" \
-  'dumpxml --inactive' \
-  "$_la_ensure_fn"
+  "R44 profile_apply_mode enforces the device-diff safety invariant" \
+  'safety invariant' \
+  "$_pam_fn"
 assert_contains_text \
-  "R42 ensure helper re-injects the saved GPU device XML (source 3)" \
-  'LIVE_ATTACH_GPU_XML' \
-  "$_la_ensure_fn"
-assert_contains_text \
-  "R42 ensure helper saves the rebuilt variant atomically" \
-  'write_file_atomic "$_with_gpu" 0644 "root:root"' \
-  "$_la_ensure_fn"
-assert_contains_text \
-  "R42 ensure helper validates the rebuilt XML before saving" \
-  'virt-xml-validate "$_tmp"' \
-  "$_la_ensure_fn"
-assert_contains_text \
-  "R42 live_attach_toggle off calls the ensure helper" \
-  '_la_ensure_with_gpu_variant "$_dom"' \
-  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
-assert_contains_text \
-  "R42 live_attach_toggle off rebuild is gated on the VM being shut off" \
-  '[[ "$_state" == "shut off" ]]' \
-  "$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+  "R44 profile_apply_mode gates on the VM being shut off" \
+  '[[ "$_state" != "shut off" ]]' \
+  "$_pam_fn"
 
 # R41+: the icon itself is clickable (left-click toggles, middle-click status).
 assert_contains_file \
@@ -1717,35 +1710,22 @@ assert_contains_file \
   'QtWidgets.QSystemTrayIcon.MiddleClick' \
   "$VFIO_SCRIPT"
 
-# --- R43b: toggle OFF must detect the GPU via awk reconstruction, not a literal BDF grep ---
-# Root cause of "tray toggle still removes the GPU from virt-manager": libvirt splits
-# the PCI address across domain=/bus=/slot=/function= attributes, so a LITERAL
-# grep for the BDF string (e.g. "0000:0e:00.0") NEVER matches a real dumpxml.
-# _la_ensure_with_gpu_variant's fast path + rebuild sources 1/2 used that broken
-# grep, so the fast path always failed and the rebuild could skip the VM (leaving
-# the GPU stripped) when the saved device XMLs were missing. R43b routes all three
-# checks through _xml_has_gpu_hostdev, which reconstructs the BDF with awk (same
-# parser the install path uses) before the membership grep.
+# --- R43b: GPU detection via awk reconstruction (used by R44 recognition) ---
+# libvirt splits the PCI address across domain=/bus=/slot=/function= attributes,
+# so a LITERAL grep for the BDF string NEVER matches a real dumpxml. R44's
+# profile_recognize / profile_apply_mode route GPU detection through
+# _xml_has_gpu_hostdev, which reconstructs the BDF with awk (same parser the
+# install path uses) before the membership grep.
 assert_contains_file \
   "R43b _xml_has_gpu_hostdev helper defined" \
   '_xml_has_gpu_hostdev() {' \
   "$VFIO_SCRIPT"
-# The ensure helper must route ALL THREE GPU-presence checks through the helper.
-_la_ensure_fn="$(sed -n '/^_la_ensure_with_gpu_variant()/,/^}/p' "$VFIO_SCRIPT")"
-_la_helper_calls="$(printf '%s\n' "$_la_ensure_fn" | grep -cF '_xml_has_gpu_hostdev "$_gpu_bdf"')"
-if (( _la_helper_calls >= 3 )); then
-  printf 'PASS: R43b ensure helper routes all 3 GPU checks through _xml_has_gpu_hostdev (%d calls)\n' "$_la_helper_calls"
-else
-  printf 'FAIL: R43b ensure helper routes only %d GPU check(s) through _xml_has_gpu_hostdev (expected >= 3)\n' "$_la_helper_calls" >&2
-  record_failure "R43b ensure helper uses _xml_has_gpu_hostdev for all 3 GPU checks"
-fi
-# The old broken literal-BDF grep must be gone from the ensure helper.
-if printf '%s\n' "$_la_ensure_fn" | grep -Fq 'grep -Fixq "$_gpu_bdf"'; then
-  printf 'FAIL: R43b ensure helper still uses the broken literal-BDF grep\n' >&2
-  record_failure "R43b ensure helper no longer uses literal grep -Fixq \"\$_gpu_bdf\""
-else
-  printf 'PASS: R43b ensure helper no longer uses the broken literal-BDF grep\n'
-fi
+# R44: profile_recognize must use _xml_has_gpu_hostdev for GPU detection.
+_pr_fn="$(sed -n '/^profile_recognize()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R44 profile_recognize detects the GPU via _xml_has_gpu_hostdev" \
+  '_xml_has_gpu_hostdev "$_gpu_bdf"' \
+  "$_pr_fn"
 # Functional proof: on a real libvirt VM XML (split attributes) the OLD literal
 # grep fails but the NEW helper succeeds — this is the exact failure that made
 # toggle OFF skip the VM and leave the GPU removed from virt-manager.
@@ -1785,6 +1765,162 @@ if printf '%s' "$_mock_xml" | _xml_has_gpu_hostdev "" 2>/dev/null; then
 else
   printf 'PASS: R43b helper rejects an empty needle\n'
 fi
+
+# ===================== R44 functional: toggle preserves unrelated devices =====================
+# ACCEPTANCE: add a <disk> + a Looking-Glass <shmem> to the VM, then toggle off->on->off.
+# The extra disk + shmem MUST survive every toggle; ONLY the GPU hostdev is added/removed.
+# Also: missing fragment + no live GPU => profile_apply_mode off refuses (no define).
+# Uses a fake virsh + fake virt-xml-validate + temp CONF_FILE/profile dir (no root, no real libvirt).
+_fn_root="$(mktemp -d)"
+_fn_bin="$_fn_root/bin"
+mkdir -p "$_fn_bin"
+# Local pass/fail helpers for the functional block (record into the shared
+# FAILED_ASSERTIONS list so the FAIL SUMMARY covers them).
+ok_fn() { printf 'PASS: %s\n' "$1"; }
+bad_fn() { printf 'FAIL: %s\n' "$1" >&2; record_failure "$1"; }
+# Fake virsh: dumpxml/domstate read the live XML store; define writes to it.
+_fn_live="$_fn_root/win11.xml"
+_fn_list="$_fn_root/la-vms"
+cat >"$_fn_live" <<'XMLEOF'
+<domain type='kvm'>
+  <name>win11</name>
+  <uuid>11111111-2222-3333-4444-555555555555</uuid>
+  <memory unit='KiB'>8388608</memory>
+  <vcpu placement='static'>4</vcpu>
+  <os><type arch='x86_64' machine='q35'>hvm</type><boot dev='hd'/></os>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/var/lib/libvirt/images/win11.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <shmem name='looking-glass'>
+      <model type='ivshmem-plain'/>
+      <size unit='M'>64</size>
+    </shmem>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source><address type='pci' domain='0x0000' bus='0x0e' slot='0x00' function='0x0'/></source>
+      <address type='pci' domain='0x0000' bus='0x01' slot='0x00' function='0x0'/>
+    </hostdev>
+  </devices>
+</domain>
+XMLEOF
+cat >"$_fn_bin/virsh" <<'VIRSH'
+#!/usr/bin/env bash
+# fake virsh: -c qemu:///system <subcmd> ...
+shift 2  # drop -c qemu:///system
+sub="$1"; shift
+case "$sub" in
+  list) echo win11 ;;
+  domstate) echo "shut off" ;;
+  dumpxml) cat "$VIRSH_LIVE" ;;
+  define) cp -f "$1" "$VIRSH_LIVE" ;;
+esac
+VIRSH
+chmod +x "$_fn_bin/virsh"
+# Fake virt-xml-validate: always passes (the mock XML is structurally fine; we
+# only test the device-add/remove logic, not libvirt's full schema).
+cat >"$_fn_bin/virt-xml-validate" <<'VXV'
+#!/usr/bin/env bash
+exit 0
+VXV
+chmod +x "$_fn_bin/virt-xml-validate"
+_fn_conf="$_fn_root/vfio.conf"
+cat >"$_fn_conf" <<EOF
+GUEST_GPU_BDF="0000:0e:00.0"
+GUEST_AUDIO_BDFS_CSV=""
+VFIO_DYNAMIC_LIVE_ATTACH="1"
+EOF
+printf 'win11\n' >"$_fn_list"
+# R44: redirect the profile dir to a temp dir via VFIO_LA_PROFILES_DIR so the
+# fragment extraction + manifest write succeed without root.
+_fn_profiles="$_fn_root/profiles"
+mkdir -p "$_fn_profiles"
+# R44: redirect the one-release fallback backup dir to an EMPTY temp dir so the
+# missing-fragment REFUSE path can be exercised without a real system backup
+# (whose GPU BDF may match the mock 0000:0e:00.0) satisfying the fallback and
+# silently re-inserting the GPU instead of refusing.
+_fn_legacy="$_fn_root/legacy"
+mkdir -p "$_fn_legacy"
+# Run the functional toggle in a subshell with the fakes on PATH + redirected
+# CONF_FILE / profile dir / mode file / live-attach list. Source vfio.sh first.
+_fn_out="$_fn_root/out.txt"
+VIRSH_LIVE="$_fn_live" PATH="$_fn_bin:$PATH" \
+  DRY_RUN=0 CONF_FILE="$_fn_conf" \
+  VFIO_LA_PROFILES_DIR="$_fn_profiles" \
+  LIVE_ATTACH_MODE_FILE="$_fn_root/la-mode" \
+  LIVE_ATTACH_VM_LIST="$_fn_list" \
+  LIVE_ATTACH_GPU_XML="$_fn_root/la-gpu.xml" \
+  LIVE_ATTACH_AUDIO_XML="$_fn_root/la-audio.xml" \
+  VFIO_LA_LEGACY_DIR="$_fn_legacy" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; . '$_fn_conf'; \
+    profile_recognize win11 >/dev/null; \
+    profile_apply_mode win11 on  >/dev/null; echo ON_DONE; \
+    profile_recognize win11 >/dev/null; \
+    profile_apply_mode win11 off >/dev/null; echo OFF_DONE; \
+    profile_recognize win11 >/dev/null; \
+    profile_apply_mode win11 on  >/dev/null; echo ON2_DONE" >"$_fn_out" 2>&1 || true
+
+# Helper: check the live XML for a substring.
+_has() { grep -Fq -- "$1" "$_fn_live" 2>/dev/null; }
+# Quote-agnostic regex helper: a toggle runs the live XML through Python's
+# ET.write, which round-trips single-quoted attributes to DOUBLE quotes
+# (dev='vda' -> dev="vda"). A fixed-string _has on a quoted attribute would
+# falsely report the device "lost" after the first toggle. _hasq matches
+# either quote style via an ERE character class ["'].
+_hasq() { grep -Eq -- "$1" "$_fn_live" 2>/dev/null; }
+
+# After the off->on->off->on sequence, the live XML is in mode=on (GPU stripped).
+# The extra disk + LG shmem MUST survive every toggle.
+if _hasq "dev=[\"']vda[\"']"; then ok_fn "extra disk survives the toggle sequence"; else bad_fn "extra disk was lost (safety invariant failed)"; fi
+if _hasq "name=[\"']looking-glass[\"']"; then ok_fn "Looking Glass shmem survives the toggle sequence"; else bad_fn "Looking Glass shmem was lost (safety invariant failed)"; fi
+# Final state (mode=on): the GPU hostdev source BDF must be ABSENT (stripped).
+# Match the source bus 0x0e (unique to the GPU hostdev; the guest address is
+# bus 0x01) in either quote style.
+if _hasq "bus=[\"']0x0e[\"']"; then bad_fn "GPU hostdev present in mode=on (strip failed)"; else ok_fn "GPU hostdev stripped in mode=on"; fi
+
+# Now toggle OFF (re-insert the GPU from the fragment) and confirm the GPU returns
+# while the disk + shmem STILL survive.
+VIRSH_LIVE="$_fn_live" PATH="$_fn_bin:$PATH" \
+  DRY_RUN=0 CONF_FILE="$_fn_conf" \
+  VFIO_LA_PROFILES_DIR="$_fn_profiles" \
+  LIVE_ATTACH_MODE_FILE="$_fn_root/la-mode" \
+  LIVE_ATTACH_VM_LIST="$_fn_list" \
+  LIVE_ATTACH_GPU_XML="$_fn_root/la-gpu.xml" \
+  LIVE_ATTACH_AUDIO_XML="$_fn_root/la-audio.xml" \
+  VFIO_LA_LEGACY_DIR="$_fn_legacy" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; . '$_fn_conf'; \
+    profile_recognize win11 >/dev/null; \
+    profile_apply_mode win11 off >/dev/null; echo OFF2_DONE" >>"$_fn_out" 2>&1 || true
+if _hasq "bus=[\"']0x0e[\"']"; then ok_fn "GPU hostdev re-inserted in mode=off (toggle off restores the GPU)"; else bad_fn "GPU hostdev missing in mode=off (toggle off did not restore the GPU)"; fi
+if _hasq "dev=[\"']vda[\"']"; then ok_fn "extra disk survives toggle off"; else bad_fn "extra disk lost on toggle off"; fi
+if _hasq "name=[\"']looking-glass[\"']"; then ok_fn "Looking Glass shmem survives toggle off"; else bad_fn "Looking Glass shmem lost on toggle off"; fi
+
+# Missing-fragment refuse: strip the GPU (mode=on), delete the fragment, then try
+# mode=off. profile_apply_mode off must REFUSE (no fragment + no live GPU) and NOT
+# define (the live XML stays GPU-less). Returns non-zero.
+VIRSH_LIVE="$_fn_live" PATH="$_fn_bin:$PATH" \
+  DRY_RUN=0 CONF_FILE="$_fn_conf" \
+  VFIO_LA_PROFILES_DIR="$_fn_profiles" \
+  LIVE_ATTACH_MODE_FILE="$_fn_root/la-mode" \
+  LIVE_ATTACH_VM_LIST="$_fn_list" \
+  LIVE_ATTACH_GPU_XML="$_fn_root/la-gpu.xml" \
+  LIVE_ATTACH_AUDIO_XML="$_fn_root/la-audio.xml" \
+  VFIO_LA_LEGACY_DIR="$_fn_legacy" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; . '$_fn_conf'; \
+    profile_recognize win11 >/dev/null; \
+    profile_apply_mode win11 on  >/dev/null; \
+    rm -f \"\$(_la_profile_dir win11)/devices/gpu.xml\"; \
+    profile_recognize win11 >/dev/null; \
+    if profile_apply_mode win11 off >/dev/null 2>&1; then echo REFUSE_FAILED; else echo REFUSED_OK; fi" >>"$_fn_out" 2>&1 || true
+if grep -Fq 'REFUSED_OK' "$_fn_out"; then ok_fn "missing fragment + no live GPU => profile_apply_mode off refuses (no define)"; else bad_fn "profile_apply_mode off did NOT refuse with a missing fragment (would guess a hostdev)"; fi
+# And the live XML must still have NO GPU (the refuse did not define anything).
+if _hasq "bus=[\"']0x0e[\"']"; then bad_fn "live XML changed after a refuse (define happened despite the refuse)"; else ok_fn "live XML unchanged after the missing-fragment refuse"; fi
+
+# Sanity: the recognition manifest was written (at the redirected profile dir).
+if [[ -f "$_fn_profiles/win11/manifest" ]]; then ok_fn "per-domain manifest written"; else bad_fn "per-domain manifest not written"; fi
+
+rm -rf "$_fn_root"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

@@ -10858,7 +10858,7 @@ for _abdf in $(printf '%s\n' "${GUEST_AUDIO_BDFS_CSV:-}" | tr ',' '\n'); do
   fi
 done
 
-# Step 2: hot-attach the GPU to the running VM.
+# Step 2: hot-attach the audio + GPU to the running VM (audio FIRST, see below).
 # Use [[ -s ]] (non-empty), not [[ -f ]] — an empty/stale XML file makes virsh
 # attach-device hang on empty input and block libvirt's VM lock (observed: a
 # stuck attach-device held the lock for minutes so every other virsh call,

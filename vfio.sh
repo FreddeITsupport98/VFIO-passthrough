@@ -10726,6 +10726,17 @@ root = ET.parse(src).getroot()
 # cold-attach, so Windows can init the display. rom_path is empty for the
 # audio fragment (no rom for audio).
 def _strip(hd):
+    # R44/vfio-backend: ensure <driver name='vfio'/> is present (libvirt schema
+    # order: driver is the first child of hostdev, before source). Required for
+    # virsh attach-device --live to use the vfio PCI backend — without it, some
+    # libvirt versions fall back to a default/non-vfio backend and the hot-add
+    # fails or attaches via the wrong backend (Red Hat Bugzilla 1035490, kubevirt
+    # #17124). libvirt 12 defaults to vfio, but adding it explicitly is
+    # version-proof and matches what cold-attach define auto-adds. Injected
+    # here so EXISTING fragments (saved before this fix) get the element at
+    # hot-attach time without needing to re-extract.
+    if hd.find('driver') is None:
+        hd.insert(0, ET.Element('driver', {'name': 'vfio'}))
     for a in list(hd.findall('address')):
         if a.get('type') == 'pci': hd.remove(a)
     rom = hd.find('rom')
@@ -11157,6 +11168,15 @@ if devices is None: sys.exit(1)
 for hd in devices.findall('hostdev'):
     if hd.get('type') != 'pci': continue
     if _src_bdf(hd).lower() == needle:
+        # R44/vfio-backend: ensure <driver name='vfio'/> is present (libvirt
+        # schema order: driver is the first child of hostdev, before source).
+        # Required for virsh attach-device --live to use the vfio PCI backend —
+        # without it, some libvirt versions fall back to a default/non-vfio
+        # backend (Red Hat Bugzilla 1035490, kubevirt #17124). libvirt 12
+        # defaults to vfio, but adding it explicitly is version-proof and
+        # matches what cold-attach define auto-adds.
+        if hd.find('driver') is None:
+            hd.insert(0, ET.Element('driver', {'name': 'vfio'}))
         ET.ElementTree(hd).write(out)
         sys.exit(0)
 sys.exit(1)

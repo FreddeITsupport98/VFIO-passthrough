@@ -336,6 +336,19 @@ assert_contains_file \
   "R44 install_live_attach extracts the GPU fragment via the helper" \
   '| _la_extract_hostdev_fragment "$_gpu_bdf" "$_pdir/devices/gpu.xml"' \
   "$VFIO_SCRIPT"
+# R44/vfio-backend: BOTH the fragment extractor AND the live-attach helper's
+# _strip_guest_addr python MUST inject <driver name='vfio'/> so virsh
+# attach-device --live uses the vfio PCI backend (Red Hat Bugzilla 1035490,
+# kubevirt #17124 — without it the hot-add can fall back to a default/non-vfio
+# backend). The same ET.Element('driver', {'name': 'vfio'}) string appears in
+# both python blocks, so assert it occurs at least twice in vfio.sh.
+_vfio_driver_inject_count="$(grep -cF "ET.Element('driver', {'name': 'vfio'})" "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _vfio_driver_inject_count >= 2 )); then
+  printf 'PASS: R44 <driver name=vfio/> injected in both extractor + helper (%d sites)\n' "$_vfio_driver_inject_count"
+else
+  printf 'FAIL: R44 <driver name=vfio/> injection missing (expected >=2, got %s)\n' "$_vfio_driver_inject_count" >&2
+  record_failure "R44 driver=vfio injected in both extractor + helper"
+fi
 assert_contains_file \
   "R44 install_live_attach recognizes each VM (writes the manifest)" \
   'profile_recognize "$_dom"' \

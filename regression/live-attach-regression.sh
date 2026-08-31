@@ -262,14 +262,48 @@ assert_contains_text \
 # the fragment has no <rom> but the romfile exists (cold-attach carries the rom so
 # OVMF reads the UEFI GOP at boot; hot-attach was shipping a romless GPU
 # -> Windows had no firmware display driver -> silent display-init failure).
+# R44/keep-addr: the call now takes a 3rd arg (the keep_guest_addr conf value)
+# so the helper KEEPS the fixed guest PCI address by default (hot-attach lands at
+# the same guest BDF as cold-attach -> Windows recognizes the device -> the AMD
+# driver binds instead of "no driver installed").
 assert_contains_text \
-  "R23 helper passes the GPU romfile path to _strip_guest_addr (rom inject)" \
-  '_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM"' \
+  "R23 helper passes the GPU romfile path + keep_addr to _strip_guest_addr" \
+  '_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr"' \
   "$helper_block"
 assert_contains_text \
-  "R23 helper passes an empty rom path for the audio (no rom for audio)" \
-  '_strip_guest_addr "$_AUDIO_SRC" ""' \
+  "R23 helper passes an empty rom path + keep_addr for the audio" \
+  '_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr"' \
   "$helper_block"
+# R44/keep-addr: the helper MUST default to KEEPING the fixed guest PCI address
+# (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR default 1) so the hot-attached GPU lands at
+# the SAME guest BDF as cold-attach. Windows matches the AMD driver to the device
+# by PCI location; a different guest slot = a different Windows device path = the
+# driver does NOT bind -> "no driver installed" (Code 28). This was the root cause
+# of the hotplug "no driver installed" symptom.
+assert_contains_text \
+  "R44 helper reads VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 1 = keep guest addr)" \
+  '_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-1}"' \
+  "$helper_block"
+assert_contains_text \
+  "R44 helper python reads keep_addr from argv" \
+  'keep_addr = (len(sys.argv) > 4 and sys.argv[4] == "1")' \
+  "$helper_block"
+assert_contains_text \
+  "R44 helper python only strips guest addr when keep_addr is False (opt-out)" \
+  'if not keep_addr:' \
+  "$helper_block"
+# The OLD unconditional strip (a bare 'for a in list(hd.findall('address')):'
+# NOT inside the keep_addr guard) MUST be GONE — the strip must be INSIDE the
+# `if not keep_addr:` block so the default (keep) does NOT strip. Assert by line
+# number: the strip line must come AFTER the `if not keep_addr:` guard line.
+_strip_line="$(grep -n "for a in list(hd.findall('address')):" <<<"$helper_block" | head -1 | cut -d: -f1)"
+_guard_line="$(grep -n 'if not keep_addr:' <<<"$helper_block" | head -1 | cut -d: -f1)"
+if [[ -n "$_strip_line" && -n "$_guard_line" && "$_strip_line" -gt "$_guard_line" ]]; then
+  printf 'PASS: R44 helper strip is inside the keep_addr guard (line %d > %d)\n' "$_strip_line" "$_guard_line"
+else
+  printf 'FAIL: R44 helper strip is NOT inside the keep_addr guard (strip=%s guard=%s)\n' "$_strip_line" "$_guard_line" >&2
+  record_failure "R44 helper strip is gated on keep_addr (inside the if-not-keep_addr block)"
+fi
 assert_contains_text \
   "R23 helper resolves the GPU romfile path from the GPU BDF (live-<BDF>.rom)" \
   '_GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"' \
@@ -326,8 +360,9 @@ assert_contains_file \
 # R44: install extracts the GPU (+ audio) hostdevs into per-domain FRAGMENTS
 # (profiles/<dom>/devices/*.xml) via the shared _la_extract_hostdev_fragment
 # helper — NOT the old inline python that wrote flat LIVE_ATTACH_GPU_XML +
-# full-domain with/without-gpu dumps. The fragment keeps the guest address
-# (the helper strips it at runtime before attach-device --live).
+# full-domain with/without-gpu dumps. The fragment KEEPS the guest address
+# (the helper now keeps it at runtime too by default, so hot-attach lands at the
+# same guest BDF as cold-attach -> Windows recognizes the device -> driver binds).
 assert_contains_file \
   "R44 _la_extract_hostdev_fragment helper defined" \
   '_la_extract_hostdev_fragment() {' \

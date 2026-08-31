@@ -10658,16 +10658,27 @@ BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
 # fragment (profiles/<DOMAIN>/devices/*.xml); fall back to the legacy flat
 # path (a symlink to the active VM's fragment under R44, or the pre-R44
 # stripped file). The fragment KEEPS the guest PCI address and the <rom file=...>
-# line (the toggle/define path wants the original slot + rom); for `attach-device --live`
-# on a RUNNING VM we strip the fixed guest <address type='pci'> at runtime into a
-# temp so libvirt auto-assigns a free guest address (a fixed address can
-# collide with an existing device in the running VM and hang attach-device —
-# observed). We ALSO strip a <rom file='...'/> when the referenced romfile is
-# missing on disk (e.g. deleted / wiped by --reset / never re-dumped after a
-# reboot) — virsh attach-device --live otherwise fails with "failed to find
-# romfile". AND we INJECT a <rom file='...'/> when the fragment has NO <rom>
-# line but the romfile EXISTS on disk (the R44 fragment can lose the <rom> line
-# if it was saved from a stripped state; the romfile is restored later by
+# line (the toggle/define path wants the original slot + rom). For `attach-device --live`
+# on a RUNNING VM we KEEP the fixed guest <address type='pci'> by default so the
+# hot-attached GPU lands at the SAME guest BDF as cold-attach — Windows matches
+# the AMD driver to the device by PCI location (Bus/Device/Function), so a
+# different guest slot = a different Windows device path = the driver does NOT
+# bind -> Device Manager shows "no driver installed" (Code 28). This is the
+# root cause of the hotplug "no driver installed" symptom: the old code stripped
+# the guest address so qemu auto-assigned a new slot, and Windows saw a new
+# device instead of the one it installed the driver against. Keeping the address
+# fixes it. The GPU's guest slot sits behind a dedicated pcie-root-port (the
+# chassis reserved in both mode=on and mode=off XML), so the slot is FREE when
+# the VM runs without the GPU — no collision. OPT-OUT: if a collision DOES
+# happen (a VM where the GPU's slot is shared with another device), set
+# VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=0 in the conf to restore the old strip
+# behavior so libvirt auto-assigns a free guest address (the collision case).
+# We ALSO strip a <rom file='...'/> when the referenced romfile is missing on
+# disk (e.g. deleted / wiped by --reset / never re-dumped after a reboot) —
+# virsh attach-device --live otherwise fails with "failed to find romfile". AND
+# we INJECT a <rom file='...'/> when the fragment has NO <rom> line but the
+# romfile EXISTS on disk (the R44 fragment can lose the <rom> line if it was
+# saved from a stripped state; the romfile is restored later by
 # --install-dynamic-binding --vbios / the live-ROM fallback). Cold-attach works
 # partly BECAUSE the persistent VM XML carries <rom file=.../> so OVMF reads
 # the UEFI GOP from the file at boot and POSTs the display; hot-attach was
@@ -10675,7 +10686,9 @@ BIND_SCRIPT="/usr/local/sbin/vfio-bind-selected-gpu.sh"
 # -> silent display-init failure -> black screen. Injecting the <rom> when
 # the romfile exists makes the hot-attached GPU carry the UEFI GOP like
 # cold-attach, so Windows can init the display. $2 = expected romfile path
-# (empty for the audio fragment, which has no rom). Best-effort: if python3
+# (empty for the audio fragment, which has no rom). $3 = keep_guest_addr ("1"
+# default = keep the fixed guest PCI address; "0" = strip it so qemu auto-
+# assigns a free slot, the collision-avoidance path). Best-effort: if python3
 # is unavailable, use the raw fragment (no inject; a missing rom is rarer but the
 # attach would fail with the same rc=1, so the python path is strongly preferred).
 _GPU_SRC="/var/lib/vfio-dynamic/live-attach-gpu.xml"
@@ -10695,7 +10708,7 @@ _LA_TMP=()
 _la_cleanup() { [[ ${#_LA_TMP[@]} -gt 0 ]] && rm -f "${_LA_TMP[@]}" 2>/dev/null || true; }
 trap _la_cleanup EXIT
 _strip_guest_addr() {
-  local _src="$1" _rom="$2" _tmp
+  local _src="$1" _rom="$2" _keep="${3:-1}" _tmp
   [[ -s "$_src" ]] || return 0
   if ! command -v python3 >/dev/null 2>&1; then
     printf '%s' "$_src"; return 0
@@ -10705,9 +10718,10 @@ _strip_guest_addr() {
   # NOTE: with `if cmd <<EOF; then`, the heredoc body is read first (up to the
   # STRIPYEOF terminator); the THEN body follows the terminator. So the Python
   # program is the heredoc body, and `printf '%s' "$_tmp"` is the success path.
-  if python3 - "$_src" "$_tmp" "$_rom" <<'STRIPYEOF'; then
+  if python3 - "$_src" "$_tmp" "$_rom" "$_keep" <<'STRIPYEOF'; then
 import sys, os, xml.etree.ElementTree as ET
 src, dst, rom_path = sys.argv[1], sys.argv[2], sys.argv[3]
+keep_addr = (len(sys.argv) > 4 and sys.argv[4] == "1")
 root = ET.parse(src).getroot()
 # R44: drop a <rom file='...'/> when the referenced romfile is missing on disk.
 # virsh attach-device --live fails with "failed to find romfile" if the
@@ -10737,8 +10751,19 @@ def _strip(hd):
     # hot-attach time without needing to re-extract.
     if hd.find('driver') is None:
         hd.insert(0, ET.Element('driver', {'name': 'vfio'}))
-    for a in list(hd.findall('address')):
-        if a.get('type') == 'pci': hd.remove(a)
+    # R44: KEEP the fixed guest <address type='pci'> by default so the hot-
+    # attached GPU lands at the SAME guest BDF as cold-attach. Windows matches
+    # the AMD driver to the device by PCI location (Bus/Device/Function); a
+    # different guest slot = a different Windows device path = the driver does
+    # NOT bind -> Device Manager shows "no driver installed" (Code 28). Only
+    # strip the guest address when the operator opted out
+    # (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=0) because the GPU's guest slot
+    # collides with another device in the running VM (the original collision
+    # case that the strip was added for). On a VM with a dedicated pcie-root-
+    # port for the GPU, the slot is free in mode=on -> no collision -> keep.
+    if not keep_addr:
+        for a in list(hd.findall('address')):
+            if a.get('type') == 'pci': hd.remove(a)
     rom = hd.find('rom')
     if rom is not None:
         rf = rom.get('file', '')
@@ -10790,12 +10815,16 @@ _notify_desktop() {
 # shellcheck disable=SC1090
 . "$CONF_FILE"
 [[ -x "$BIND_SCRIPT" ]] || { jlog "live-attach: $BIND_SCRIPT missing"; exit 0; }
-# R44: compute the GPU romfile path + stripped device fragments NOW that the conf
+# R44: compute the GPU romfile path + the device fragments NOW that the conf
 # has been sourced (GUEST_GPU_BDF is defined here; referencing it before this
-# point crashes under `set -u`). Audio gets no romfile (empty 2nd arg).
+# point crashes under `set -u`). Audio gets no romfile (empty 2nd arg). The 3rd
+# arg is VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 1 = keep the fixed guest PCI
+# address so hot-attach lands at the same guest BDF as cold-attach -> Windows
+# recognizes the device -> the AMD driver binds instead of "no driver installed").
+_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-1}"
 _GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"
-GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM")"
-AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "")"
+GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr")"
+AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr")"
 
 # Wait for Windows userspace to be ready before binding + hot-attaching the GPU.
 # Smart path: poll the qemu guest agent (guest-ping) — when it responds, Windows

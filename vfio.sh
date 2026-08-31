@@ -2407,7 +2407,22 @@ assert_not_equal() {
 
 confirm_phrase() {
   # confirm_phrase "Prompt" "PHRASE"
+  # R45: re-prompt on a TYPED mismatch (up to CONFIRM_PHRASE_MAX_TRIES, default
+  # 3) instead of one-shot dying on a typo, so a fat-fingered destructive
+  # confirm (RESET VFIO / BLACKLIST / ...) no longer silently aborts the whole
+  # operation with NOTHING removed — the original "--reset --full didnt clear
+  # trayicon" bug was exactly this: a typo'd RESET VFIO -> die -> exit before any
+  # rm. An EXPLICIT decline (whiptail Cancel/Esc, /dev/tty EOF) still returns 1
+  # right away (do NOT loop on a deliberate cancel); only a typed-but-wrong
+  # phrase re-prompts. After $max mismatches it returns 1 so the caller's
+  # die/cancel path still fires — stupid-proof gate kept, just no longer
+  # one-strike. Use if-form conditionals throughout: the script runs under
+  # `set -euo pipefail`, and `(( expr )) && cmd` would trip -e when expr is 0.
   local prompt="$1" phrase="$2" ans
+  local max="${CONFIRM_PHRASE_MAX_TRIES:-3}"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=3
+  if (( max < 1 )); then max=1; fi
+  local i _box
 
   # R39: --recommended auto-accepts ONLY acknowledgement phrases ("I UNDERSTAND"
   # — ReBAR / hostile-kernel / in-use-GPU acks). Destructive phrases (BLACKLIST,
@@ -2420,32 +2435,60 @@ confirm_phrase() {
 
   # R38: GUI path so the destructive/safety confirmation stays in the TUI
   # (whiptail --inputbox) and the operator never has to drop to a plain CLI
-  # prompt to type the phrase. whiptail writes the dialog to stderr and
-  # returns the typed text on stdout via the fd dance; Cancel/Esc or a
-  # mismatched phrase returns non-zero (declined). Falls back to the original
-  # plain-text /dev/tty read when there is no TUI or no tty.
+  # prompt to type the phrase. whiptail writes the dialog to stderr and returns
+  # the typed text on stdout via the fd dance; Cancel/Esc is an EXPLICIT decline
+  # (return 1 immediately — do NOT loop on a cancel); a mismatched typed phrase
+  # re-prompts up to $max times. Falls back to the plain-text read when there is
+  # no TUI or no tty.
   if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
-    ans="$(whiptail --title "Confirm" --inputbox "$prompt
-
-Type exactly: $phrase" 12 70 "" 3>&1 1>&2 2>&3)" || return 1
-    [[ "$ans" == "$phrase" ]]
-    return $?
+    for (( i = 1; i <= max; ++i )); do
+      if (( i > 1 )); then
+        # Real newlines (printf -v) — a literal "\n" inside double quotes is
+        # NOT a newline, so whiptail would render the backslashes. Re-prompt
+        # body tells the operator which attempt they are on.
+        printf -v _box '%s\n\nPrevious attempt did not match. Attempt %d of %d.\n\nType exactly: %s' \
+          "$prompt" "$i" "$max" "$phrase"
+      else
+        printf -v _box '%s\n\nType exactly: %s' "$prompt" "$phrase"
+      fi
+      if ans="$(whiptail --title "Confirm" --inputbox "$_box" 12 70 "" 3>&1 1>&2 2>&3)"; then
+        if [[ "$ans" == "$phrase" ]]; then return 0; fi
+      else
+        return 1   # Cancel/Esc = explicit decline, do not loop
+      fi
+    done
+    return 1
   fi
 
   # IMPORTANT: do not print prompts to stdout (stdout may be captured).
-  local in="/dev/stdin"
-  local out="/dev/stderr"
-  if [[ -r /dev/tty && -w /dev/tty ]]; then
-    in="/dev/tty"
-    out="/dev/tty"
+  # R45 testability: VFIO_CONFIRM_IN / VFIO_CONFIRM_OUT override the I/O channel
+  # (internal, undocumented) so the re-prompt loop can be exercised in regression
+  # without a real tty (feed a FIFO). Unset -> the original /dev/tty-or-stdin
+  # logic, so production behavior is unchanged.
+  local in="${VFIO_CONFIRM_IN:-}"
+  local out="${VFIO_CONFIRM_OUT:-}"
+  if [[ -z "$in" ]]; then
+    in="/dev/stdin"
+    if [[ -r /dev/tty && -w /dev/tty ]]; then in="/dev/tty"; fi
+  fi
+  if [[ -z "$out" ]]; then
+    out="/dev/stderr"
+    if [[ -r /dev/tty && -w /dev/tty ]]; then out="/dev/tty"; fi
   fi
 
-  printf '%s\n' "$prompt" >"$out"
-  printf '%s\n' "Type exactly: $phrase" >"$out"
-  printf '> ' >"$out"
-
-  read -r ans <"$in"
-  [[ "$ans" == "$phrase" ]]
+  for (( i = 1; i <= max; ++i )); do
+    printf '%s\n' "$prompt" >"$out"
+    printf '%s\n' "Type exactly: $phrase" >"$out"
+    if (( i > 1 )); then
+      printf '%s\n' "(attempt $i of $max — previous attempt did not match)" >"$out"
+    fi
+    printf '> ' >"$out"
+    if ! read -r ans <"$in"; then
+      return 1   # EOF (Ctrl-D) = explicit decline, do not loop
+    fi
+    if [[ "$ans" == "$phrase" ]]; then return 0; fi
+  done
+  return 1
 }
 
 pci_slot_of_bdf() {
@@ -25015,6 +25058,59 @@ _wipe_vm_stage_backups() {
   note "Removed ALL VM-XML stage backups (stealth/perf/live-attach) for a fresh start: $_stealth_dir, $_perf_dir, $_la_dir live-attach variants + legacy $_legacy_dir. The VM XMLs themselves are NOT reverted — run --reset-stealth-vm-tuning / --reset-ultimate-perf-vm-tuning / --install-dynamic-binding (reverts live-attach) to revert them BEFORE --reset, since the backups are deleted here."
 }
 
+# R45: enumerate which of the passed managed-file paths currently exist on disk,
+# so the operator sees EXACTLY what --reset will remove BEFORE typing the confirm
+# phrase (preview), and so a partial removal is visible AFTERWARD instead of
+# silent (verify). [[ -e ]] matches regular files AND symlinks (incl. the
+# dangling R44 device-fragment symlinks), so a leftover symlink is reported too.
+# Pure / read-only: never mutates state, never dies. Output goes through note()
+# so it stays off captured stdout and is visually framed.
+_reset_preview_paths() {
+  # _reset_preview_paths "label" path1 path2 ...
+  local _label="$1"; shift
+  local _p
+  # _rp_found (not _found) so shellcheck does not flag the scalar _found=0/1
+  # used in unrelated functions as SC2178 (array-vs-scalar cross-scope noise).
+  local -a _rp_found=()
+  for _p in "$@"; do
+    # -e follows symlinks to the target; -L also catches a DANGLING symlink
+    # (target gone) so the R44 device-fragment symlinks are reported even when
+    # their target fragment was already removed.
+    { [[ -e "$_p" ]] || [[ -L "$_p" ]]; } || continue
+    _rp_found+=("$_p")
+  done
+  if (( ${#_rp_found[@]} == 0 )); then
+    note "$_label: (no managed files currently present — nothing to remove)"
+    return 0
+  fi
+  note "$_label: ${#_rp_found[@]} managed file(s) currently present:"
+  for _p in "${_rp_found[@]}"; do
+    note "  - $(_link "$_p")"
+  done
+}
+
+# R45: post-removal verification. Re-checks the same path list and reports any
+# artifact still on disk (a partial rm failure, a path the rm block missed, or a
+# leftover symlink). When all are gone, prints a clean "verified removed" line
+# so the operator can trust the reset actually completed — no more silent "tray
+# icon still there" surprises. Pure/read-only; never dies.
+_reset_verify_paths() {
+  # _reset_verify_paths "label" path1 path2 ...
+  local _label="$1"; shift
+  local _p _left=0
+  for _p in "$@"; do
+    { [[ -e "$_p" ]] || [[ -L "$_p" ]]; } || continue
+    _left=$((_left + 1))
+    note "  - $(_link "$_p") (still present)"
+  done
+  if (( _left == 0 )); then
+    note "$_label: all managed files verified removed."
+  else
+    note "$_label: $_left managed file(s) still present (listed above). Remove manually if needed."
+  fi
+  return 0
+}
+
 reset_vfio_all() {
   # R37: $1=full removes the self-installed CLI command + shell completions too
   # (a true "remove everything this script installed"). The repo script itself
@@ -25049,6 +25145,45 @@ reset_vfio_all() {
     note "      (./vfio.sh) or re-run --install-self first."
   fi
 
+  # R45: build the managed-file removal list ONCE (before the confirm gate) so
+  # the preview can show exactly what will be removed, the rm below uses the same
+  # list, and the post-removal verify re-checks it — one source of truth, no more
+  # silent "tray icon still there" surprises. bootlog_bin_path() is pure (reads
+  # /etc/passwd only), safe to compute here. The 4 live-attach paths are kept
+  # contiguous so the static regression substring still matches.
+  local bootlog_unit="/etc/systemd/system/vfio-dump-boot-log.service"
+  local bootlog_bin
+  bootlog_bin="$(bootlog_bin_path)"
+  local -a _rm_paths=(
+    "$SYSTEMD_UNIT" "$BIND_SCRIPT" "$AUDIO_SCRIPT"
+    "$OPENBOX_MONITOR_SCRIPT"
+    "$LIBVIRT_HOOK_SCRIPT"
+    "$CONF_FILE" "$MODULES_LOAD" "$BLACKLIST_FILE"
+    "$SOFTDEP_FILE" "$DRACUT_VFIO_CONF"
+    "$UDEV_ISOLATION_RULE"
+    "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF"
+    "$GRAPHICS_DAEMON_SCRIPT" "$GRAPHICS_DAEMON_UNIT"
+    "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF"
+    "$KWIN_RENDER_PIN_FILE" "$WLR_RENDER_PIN_FILE"
+    "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT"
+    "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" "$PARK_KEEPALIVE_CHECK_UNIT"
+    "$PARK_KEEPALIVE_RESUME_HOOK" "$PARK_KEEPALIVE_UDEV_RULE" "$PARK_KEEPALIVE_STATE_FILE"
+    "$LIVE_ATTACH_HELPER" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" "$LIVE_ATTACH_VM_LIST"
+    "$LIVE_ATTACH_MODE_FILE" "$LIVE_ATTACH_TRAY" "$LIVE_ATTACH_POLKIT"
+    "$bootlog_unit" "$bootlog_bin"
+  )
+  note "Preview of managed files this reset will remove:"
+  _reset_preview_paths "Managed files" "${_rm_paths[@]}"
+  if [[ "$_full" == "full" ]]; then
+    local _installed_cmd
+    _installed_cmd="$(basename "$SELF_INSTALL_BIN")"
+    _reset_preview_paths "Self-installed CLI + completions (full)" \
+      "$SELF_INSTALL_BIN" \
+      "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" \
+      "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
+      "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+  fi
+
   if ! confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
     die "Reset cancelled"
   fi
@@ -25079,10 +25214,8 @@ reset_vfio_all() {
     run systemctl daemon-reload 2>/dev/null || true
   fi
 
-  # Remove managed files, including optional helpers
-  local bootlog_unit="/etc/systemd/system/vfio-dump-boot-log.service"
-  local bootlog_bin
-  bootlog_bin="$(bootlog_bin_path)"
+  # Remove managed files (bootlog_unit/bootlog_bin + _rm_paths were declared
+  # above, before the confirm gate, so the preview could enumerate them).
 
   # Remove the vBIOS ROM auto-injection (VM-XML <rom> pins + runtime dir).
   # Must run BEFORE $CONF_FILE is deleted below (it reads GUEST_GPU_BDF from it).
@@ -25123,22 +25256,10 @@ reset_vfio_all() {
     fi
   fi
 
-  run rm -f "$SYSTEMD_UNIT" "$BIND_SCRIPT" "$AUDIO_SCRIPT" \
-           "$OPENBOX_MONITOR_SCRIPT" \
-           "$LIBVIRT_HOOK_SCRIPT" \
-           "$CONF_FILE" "$MODULES_LOAD" "$BLACKLIST_FILE" \
-           "$SOFTDEP_FILE" "$DRACUT_VFIO_CONF" \
-           "$UDEV_ISOLATION_RULE" \
-           "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE" "$USB_BT_MATCH_CONF" \
-           "$GRAPHICS_DAEMON_SCRIPT" "$GRAPHICS_DAEMON_UNIT" \
-           "$LIGHTDM_FALLBACK_CONF" "$XORG_HOST_GPU_CONF" "$LIGHTDM_HOST_GPU_CONF" \
-           "$KWIN_RENDER_PIN_FILE" "$WLR_RENDER_PIN_FILE" \
-           "$REBOOT_FLR_SCRIPT" "$REBOOT_FLR_UNIT" \
-           "$PARK_KEEPALIVE_SCRIPT" "$PARK_KEEPALIVE_UNIT" "$PARK_KEEPALIVE_CHECK_UNIT" \
-           "$PARK_KEEPALIVE_RESUME_HOOK" "$PARK_KEEPALIVE_UDEV_RULE" "$PARK_KEEPALIVE_STATE_FILE" \
-           "$LIVE_ATTACH_HELPER" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" "$LIVE_ATTACH_VM_LIST" \
-           "$LIVE_ATTACH_MODE_FILE" "$LIVE_ATTACH_TRAY" "$LIVE_ATTACH_POLKIT" \
-           "$bootlog_unit" "$bootlog_bin" 2>/dev/null || true
+  # R45: remove every managed file from the single _rm_paths list (the same list
+  # the preview showed above and the verify step re-checks below). 2>/dev/null +
+  # || true keep this best-effort for paths that never existed on this host.
+  run rm -f "${_rm_paths[@]}" 2>/dev/null || true
 
   remove_openbox_autostart_hook
 
@@ -25393,6 +25514,24 @@ reset_vfio_all() {
     fi
   fi
 
+  # R45: post-removal verification — re-check every managed file the preview
+  # showed (+ CLI/completion files when full) and report any still on disk, so a
+  # partial rm failure or a missed path is visible instead of silent. Skipped
+  # under DRY_RUN (nothing is actually removed, so leftovers are meaningless).
+  if (( ! DRY_RUN )); then
+    hdr "Reset verification"
+    _reset_verify_paths "Managed files" "${_rm_paths[@]}"
+    if [[ "$_full" == "full" ]]; then
+      local _installed_cmd
+      _installed_cmd="$(basename "$SELF_INSTALL_BIN")"
+      _reset_verify_paths "Self-installed CLI + completions" \
+        "$SELF_INSTALL_BIN" \
+        "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" \
+        "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
+        "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+    fi
+  fi
+
   say
   say "Reset complete. Reboot recommended."
   note "If any devices are currently bound to vfio-pci, a reboot is the cleanest way to restore host drivers."
@@ -25419,6 +25558,15 @@ reset_usb_mitigation_only() {
   note "  - USB mitigation match-policy config (including USB Ethernet EEE-off settings)"
   note "It does NOT remove core VFIO GPU passthrough configuration."
 
+  # R45: preview the USB mitigation files before the confirm gate (same
+  # robustness as reset_vfio_all — show what will be removed, then verify after).
+  local -a _usb_rm_paths=(
+    "$USB_BT_SCRIPT" "$USB_BT_SYSTEMD_UNIT" "$USB_BT_UDEV_RULE"
+    "$USB_BT_MATCH_CONF" "$USB_BT_STATE_FILE"
+  )
+  note "Preview of USB mitigation files this reset will remove:"
+  _reset_preview_paths "USB mitigation files" "${_usb_rm_paths[@]}"
+
   if ! confirm_phrase "To continue, confirm USB mitigation reset." "RESET USB MITIGATION"; then
     die "USB mitigation reset cancelled"
   fi
@@ -25432,6 +25580,11 @@ reset_usb_mitigation_only() {
   if have_cmd udevadm; then
     run udevadm control --reload-rules 2>/dev/null || true
     run udevadm trigger --subsystem-match=usb 2>/dev/null || true
+  fi
+  # R45: post-removal verification (skipped under DRY_RUN).
+  if (( ! DRY_RUN )); then
+    hdr "Reset verification"
+    _reset_verify_paths "USB mitigation files" "${_usb_rm_paths[@]}"
   fi
   say "USB mitigation reset complete."
 }

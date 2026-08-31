@@ -107,7 +107,17 @@ assert_contains_file "usage one-liner includes --remove-looking-glass-client" '[
 assert_contains_file "remove_looking_glass_client checks rpm -qf" 'rpm -qf' "$VFIO_SCRIPT"
 assert_contains_file "remove_looking_glass_client checks dpkg -S" 'dpkg -S' "$VFIO_SCRIPT"
 assert_contains_file "_vm_tuning_status_block called below menu" '_vm_tuning_status_block' "$VFIO_SCRIPT"
-assert_contains_file "install_looking_glass sets video=none" 'video=none' "$VFIO_SCRIPT"
+# R44/live-attach: _lg_set_vm_display_live_attach helper (the live-attach boot-
+# display path, never video=none) MUST be defined, and install_looking_glass
+# MUST branch on the live-attach mode (video=none for cold-attach / boot display
+# for live-attach mode=on). In live-attach mode=on the GPU is ABSENT at boot, so
+# video=none leaves Windows headless and the hot-attached GPU's display silently
+# fails (black screen).
+assert_contains_file "_lg_set_vm_display_live_attach helper exists" '_lg_set_vm_display_live_attach() {' "$VFIO_SCRIPT"
+assert_contains_file "_vm_live_attach_mode_on helper exists" '_vm_live_attach_mode_on() {' "$VFIO_SCRIPT"
+assert_contains_file "install_looking_glass branches on live-attach mode for video" '_vm_live_attach_mode_on' "$VFIO_SCRIPT"
+assert_contains_file "install_looking_glass calls the live-attach display path" '_lg_set_vm_display_live_attach' "$VFIO_SCRIPT"
+assert_contains_file "install_looking_glass sets video=none (cold-attach path)" 'video=none' "$VFIO_SCRIPT"
 assert_contains_file "install_looking_glass sets the LG spice input block" 'Looking Glass input block' "$VFIO_SCRIPT"
 # vBIOS is NOT duplicated in the LG path (vfio.sh already does vBIOS injection).
 assert_contains_file "install_looking_glass notes vBIOS NOT touched" 'vBIOS is NOT touched here' "$VFIO_SCRIPT"
@@ -367,6 +377,111 @@ if command -v virt-xml-validate >/dev/null 2>&1; then
   else
     printf 'FAIL: display-none XML fails virt-xml-validate\n' >&2
     record_failure "display-none XML validates"
+  fi
+fi
+
+# ===================== R44/live-attach: Functional live-attach display patcher =====================
+# _lg_set_vm_display_live_attach: normalize spice to the LG input block BUT ensure
+# the VM KEEPS a boot display (virtio-gpu), NEVER video=none. In live-attach
+# mode=on the GPU is absent at boot; video=none leaves Windows headless and the
+# hot-attached GPU's display silently fails (black screen). The patcher flips an
+# existing video=none -> virtio and normalizes the spice graphics block.
+lg_display_la_py="$tmp_dir/lg_display_la.py"
+awk '
+  /_lg_set_vm_display_live_attach\(\)/ { in_fn=1 }
+  in_fn && /<<.PYEOF./ { grab=1; next }
+  grab && /^PYEOF$/ { grab=0; in_fn=0 }
+  grab { print }
+' "$VFIO_SCRIPT" > "$lg_display_la_py"
+
+if python3 -m py_compile "$lg_display_la_py" 2>/dev/null; then
+  printf 'PASS: LG display-live-attach patcher python compiles\n'
+else
+  printf 'FAIL: LG display-live-attach patcher python does not compile\n' >&2
+  record_failure "LG display-live-attach patcher python compiles"
+fi
+
+# Mock XML #1: video=none (the broken state _lg_apply_to_vm used to leave) -> must flip to virtio.
+mock_la_none="$tmp_dir/mock_la_none.xml"
+cat >"$mock_la_none" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <devices>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+    </hostdev>
+    <graphics type="spice">
+      <listen type="address" address="127.0.0.1"/>
+    </graphics>
+    <video>
+      <model type="none"/>
+    </video>
+  </devices>
+</domain>
+XEOF
+# Mock XML #2: no video at all -> must add a virtio boot display.
+mock_la_novideo="$tmp_dir/mock_la_novideo.xml"
+cat >"$mock_la_novideo" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <devices>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+    </hostdev>
+    <graphics type="spice">
+      <listen type="address" address="127.0.0.1"/>
+    </graphics>
+  </devices>
+</domain>
+XEOF
+
+# --- Run 1: video=none -> flip to virtio (the live-attach boot display) ---
+la1="$tmp_dir/la1.xml"
+cp "$mock_la_none" "$la1"
+set +e
+python3 - "$la1" <"$lg_display_la_py" >/dev/null 2>&1
+rc_la1=$?
+set -e
+assert_eq "live-attach display patcher exit 0 on video=none -> virtio" "0" "$rc_la1"
+assert_contains_file "live-attach video flipped none -> virtio (boot display)" 'type="virtio"' "$la1"
+assert_not_contains_file "live-attach video is NOT none (boot display kept)" 'type="none"' "$la1"
+assert_contains_file "live-attach video heads=1" 'heads="1"' "$la1"
+assert_contains_file "live-attach video primary=yes" 'primary="yes"' "$la1"
+assert_contains_file "live-attach spice normalized (port=-1)" 'port="-1"' "$la1"
+assert_contains_file "live-attach spice normalized (autoport=no)" 'autoport="no"' "$la1"
+assert_contains_file "live-attach spice listen type=address" 'listen type="address"' "$la1"
+assert_contains_file "live-attach spice image compression=off" 'compression="off"' "$la1"
+
+# --- Run 2: idempotent (already virtio + LG spice block) -> exit 3 ---
+set +e
+python3 - "$la1" <"$lg_display_la_py" >/dev/null 2>&1
+rc_la2=$?
+set -e
+assert_eq "live-attach display patcher idempotent (exit 3 on re-run)" "3" "$rc_la2"
+
+# --- Run 3: no video element -> add a virtio boot display ---
+la3="$tmp_dir/la3.xml"
+cp "$mock_la_novideo" "$la3"
+set +e
+python3 - "$la3" <"$lg_display_la_py" >/dev/null 2>&1
+rc_la3=$?
+set -e
+assert_eq "live-attach display patcher exit 0 on missing video (adds boot display)" "0" "$rc_la3"
+assert_contains_file "live-attach adds virtio boot display on missing video" 'type="virtio"' "$la3"
+assert_contains_file "live-attach added video heads=1" 'heads="1"' "$la3"
+assert_contains_file "live-attach added video primary=yes" 'primary="yes"' "$la3"
+
+# --- Run 4: validate the live-attach-patched XML (if virt-xml-validate available) ---
+if command -v virt-xml-validate >/dev/null 2>&1; then
+  if virt-xml-validate "$la1" >/dev/null 2>&1; then
+    printf 'PASS: live-attach display XML validates (virt-xml-validate)\n'
+  else
+    printf 'FAIL: live-attach display XML fails virt-xml-validate\n' >&2
+    record_failure "live-attach display XML validates"
   fi
 fi
 

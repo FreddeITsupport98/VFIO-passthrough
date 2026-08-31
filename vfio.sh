@@ -10982,6 +10982,25 @@ _la_read_mode() {
   esac
 }
 
+# R44/live-attach + Looking Glass interaction: return 0 if $1 (dom) is in the
+# live-attach VM list AND the mode file reads "on". Used by install_looking_glass
+# to decide whether to keep a BOOT display (virtio-gpu) instead of video=none:
+# in live-attach mode=on the GPU is ABSENT at boot, so video=none leaves Windows
+# headless and the hot-attached GPU's display silently fails to initialize
+# (black screen, confirmed empirically + via Level1Techs "Guest won't boot with
+# video type 'none'" + kubevirt #8733). A boot display keeps the Windows display
+# subsystem active so the hot-added GPU initializes and takes over the physical
+# monitor. In mode=off (cold-attach) the GPU IS present at boot, so video=none is
+# correct (the GPU is the only display via Looking Glass; no competing virtual
+# card). Best-effort: a missing list/mode file returns 1 (not live-attach-on).
+_vm_live_attach_mode_on() {
+  local _dom="$1"
+  [[ -n "$_dom" ]] || return 1
+  [[ -f "$LIVE_ATTACH_VM_LIST" ]] || return 1
+  grep -Fixq "$_dom" "$LIVE_ATTACH_VM_LIST" 2>/dev/null || return 1
+  [[ "$(_la_read_mode)" == "on" ]]
+}
+
 # R41: persist the live-attach mode. Writes the world-readable mode file AND
 # flips VFIO_LIVE_ATTACH_MODE in the conf (the conf key is the durable record;
 # the mode file is the fast-check the hook/tray read without root). $1=on|off.
@@ -16247,6 +16266,88 @@ sys.exit(0)
 PYEOF
 }
 
+# R44/live-attach: normalize spice to the LG input block (same as
+# _lg_set_vm_display_none) BUT ensure the VM KEEPS a boot display (virtio-gpu),
+# NEVER video=none. In live-attach mode=on the GPU is absent at boot, so
+# video=none leaves Windows headless and the hot-attached GPU's display silently
+# fails to initialize (black screen). A virtio-gpu boot display keeps the
+# Windows display subsystem active so the hot-added GPU initializes and takes
+# over the physical monitor; Looking Glass still captures the GPU via shmem.
+# Idempotent: exit 3 if spice is already the LG input block AND video is already
+# a boot display (not none). $1 = path to a temp file holding the VM dumpxml.
+_lg_set_vm_display_live_attach() {
+  local _xml_file="$1"
+  python3 - "$_xml_file" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+tree = ET.parse(path); root = tree.getroot()
+devices = root.find('devices')
+if devices is None:
+    sys.exit(1)
+changed = False
+# --- <video>: ensure a boot display (virtio-gpu), never none. ---
+video = devices.find('video')
+if video is None:
+    video = ET.SubElement(devices, 'video')
+    ET.SubElement(video, 'model', {'type': 'virtio', 'heads': '1', 'primary': 'yes'})
+    changed = True
+else:
+    model = video.find('model')
+    if model is None:
+        ET.SubElement(video, 'model', {'type': 'virtio', 'heads': '1', 'primary': 'yes'})
+        changed = True
+    else:
+        cur = model.get('type', '')
+        if cur == 'none':
+            # Flip none -> virtio (the live-attach boot display). Keep any other
+            # boot display the user chose (virtio/qxl/bochs/etc) as-is.
+            model.set('type', 'virtio')
+            model.set('heads', '1')
+            model.set('primary', 'yes')
+            for k in list(model.attrib):
+                if k not in ('type', 'heads', 'primary'):
+                    del model.attrib[k]
+            changed = True
+# --- <graphics>: normalize to the Looking Glass spice input block (same as
+# _lg_set_vm_display_none): port=-1, autoport=no, <listen type='address'/>,
+# <image compression='off'/> — a local 127.0.0.1 port for LG's PureSpice input. ---
+def _setattr(el, k, v):
+    if el.get(k) != v:
+        el.set(k, v); return True
+    return False
+graphics = devices.find('graphics')
+if graphics is None:
+    graphics = ET.SubElement(devices, 'graphics'); changed = True
+if _setattr(graphics, 'type', 'spice'): changed = True
+if _setattr(graphics, 'port', '-1'): changed = True
+if _setattr(graphics, 'autoport', 'no'): changed = True
+for _k in ('tlsPort', 'tlsport', 'passwd', 'passwdValidTo', 'defaultMode', 'listen', 'address'):
+    if _k in graphics.attrib:
+        del graphics.attrib[_k]; changed = True
+listen = graphics.find('listen')
+if listen is None:
+    ET.SubElement(graphics, 'listen', {'type': 'address'}); changed = True
+else:
+    if _setattr(listen, 'type', 'address'): changed = True
+    for _k in ('address', 'network', 'socket', 'from'):
+        if _k in listen.attrib:
+            del listen.attrib[_k]; changed = True
+    for _extra in graphics.findall('listen')[1:]:
+        graphics.remove(_extra); changed = True
+image = graphics.find('image')
+if image is None:
+    ET.SubElement(graphics, 'image', {'compression': 'off'}); changed = True
+else:
+    if _setattr(image, 'compression', 'off'): changed = True
+    for _extra in graphics.findall('image')[1:]:
+        graphics.remove(_extra); changed = True
+if not changed:
+    sys.exit(3)
+tree.write(path)
+sys.exit(0)
+PYEOF
+}
+
 # R40b: Restore the VM's <video> model to 'virtio' (undo the video=none that
 # Looking Glass setup applied). Leaves spice <listen type='none'/> in place
 # (local-only is safe to keep). Idempotent: exit 3 if not currently 'none'.
@@ -16318,12 +16419,17 @@ _lg_client_install_hints() {
   fi
 }
 
-# R42: Apply the Looking Glass VM-side setup (ivshmem shmem + video=none + the
-# LG spice input block) to ONE VM XML file. Used by install_live_attach so that
-# opting into hotplug auto-installs Looking Glass on BOTH the with-gpu (mode=off)
-# and without-gpu (mode=on) variants, persisting in the saved variant files (the
-# toggle virsh-defines them, so LG survives every on/off flip + a reboot). Best-
-# effort + idempotent (exit 3 from either patcher = already configured = success).
+# R42/R44: Apply the Looking Glass VM-side setup (ivshmem shmem + the LG spice
+# input block) to ONE VM XML file. Used by install_live_attach so opting into
+# hotplug auto-installs Looking Glass on the live VM XML (the device-diff safety
+# invariant preserves the shmem through later toggles). Best-effort + idempotent
+# (exit 3 from either patcher = already configured = success).
+# R44/live-attach: the VM display is a BOOT display (virtio-gpu), NOT video=none
+# — install_live_attach is inherently the live-attach path, where the GPU is
+# ABSENT at boot and hot-attached after Windows loads. video=none would leave
+# Windows headless and the hot-attached GPU's display silently fails to
+# initialize (black screen, confirmed empirically). _lg_set_vm_display_live_attach
+# normalizes the spice LG input block AND ensures a virtio-gpu boot display.
 # $1 = path to a VM XML file, $2 = shmem size MB (default LG_DEFAULT_SIZE).
 _lg_apply_to_vm() {
   local _file="$1" _size="${2:-$LG_DEFAULT_SIZE}"
@@ -16334,7 +16440,7 @@ _lg_apply_to_vm() {
   if (( _sh != 0 && _sh != 3 )); then
     note "WARN: Looking Glass shmem attach failed (python exit $_sh) for $_file; continuing."
   fi
-  _lg_set_vm_display_none "$_file" || _vd=$?
+  _lg_set_vm_display_live_attach "$_file" || _vd=$?
   if (( _vd != 0 && _vd != 3 )); then
     note "WARN: Looking Glass video/spice patch failed (python exit $_vd) for $_file; continuing."
   fi
@@ -16385,7 +16491,7 @@ install_looking_glass() {
   note "to the host with low latency via Looking Glass:"
   note "  - /dev/shm/looking-glass backing file (tmpfiles.d + perms + SELinux/AppArmor)"
   note "  - a <shmem name='looking-glass'> ivshmem-plain device attached to each shut-off guest-GPU VM"
-  note "  - <video> model set to 'none' (no virtual video card — the passed-through GPU is the display)"
+  note "  - <video> model: 'none' for cold-attach (GPU present at boot = the only display via LG); kept as a boot display (virtio-gpu) for live-attach mode=on (GPU absent at boot — video=none would leave Windows headless and the hot-attached GPU's display would silently fail -> black screen)"
   note "  - spice <graphics> set to the Looking Glass input block (<listen type='address'/> port=-1, image compression=off — local 127.0.0.1 port for LG's PureSpice input)"
   note "  - ~/.looking-glass-client.ini for $SUDO_USER (shmFile + spice + wayland)"
   note "  - optional ReBAR 64-bit MMIO on the VM (helps the GPU map large BARs)"
@@ -16443,12 +16549,23 @@ install_looking_glass() {
         note "WARN: ReBAR patching failed for '$_dom' (python exit $_rb_status); continuing without ReBAR."
       fi
     fi
-    # R40b: set video=none + spice local-only (the passed-through GPU is the
-    # only display via Looking Glass; spice stays as the input/audio channel
-    # but local-only so it is not network-exposed). Best-effort; exit 3 = already
-    # configured, exit 0 = patched, other = warn but continue.
+    # R44/live-attach + Looking Glass interaction: in live-attach mode=on the
+    # GPU is ABSENT at boot, so video=none leaves Windows headless and the
+    # hot-attached GPU's display silently fails to initialize (black screen,
+    # confirmed empirically + via Level1Techs "Guest won't boot with video type
+    # 'none'" + kubevirt #8733). Keep a boot display (virtio-gpu) so Windows'
+    # display subsystem is active when the GPU hot-attaches; the GPU then takes
+    # over the physical monitor. In mode=off (cold-attach) the GPU IS present at
+    # boot, so video=none is correct (the GPU is the only display via LG; no
+    # competing virtual card). Best-effort; exit 3 = already configured, exit 0
+    # = patched, other = warn but continue.
     local _vd_status=0
-    _lg_set_vm_display_none "$_tmp" || _vd_status=$?
+    if _vm_live_attach_mode_on "$_dom"; then
+      say "  VM '$_dom' is in live-attach mode=on — keeping a boot display (virtio-gpu) so the hot-attached GPU can initialize (video=none would leave Windows headless -> black screen)."
+      _lg_set_vm_display_live_attach "$_tmp" || _vd_status=$?
+    else
+      _lg_set_vm_display_none "$_tmp" || _vd_status=$?
+    fi
     if (( _vd_status != 0 && _vd_status != 3 )); then
       note "WARN: video/spice patching failed for '$_dom' (python exit $_vd_status); continuing."
     fi

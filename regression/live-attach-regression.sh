@@ -1656,10 +1656,22 @@ assert_contains_text \
   "R42 _lg_apply_to_vm attaches the shmem device" \
   '_lg_attach_shmem_to_vm "$_file" "$_size"' \
   "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+# R44/live-attach: _lg_apply_to_vm (the install_live_attach code path) now uses
+# _lg_set_vm_display_live_attach (a BOOT display, never video=none) instead of
+# _lg_set_vm_display_none. In live-attach mode=on the GPU is ABSENT at boot, so
+# video=none leaves Windows headless and the hot-attached GPU's display silently
+# fails to initialize (black screen, confirmed empirically). The old assertion
+# checked for video=none; it MUST now check for the live-attach display path.
 assert_contains_text \
-  "R42 _lg_apply_to_vm sets video=none + the LG spice block" \
-  '_lg_set_vm_display_none "$_file"' \
+  "R44 _lg_apply_to_vm sets a live-attach boot display (not video=none) + LG spice block" \
+  '_lg_set_vm_display_live_attach "$_file"' \
   "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+if printf '%s\n' "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")" | grep -Fq '_lg_set_vm_display_none'; then
+  printf 'FAIL: R44 _lg_apply_to_vm still uses _lg_set_vm_display_none (live-attach + video=none = black screen)\n' >&2
+  record_failure "R44 _lg_apply_to_vm uses live-attach display path (not video=none)"
+else
+  printf 'PASS: R44 _lg_apply_to_vm does NOT use _lg_set_vm_display_none (live-attach boot display)\n'
+fi
 assert_contains_text \
   "R42 _install_looking_glass_defaults writes the tmpfiles.d entry" \
   '_lg_write_tmpfiles' \

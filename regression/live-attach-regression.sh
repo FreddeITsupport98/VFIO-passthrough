@@ -267,10 +267,10 @@ assert_contains_text \
 # <rom> cannot produce a GOP framebuffer anyway (the vendor driver initializes
 # the hot-plugged display). Shipping a romless hot-attach matches the romless
 # cold-attach that already works.
-# R44/keep-addr: the call now takes a 3rd arg (the keep_guest_addr conf value)
-# so the helper KEEPS the fixed guest PCI address by default (hot-attach lands at
-# the same guest BDF as cold-attach -> Windows recognizes the device -> the AMD
-# driver binds instead of "no driver installed").
+# R44/keep-addr: the call now takes a 3rd arg (the keep_guest_addr conf value).
+# Default 0 = STRIP the fixed guest PCI address so libvirt auto-assigns a free
+# slot on hot-attach (the v7-proven behavior — v7 stripped and live-attach
+# worked). The earlier keep-by-default fix was a regression and is reverted.
 assert_contains_text \
   "R23 helper passes the GPU romfile path + keep_addr to _strip_guest_addr" \
   '_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr"' \
@@ -279,15 +279,18 @@ assert_contains_text \
   "R23 helper passes an empty rom path + keep_addr for the audio" \
   '_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr"' \
   "$helper_block"
-# R44/keep-addr: the helper MUST default to KEEPING the fixed guest PCI address
-# (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR default 1) so the hot-attached GPU lands at
-# the SAME guest BDF as cold-attach. Windows matches the AMD driver to the device
-# by PCI location; a different guest slot = a different Windows device path = the
-# driver does NOT bind -> "no driver installed" (Code 28). This was the root cause
-# of the hotplug "no driver installed" symptom.
+# R44/keep-addr REVERTED: the helper MUST default to STRIPPING the fixed guest
+# PCI address (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR default 0) so libvirt auto-
+# assigns a free guest slot on hot-attach. This is the v7-proven behavior: v7
+# stripped the guest address and live-attach worked, with the AMD driver binding
+# to the auto-assigned slot. An earlier fix inverted this to keep-by-default on
+# the theory that Windows needs the GPU at the cold-attach slot; that theory was
+# wrong (Windows binds the driver wherever the device appears) and the keep-
+# default caused collisions/reassignment -> Code 28. Reverted to strip-by-
+# default; keep is opt-IN (=1) for the rare collision case.
 assert_contains_text \
-  "R44 helper reads VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 1 = keep guest addr)" \
-  '_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-1}"' \
+  "R44 helper reads VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 0 = strip guest addr)" \
+  '_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-0}"' \
   "$helper_block"
 assert_contains_text \
   "R44 helper python reads keep_addr from argv" \
@@ -299,7 +302,7 @@ assert_contains_text \
   "$helper_block"
 # The OLD unconditional strip (a bare 'for a in list(hd.findall('address')):'
 # NOT inside the keep_addr guard) MUST be GONE — the strip must be INSIDE the
-# `if not keep_addr:` block so the default (keep) does NOT strip. Assert by line
+# `if not keep_addr:` block so the opt-IN (keep) does NOT strip. Assert by line
 # number: the strip line must come AFTER the `if not keep_addr:` guard line.
 _strip_line="$(grep -n "for a in list(hd.findall('address')):" <<<"$helper_block" | head -1 | cut -d: -f1)"
 _guard_line="$(grep -n 'if not keep_addr:' <<<"$helper_block" | head -1 | cut -d: -f1)"
@@ -383,9 +386,10 @@ assert_contains_file \
 # R44: install extracts the GPU (+ audio) hostdevs into per-domain FRAGMENTS
 # (profiles/<dom>/devices/*.xml) via the shared _la_extract_hostdev_fragment
 # helper — NOT the old inline python that wrote flat LIVE_ATTACH_GPU_XML +
-# full-domain with/without-gpu dumps. The fragment KEEPS the guest address
-# (the helper now keeps it at runtime too by default, so hot-attach lands at the
-# same guest BDF as cold-attach -> Windows recognizes the device -> driver binds).
+# full-domain with/without-gpu dumps. The fragment KEEPS the guest address in
+# the on-disk file (so the toggle/define path has the original slot); the live-
+# attach helper STRIPS it at runtime by default (v7-proven) so libvirt auto-
+# assigns a free slot on hot-attach.
 assert_contains_file \
   "R44 _la_extract_hostdev_fragment helper defined" \
   '_la_extract_hostdev_fragment() {' \

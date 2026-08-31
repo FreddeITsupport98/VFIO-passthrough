@@ -10753,16 +10753,18 @@ def _strip(hd):
     # hot-attach time without needing to re-extract.
     if hd.find('driver') is None:
         hd.insert(0, ET.Element('driver', {'name': 'vfio'}))
-    # R44: KEEP the fixed guest <address type='pci'> by default so the hot-
-    # attached GPU lands at the SAME guest BDF as cold-attach. Windows matches
-    # the AMD driver to the device by PCI location (Bus/Device/Function); a
-    # different guest slot = a different Windows device path = the driver does
-    # NOT bind -> Device Manager shows "no driver installed" (Code 28). Only
-    # strip the guest address when the operator opted out
-    # (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=0) because the GPU's guest slot
-    # collides with another device in the running VM (the original collision
-    # case that the strip was added for). On a VM with a dedicated pcie-root-
-    # port for the GPU, the slot is free in mode=on -> no collision -> keep.
+    # R44: STRIP the fixed guest <address type='pci'> by DEFAULT so libvirt
+    # AUTO-assigns a free guest slot on hot-attach. This is the v7-proven
+    # behavior: v7 stripped the guest address and live-attach worked, with the
+    # AMD driver binding to the auto-assigned slot. An earlier fix (keep-guest-
+    # address) inverted this on the theory that Windows needs the GPU at the
+    # SAME guest BDF as cold-attach for the driver to bind; that theory was WRONG
+    # — Windows binds the AMD driver to the device wherever it appears, and
+    # pinning the hot-attach to the cold-attach slot caused collisions with the
+    # virtio-gpu boot display / reassignment -> Code 28 "no driver installed".
+    # Reverted to strip-by-default. OPT-IN to keep with
+    # VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=1 only for the rare case where the
+    # auto-assigned slot clashes with another device in the running VM.
     if not keep_addr:
         for a in list(hd.findall('address')):
             if a.get('type') == 'pci': hd.remove(a)
@@ -10817,10 +10819,15 @@ _notify_desktop() {
 # R44: compute the GPU romfile path + the device fragments NOW that the conf
 # has been sourced (GUEST_GPU_BDF is defined here; referencing it before this
 # point crashes under `set -u`). Audio gets no romfile (empty 2nd arg). The 3rd
-# arg is VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 1 = keep the fixed guest PCI
-# address so hot-attach lands at the same guest BDF as cold-attach -> Windows
-# recognizes the device -> the AMD driver binds instead of "no driver installed").
-_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-1}"
+# arg is VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 0 = STRIP the fixed guest PCI
+# address so libvirt auto-assigns a free slot on hot-attach — the v7-proven
+# behavior; v7 stripped the guest address and live-attach worked, binding the
+# AMD driver to the auto-assigned slot. An earlier fix inverted this to keep the
+# cold-attach slot on the theory that Windows needs the GPU at the same PCI
+# location; that theory was wrong and broke hot-attach -> Code 28. Opt-IN to
+# keep with VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=1 only for the rare collision case
+# where the auto-assigned slot clashes with another device).
+_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-0}"
 _GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"
 GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr")"
 AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr")"

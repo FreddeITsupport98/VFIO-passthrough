@@ -274,6 +274,18 @@ assert_contains_text \
   "R23 helper resolves the GPU romfile path from the GPU BDF (live-<BDF>.rom)" \
   '_GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"' \
   "$helper_block"
+# R44/set -u fix: _GPU_ROM references GUEST_GPU_BDF which is unbound until the
+# conf is sourced. If _GPU_ROM= appears BEFORE `. "$CONF_FILE"` in the helper,
+# set -u crashes the helper at launch (no GPU attaches -> silent fail). Assert
+# the _GPU_ROM line comes AFTER the conf source line.
+_rom_line="$(grep -n '_GPU_ROM="' <<<"$helper_block" | head -1 | cut -d: -f1)"
+_conf_line="$(grep -n '^\. "\$CONF_FILE"' <<<"$helper_block" | head -1 | cut -d: -f1)"
+if [[ -n "$_rom_line" && -n "$_conf_line" && "$_rom_line" -gt "$_conf_line" ]]; then
+  printf 'PASS: R44 helper sets _GPU_ROM after . "$CONF_FILE" (no set -u crash)\n'
+else
+  printf 'FAIL: R44 helper sets _GPU_ROM before . "$CONF_FILE" (set -u crash on unbound GUEST_GPU_BDF)\n' >&2
+  record_failure "R44 helper _GPU_ROM placement crashes under set -u"
+fi
 assert_contains_text \
   "R23 helper python injects <rom> when the fragment has no rom but the romfile exists" \
   "elif rom is None and rom_path and os.path.isfile(rom_path):" \

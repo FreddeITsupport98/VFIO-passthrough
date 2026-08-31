@@ -10687,8 +10687,10 @@ _PROF_AUDIO="/var/lib/vfio-dynamic/profiles/$DOMAIN/devices/gpu-audio.xml"
 # R44: the expected vBIOS romfile path for the GPU (VBIOS_RUNTIME_DIR/live-<BDF>.rom,
 # mirroring install_vbios_romfile's live-ROM fallback naming). Injected into the
 # GPU fragment below when the fragment has no <rom> but this file exists.
+# NOTE: _GPU_ROM is set AFTER `. "$CONF_FILE"` below — GUEST_GPU_BDF comes from
+# the conf, and `set -u` makes referencing it here (before the source) a fatal
+# crash that kills the helper at launch (no GPU attaches -> silent fail).
 _VBIOS_DIR="/var/lib/libvirt/vbios"
-_GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"
 _LA_TMP=()
 _la_cleanup() { [[ ${#_LA_TMP[@]} -gt 0 ]] && rm -f "${_LA_TMP[@]}" 2>/dev/null || true; }
 trap _la_cleanup EXIT
@@ -10749,9 +10751,6 @@ STRIPYEOF
     printf '%s' "$_src"; return 0
   fi
 }
-GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM")"
-AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "")"
-
 jlog() { command -v logger >/dev/null 2>&1 && logger -t vfio-live-attach -- "$*" 2>/dev/null || true; }
 
 # Best-effort desktop notification (never fatal). This helper runs as root under
@@ -10780,6 +10779,12 @@ _notify_desktop() {
 # shellcheck disable=SC1090
 . "$CONF_FILE"
 [[ -x "$BIND_SCRIPT" ]] || { jlog "live-attach: $BIND_SCRIPT missing"; exit 0; }
+# R44: compute the GPU romfile path + stripped device fragments NOW that the conf
+# has been sourced (GUEST_GPU_BDF is defined here; referencing it before this
+# point crashes under `set -u`). Audio gets no romfile (empty 2nd arg).
+_GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"
+GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM")"
+AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "")"
 
 # Wait for Windows userspace to be ready before binding + hot-attaching the GPU.
 # Smart path: poll the qemu guest agent (guest-ping) — when it responds, Windows

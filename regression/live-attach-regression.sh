@@ -349,6 +349,41 @@ else
   printf 'FAIL: R44 <driver name=vfio/> injection missing (expected >=2, got %s)\n' "$_vfio_driver_inject_count" >&2
   record_failure "R44 driver=vfio injected in both extractor + helper"
 fi
+# R44/RDNA4: the helper MUST resize BAR2 to 8MB (resource2_resize=3) + lock D0
+# (d3cold_allowed=0) + unbind amdgpu BEFORE vfio-pci binding, or the RX 9070 XT /
+# Navi 48 Windows AMD driver throws Code 43/28 ("no driver installed"). Gated on
+# VFIO_LIVE_ATTACH_BAR2_RESIZE (default 1) and AMD vendor (0x1002). Proven RDNA4
+# bind sequence from the PhialsBasement RX 9070 XT CachyOS guide.
+assert_contains_text \
+  "R44 helper resizes BAR2 to 8MB before vfio-pci bind (RDNA4)" \
+  'resource2_resize' \
+  "$helper_block"
+assert_contains_text \
+  "R44 helper locks D0 before amdgpu unbind (RDNA4 D3cold guard)" \
+  'd3cold_allowed' \
+  "$helper_block"
+assert_contains_text \
+  "R44 helper unbinds amdgpu by BDF before BAR2 resize (RDNA4)" \
+  'drivers/$_g_drv/unbind' \
+  "$helper_block"
+assert_contains_text \
+  "R44 helper BAR2 resize is gated on the VFIO_LIVE_ATTACH_BAR2_RESIZE conf key" \
+  'VFIO_LIVE_ATTACH_BAR2_RESIZE' \
+  "$helper_block"
+assert_contains_text \
+  "R44 helper BAR2 resize is AMD-only (vendor 0x1002 guard)" \
+  '0x1002' \
+  "$helper_block"
+# The BAR2 resize MUST come BEFORE the --bind-now call (the resize must happen
+# while the card is driverless, between amdgpu-unbind and vfio-pci-bind).
+_bar2_line="$(grep -n 'resource2_resize' <<<"$helper_block" | head -1 | cut -d: -f1)"
+_bind_line="$(grep -n '"\$BIND_SCRIPT" --bind-now' <<<"$helper_block" | head -1 | cut -d: -f1)"
+if [[ -n "$_bar2_line" && -n "$_bind_line" && "$_bar2_line" -lt "$_bind_line" ]]; then
+  printf 'PASS: R44 helper BAR2 resize comes before --bind-now (line %d < %d)\n' "$_bar2_line" "$_bind_line"
+else
+  printf 'FAIL: R44 helper BAR2 resize does NOT come before --bind-now (bar2=%s bind=%s)\n' "$_bar2_line" "$_bind_line" >&2
+  record_failure "R44 helper BAR2 resize comes before --bind-now"
+fi
 assert_contains_file \
   "R44 install_live_attach recognizes each VM (writes the manifest)" \
   'profile_recognize "$_dom"' \

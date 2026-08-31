@@ -10828,6 +10828,58 @@ if (( ! _ready )); then
   jlog "live-attach: guest agent did not respond within ${DELAY}s — proceeding with bind (install the virtio-win guest agent inside Windows for a faster handoff)"
 fi
 
+# Step 0 (RDNA4/Navi 48): lock the GPU in D0, unbind amdgpu, and resize BAR2 to
+# 8MB BEFORE vfio-pci binding. The RX 9070 XT / Navi 48 Windows AMD driver throws
+# Code 43 (and on some setups Code 28 "no driver installed") if BAR2 is not resized
+# to 8MB before vfio-pci takes ownership. The card MUST also be locked in D0
+# (d3cold_allowed=0) before unbinding amdgpu, or the kernel drops it into D3cold
+# during the driverless window and vfio-pci reads 0xFFFF config space ("stuck in D3"
+# / config space all 0xff -> Windows sees a dead device -> "no driver installed").
+# This is the proven RDNA4 bind sequence from the PhialsBasement RX 9070 XT CachyOS
+# guide. Gated on VFIO_LIVE_ATTACH_BAR2_RESIZE (default 1) and AMD vendor (0x1002) so
+# non-AMD GPUs skip it. Best-effort: a missing resource2_resize sysfs file (older
+# kernels) just logs and continues — the bind still proceeds via --bind-now below.
+# --bind-now will find the card already unbound from amdgpu and just do the vfio-pci
+# bind part (its unbind is a no-op on an already-unbound card).
+if [[ "${VFIO_LIVE_ATTACH_BAR2_RESIZE:-1}" == "1" ]]; then
+  _g_vendor=""
+  if [[ -r "/sys/bus/pci/devices/$GUEST_GPU_BDF/vendor" ]]; then
+    read -r _g_vendor <"/sys/bus/pci/devices/$GUEST_GPU_BDF/vendor" 2>/dev/null || true
+  fi
+  if [[ "$_g_vendor" == "0x1002" ]]; then
+    jlog "live-attach: AMD GPU detected — locking D0 + unbinding amdgpu + resizing BAR2 to 8MB (RDNA4/Navi 48 requirement)"
+    # Lock D0 before unbinding amdgpu (prevents D3cold during the driverless window).
+    echo 0 >"/sys/bus/pci/devices/$GUEST_GPU_BDF/d3cold_allowed" 2>/dev/null || true
+    echo on >"/sys/bus/pci/devices/$GUEST_GPU_BDF/power/control" 2>/dev/null || true
+    # Unbind amdgpu by BDF (the by-address unbind is the proven path; modprobe -r
+    # amdgpu would kill the host iGPU too on A+A setups). Best-effort: if amdgpu is
+    # already unbound (a re-run, or dynamic binding already parked it on vfio-pci),
+    # the unbind write is a no-op.
+    if [[ -L "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" ]]; then
+      _g_drv="$(basename "$(readlink "/sys/bus/pci/devices/$GUEST_GPU_BDF/driver" 2>/dev/null)" 2>/dev/null || echo "")"
+      if [[ -n "$_g_drv" && -w "/sys/bus/pci/drivers/$_g_drv/unbind" ]]; then
+        echo "$GUEST_GPU_BDF" >"/sys/bus/pci/drivers/$_g_drv/unbind" 2>/dev/null || true
+        sleep 1
+        jlog "live-attach: unbound $GUEST_GPU_BDF from $_g_drv"
+      fi
+    fi
+    # Resize BAR2 to 8MB (resource2_resize=3 -> 8MB). The Windows AMD driver chokes
+    # on BAR2 > 8MB and throws Code 43/28. Best-effort: older kernels without this
+    # sysfs file just log and continue.
+    if [[ -w "/sys/bus/pci/devices/$GUEST_GPU_BDF/resource2_resize" ]]; then
+      if echo 3 >"/sys/bus/pci/devices/$GUEST_GPU_BDF/resource2_resize" 2>/dev/null; then
+        jlog "live-attach: BAR2 resized to 8MB (resource2_resize=3) for $GUEST_GPU_BDF"
+      else
+        jlog "live-attach: WARN BAR2 resize write failed for $GUEST_GPU_BDF (non-fatal; continuing)"
+      fi
+    else
+      jlog "live-attach: WARN resource2_resize sysfs file missing for $GUEST_GPU_BDF (older kernel? non-fatal; continuing without BAR2 resize)"
+    fi
+  else
+    jlog "live-attach: GPU vendor $_g_vendor is not AMD (0x1002) — skipping BAR2 resize (RDNA4-only step)"
+  fi
+fi
+
 # Step 1: bind the GPU to vfio-pci (same as the normal prepare hook does).
 # Capture the full output so a failure surfaces the REAL cause in the journal
 # (a swallowed stderr left us blind to a bind-script bug for an entire session).

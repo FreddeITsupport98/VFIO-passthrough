@@ -11267,6 +11267,35 @@ PYEOF
   return "$_rc"
 }
 
+# R44/live-attach: echo the GUEST PCI bus ("0xNN") from a device fragment's
+# direct-child <address type='pci' bus='0xNN' .../> (the guest slot, NOT the
+# <source> host BDF). Empty if absent/unreadable. Used by install_live_attach
+# and install_looking_glass to populate VFIO_LA_RESERVED_GUEST_BUSES so
+# _lg_set_vm_display_live_attach pins the virtio-gpu boot display OFF the
+# GPU/audio reserved guest buses (the root-cause fix for hotplug "no driver
+# installed" / Code 28: without the pin, libvirt auto-places the boot display
+# on the GPU's freed root-port at boot and the later GPU hot-attach collides
+# -> Windows sees a new device -> the AMD driver does not start). $1 = fragment.
+_la_fragment_guest_bus() {
+  local _f="$1"
+  [[ -r "$_f" ]] || { echo ""; return 0; }
+  python3 - "$_f" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    sys.exit(0)
+hd = root if root.tag == 'hostdev' else root.find('hostdev')
+if hd is not None:
+    for a in hd.findall('address'):
+        if a.get('type') == 'pci':
+            b = a.get('bus')
+            if b:
+                print(b)
+                break
+PYEOF
+}
+
 # R44: stable fingerprint of every <devices> child EXCEPT PCI hostdevs whose
 # <source> BDF is in the exclude list ($1 = comma-separated BDFs). The toggle
 # only adds/removes the GPU/audio hostdevs, so the signature of everything ELSE
@@ -12492,7 +12521,28 @@ GAPYEOF
     fi
     # Looking Glass (best-effort, idempotent): apply to the working copy so the
     # live VM carries the shmem regardless of mode; survives toggles.
+    # R44/live-attach: reserve the GPU + audio GUEST buses (read from the
+    # just-saved device fragments) so _lg_set_vm_display_live_attach pins the
+    # virtio-gpu boot display to a DIFFERENT root-port. Without this, libvirt
+    # auto-places the boot display on the GPU's freed root-port (bus 0x06) at
+    # boot (mode=on strips the GPU), and the later GPU hot-attach at bus 0x06
+    # (keep-guest-address) collides -> libvirt reassigns the GPU to another bus
+    # -> Windows sees a NEW device -> "no driver installed" (Code 28). Passed
+    # through the VFIO_LA_RESERVED_GUEST_BUSES env var (comma-sep "0xNN").
+    local _rgb_gpu _rgb_audio _rgb_save _rgb_val
+    _rgb_gpu="$(_la_fragment_guest_bus "$_pdir/devices/gpu.xml")"
+    _rgb_audio="$(_la_fragment_guest_bus "$_pdir/devices/gpu-audio.xml")"
+    _rgb_save="${VFIO_LA_RESERVED_GUEST_BUSES:-}"
+    if [[ -n "$_rgb_gpu" || -n "$_rgb_audio" ]]; then
+      _rgb_val="$(printf '%s,%s' "$_rgb_gpu" "$_rgb_audio" | sed -E 's/^,//; s/,$//')"
+      export VFIO_LA_RESERVED_GUEST_BUSES="$_rgb_val"
+    fi
     _lg_apply_to_vm "$_tmp_vm" "$LG_DEFAULT_SIZE" 2>/dev/null || true
+    if [[ -n "$_rgb_save" ]]; then
+      export VFIO_LA_RESERVED_GUEST_BUSES="$_rgb_save"
+    else
+      unset VFIO_LA_RESERVED_GUEST_BUSES
+    fi
     if virt-xml-validate "$_tmp_vm" 2>/dev/null; then
       if (( ! DRY_RUN )); then
         virsh -c qemu:///system define "$_tmp_vm" 2>/dev/null || note "WARN: virsh define (GA+LG) failed for '$_dom'; continuing with the live XML as-is."
@@ -16463,8 +16513,75 @@ else:
                 if k not in ('type', 'heads', 'primary'):
                     del model.attrib[k]
             changed = True
+# --- Pin the virtio-gpu boot display to a free pcie-root-port whose bus is
+# NOT the GPU's or audio's reserved guest bus. ROOT CAUSE of hotplug "no driver
+# installed" (Code 28) on a primed VM: in mode=on the GPU hostdev is stripped,
+# so its pcie-root-port (e.g. bus 0x06) is FREE at boot; libvirt auto-places
+# the virtio-gpu boot display there, and the later GPU hot-attach (which keeps
+# its fixed guest address 0x06 via VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR) collides
+# -> libvirt reassigns the GPU to a different bus -> Windows sees a NEW device
+# instance -> the AMD driver (bound to the 0x06 instance from cold-attach) does
+# NOT start -> Device Manager "no driver installed" (Code 28). Pinning the boot
+# display to a different root-port leaves bus 0x06 free for the GPU hot-attach.
+# Reserved buses: VFIO_LA_RESERVED_GUEST_BUSES env (comma-sep "0xNN", set by
+# install_live_attach / install_looking_glass from the gpu/audio fragment guest
+# addresses) UNION the buses of PCI hostdevs still in this XML. A pcie-root-
+# port's child bus = its index in hex (standard libvirt q35 allocation). Pick
+# the smallest-index free, non-reserved root-port and pin <video> there. If none
+# found, leave the video unpinned (legacy behavior) — a wrong pin fails virt-
+# xml-validate and the caller falls back to the unpatched XML, so this is safe.
+import os
+_reserved = set()
+for _b in (os.environ.get('VFIO_LA_RESERVED_GUEST_BUSES') or '').split(','):
+    _b = _b.strip().lower()
+    if _b:
+        _reserved.add(_b)
+for _hd in devices.findall('hostdev'):
+    if _hd.get('type') != 'pci':
+        continue
+    for _a in _hd.findall('address'):
+        if _a.get('type') == 'pci':
+            _b = (_a.get('bus') or '').lower()
+            if _b:
+                _reserved.add(_b)
+_in_use = set()
+for _d in list(devices):
+    if _d is video:
+        continue
+    _a = _d.find('address')
+    if _a is not None and _a.get('type') == 'pci':
+        _b = (_a.get('bus') or '').lower()
+        if _b:
+            _in_use.add(_b)
+def _child_bus(idx):
+    try:
+        return "0x%02x" % int(idx)
+    except Exception:
+        return None
+_cands = []
+for _c in devices.findall('controller'):
+    if _c.get('type') == 'pci' and _c.get('model') == 'pcie-root-port':
+        _cb = _child_bus(_c.get('index', ''))
+        if _cb and _cb not in _reserved and _cb not in _in_use:
+            _cands.append((int(_c.get('index', '0') or 0), _cb))
+if _cands:
+    _cands.sort()
+    _pin = _cands[0][1]
+    _va = video.find('address')
+    if _va is None:
+        ET.SubElement(video, 'address', {'type': 'pci', 'domain': '0x0000', 'bus': _pin, 'slot': '0x00', 'function': '0x0'})
+        changed = True
+    elif (_va.get('bus') or '').lower() != _pin:
+        for _k in list(_va.attrib):
+            del _va.attrib[_k]
+        _va.set('type', 'pci')
+        _va.set('domain', '0x0000')
+        _va.set('bus', _pin)
+        _va.set('slot', '0x00')
+        _va.set('function', '0x0')
+        changed = True
 # --- <graphics>: normalize to the Looking Glass spice input block (same as
-# _lg_set_vm_display_none): port=-1, autoport=no, <listen type='address'/>,
+# _lg_set_vm_display_none) BUT ensure the VM KEEPS a boot display (virtio-gpu),
 # <image compression='off'/> — a local 127.0.0.1 port for LG's PureSpice input. ---
 def _setattr(el, k, v):
     if el.get(k) != v:
@@ -16716,8 +16833,24 @@ install_looking_glass() {
     # = patched, other = warn but continue.
     local _vd_status=0
     if _vm_live_attach_mode_on "$_dom"; then
+      # R44/live-attach: reserve the GPU + audio guest buses (from the profile
+      # fragments) so the virtio-gpu boot display is pinned OFF those slots
+      # (root-cause fix for hotplug "no driver installed" / Code 28).
+      local _rgb_gpu _rgb_audio _rgb_save _rgb_val
+      _rgb_gpu="$(_la_fragment_guest_bus "$(_la_profile_dir "$_dom")/devices/gpu.xml")"
+      _rgb_audio="$(_la_fragment_guest_bus "$(_la_profile_dir "$_dom")/devices/gpu-audio.xml")"
+      _rgb_save="${VFIO_LA_RESERVED_GUEST_BUSES:-}"
+      if [[ -n "$_rgb_gpu" || -n "$_rgb_audio" ]]; then
+        _rgb_val="$(printf '%s,%s' "$_rgb_gpu" "$_rgb_audio" | sed -E 's/^,//; s/,$//')"
+        export VFIO_LA_RESERVED_GUEST_BUSES="$_rgb_val"
+      fi
       say "  VM '$_dom' is in live-attach mode=on — keeping a boot display (virtio-gpu) so the hot-attached GPU can initialize (video=none would leave Windows headless -> black screen)."
       _lg_set_vm_display_live_attach "$_tmp" || _vd_status=$?
+      if [[ -n "$_rgb_save" ]]; then
+        export VFIO_LA_RESERVED_GUEST_BUSES="$_rgb_save"
+      else
+        unset VFIO_LA_RESERVED_GUEST_BUSES
+      fi
     else
       _lg_set_vm_display_none "$_tmp" || _vd_status=$?
     fi

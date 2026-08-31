@@ -501,7 +501,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R44 install_live_attach prompts to shut off a running chosen VM (virsh destroy)" \
-  "virsh -c qemu:///system destroy \"$_dom\"" \
+  'virsh -c qemu:///system destroy "$_dom"' \
   "$VFIO_SCRIPT"
 # The OLD silent-skip behavior (a bare WARN + continue with no shut-off prompt)
 # MUST be GONE for the running-VM case — the user should be offered a shut-off.

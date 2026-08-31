@@ -485,6 +485,51 @@ if command -v virt-xml-validate >/dev/null 2>&1; then
   fi
 fi
 
+# --- Run 5: boot-display pin OFF the GPU/audio reserved guest buses ---
+# _lg_set_vm_display_live_attach MUST pin the virtio-gpu boot display to a free
+# pcie-root-port whose bus is NOT the GPU's (0x06) or audio's (0x07) reserved
+# guest bus (VFIO_LA_RESERVED_GUEST_BUSES). Otherwise libvirt auto-places the
+# boot display on the GPU's freed root-port at boot (mode=on strips the GPU)
+# and the later GPU hot-attach (keep-guest-address 0x06) collides -> libvirt
+# reassigns the GPU to another bus -> Windows sees a new device -> Code 28
+# "no driver installed". Root-cause fix for the hotplug "no driver installed"
+# symptom on a primed VM.
+mock_la_pin="$tmp_dir/mock_la_pin.xml"
+cat >"$mock_la_pin" <<'XEOF'
+<domain type="kvm">
+  <name>win11</name>
+  <memory unit="KiB">8388608</memory>
+  <vcpu placement="static">4</vcpu>
+  <devices>
+    <controller type="pci" index="5" model="pcie-root-port"/>
+    <controller type="pci" index="6" model="pcie-root-port"/>
+    <controller type="pci" index="7" model="pcie-root-port"/>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x0"/></source>
+      <address type="pci" domain="0x0000" bus="0x06" slot="0x00" function="0x0"/>
+    </hostdev>
+    <hostdev mode="subsystem" type="pci" managed="yes">
+      <source><address domain="0x0000" bus="0x0e" slot="0x00" function="0x1"/></source>
+      <address type="pci" domain="0x0000" bus="0x07" slot="0x00" function="0x0"/>
+    </hostdev>
+    <graphics type="spice">
+      <listen type="address" address="127.0.0.1"/>
+    </graphics>
+    <video>
+      <model type="none"/>
+    </video>
+  </devices>
+</domain>
+XEOF
+la5="$tmp_dir/la5.xml"
+cp "$mock_la_pin" "$la5"
+set +e
+VFIO_LA_RESERVED_GUEST_BUSES="0x06,0x07" python3 - "$la5" <"$lg_display_la_py" >/dev/null 2>&1
+rc_la5=$?
+set -e
+assert_eq "live-attach display patcher exit 0 on pin run (video=none -> virtio + pin)" "0" "$rc_la5"
+assert_contains_file "live-attach boot display pinned off GPU/audio bus (to 0x05)" 'bus="0x05"' "$la5"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

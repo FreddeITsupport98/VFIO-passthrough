@@ -12355,17 +12355,71 @@ install_live_attach() {
   # (profiles/<dom>/devices/) and the manifest is derived from recognition.
   local _dom _xml _state _found=0 _gpu_bdf="$GUEST_GPU_BDF"
 
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
+  # R44/VM-choice: detect existing guest-GPU VMs (shut off OR running) and let
+  # the user pick which one to set up for live-attach, so they don't have to re-run
+  # the installer to get their VM attached. If a chosen VM is running, prompt to
+  # shut it off (virsh destroy) instead of silently skipping — the original
+  # behavior forced a re-run whenever the VM was up, which was the user's pain
+  # point ("i dont have to re run installer so thier vm is attached").
+  local _la_dom _la_xml _la_state
+  local -a _la_candidate_vms=() _la_candidate_states=() _la_target_vms=()
+  while IFS= read -r _la_dom; do
+    [[ -n "$_la_dom" ]] || continue
+    _la_xml="$(virsh -c qemu:///system dumpxml --inactive "$_la_dom" 2>/dev/null || true)"
+    [[ -n "$_la_xml" ]] || continue
     # Guest-GPU VM by current rules (BDF in XML OR in the live-attach VM list —
     # live-attach strips the GPU hostdev, so a stripped VM still qualifies).
-    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+    _vm_is_guest_gpu_vm "$_la_dom" "$_la_xml" || continue
+    _la_state="$(LC_ALL=C virsh -c qemu:///system domstate "$_la_dom" 2>/dev/null || echo "")"
+    _la_candidate_vms+=("$_la_dom")
+    _la_candidate_states+=("$_la_state")
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+
+  if (( ${#_la_candidate_vms[@]} == 0 )); then
+    : # no guest-GPU VM found; fall through to the existing "no shut-off VMs
+      # found" / idempotency path below (_found stays 0).
+  elif (( ${#_la_candidate_vms[@]} == 1 )); then
+    _la_target_vms=("${_la_candidate_vms[@]}")
+    say "Found 1 guest-GPU VM: '${_la_candidate_vms[0]}' (state: ${_la_candidate_states[0]})."
+  else
+    say "Found ${#_la_candidate_vms[@]} guest-GPU VMs. Pick which one to set up for live-attach (hotplug)."
+    local -a _la_opts=() _i
+    for _i in "${!_la_candidate_vms[@]}"; do
+      _la_opts+=("VM '${_la_candidate_vms[$_i]}' (state: ${_la_candidate_states[$_i]})")
+    done
+    local _picked
+    _picked="$(select_from_list "Which VM should be set up for live-attach (hotplug)?" "Pick guest-GPU VM" "${_la_opts[@]}")" || die "Selection cancelled."
+    _la_target_vms=("${_la_candidate_vms[$_picked]}")
+  fi
+
+  # Process each chosen target VM. If a target is running, prompt to shut it
+  # off (virsh destroy) so setup can continue — instead of silently skipping
+  # and forcing a re-run.
+  for _dom in "${_la_target_vms[@]}"; do
+    _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
-      note "WARN: VM '$_dom' is '$_state' (not shut off); skipping. Shut it off and re-run."
-      continue
+      note "VM '$_dom' is '$_state' (not shut off)."
+      if prompt_yn "Shut it off now so live-attach setup can continue? (virsh destroy '$_dom')" Y "Live-attach VM setup"; then
+        if virsh -c qemu:///system destroy "$_dom" >/dev/null 2>&1; then
+          say "  Shut off '$_dom'."
+          sleep 1
+          _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
+          if [[ "$_state" != "shut off" ]]; then
+            note "WARN: '$_dom' still not shut off after virsh destroy; skipping. Shut it off manually and re-run."
+            continue
+          fi
+          # Re-dump the XML after shutdown so the per-VM setup sees the shut-off state.
+          _xml="$(virsh -c qemu:///system dumpxml --inactive "$_dom" 2>/dev/null || true)"
+        else
+          note "WARN: could not shut off '$_dom' (virsh destroy failed); skipping. Shut it off manually and re-run."
+          continue
+        fi
+      else
+        note "Skipping '$_dom' for now. Shut it off and re-run: sudo $SCRIPT_NAME --install-live-attach"
+        continue
+      fi
     fi
     _found=1
     local _pdir _has_gpu_now=0 _abdf _tmp_vm _ga_rc
@@ -12482,7 +12536,7 @@ GAPYEOF
       grep -Fixq "$_dom" "$LIVE_ATTACH_VM_LIST" 2>/dev/null || printf '%s\n' "$_dom" >>"$LIVE_ATTACH_VM_LIST"
     fi
     say "  Added '$_dom' to live-attach VM list"
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done
 
   if (( ! _found )); then
     # Idempotency: a re-run on an ALREADY-active live-attach setup (e.g. the

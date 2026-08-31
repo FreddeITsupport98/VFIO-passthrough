@@ -486,6 +486,31 @@ assert_contains_text \
   "R23 install_live_attach calls install_bind_script (helper uses --bind-now)" \
   'install_bind_script' \
   "$_la_fn"
+# R44/VM-choice: install_live_attach MUST detect existing guest-GPU VMs (shut
+# off OR running), let the user pick which one to set up when there is more than
+# one (select_from_list), and prompt to shut off a running chosen VM (virsh
+# destroy) instead of silently skipping — so the user doesn't have to re-run the
+# installer to get their VM attached.
+assert_contains_file \
+  "R44 install_live_attach detects guest-GPU VMs into a candidate array" \
+  '_la_candidate_vms+=("$_la_dom")' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R44 install_live_attach lets the user pick which VM when >1 candidate" \
+  'select_from_list "Which VM should be set up for live-attach (hotplug)?"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R44 install_live_attach prompts to shut off a running chosen VM (virsh destroy)" \
+  "virsh -c qemu:///system destroy \"$_dom\"" \
+  "$VFIO_SCRIPT"
+# The OLD silent-skip behavior (a bare WARN + continue with no shut-off prompt)
+# MUST be GONE for the running-VM case — the user should be offered a shut-off.
+if printf '%s\n' "$_la_fn" | grep -Fq 'not shut off); skipping. Shut it off and re-run.'; then
+  printf 'FAIL: R44 install_live_attach still silently skips running VMs (no shut-off prompt)\n' >&2
+  record_failure "R44 install_live_attach prompts to shut off running VMs (no silent skip)"
+else
+  printf 'PASS: R44 install_live_attach does NOT silently skip running VMs (offers shut-off prompt)\n'
+fi
 assert_contains_file \
   "R23 install_live_attach regenerates the bind script" \
   'Regenerated $BIND_SCRIPT (bind logic for the live-attach helper)' \

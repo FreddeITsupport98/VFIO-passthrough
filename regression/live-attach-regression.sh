@@ -257,11 +257,16 @@ assert_contains_text \
   "R23 helper hot-attaches the GPU AFTER the audio (IOMMU group ownership fix)" \
   '_hot_attach_one "GPU" "$GPU_XML" "GPU"' \
   "$helper_block"
-# R44/rom-inject fix: the helper MUST pass the expected vBIOS romfile path to
-# _strip_guest_addr for the GPU so the python can INJECT a <rom file='...'/> when
-# the fragment has no <rom> but the romfile exists (cold-attach carries the rom so
-# OVMF reads the UEFI GOP at boot; hot-attach was shipping a romless GPU
-# -> Windows had no firmware display driver -> silent display-init failure).
+# R44/rom-strip: the helper MUST pass the expected vBIOS romfile path to
+# _strip_guest_addr for the GPU so the python can STRIP a stale <rom file='...'/>
+# when the referenced romfile is MISSING on disk (virsh attach-device --live
+# otherwise fails with "failed to find romfile"). The helper does NOT inject a
+# <rom> when the fragment has none — cold-attach works WITHOUT a <rom> line
+# (vfio reads the card's own ROM from /sys/.../rom at boot and OVMF runs it for
+# the GOP framebuffer), and on hot-attach OVMF is already done so an injected
+# <rom> cannot produce a GOP framebuffer anyway (the vendor driver initializes
+# the hot-plugged display). Shipping a romless hot-attach matches the romless
+# cold-attach that already works.
 # R44/keep-addr: the call now takes a 3rd arg (the keep_guest_addr conf value)
 # so the helper KEEPS the fixed guest PCI address by default (hot-attach lands at
 # the same guest BDF as cold-attach -> Windows recognizes the device -> the AMD
@@ -320,10 +325,28 @@ else
   printf 'FAIL: R44 helper sets _GPU_ROM before . "$CONF_FILE" (set -u crash on unbound GUEST_GPU_BDF)\n' >&2
   record_failure "R44 helper _GPU_ROM placement crashes under set -u"
 fi
+# R44/rom-strip: the helper python MUST strip a stale <rom file='...'/> when the
+# referenced romfile is MISSING on disk (prevents virsh attach-device --live
+# "failed to find romfile"), and MUST NOT inject a <rom> when the fragment has
+# none (cold-attach works romless via vfio's own /sys/.../rom read; an injected
+# <rom> cannot help hot-attach because OVMF is not running to execute it).
 assert_contains_text \
-  "R23 helper python injects <rom> when the fragment has no rom but the romfile exists" \
-  "elif rom is None and rom_path and os.path.isfile(rom_path):" \
+  "R23 helper python strips stale <rom> when the romfile is missing" \
+  'if rf and not os.path.isfile(rf):' \
   "$helper_block"
+assert_contains_text \
+  "R23 helper python keeps a <rom> whose romfile still exists" \
+  "rom = hd.find('rom')" \
+  "$helper_block"
+# The OLD rom-INJECT branch (elif rom is None and rom_path and os.path.isfile(rom_path))
+# MUST be GONE — injecting a <rom> on hot-attach was based on the wrong premise
+# that OVMF runs option ROMs on hot-attach (it does not).
+if grep -Fq "elif rom is None and rom_path and os.path.isfile(rom_path):" <<<"$helper_block"; then
+  printf 'FAIL: R23 helper still injects <rom> on hot-attach (OVMF does not run option ROMs on hot-attach)\n' >&2
+  record_failure "R23 helper does not inject <rom> on hot-attach (inject branch removed)"
+else
+  printf 'PASS: R23 helper does not inject <rom> on hot-attach (inject branch removed)\n'
+fi
 # The helper MUST capture and log the bind script's full output on failure so a
 # bind-script bug surfaces in the journal instead of being swallowed (a swallowed
 # stderr left us blind to the say() semicolon bug for an entire session — the

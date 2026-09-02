@@ -126,6 +126,15 @@ assert_contains_file "install_looking_glass notes client NOT auto-installed" 'cl
 assert_contains_file "recommended table: Looking Glass = No" '_RECOMMENDED_ANSWERS["Looking Glass"]=1' "$VFIO_SCRIPT"
 # --reset removes Looking Glass.
 assert_contains_file "reset calls remove_looking_glass" 'remove_looking_glass' "$VFIO_SCRIPT"
+# R44/ReBAR vendor gate: the ReBAR sub-prompt is offered ONLY for NVIDIA (10de)
+# / Intel (8086) guest GPUs. AMD (1002) skips it (a resized BAR0 breaks the
+# Windows driver on RX 6900/9070 -> display engine fails -> black screen).
+assert_contains_file "ReBAR sub-prompt gated by vendor case" '_rebar_vendor' "$VFIO_SCRIPT"
+assert_contains_file "ReBAR offered for NVIDIA/Intel (10de|8086)" '10de|8086)' "$VFIO_SCRIPT"
+assert_contains_file "ReBAR skipped for AMD (1002) with note" 'ReBAR 64-bit MMIO NOT offered for AMD' "$VFIO_SCRIPT"
+# R44/LG video default: cold-attach defaults to video=none (the GPU is the
+# only display via LG); live-attach mode=on keeps a virtio-gpu boot display.
+assert_contains_file "LG video default none documented for cold-attach" "DEFAULT 'none' for cold-attach" "$VFIO_SCRIPT"
 # Dynamic flow offers Looking Glass (both switcher + wizard).
 _lg_dyn_count="$(grep -cF 'Set up Looking Glass (shared-memory display mirror) for the guest-GPU VM now?' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
 if (( _lg_dyn_count >= 2 )); then

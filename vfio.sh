@@ -16812,7 +16812,7 @@ install_looking_glass() {
   note "to the host with low latency via Looking Glass:"
   note "  - /dev/shm/looking-glass backing file (tmpfiles.d + perms + SELinux/AppArmor)"
   note "  - a <shmem name='looking-glass'> ivshmem-plain device attached to each shut-off guest-GPU VM"
-  note "  - <video> model: 'none' for cold-attach (GPU present at boot = the only display via LG); kept as a boot display (virtio-gpu) for live-attach mode=on (GPU absent at boot — video=none would leave Windows headless and the hot-attached GPU's display would silently fail -> black screen)"
+  note "  - <video> model: DEFAULT 'none' for cold-attach (GPU present at boot = the only display via LG; no competing virtual card). Kept as a boot display (virtio-gpu) ONLY for live-attach mode=on (GPU absent at boot — video=none would leave Windows headless and the hot-attached GPU's display would silently fail -> black screen)"
   note "  - spice <graphics> set to the Looking Glass input block (<listen type='address'/> port=-1, image compression=off — local 127.0.0.1 port for LG's PureSpice input)"
   note "  - ~/.looking-glass-client.ini for $SUDO_USER (shmFile + spice + wayland)"
   note "  - optional ReBAR 64-bit MMIO on the VM (helps the GPU map large BARs)"
@@ -16829,11 +16829,25 @@ install_looking_glass() {
   esac
   say "  Shared-memory size: ${size}MB"
 
-  # Optional ReBAR sub-prompt (default N).
+  # Optional ReBAR sub-prompt (default N). Only offered for NVIDIA (10de) /
+  # Intel (8086) guest GPUs: on AMD (1002) a resized BAR0 breaks the Windows
+  # driver on cards like the RX 6900 / 9070 (display engine fails to
+  # initialize -> black screen, confirmed empirically), so ReBAR is NOT offered
+  # for AMD. NVIDIA/Intel handle a resized BAR cleanly. An unknown vendor skips
+  # the prompt (safe default); add the fw_cfg manually if you have a specific need.
   local do_rebar=0
-  if prompt_yn "Also enable ReBAR 64-bit MMIO (-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536) on each tuned VM? (helps the GPU map large BARs)" N "Looking Glass ReBAR"; then
-    do_rebar=1
-  fi
+  local _rebar_vendor="${GUEST_GPU_VENDOR_ID:-}"
+  _rebar_vendor="${_rebar_vendor#0x}"
+  case "${_rebar_vendor,,}" in
+    10de|8086)
+      if prompt_yn "Also enable ReBAR 64-bit MMIO (-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536) on each tuned VM? (helps the GPU map large BARs)" N "Looking Glass ReBAR"; then
+        do_rebar=1
+      fi
+      ;;
+    1002)
+      note "ReBAR 64-bit MMIO NOT offered for AMD (1002): a resized BAR0 breaks the Windows driver on cards like the RX 6900/9070 (display engine fails -> black screen). Add it manually only if you have a specific need."
+      ;;
+  esac
 
   local _dom _xml _state _found=0 _updated=0 _skipped_running=0
   while IFS= read -r _dom; do

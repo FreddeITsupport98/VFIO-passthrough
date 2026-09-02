@@ -11871,12 +11871,33 @@ live_attach_status() {
     . "$CONF_FILE"
   fi
 
+  # R45: ReBAR safety check for AMD guest GPUs. The amdgpu driver auto-resizes
+  # BAR0 to full VRAM on load (overriding BIOS ReBAR-off); a 16GB BAR0 breaks
+  # the Windows AMD display driver (black screen). amdgpu.rebar=0 on the kernel
+  # cmdline stops the resize. rebar_ok=1 when the param is present OR the guest
+  # GPU is not AMD (not at risk); rebar_ok=0 when AMD + the param is MISSING.
+  # Surfaced in both the text + JSON --live-attach-status output so the tray
+  # applet + non-GUI tooling can warn the operator.
+  local _rebar_ok=1 _vendor _cmdline
+  if (( _installed )) && readable_file "$CONF_FILE"; then
+    _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    if [[ "${_vendor#0x}" == "1002" ]]; then
+      _cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+      if grep -Fq 'amdgpu.rebar=0' <<<"$_cmdline" 2>/dev/null; then
+        _rebar_ok=1
+      else
+        _rebar_ok=0
+      fi
+    fi
+  fi
+
   if (( JSON_OUTPUT )); then
     local _first=1 _dom _xml _rec _state
     printf '{\n'
     printf '  "installed": %s,\n' "$_installed"
     printf '  "mode_file": "%s",\n' "$(json_escape "$_mode_file")"
     printf '  "gpu": "%s",\n' "$(json_escape "$_gpu")"
+    printf '  "rebar_ok": %s,\n' "$_rebar_ok"
     printf '  "vms": ['
     if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
       while IFS= read -r _dom; do
@@ -11900,6 +11921,7 @@ live_attach_status() {
   printf 'installed=%s\n' "$_installed"
   printf 'mode_file=%s\n' "$_mode_file"
   printf 'gpu=%s\n' "$_gpu"
+  printf 'rebar_ok=%s\n' "$_rebar_ok"
   if (( _installed )) && have_cmd virsh && libvirt_runtime_ok; then
     local _dom _xml _rec _state
     while IFS= read -r _dom; do
@@ -12089,6 +12111,59 @@ def gpu_state():
         return "unknown"
     return "alive"
 
+def read_guest_vendor():
+    # Read GUEST_GPU_VENDOR_ID="0x1002" out of the (world-readable) conf so the
+    # tray can check whether the guest GPU is AMD (at risk from ReBAR) without
+    # root. Returns the bare hex vendor id (e.g. "1002") or "".
+    try:
+        with open(CONF_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GUEST_GPU_VENDOR_ID="):
+                    v = line.split("=", 1)[1].strip()
+                    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+                        v = v[1:-1]
+                    if v.lower().startswith("0x"):
+                        v = v[2:]
+                    return v.lower()
+    except Exception:
+        pass
+    return ""
+
+def rebar_at_risk():
+    # Returns True when the guest GPU is AMD (vendor 1002) AND amdgpu.rebar=0 is
+    # NOT on the kernel cmdline. The amdgpu driver auto-resizes BAR0 to full VRAM
+    # on load (overriding BIOS ReBAR-off); a 16GB BAR0 breaks the Windows AMD
+    # display driver (display engine fails -> black screen). amdgpu.rebar=0 stops
+    # the resize so BAR0 stays at 256MB. NOTE: amdgpu.resizable_bar is NOT a real
+    # module param (silently ignored) — use amdgpu.rebar=0. /proc/cmdline is
+    # world-readable so this works from the user session without root.
+    if read_guest_vendor() != "1002":
+        return False
+    try:
+        with open("/proc/cmdline") as f:
+            cmdline = f.read()
+        return "amdgpu.rebar=0" not in cmdline
+    except Exception:
+        return False
+
+def show_rebar_warning():
+    try:
+        subprocess.run(["zenity", "--info", "--title", "ReBAR warning",
+                        "--text",
+                        "ReBAR (resizable BAR) is ON for your AMD guest GPU.\n\n"
+                        "The amdgpu driver auto-resizes BAR0 to full VRAM on load, "
+                        "which breaks the Windows AMD display driver — the display "
+                        "goes black even though the driver loads.\n\n"
+                        "FIX: add amdgpu.rebar=0 to the kernel cmdline so BAR0 stays "
+                        "at 256MB (the BIOS size). The script can do this for you:\n"
+                        "  sudo vfio --install-dynamic-binding --amd-rebar\n\n"
+                        "NOTE: amdgpu.resizable_bar is NOT a real module param "
+                        "(silently ignored) — use amdgpu.rebar=0."],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
 def notify(title, body, urgency="normal"):
     try:
         subprocess.run(["notify-send", "-u", urgency, "--icon", "video-display", title, body],
@@ -12226,6 +12301,13 @@ def main():
     menu = QtWidgets.QMenu()
     toggle_act = menu.addAction("Toggle hotplug")
     status_act = menu.addAction("Status…")
+    # R45: ReBAR banner — a red-style warning menu item, visible ONLY when the
+    # guest GPU is AMD + amdgpu.rebar=0 is missing from the kernel cmdline (the
+    # AMD display will go black). Clicking it pops a zenity info dialog naming
+    # the fix. setVisible(False) here; refresh() flips it on when at risk.
+    rebar_warn_act = menu.addAction("⚠ ReBAR is ON — AMD display will go black")
+    rebar_warn_act.triggered.connect(show_rebar_warning)
+    rebar_warn_act.setVisible(False)
     menu.addSeparator()
     quit_act = menu.addAction("Quit")
     quit_act.triggered.connect(app.quit)
@@ -12282,6 +12364,13 @@ def main():
             # Red icon = hotplug OFF (VM boots normally with the GPU present).
             tray.setIcon(_status_icon(_GREEN if m == "on" else _RED))
         _prev_gpu[0] = g
+        # R45: ReBAR banner visibility + tooltip — visible only when the guest
+        # GPU is AMD + amdgpu.rebar=0 is missing from the kernel cmdline. Absent
+        # when the param is present so the tray stays clean.
+        _rebar_bad = rebar_at_risk()
+        rebar_warn_act.setVisible(_rebar_bad)
+        if _rebar_bad:
+            tray.setToolTip(tray.toolTip() + "\n⚠ ReBAR ON — AMD display will go black (add amdgpu.rebar=0)")
         toggle_act.setText("Toggle hotplug (currently %s)" % m.upper())
     tray.setContextMenu(menu)
     refresh()
@@ -14929,16 +15018,8 @@ install_stealth_vm_tuning() {
   else
     note "DMI unreadable; using hardcoded SMBIOS defaults (ASUS ROG STRIX B550-F / AMI 1802)."
   fi
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    # Detect guest-GPU VMs: BDF match in the XML OR in the live-attach VM list
-    # (live-attach strips the GPU hostdev from the persistent XML, so a BDF
-    # grep alone would miss an already-live-attach-configured VM).
-    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
-      continue
-    fi
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     # Only define shut-off VMs.
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
@@ -15235,7 +15316,7 @@ PYEOF
     note "Restore with: sudo $SCRIPT_NAME --reset-stealth-vm-tuning  (or: virsh -c qemu:///system define $_backup_xml)"
     _updated=1
     rm -f "$_tmp"
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
   if (( ! _updated )); then
     if (( _skipped_running )); then
       note "No VMs were tuned (running VMs must be shut off first). Shut off the VM and re-run."
@@ -15282,15 +15363,8 @@ reset_stealth_vm_tuning() {
   note "Only shut-off VMs are touched; running VMs are skipped."
   say
   local _reverted=0 _skipped_running=0 _dom _xml _bdfs _state _backup _newest
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
-    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
-    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
-      continue
-    fi
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping revert. Shut it off and re-run."
@@ -15333,7 +15407,7 @@ reset_stealth_vm_tuning() {
     fi
     say "Reverted VM '$_dom' from backup: $_newest"
     _reverted=1
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
   if (( ! _reverted )); then
     if (( _skipped_running )); then
       note "No VMs were reverted (running VMs must be shut off first)."
@@ -15352,13 +15426,8 @@ stealth_vm_tuning_status() {
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
   have_cmd virsh || return 0
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
-    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
-    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _has_vendor=0; _has_cpu=0; _has_smbios=0
     grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && _has_vendor=1
     grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && _has_cpu=1
@@ -15376,7 +15445,7 @@ stealth_vm_tuning_status() {
         say "INFO: VM '$_dom' is NOT stealth-tuned (use 'sudo $SCRIPT_NAME --install-stealth-vm-tuning')"
       fi
     fi
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
 }
 
 # R35: Detect whether a libvirt domain is a guest-GPU VM. A VM qualifies if
@@ -15425,6 +15494,32 @@ _vm_is_guest_gpu_vm() {
   return 1
 }
 
+# R45: Shared enumerator — list every guest-GPU VM + its current dumpxml in one
+# scan. Wraps `virsh list --all --name` + per-VM `virsh dumpxml` +
+# _vm_is_guest_gpu_vm so every caller (the preflight gate + the stealth /
+# Looking-Glass / ultimate-perf install / status / reset loops) gets the SAME
+# detection in one place instead of each reinventing the scan + filter. Emits
+# NUL-delimited name\0xml\0 records on stdout (NUL-safe so a VM name or an XML
+# containing a newline cannot corrupt the stream). Best-effort: empty output =
+# no guest-GPU VM (or virsh/libvirt/unreadable-conf). Callers iterate with:
+#   while IFS= read -r -d '' _dom; do
+#     IFS= read -r -d '' _xml || continue
+#     ...per-VM work (the XML is already fetched + the VM already filtered)...
+#   done < <(_list_guest_gpu_vms)
+_list_guest_gpu_vms() {
+  readable_file "$CONF_FILE" || return 0
+  have_cmd virsh || return 0
+  local _dom _xml
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    if _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
+      printf '%s\0%s\0' "$_dom" "$_xml"
+    fi
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+}
+
 # R45: Preflight gate — does at least one guest-GPU VM exist? Scans every
 # libvirt domain via _vm_is_guest_gpu_vm (BDF in the XML OR in the live-attach
 # VM list). Returns 0 if >=1 guest-GPU VM is found, 1 if none (and prints a
@@ -15443,15 +15538,22 @@ _preflight_guest_gpu_vm_gate() {
     return 1
   fi
   local _dom _xml _found=0
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    if _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
-      _found=1
-      break
+  # R45: consume the shared enumerator so the detection is visible (print each
+  # matched VM) instead of a silent break-on-first. The gate still returns 0 if
+  # >=1 guest-GPU VM exists, 1 if none.
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
+    if (( ! _found )); then
+      say
+      hdr "Guest-GPU VM detection"
     fi
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+    _found=1
+    if (( ENABLE_COLOR )); then
+      say "  ${C_GREEN}✔${C_RESET} Detected guest-GPU VM: ${C_BOLD}$_dom${C_RESET}"
+    else
+      say "  ✔ Detected guest-GPU VM: $_dom"
+    fi
+  done < <(_list_guest_gpu_vms)
   if (( ! _found )); then
     say
     hdr "No guest-GPU VM found"
@@ -15468,6 +15570,7 @@ _preflight_guest_gpu_vm_gate() {
     say
     return 1
   fi
+  say
   return 0
 }
 
@@ -16976,11 +17079,8 @@ install_looking_glass() {
   esac
 
   local _dom _xml _state _found=0 _updated=0 _skipped_running=0
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _found=1
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
@@ -17054,7 +17154,7 @@ install_looking_glass() {
     say "  ✔ Attached ${size}MB looking-glass shmem to '$_dom'${do_rebar:+ (+ ReBAR)}."
     _updated=1
     rm -f "$_tmp"
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
 
   if (( ! _found )); then
     note "No shut-off guest-GPU VMs found; nothing to attach. Run the full installer / --install-dynamic-binding first."
@@ -17090,11 +17190,8 @@ remove_looking_glass() {
     note "libvirt not reachable; skipping Looking Glass VM cleanup (host-side files still removed below)."
   else
     local _dom _xml _state _did_vm=0
-    while IFS= read -r _dom; do
-      [[ -n "$_dom" ]] || continue
-      _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-      [[ -n "$_xml" ]] || continue
-      _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+    while IFS= read -r -d '' _dom; do
+      IFS= read -r -d '' _xml || continue
       _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
       if [[ "$_state" != "shut off" ]]; then
         note "WARN: VM '$_dom' is '$_state' (not shut off); skipping Looking Glass cleanup. Shut it off and re-run."
@@ -17124,7 +17221,7 @@ remove_looking_glass() {
         rm -f "$_tmp"
       fi
       _did_vm=1
-    done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+    done < <(_list_guest_gpu_vms)
     (( _did_vm )) || note "No guest-GPU VMs needed Looking Glass cleanup."
   fi
 
@@ -17167,11 +17264,8 @@ looking_glass_status() {
   local _guest_gpu _dom _xml _sz _has_shmem _has_rebar
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _sz="$(grep -oE "<size unit='M'>[0-9]+" <<<"$_xml" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)"
     _has_shmem=0; _has_rebar=0
     grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null && _has_shmem=1
@@ -17199,7 +17293,7 @@ looking_glass_status() {
     else
       say "OK: VM '$_dom' Looking Glass: $_tag"
     fi
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
 }
 
 # R35: Ultimate-performance VM XML tuning (stealth-safe). A SEPARATE, more
@@ -17400,16 +17494,8 @@ install_ultimate_perf_vm_tuning() {
   fi
 
   local _updated=0 _skipped_running=0 _any_hp_reserved=0 _dom _xml _bdfs _state _tmp _backup_xml
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    # Detect guest-GPU VMs: BDF match in the XML OR in the live-attach VM list
-    # (live-attach strips the GPU hostdev from the persistent XML, so a BDF
-    # grep alone would miss an already-live-attach-configured VM).
-    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
-      continue
-    fi
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping ultimate-perf tuning. Shut it off and re-run."
@@ -17977,7 +18063,7 @@ PYEOF
     note "Restore with: sudo $SCRIPT_NAME --reset-ultimate-perf-vm-tuning  (or: virsh -c qemu:///system define $_backup_xml)"
     _updated=1
     rm -f "$_tmp"
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
   if (( ! _updated )); then
     if (( _skipped_running )); then
       note "No VMs were tuned (running VMs must be shut off first). Shut off the VM and re-run."
@@ -18043,15 +18129,8 @@ reset_ultimate_perf_vm_tuning() {
   note "VMs are touched; running VMs are skipped."
   say
   local _reverted=0 _skipped_running=0 _dom _xml _bdfs _state _backup _newest
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
-    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
-    if ! _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
-      continue
-    fi
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _state="$(LC_ALL=C virsh -c qemu:///system domstate "$_dom" 2>/dev/null || echo "")"
     if [[ "$_state" != "shut off" ]]; then
       note "WARN: VM '$_dom' is '$_state' (not shut off); skipping revert. Shut it off and re-run."
@@ -18099,7 +18178,7 @@ reset_ultimate_perf_vm_tuning() {
     say "Reverted VM '$_dom' from backup: $_newest"
     _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"
     _reverted=1
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
   if (( ! _reverted )); then
     if (( _skipped_running )); then
       note "No VMs were reverted (running VMs must be shut off first)."
@@ -18128,13 +18207,8 @@ ultimate_perf_vm_tuning_status() {
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/\"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
   have_cmd virsh || return 0
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    # Detect guest-GPU VMs: BDF match OR in the live-attach VM list (live-attach
-    # strips the GPU hostdev, so a BDF grep alone misses a live-attach VM).
-    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _has_cache=0; _has_io=0; _has_cputune=0; _has_pm=0; _has_hp=0
     grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && _has_cache=1
     grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && _has_io=1
@@ -18156,7 +18230,7 @@ ultimate_perf_vm_tuning_status() {
         say "INFO: VM '$_dom' is NOT ultimate-perf tuned (use 'sudo $SCRIPT_NAME --install-ultimate-perf-vm-tuning')"
       fi
     fi
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  done < <(_list_guest_gpu_vms)
 }
 
 # Remove the reboot-FLR monitor service + script.

@@ -1844,6 +1844,85 @@ assert_contains_file \
   "R45 _sync_conf_defaults syncs VFIO_LIVE_ATTACH_BOOT_DISPLAY" \
   '[VFIO_LIVE_ATTACH_BOOT_DISPLAY]="none"' \
   "$VFIO_SCRIPT"
+# R45: centralized guest-GPU VM detection — _list_guest_gpu_vms enumerator
+# (NUL-delimited name\0xml\0) consumed by the preflight gate + all 9 optional-
+# tuner loops (stealth/LG/perf install+status+reset). The gate now PRINTS each
+# detected VM instead of a silent break-on-first.
+assert_contains_file \
+  "R45 _list_guest_gpu_vms enumerator defined" \
+  '_list_guest_gpu_vms() {' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R45 preflight gate consumes _list_guest_gpu_vms" \
+  'done < <(_list_guest_gpu_vms)' \
+  "$(sed -n '/^_preflight_guest_gpu_vm_gate()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_file \
+  "R45 preflight gate prints 'Detected guest-GPU VM:'" \
+  'Detected guest-GPU VM:' \
+  "$VFIO_SCRIPT"
+# R45: the shared enumerator is consumed by >=10 call sites (1 gate + 9 tuners).
+# The enumerator itself uses `virsh list --all --name` (the single scan), so it
+# is NOT counted here.
+_list_guest_done=$(grep -cF 'done < <(_list_guest_gpu_vms)' "$VFIO_SCRIPT" 2>/dev/null || echo 0)
+if (( _list_guest_done >= 10 )); then
+  printf 'PASS: R45 shared enumerator consumed by >=10 call sites (gate + 9 tuners: %d)\n' "$_list_guest_done"
+else
+  printf 'FAIL: R45 shared enumerator consumed by only %d call sites (expected >=10)\n' "$_list_guest_done" >&2
+  record_failure "R45 shared enumerator consumed by >=10 call sites"
+fi
+# R45: the old per-function `virsh list --all --name` scan must be GONE from the
+# rewired tuners (representative: install_stealth_vm_tuning).
+_stealth_fn="$(sed -n '/^install_stealth_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+if printf '%s\n' "$_stealth_fn" | grep -Fq 'virsh -c qemu:///system list --all --name'; then
+  printf 'FAIL: R45 install_stealth_vm_tuning still has its own virsh list scan\n' >&2
+  record_failure "R45 install_stealth_vm_tuning uses the shared enumerator (no own scan)"
+else
+  printf 'PASS: R45 install_stealth_vm_tuning uses the shared enumerator (no own scan)\n'
+fi
+# R45: live_attach_status surfaces a rebar_ok field (text + JSON) so the tray +
+# non-GUI tooling can warn when the AMD guest GPU is at risk (amdgpu.rebar=0
+# missing from the kernel cmdline -> BAR0 auto-resized to full VRAM -> Windows
+# AMD display driver black screen).
+assert_contains_file \
+  "R45 live_attach_status text emits rebar_ok=" \
+  "printf 'rebar_ok=%s\\n' \"\$_rebar_ok\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 live_attach_status JSON emits rebar_ok" \
+  '"rebar_ok": %s,' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 live_attach_status reads /proc/cmdline for amdgpu.rebar=0" \
+  "grep -Fq 'amdgpu.rebar=0'" \
+  "$VFIO_SCRIPT"
+# R45: tray applet ReBAR/AMD-display banner — visible ONLY when the guest GPU
+# is AMD + amdgpu.rebar=0 is missing from the kernel cmdline. Clicking pops a
+# zenity info dialog with the fix; the tooltip gets a warning line. Absent when
+# the param is present so the tray stays clean.
+assert_contains_file \
+  "R45 tray read_guest_vendor helper defined" \
+  'def read_guest_vendor():' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 tray rebar_at_risk helper defined" \
+  'def rebar_at_risk():' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 tray show_rebar_warning dialog defined" \
+  'def show_rebar_warning():' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 tray banner menu item warns ReBAR ON -> AMD display black" \
+  '⚠ ReBAR is ON — AMD display will go black' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 tray banner visibility flips in refresh()" \
+  'rebar_warn_act.setVisible(_rebar_bad)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 tray tooltip appends ReBAR warning when at risk" \
+  '⚠ ReBAR ON — AMD display will go black (add amdgpu.rebar=0)' \
+  "$VFIO_SCRIPT"
 assert_contains_text \
   "R42 _install_looking_glass_defaults writes the tmpfiles.d entry" \
   '_lg_write_tmpfiles' \

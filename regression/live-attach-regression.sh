@@ -268,9 +268,13 @@ assert_contains_text \
 # the hot-plugged display). Shipping a romless hot-attach matches the romless
 # cold-attach that already works.
 # R44/keep-addr: the call now takes a 3rd arg (the keep_guest_addr conf value).
-# Default 0 = STRIP the fixed guest PCI address so libvirt auto-assigns a free
-# slot on hot-attach (the v7-proven behavior — v7 stripped and live-attach
-# worked). The earlier keep-by-default fix was a regression and is reverted.
+# Default 1 = KEEP the fixed guest PCI address so the GPU explicitly claims its
+# cold-attach slot (e.g. bus 0x06) on hot-attach (Windows binds the AMD driver
+# by PCI location, so a different slot = a different device instance = Code 28).
+# The earlier strip-by-default let libvirt auto-assign the GPU to bus 0x07 ->
+# Windows saw a new device -> Code 28; the black screen that masked it was ReBAR
+# (amdgpu BAR0=16GB), now fixed via amdgpu.rebar=0. Strip is opt-OUT (=0) for
+# the rare collision case.
 assert_contains_text \
   "R23 helper passes the GPU romfile path + keep_addr to _strip_guest_addr" \
   '_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr"' \
@@ -279,18 +283,14 @@ assert_contains_text \
   "R23 helper passes an empty rom path + keep_addr for the audio" \
   '_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr"' \
   "$helper_block"
-# R44/keep-addr REVERTED: the helper MUST default to STRIPPING the fixed guest
-# PCI address (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR default 0) so libvirt auto-
-# assigns a free guest slot on hot-attach. This is the v7-proven behavior: v7
-# stripped the guest address and live-attach worked, with the AMD driver binding
-# to the auto-assigned slot. An earlier fix inverted this to keep-by-default on
-# the theory that Windows needs the GPU at the cold-attach slot; that theory was
-# wrong (Windows binds the driver wherever the device appears) and the keep-
-# default caused collisions/reassignment -> Code 28. Reverted to strip-by-
-# default; keep is opt-IN (=1) for the rare collision case.
+# R44/keep-addr: the helper MUST default to KEEPING the fixed guest PCI address
+# (VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR default 1) so the GPU lands at the SAME
+# guest slot as cold-attach (no Code 28). Confirmed this session: strip-by-
+# default (old :-0) shifted bus 0x06 -> 0x07 -> Windows "no driver installed".
+# Strip is opt-OUT (=0) for the rare collision case.
 assert_contains_text \
-  "R44 helper reads VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 0 = strip guest addr)" \
-  '_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-0}"' \
+  "R44 helper reads VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 1 = keep guest addr)" \
+  '_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-1}"' \
   "$helper_block"
 assert_contains_text \
   "R44 helper python reads keep_addr from argv" \
@@ -1791,22 +1791,59 @@ assert_contains_text \
   "R42 _lg_apply_to_vm attaches the shmem device" \
   '_lg_attach_shmem_to_vm "$_file" "$_size"' \
   "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
-# R44/live-attach: _lg_apply_to_vm (the install_live_attach code path) now uses
-# _lg_set_vm_display_live_attach (a BOOT display, never video=none) instead of
-# _lg_set_vm_display_none. In live-attach mode=on the GPU is ABSENT at boot, so
-# video=none leaves Windows headless and the hot-attached GPU's display silently
-# fails to initialize (black screen, confirmed empirically). The old assertion
-# checked for video=none; it MUST now check for the live-attach display path.
+# R44b: _lg_apply_to_vm (the install_live_attach code path) now branches on the
+# VFIO_LIVE_ATTACH_BOOT_DISPLAY conf key (default none = video=none, the GPU is
+# the only display via LG; virtio = opt back into a boot display). The earlier
+# "live-attach needs a virtio boot display or video=none = black screen" premise
+# was overturned this session — the black screen was ReBAR (amdgpu BAR0=16GB),
+# now fixed via amdgpu.rebar=0. So video=none is the correct default for BOTH
+# modes now; virtio is the opt-IN.
 assert_contains_text \
-  "R44 _lg_apply_to_vm sets a live-attach boot display (not video=none) + LG spice block" \
-  '_lg_set_vm_display_live_attach "$_file"' \
+  "R44b _lg_apply_to_vm branches on VFIO_LIVE_ATTACH_BOOT_DISPLAY (default none)" \
+  '_boot_disp="${VFIO_LIVE_ATTACH_BOOT_DISPLAY:-none}"' \
   "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
-if printf '%s\n' "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")" | grep -Fq '_lg_set_vm_display_none'; then
-  printf 'FAIL: R44 _lg_apply_to_vm still uses _lg_set_vm_display_none (live-attach + video=none = black screen)\n' >&2
-  record_failure "R44 _lg_apply_to_vm uses live-attach display path (not video=none)"
-else
-  printf 'PASS: R44 _lg_apply_to_vm does NOT use _lg_set_vm_display_none (live-attach boot display)\n'
-fi
+assert_contains_text \
+  "R44b _lg_apply_to_vm default branch uses _lg_set_vm_display_none (video=none)" \
+  '_lg_set_vm_display_none "$_file" || _vd=$?' \
+  "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R44b _lg_apply_to_vm virtio opt-in branch uses _lg_set_vm_display_live_attach" \
+  '_lg_set_vm_display_live_attach "$_file" || _vd=$?' \
+  "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+# R45/Job1: preflight guest-GPU VM gate — the dynamic installer + full wizard
+# must detect a guest-GPU VM BEFORE running the VM-customization steps, and
+# print a "you need a VM first" banner if none exists (instead of silently
+# skipping every step).
+assert_contains_file \
+  "R45 _preflight_guest_gpu_vm_gate helper defined" \
+  '_preflight_guest_gpu_vm_gate() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 dynamic installer calls the preflight gate before VM-customization steps" \
+  '_preflight_guest_gpu_vm_gate && _vm_gate=1' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 preflight gate prints a 'No guest-GPU VM found' banner" \
+  'No guest-GPU VM found' \
+  "$VFIO_SCRIPT"
+# R45/Job2: VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR + VFIO_LIVE_ATTACH_BOOT_DISPLAY
+# conf defaults persisted by write_conf + _sync_conf_defaults.
+assert_contains_file \
+  "R45 write_conf emits VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR default (1 = keep)" \
+  'VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR="1"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 write_conf emits VFIO_LIVE_ATTACH_BOOT_DISPLAY default (none)" \
+  'VFIO_LIVE_ATTACH_BOOT_DISPLAY="none"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 _sync_conf_defaults syncs VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR" \
+  '[VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR]="1"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R45 _sync_conf_defaults syncs VFIO_LIVE_ATTACH_BOOT_DISPLAY" \
+  '[VFIO_LIVE_ATTACH_BOOT_DISPLAY]="none"' \
+  "$VFIO_SCRIPT"
 assert_contains_text \
   "R42 _install_looking_glass_defaults writes the tmpfiles.d entry" \
   '_lg_write_tmpfiles' \

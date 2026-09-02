@@ -1126,6 +1126,81 @@ assert_contains_file \
   "pcie_port_pm=off" \
   "$VFIO_SCRIPT"
 
+# --- AMD ReBAR disable (amdgpu.rebar=0) — R45: stops amdgpu auto-resizing BAR0 to
+# --- full VRAM; a 16GB BAR0 breaks the Windows AMD display driver (black screen). ---
+assert_contains_file \
+  "AMD rebar override var declared" \
+  "AMD_REBAR_OVERRIDE=" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "_should_add_amdgpu_rebar helper defined" \
+  "_should_add_amdgpu_rebar() {" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --amd-rebar" \
+  "--amd-rebar)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "parse_args handles --no-amd-rebar" \
+  "--no-amd-rebar)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "ensure_amd_reset_bug_params adds amdgpu.rebar=0 (gated on _should_add_amdgpu_rebar)" \
+  'if _should_add_amdgpu_rebar; then' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "ensure_amd_reset_bug_params adds the amdgpu.rebar=0 param" \
+  "add_param_once \"\$cmdline\" \"amdgpu.rebar=0\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "ensure_amd_reset_bug_params notes amdgpu.rebar=0 when added" \
+  'Also ensured amdgpu.rebar=0' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "openSUSE inline AMD block adds amdgpu.rebar=0" \
+  "add_param_once \"\$new_cmdline\" \"amdgpu.rebar=0\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "systemd-boot inline AMD block adds amdgpu.rebar=0" \
+  "add_param_once \"\$new_opts\" \"amdgpu.rebar=0\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "GRUB inline AMD block adds amdgpu.rebar=0" \
+  "add_param_once \"\$new\" \"amdgpu.rebar=0\"" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "AMD stability workaround prompt documents amdgpu.rebar=0 (item 5)" \
+  "5) amdgpu.rebar=0" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "AMD stability workaround prompt question includes amdgpu.rebar=0" \
+  "and amdgpu.rebar=0 to" \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "manual instructions mention amdgpu.rebar=0" \
+  "amdgpu.rebar=0" \
+  "$(sed -n '/^print_manual_iommu_instructions()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "manual instructions explain amdgpu.resizable_bar is NOT a real param" \
+  "amdgpu.resizable_bar is NOT" \
+  "$(sed -n '/^print_manual_iommu_instructions()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_file \
+  "fish completion includes --amd-rebar" \
+  "complete -c \$cmd -l amd-rebar" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "fish completion includes --no-amd-rebar" \
+  "complete -c \$cmd -l no-amd-rebar" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "bash completion opts include --amd-rebar --no-amd-rebar" \
+  "--amd-rebar --no-amd-rebar" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "zsh completion includes --amd-rebar" \
+  "'--amd-rebar" \
+  "$VFIO_SCRIPT"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

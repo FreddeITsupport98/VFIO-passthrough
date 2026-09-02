@@ -854,6 +854,8 @@ complete -c $cmd -l amd-disable-idle-d3 -d 'Force-add vfio-pci.disable_idle_d3=1
 complete -c $cmd -l no-amd-disable-idle-d3 -d 'Skip vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)'
 complete -c $cmd -l amd-pcie-port-pm-off -d 'Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)'
 complete -c $cmd -l no-amd-pcie-port-pm-off -d 'Skip pcie_port_pm=off for AMD guest GPU (skip prompt)'
+complete -c $cmd -l amd-rebar -d 'Force-add amdgpu.rebar=0 for AMD guest GPU (disables amdgpu BAR0 auto-resize; fixes black screen on RX 6900/9070) (skip prompt)'
+complete -c $cmd -l no-amd-rebar -d 'Skip amdgpu.rebar=0 for AMD guest GPU (skip prompt)'
 complete -c $cmd -l binding-mode -r -a 'early dynamic' -d 'Install-mode GPU binding strategy (early|dynamic)'
 complete -c $cmd -l stealth-vm-tuning -d 'Dynamic-install: apply stealth/perf VM XML tuning (skip prompt)'
 complete -c $cmd -l no-stealth-vm-tuning -d 'Dynamic-install: skip stealth/perf VM XML tuning'
@@ -927,7 +929,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
@@ -976,6 +978,8 @@ _vfio_sh_complete() {
     '--no-amd-disable-idle-d3[Skip vfio-pci.disable_idle_d3=1 for AMD guest GPU (skip prompt)]' \\
     '--amd-pcie-port-pm-off[Force-add pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
     '--no-amd-pcie-port-pm-off[Skip pcie_port_pm=off for AMD guest GPU (skip prompt)]' \\
+    '--amd-rebar[Force-add amdgpu.rebar=0 for AMD guest GPU (disables amdgpu BAR0 auto-resize; fixes black screen on RX 6900/9070) (skip prompt)]' \\
+    '--no-amd-rebar[Skip amdgpu.rebar=0 for AMD guest GPU (skip prompt)]' \\
     '--binding-mode=[Install-mode GPU binding strategy]:mode:(early dynamic)' \\
     '--stealth-vm-tuning[Dynamic-install: apply stealth/perf VM XML tuning (skip prompt)]' \\
     '--no-stealth-vm-tuning[Dynamic-install: skip stealth/perf VM XML tuning]' \\
@@ -2071,6 +2075,12 @@ parse_args() {
         ;;
       --no-amd-pcie-port-pm-off)
         AMD_PORTPM_OVERRIDE=0
+        ;;
+      --amd-rebar)
+        AMD_REBAR_OVERRIDE=1
+        ;;
+      --no-amd-rebar)
+        AMD_REBAR_OVERRIDE=0
         ;;
       --binding-mode)
         shift
@@ -5022,6 +5032,8 @@ _sync_conf_defaults() {
     [VFIO_DYNAMIC_LIVE_ATTACH]="0"
     [VFIO_DYNAMIC_LIVE_ATTACH_DELAY]="30"
     [VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT]="60"
+    [VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR]="1"
+    [VFIO_LIVE_ATTACH_BOOT_DISPLAY]="none"
   )
   # VFIO_DYNAMIC_PCI_RESET is card-specific (not a fixed 0/1): default 1 for
   # RX 9070 / RDNA4 (Navi 48, device 7550) where the pre-bind FLR is needed to
@@ -5497,6 +5509,19 @@ VFIO_DYNAMIC_LIVE_ATTACH_DELAY="30"
 # slow) and live-attach won't work for the card — revert with
 # --install-dynamic-binding. Floor is 10s.
 VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT="60"
+# Live-attach hot-attach: keep the GPU's fixed guest PCI address so it lands at
+# the SAME guest slot as cold-attach (e.g. bus 0x06). Windows binds the AMD
+# driver by PCI location, so a different slot = "no driver installed" (Code 28).
+# 1 (default) = KEEP the address; 0 = strip it so libvirt auto-assigns a free
+# slot (only for the rare collision case where the fixed slot clashes with
+# another device in the running VM).
+VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR="1"
+# Live-attach + Looking Glass VM <video> model. none (default) = the GPU is the
+# only display via LG (correct now that the black-screen root cause — ReBAR /
+# amdgpu BAR0=16GB — is fixed via the amdgpu.rebar=0 kernel param). virtio = keep
+# a virtio-gpu boot display (the old workaround; use ONLY if Windows cannot POST
+# headless on a setup where the GPU is genuinely absent at boot).
+VFIO_LIVE_ATTACH_BOOT_DISPLAY="none"
 EOF
 }
 
@@ -7907,7 +7932,7 @@ systemd_boot_add_kernel_params() {
     # Only vfio-pci.ids and rd.driver.pre=vfio-pci are early-binding-specific
     # (dynamic strips them, handled above/below). Honors --no-amd-* opt-outs.
     if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" && -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
-      note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to /etc/kernel/cmdline (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
+      note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off, amdgpu.rebar=0 to /etc/kernel/cmdline (RX 9070 / RDNA4 reset-bug stability + ReBAR-off for the Windows AMD driver; required for both modes)."
       if _should_add_disable_idle_d3; then
         new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
       else
@@ -7915,6 +7940,9 @@ systemd_boot_add_kernel_params() {
       fi
       [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
       new_cmdline="$(add_param_once "$new_cmdline" "pcie_aspm=off")"
+      if _should_add_amdgpu_rebar; then
+        new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.rebar=0")"
+      fi
     fi
     # Optional: USB/xHCI stability workaround for hosts that can freeze or
     # spam disconnects due to USB runtime PM / PCIe ASPM interactions.
@@ -7985,19 +8013,27 @@ systemd_boot_add_kernel_params() {
       note "4) pcie_port_pm=off — disables PCIe port power management."
       note "   What it does: prevents PCIe port runtime power-state transitions on the guest GPU path."
       note "   Why it can help: PCIe port PM can cause link drops on the guest GPU path, contributing to 'device lost from bus' cascades."
-      if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" ]]; then
+      note ""
+      note "5) amdgpu.rebar=0 — stops the amdgpu driver from auto-resizing BAR0 to full VRAM (RECOMMENDED for AMD passthrough)."
+      note "   What it does: keeps BAR0 at the BIOS size (256MB) instead of the driver resizing it to 16GB."
+      note "   Why it can help: a 16GB BAR0 breaks the Windows AMD display driver on RX 6900/9070 (display engine fails -> black screen). Confirmed this session: amdgpu.rebar=0 + BAR0=256MB -> display works. NOTE: amdgpu.resizable_bar is NOT a real module param (silently ignored) — use amdgpu.rebar=0."
+      if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" || "${AMD_REBAR_OVERRIDE:-}" == "1" ]]; then
         note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
         [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.runpm=0")"
         [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.noretry=0")"
         [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
         [[ "${AMD_PORTPM_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
-      elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" ]]; then
-        note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off)."
-      elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1 and pcie_port_pm=off to /etc/kernel/cmdline for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+        [[ "${AMD_REBAR_OVERRIDE:-}" == "1" ]] && new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.rebar=0")"
+      elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" && "${AMD_REBAR_OVERRIDE:-}" == "0" ]]; then
+        note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off --no-amd-rebar)."
+      elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1, pcie_port_pm=off and amdgpu.rebar=0 to /etc/kernel/cmdline for the AMD guest GPU? (optional workarounds; amdgpu.rebar=0 is recommended)" N "AMD stability workarounds"; then
         new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.runpm=0")"
         new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.noretry=0")"
         new_cmdline="$(add_param_once "$new_cmdline" "vfio-pci.disable_idle_d3=1")"
         new_cmdline="$(add_param_once "$new_cmdline" "pcie_port_pm=off")"
+        if _should_add_amdgpu_rebar; then
+          new_cmdline="$(add_param_once "$new_cmdline" "amdgpu.rebar=0")"
+        fi
       else
         note "Skipping AMD GPU stability parameters. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
       fi
@@ -8290,15 +8326,18 @@ systemd_boot_add_kernel_params() {
   # for dynamic too. Only vfio-pci.ids is early-binding-specific (dynamic strips
   # it, handled above). Honors --no-amd-* opt-outs.
   if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" && -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
-    note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to this boot entry (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
-    if _should_add_disable_idle_d3; then
-      new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
-    else
-      note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there; the bind script's D0-lock is the correct defense. Use --amd-disable-idle-d3 to force it."
+      note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off, amdgpu.rebar=0 to this boot entry (RX 9070 / RDNA4 reset-bug stability + ReBAR-off for the Windows AMD driver; required for both modes)."
+      if _should_add_disable_idle_d3; then
+        new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
+      else
+        note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there; the bind script's D0-lock is the correct defense. Use --amd-disable-idle-d3 to force it."
+      fi
+      [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
+      new_opts="$(add_param_once "$new_opts" "pcie_aspm=off")"
+      if _should_add_amdgpu_rebar; then
+        new_opts="$(add_param_once "$new_opts" "amdgpu.rebar=0")"
+      fi
     fi
-    [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
-    new_opts="$(add_param_once "$new_opts" "pcie_aspm=off")"
-  fi
   # Optional: USB/xHCI stability workaround for the selected live entry.
   say
   hdr "USB/xHCI power-management stability (optional)"
@@ -8336,19 +8375,27 @@ systemd_boot_add_kernel_params() {
     note "4) pcie_port_pm=off — disables PCIe port power management."
     note "   What it does: prevents PCIe port runtime power-state transitions on the guest GPU path."
     note "   Why it can help: PCIe port PM can cause link drops on the guest GPU path, contributing to 'device lost from bus' cascades."
-    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" ]]; then
+    note ""
+    note "5) amdgpu.rebar=0 — stops the amdgpu driver from auto-resizing BAR0 to full VRAM (RECOMMENDED for AMD passthrough)."
+    note "   What it does: keeps BAR0 at the BIOS size (256MB) instead of the driver resizing it to 16GB."
+    note "   Why it can help: a 16GB BAR0 breaks the Windows AMD display driver on RX 6900/9070 (display engine fails -> black screen). Confirmed this session: amdgpu.rebar=0 + BAR0=256MB -> display works. NOTE: amdgpu.resizable_bar is NOT a real module param (silently ignored) — use amdgpu.rebar=0."
+    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" || "${AMD_REBAR_OVERRIDE:-}" == "1" ]]; then
       note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
       [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.runpm=0")"
       [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.noretry=0")"
       [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
       [[ "${AMD_PORTPM_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
-    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" ]]; then
-      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off)."
-    elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1 and pcie_port_pm=off to this boot entry for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+      [[ "${AMD_REBAR_OVERRIDE:-}" == "1" ]] && new_opts="$(add_param_once "$new_opts" "amdgpu.rebar=0")"
+    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" && "${AMD_REBAR_OVERRIDE:-}" == "0" ]]; then
+      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off --no-amd-rebar)."
+    elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1, pcie_port_pm=off and amdgpu.rebar=0 to this boot entry for the AMD guest GPU? (optional workarounds; amdgpu.rebar=0 is recommended)" N "AMD stability workarounds"; then
       new_opts="$(add_param_once "$new_opts" "amdgpu.runpm=0")"
       new_opts="$(add_param_once "$new_opts" "amdgpu.noretry=0")"
       new_opts="$(add_param_once "$new_opts" "vfio-pci.disable_idle_d3=1")"
       new_opts="$(add_param_once "$new_opts" "pcie_port_pm=off")"
+      if _should_add_amdgpu_rebar; then
+        new_opts="$(add_param_once "$new_opts" "amdgpu.rebar=0")"
+      fi
     else
       note "Skipping AMD GPU stability parameters for this entry. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
     fi
@@ -8412,6 +8459,11 @@ print_manual_iommu_instructions() {
   say "    - Keeps the vfio-pci-bound GPU out of D3hot idle to avoid D3 entry/exit races during VM start/stop reset."
   say "  pcie_port_pm=off"
   say "    - Disables PCIe port power management to prevent link drops on the guest GPU path."
+  say "  amdgpu.rebar=0"
+  say "    - Stops the amdgpu driver from auto-resizing BAR0 to full VRAM (RECOMMENDED for AMD passthrough)."
+  say "    - A 16GB BAR0 breaks the Windows AMD display driver on RX 6900/9070 (black screen);"
+  say "      amdgpu.rebar=0 keeps BAR0 at 256MB so the display works. (amdgpu.resizable_bar is NOT"
+  say "      a real module param and is silently ignored — use amdgpu.rebar=0.)"
   say "Advanced (usually NOT recommended): pcie_acs_override=downstream"
   say "  - Only consider this if your IOMMU groups are not isolated."
   say "  - It can reduce PCIe isolation and may cause instability on some systems."
@@ -8463,15 +8515,18 @@ grub_add_kernel_params() {
   # rd.driver.pre=vfio-pci are early-binding-specific (dynamic strips them,
   # handled above/below). Honors --no-amd-disable-idle-d3 / --no-amd-pcie-port-pm-off.
   if [[ "${CTX[binding_mode]:-EARLY}" == "DYNAMIC" && -n "${CTX[guest_vendor]:-}" && "${CTX[guest_vendor],,}" == "1002" ]]; then
-    note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off to GRUB kernel cmdline (RX 9070 / RDNA4 reset-bug stability; required for both modes)."
-    if _should_add_disable_idle_d3; then
-      new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
-    else
-      note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there; the bind script's D0-lock is the correct defense. Use --amd-disable-idle-d3 to force it."
+      note "Dynamic binding + AMD guest GPU: auto-adding vfio-pci.disable_idle_d3=1, pcie_port_pm=off, pcie_aspm=off, amdgpu.rebar=0 to GRUB kernel cmdline (RX 9070 / RDNA4 reset-bug stability + ReBAR-off for the Windows AMD driver; required for both modes)."
+      if _should_add_disable_idle_d3; then
+        new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
+      else
+        note "  vfio-pci.disable_idle_d3=1 SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues there; the bind script's D0-lock is the correct defense. Use --amd-disable-idle-d3 to force it."
+      fi
+      [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new="$(add_param_once "$new" "pcie_port_pm=off")"
+      new="$(add_param_once "$new" "pcie_aspm=off")"
+      if _should_add_amdgpu_rebar; then
+        new="$(add_param_once "$new" "amdgpu.rebar=0")"
+      fi
     fi
-    [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]] && new="$(add_param_once "$new" "pcie_port_pm=off")"
-    new="$(add_param_once "$new" "pcie_aspm=off")"
-  fi
   # Optional USB/xHCI power-management workaround.
   say
   hdr "USB/xHCI power-management stability (optional)"
@@ -8535,20 +8590,28 @@ grub_add_kernel_params() {
     note "4) pcie_port_pm=off — disables PCIe port power management."
     note "   What it does: prevents PCIe port runtime power-state transitions on the guest GPU path."
     note "   Why it can help: PCIe port PM can cause link drops on the guest GPU path, contributing to 'device lost from bus' cascades."
-    note "If your AMD guest GPU works reliably without these, leaving the defaults enabled is preferred for lower power usage."
-    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" ]]; then
+    note ""
+    note "5) amdgpu.rebar=0 — stops the amdgpu driver from auto-resizing BAR0 to full VRAM (RECOMMENDED for AMD passthrough)."
+    note "   What it does: keeps BAR0 at the BIOS size (256MB) instead of the driver resizing it to 16GB."
+    note "   Why it can help: a 16GB BAR0 breaks the Windows AMD display driver on RX 6900/9070 (display engine fails -> black screen). Confirmed this session: amdgpu.rebar=0 + BAR0=256MB -> display works. NOTE: amdgpu.resizable_bar is NOT a real module param (silently ignored) — use amdgpu.rebar=0."
+    note "If your AMD guest GPU works reliably without these, leaving the defaults enabled is preferred for lower power usage (except amdgpu.rebar=0, which is recommended for passthrough)."
+    if [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" || "${AMD_NORETRY_OVERRIDE:-}" == "1" || "${AMD_D3_OVERRIDE:-}" == "1" || "${AMD_PORTPM_OVERRIDE:-}" == "1" || "${AMD_REBAR_OVERRIDE:-}" == "1" ]]; then
       note "AMD stability workaround override in effect: force-adding requested parameters without prompt."
       [[ "${AMD_RUNPM_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.runpm=0")"
       [[ "${AMD_NORETRY_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.noretry=0")"
       [[ "${AMD_D3_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
       [[ "${AMD_PORTPM_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "pcie_port_pm=off")"
-    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" ]]; then
-      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off)."
-    elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1 and pcie_port_pm=off to GRUB kernel parameters for the AMD guest GPU? (optional workarounds)" N "AMD stability workarounds"; then
+      [[ "${AMD_REBAR_OVERRIDE:-}" == "1" ]] && new="$(add_param_once "$new" "amdgpu.rebar=0")"
+    elif [[ "${AMD_RUNPM_OVERRIDE:-}" == "0" && "${AMD_NORETRY_OVERRIDE:-}" == "0" && "${AMD_D3_OVERRIDE:-}" == "0" && "${AMD_PORTPM_OVERRIDE:-}" == "0" && "${AMD_REBAR_OVERRIDE:-}" == "0" ]]; then
+      note "AMD stability workaround override in effect: skipping all AMD GPU stability parameters (--no-amd-runpm --no-amd-noretry --no-amd-disable-idle-d3 --no-amd-pcie-port-pm-off --no-amd-rebar)."
+    elif prompt_yn "Add amdgpu.runpm=0, amdgpu.noretry=0, vfio-pci.disable_idle_d3=1, pcie_port_pm=off and amdgpu.rebar=0 to GRUB kernel parameters for the AMD guest GPU? (optional workarounds; amdgpu.rebar=0 is recommended)" N "AMD stability workarounds"; then
       new="$(add_param_once "$new" "amdgpu.runpm=0")"
       new="$(add_param_once "$new" "amdgpu.noretry=0")"
       new="$(add_param_once "$new" "vfio-pci.disable_idle_d3=1")"
       new="$(add_param_once "$new" "pcie_port_pm=off")"
+      if _should_add_amdgpu_rebar; then
+        new="$(add_param_once "$new" "amdgpu.rebar=0")"
+      fi
     else
       note "Skipping AMD GPU stability parameters. If you later see PCIe dropouts, 'device lost from bus', or USB/xHCI cascades with the AMD guest GPU, rerun and enable these options."
     fi
@@ -10796,18 +10859,18 @@ def _strip(hd):
     # hot-attach time without needing to re-extract.
     if hd.find('driver') is None:
         hd.insert(0, ET.Element('driver', {'name': 'vfio'}))
-    # R44: STRIP the fixed guest <address type='pci'> by DEFAULT so libvirt
-    # AUTO-assigns a free guest slot on hot-attach. This is the v7-proven
-    # behavior: v7 stripped the guest address and live-attach worked, with the
-    # AMD driver binding to the auto-assigned slot. An earlier fix (keep-guest-
-    # address) inverted this on the theory that Windows needs the GPU at the
-    # SAME guest BDF as cold-attach for the driver to bind; that theory was WRONG
-    # — Windows binds the AMD driver to the device wherever it appears, and
-    # pinning the hot-attach to the cold-attach slot caused collisions with the
-    # virtio-gpu boot display / reassignment -> Code 28 "no driver installed".
-    # Reverted to strip-by-default. OPT-IN to keep with
-    # VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=1 only for the rare case where the
-    # auto-assigned slot clashes with another device in the running VM.
+    # R44: KEEP the fixed guest <address type='pci'> by DEFAULT so the GPU
+    # explicitly claims its cold-attach slot (e.g. bus 0x06) on hot-attach.
+    # Windows binds the AMD driver to the device by PCI location (Bus/Device/
+    # Function), so a different guest slot = a different Windows device instance
+    # = "no driver installed" (Code 28). Confirmed this session: strip-by-default
+    # let libvirt auto-assign the GPU to bus 0x07 (cold-attach was 0x06) ->
+    # Windows saw a new device -> Code 28; a fresh XML with the GPU pinned at
+    # 0x06 works. The earlier "strip is v7-proven" conclusion was a misread: the
+    # black screen that masked the Code 28 was ReBAR (amdgpu BAR0=16GB), now
+    # fixed via amdgpu.rebar=0, so the bus-shift Code 28 is now visible as the
+    # remaining failure. OPT OUT of keep with VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=0
+    # only for the rare case where the fixed slot clashes with another device.
     if not keep_addr:
         for a in list(hd.findall('address')):
             if a.get('type') == 'pci': hd.remove(a)
@@ -10862,15 +10925,19 @@ _notify_desktop() {
 # R44: compute the GPU romfile path + the device fragments NOW that the conf
 # has been sourced (GUEST_GPU_BDF is defined here; referencing it before this
 # point crashes under `set -u`). Audio gets no romfile (empty 2nd arg). The 3rd
-# arg is VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 0 = STRIP the fixed guest PCI
-# address so libvirt auto-assigns a free slot on hot-attach — the v7-proven
-# behavior; v7 stripped the guest address and live-attach worked, binding the
-# AMD driver to the auto-assigned slot. An earlier fix inverted this to keep the
-# cold-attach slot on the theory that Windows needs the GPU at the same PCI
-# location; that theory was wrong and broke hot-attach -> Code 28. Opt-IN to
-# keep with VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=1 only for the rare collision case
-# where the auto-assigned slot clashes with another device).
-_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-0}"
+# arg is VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR (default 1 = KEEP the fixed guest PCI
+# address so the GPU explicitly claims its cold-attach slot, e.g. bus 0x06, on
+# hot-attach — Windows binds the AMD driver to the device by PCI location
+# (Bus/Device/Function), so a DIFFERENT guest slot = a different Windows device
+# instance = "no driver installed" (Code 28). Confirmed this session: strip-by-
+# default let libvirt auto-assign the GPU to bus 0x07 (cold-attach was 0x06) ->
+# Windows saw a new device -> Code 28; a fresh XML with the GPU pinned at 0x06
+# works. The earlier "strip is v7-proven" conclusion was a misread: the black
+# screen that masked the Code 28 was ReBAR (amdgpu BAR0=16GB), now fixed via
+# amdgpu.rebar=0, so the bus-shift Code 28 is now visible as the remaining
+# failure. Opt OUT to strip with VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR=0 only for the
+# rare case where the fixed slot clashes with another device in the running VM.
+_keep_addr="${VFIO_LIVE_ATTACH_KEEP_GUEST_ADDR:-1}"
 _GPU_ROM="$_VBIOS_DIR/live-${GUEST_GPU_BDF}.rom"
 GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr")"
 AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr")"
@@ -11125,15 +11192,16 @@ _la_read_mode() {
 
 # R44/live-attach + Looking Glass interaction: return 0 if $1 (dom) is in the
 # live-attach VM list AND the mode file reads "on". Used by install_looking_glass
-# to decide whether to keep a BOOT display (virtio-gpu) instead of video=none:
-# in live-attach mode=on the GPU is ABSENT at boot, so video=none leaves Windows
-# headless and the hot-attached GPU's display silently fails to initialize
-# (black screen, confirmed empirically + via Level1Techs "Guest won't boot with
-# video type 'none'" + kubevirt #8733). A boot display keeps the Windows display
-# subsystem active so the hot-added GPU initializes and takes over the physical
-# monitor. In mode=off (cold-attach) the GPU IS present at boot, so video=none is
-# correct (the GPU is the only display via Looking Glass; no competing virtual
-# card). Best-effort: a missing list/mode file returns 1 (not live-attach-on).
+# to decide whether to keep a BOOT display (virtio-gpu) instead of video=none.
+# NOTE (R44b): the earlier "video=none leaves Windows headless -> black screen"
+# premise was overturned this session — the black screen was ReBAR (amdgpu auto-
+# resized BAR0 to 16GB, breaking the AMD Windows display driver), now fixed via
+# the amdgpu.rebar=0 kernel param. video=none is the correct default for BOTH
+# modes now (the GPU is the only display via Looking Glass; no competing virtual
+# card). A virtio-gpu boot display is still available as an opt-in
+# (VFIO_LIVE_ATTACH_BOOT_DISPLAY=virtio) for the rare setup where Windows cannot
+# POST headless. Best-effort: a missing list/mode file returns 1 (not live-
+# attach-on).
 _vm_live_attach_mode_on() {
   local _dom="$1"
   [[ -n "$_dom" ]] || return 1
@@ -15357,6 +15425,52 @@ _vm_is_guest_gpu_vm() {
   return 1
 }
 
+# R45: Preflight gate — does at least one guest-GPU VM exist? Scans every
+# libvirt domain via _vm_is_guest_gpu_vm (BDF in the XML OR in the live-attach
+# VM list). Returns 0 if >=1 guest-GPU VM is found, 1 if none (and prints a
+# prominent "you need a VM first" banner naming the requirement + the re-run
+# command). Non-fatal: the caller continues non-VM steps (kernel params, conf,
+# hook, monitors) regardless. Used by install_dynamic_binding_from_existing_config
+# and apply_configuration so the VM-customization steps (vBIOS, stealth/perf,
+# ultimate-perf, Looking Glass, live-attach) only run when a target VM exists —
+# otherwise they silently skipped with no notice, leaving the user wondering why
+# nothing happened.
+_preflight_guest_gpu_vm_gate() {
+  readable_file "$CONF_FILE" || return 1
+  have_cmd virsh || return 1
+  if ! libvirt_runtime_ok; then
+    note "WARN: libvirt not reachable; cannot check for a guest-GPU VM. The VM-customization steps will be skipped."
+    return 1
+  fi
+  local _dom _xml _found=0
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    if _vm_is_guest_gpu_vm "$_dom" "$_xml"; then
+      _found=1
+      break
+    fi
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  if (( ! _found )); then
+    say
+    hdr "No guest-GPU VM found"
+    note "No libvirt VM with the guest GPU (GUEST_GPU_BDF) in its XML was detected."
+    note "The VM-customization steps (vBIOS injection, stealth/perf tuning, ultimate-perf tuning,"
+    note "Looking Glass, live-attach / hotplug) will be SKIPPED — there is no VM to customize."
+    note ""
+    note "Create a libvirt VM first (e.g. in virt-manager), attach the guest GPU to it as a PCI"
+    note "hostdev, shut it off, then re-run:"
+    note "  sudo $SCRIPT_NAME --install-dynamic-binding"
+    note ""
+    note "The non-VM steps (kernel parameters, conf, libvirt hook, reboot-FLR / park-keepalive"
+    note "monitors) still run so the host side is ready when the VM appears."
+    say
+    return 1
+  fi
+  return 0
+}
+
 # R37: Boolean — is <dom> (with dumpxml <xml>) already stealth-tuned? Greps the
 # same markers stealth_vm_tuning_status reports (vendor_id + QEMU -cpu/-smbios).
 # Used by install_stealth_vm_tuning so a re-tune does NOT overwrite the pristine
@@ -16522,11 +16636,11 @@ PYEOF
 
 # R44/live-attach: normalize spice to the LG input block (same as
 # _lg_set_vm_display_none) BUT ensure the VM KEEPS a boot display (virtio-gpu),
-# NEVER video=none. In live-attach mode=on the GPU is absent at boot, so
-# video=none leaves Windows headless and the hot-attached GPU's display silently
-# fails to initialize (black screen). A virtio-gpu boot display keeps the
-# Windows display subsystem active so the hot-added GPU initializes and takes
-# over the physical monitor; Looking Glass still captures the GPU via shmem.
+# NEVER video=none. This is the OPT-IN path (VFIO_LIVE_ATTACH_BOOT_DISPLAY=virtio)
+# for setups where Windows cannot POST headless; the DEFAULT is now video=none
+# (see _lg_set_vm_display_none) because the earlier "video=none -> black screen"
+# premise was overturned — the black screen was ReBAR (amdgpu BAR0=16GB), fixed
+# via amdgpu.rebar=0. Looking Glass still captures the GPU via shmem either way.
 # Idempotent: exit 3 if spice is already the LG input block AND video is already
 # a boot display (not none). $1 = path to a temp file holding the VM dumpxml.
 _lg_set_vm_display_live_attach() {
@@ -16745,12 +16859,12 @@ _lg_client_install_hints() {
 # hotplug auto-installs Looking Glass on the live VM XML (the device-diff safety
 # invariant preserves the shmem through later toggles). Best-effort + idempotent
 # (exit 3 from either patcher = already configured = success).
-# R44/live-attach: the VM display is a BOOT display (virtio-gpu), NOT video=none
-# — install_live_attach is inherently the live-attach path, where the GPU is
-# ABSENT at boot and hot-attached after Windows loads. video=none would leave
-# Windows headless and the hot-attached GPU's display silently fails to
-# initialize (black screen, confirmed empirically). _lg_set_vm_display_live_attach
-# normalizes the spice LG input block AND ensures a virtio-gpu boot display.
+# R44b: the VM display defaults to video=none (the GPU is the only display via
+# LG). The earlier "live-attach needs a virtio-gpu boot display or Windows is
+# headless -> black screen" premise was overturned this session — the black
+# screen was ReBAR (amdgpu auto-resized BAR0 to 16GB), now fixed via
+# amdgpu.rebar=0. Opt into the virtio boot display with
+# VFIO_LIVE_ATTACH_BOOT_DISPLAY=virtio only if headless boot fails (rare).
 # $1 = path to a VM XML file, $2 = shmem size MB (default LG_DEFAULT_SIZE).
 _lg_apply_to_vm() {
   local _file="$1" _size="${2:-$LG_DEFAULT_SIZE}"
@@ -16761,7 +16875,19 @@ _lg_apply_to_vm() {
   if (( _sh != 0 && _sh != 3 )); then
     note "WARN: Looking Glass shmem attach failed (python exit $_sh) for $_file; continuing."
   fi
-  _lg_set_vm_display_live_attach "$_file" || _vd=$?
+  # R44b: boot-display policy. Default video=none (the GPU is the only display
+  # via LG). The earlier live-attach virtio-gpu boot display was a workaround for
+  # a black screen that turned out to be ReBAR (amdgpu auto-resized BAR0 to
+  # 16GB, breaking the AMD Windows display driver), NOT video=none — now fixed
+  # via the amdgpu.rebar=0 kernel param. Opt back into the virtio boot display
+  # with VFIO_LIVE_ATTACH_BOOT_DISPLAY=virtio ONLY if headless boot fails on a
+  # setup where the GPU is genuinely absent at boot and Windows cannot POST
+  # headless (rare; the RX 9070 + amdgpu.rebar=0 cold-attach path needs none).
+  local _boot_disp="${VFIO_LIVE_ATTACH_BOOT_DISPLAY:-none}"
+  case "${_boot_disp,,}" in
+    virtio) _lg_set_vm_display_live_attach "$_file" || _vd=$? ;;
+    *)      _lg_set_vm_display_none "$_file" || _vd=$? ;;
+  esac
   if (( _vd != 0 && _vd != 3 )); then
     note "WARN: Looking Glass video/spice patch failed (python exit $_vd) for $_file; continuing."
   fi
@@ -16884,19 +17010,16 @@ install_looking_glass() {
         note "WARN: ReBAR patching failed for '$_dom' (python exit $_rb_status); continuing without ReBAR."
       fi
     fi
-    # R44/live-attach + Looking Glass interaction: in live-attach mode=on the
-    # GPU is ABSENT at boot, so video=none leaves Windows headless and the
-    # hot-attached GPU's display silently fails to initialize (black screen,
-    # confirmed empirically + via Level1Techs "Guest won't boot with video type
-    # 'none'" + kubevirt #8733). Keep a boot display (virtio-gpu) so Windows'
-    # display subsystem is active when the GPU hot-attaches; the GPU then takes
-    # over the physical monitor. In mode=off (cold-attach) the GPU IS present at
-    # boot, so video=none is correct (the GPU is the only display via LG; no
-    # competing virtual card). Best-effort; exit 3 = already configured, exit 0
-    # = patched, other = warn but continue.
+    # R44b: boot-display policy (default video=none). The earlier live-attach
+    # virtio-gpu boot display was a workaround for a black screen that turned
+    # out to be ReBAR (amdgpu BAR0=16GB), not video=none — now fixed via
+    # amdgpu.rebar=0. Opt into the virtio boot display with
+    # VFIO_LIVE_ATTACH_BOOT_DISPLAY=virtio only if headless boot fails (rare).
+    # Best-effort; exit 3 = already configured, exit 0 = patched, other = warn.
     local _vd_status=0
-    if _vm_live_attach_mode_on "$_dom"; then
-      # R44/live-attach: reserve the GPU + audio guest buses (from the profile
+    local _boot_disp="${VFIO_LIVE_ATTACH_BOOT_DISPLAY:-none}"
+    if [[ "${_boot_disp,,}" == "virtio" ]] && _vm_live_attach_mode_on "$_dom"; then
+      # virtio + mode=on: reserve the GPU + audio guest buses (from the profile
       # fragments) so the virtio-gpu boot display is pinned OFF those slots
       # (root-cause fix for hotplug "no driver installed" / Code 28).
       local _rgb_gpu _rgb_audio _rgb_save _rgb_val
@@ -16907,7 +17030,7 @@ install_looking_glass() {
         _rgb_val="$(printf '%s,%s' "$_rgb_gpu" "$_rgb_audio" | sed -E 's/^,//; s/,$//')"
         export VFIO_LA_RESERVED_GUEST_BUSES="$_rgb_val"
       fi
-      say "  VM '$_dom' is in live-attach mode=on — keeping a boot display (virtio-gpu) so the hot-attached GPU can initialize (video=none would leave Windows headless -> black screen)."
+      say "  VM '$_dom' — keeping a virtio-gpu boot display (VFIO_LIVE_ATTACH_BOOT_DISPLAY=virtio; mode=on)."
       _lg_set_vm_display_live_attach "$_tmp" || _vd_status=$?
       if [[ -n "$_rgb_save" ]]; then
         export VFIO_LA_RESERVED_GUEST_BUSES="$_rgb_save"
@@ -20084,6 +20207,24 @@ _should_add_disable_idle_d3() {
   ! _is_guest_rx9070_family
 }
 
+# Returns 0 (true) if amdgpu.rebar=0 should be added to the kernel cmdline for
+# the current guest GPU. The amdgpu kernel driver auto-resizes BAR0 to full VRAM
+# (e.g. 16GB on the RX 9070) on load, overriding BIOS Re-Size BAR Support = OFF;
+# a 16GB BAR0 breaks the Windows AMD display driver (display engine fails to
+# initialize -> black screen, confirmed on RX 6900/9070). amdgpu.rebar=0 (the
+# CORRECT module-param name — amdgpu.resizable_bar is NOT a real param and is
+# silently ignored) stops the driver from resizing so the BIOS leaves BAR0 at
+# 256MB. Unlike disable_idle_d3 (Navi-48-gated OUT), rebar-off is correct for
+# EVERY AMD passthrough card, so the default is ADD for all AMD. Decision matrix:
+#  - --no-amd-rebar (AMD_REBAR_OVERRIDE=0): always SKIP (explicit opt-out; for a
+#    host where ReBAR is wanted for a non-passthrough AMD card).
+#  - --amd-rebar    (AMD_REBAR_OVERRIDE=1): always ADD  (explicit force).
+#  - default (unset): ADD for AMD guest GPUs (callers already gate on AMD).
+_should_add_amdgpu_rebar() {
+  [[ "${AMD_REBAR_OVERRIDE:-}" != "0" ]] || return 1
+  return 0
+}
+
 # Persist GUEST_GPU_DEVICE_ID into $CONF_FILE if it is missing, using the live
 # sysfs device id of the configured guest GPU. Called by the standalone binding
 # switchers (--install-dynamic-binding / --install-early-binding), which do NOT
@@ -20143,12 +20284,18 @@ ensure_amd_reset_bug_params() {
   if [[ "${AMD_PORTPM_OVERRIDE:-}" != "0" ]]; then
     cmdline="$(add_param_once "$cmdline" "pcie_port_pm=off")"
   fi
+  if _should_add_amdgpu_rebar; then
+    cmdline="$(add_param_once "$cmdline" "amdgpu.rebar=0")"
+  fi
   if [[ "$cmdline" != "$_before" ]]; then
     note "AMD guest GPU: ensured pcie_port_pm=off on the kernel cmdline (prevents the RX 9070 / RDNA4 D3cold reset bug; required for both binding modes)." >&2
     if grep -q 'vfio-pci.disable_idle_d3=1' <<<"$cmdline"; then
       note "  Also ensured vfio-pci.disable_idle_d3=1." >&2
     else
       note "  vfio-pci.disable_idle_d3=1 deliberately SKIPPED for RX 9070 / RDNA4 (Navi 48, device 7550): it worsens D3 issues on Navi 48 (triggers a vfio_bar_restore reset loop that drops the card off the bus mid-session); the D0-lock (d3cold_allowed=0 + power/control=on) already applied by the bind script is the correct defense. Pass --amd-disable-idle-d3 to force it anyway." >&2
+    fi
+    if grep -q 'amdgpu.rebar=0' <<<"$cmdline"; then
+      note "  Also ensured amdgpu.rebar=0 (stops the amdgpu driver from auto-resizing BAR0 to full VRAM; a 16GB BAR0 breaks the Windows AMD display driver on RX 6900/9070 -> black screen. Confirmed this session: BAR0=256MB + amdgpu.rebar=0 -> display works)." >&2
     fi
   fi
   printf '%s' "$(trim "$cmdline")"
@@ -20557,6 +20704,10 @@ install_dynamic_binding_from_existing_config() {
   #      recovers the guest GPU while it is parked on vfio-pci between VM sessions.
   install_park_keepalive_monitor
 
+  # R45: preflight — only run the VM-customization steps if a guest-GPU VM exists.
+  local _vm_gate=0
+  _preflight_guest_gpu_vm_gate && _vm_gate=1
+  if (( _vm_gate )); then
   # 3c3. vBIOS ROM auto-injection (opt-in prompt): pin a matching *.rom dump
   #       from VBIOS/ into each shut-off guest-GPU VM's hostdev, fixing a black
   #       screen caused by an unreliable live sysfs ROM read. If the user already
@@ -20652,6 +20803,7 @@ install_dynamic_binding_from_existing_config() {
     install_looking_glass
   else
     note "Skipping Looking Glass. You can set it up later with: sudo $SCRIPT_NAME --install-looking-glass"
+  fi
   fi
 
   # 3b. Pin KDE/KWin Wayland to the HOST GPU so binding the (Boot VGA) guest
@@ -26550,6 +26702,10 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
     # Install the park-keepalive monitor (instant on, no prompt): proactively
     # recovers the guest GPU while it is parked on vfio-pci between VM sessions.
     install_park_keepalive_monitor
+    # R45: preflight — only run the VM-customization steps if a guest-GPU VM exists.
+    local _vm_gate=0
+    _preflight_guest_gpu_vm_gate && _vm_gate=1
+    if (( _vm_gate )); then
     # vBIOS ROM auto-injection (opt-in prompt): pin a matching *.rom dump
     # from VBIOS/ into each shut-off guest-GPU VM's hostdev. If the user
     # already has a vBIOS configured manually (or does not want one), they can
@@ -26631,6 +26787,7 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
       install_looking_glass
     else
       note "Skipping Looking Glass. You can set it up later with: sudo $SCRIPT_NAME --install-looking-glass"
+    fi
     fi
   fi
   if (( INSTALL_GRAPHICS_DAEMON )); then

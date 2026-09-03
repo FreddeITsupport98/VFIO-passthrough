@@ -15240,8 +15240,10 @@ install_stealth_vm_tuning() {
   note "This applies the Stealthy-VM tuning to each shut-off VM that has the guest GPU:"
   note "  - hyperv vendor_id=GENUINE00000 + kvm hidden (hypervisor hide for the AMD driver)"
   note "  - cpu host-passthrough + hypervisor CPUID bit disabled"
-  note "  - SMBIOS type 0 (BIOS) + type 1 (system) spoofing with randomized serial/UUID"
-  note "  - virtio NIC -> e1000e; randomized disk serials; memballoon=none"
+  note "  - SMBIOS type 0 (BIOS) + type 1 (system) + type 2 (baseboard) + type 3 (chassis)"
+  note "    + type 17 (memory) spoofing from host DMI with randomized serial/UUID"
+  note "  - NIC -> e1000e AND MAC OUI spoofed (52:54:00 QEMU prefix -> real-vendor OUI)"
+  note "  - randomized disk serials; memballoon=none"
   note "  - hypervclock off; TSC native; QEMU -cpu/-smbios commandline args"
   note "  - perf: iothreads=1, host-aware cputune, disk iothread assignment"
   note "Only shut-off VMs are touched; running VMs are skipped. The tuned XML is"
@@ -15276,19 +15278,33 @@ install_stealth_vm_tuning() {
   # #1: read the host's real DMI identity so the VM's spoofed SMBIOS matches the
   # host hardware (realistic stealth) instead of a generic ASUS B550. Falls back
   # to the hardcoded defaults if DMI is unreadable. Exported for the python tuning.
+  # R48g: extended to board (type 2) + chassis (type 3) DMI so Win32_BaseBoard /
+  # Win32_SystemEnclosure no longer report QEMU defaults — a key residual VM tell
+  # (the system-manufacturer spoof alone leaves the baseboard manufacturer blank
+  # / 'Default string', which Windows detection tools flag).
   local _dmi_sys_vendor _dmi_product _dmi_bios_vendor _dmi_bios_version _dmi_bios_date
+  local _dmi_board_vendor _dmi_board_name _dmi_board_version _dmi_chassis_vendor
   _dmi_sys_vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
   _dmi_product="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
   _dmi_bios_vendor="$(cat /sys/class/dmi/id/bios_vendor 2>/dev/null || true)"
   _dmi_bios_version="$(cat /sys/class/dmi/id/bios_version 2>/dev/null || true)"
   _dmi_bios_date="$(cat /sys/class/dmi/id/bios_date 2>/dev/null || true)"
+  _dmi_board_vendor="$(cat /sys/class/dmi/id/board_vendor 2>/dev/null || true)"
+  _dmi_board_name="$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)"
+  _dmi_board_version="$(cat /sys/class/dmi/id/board_version 2>/dev/null || true)"
+  _dmi_chassis_vendor="$(cat /sys/class/dmi/id/chassis_vendor 2>/dev/null || true)"
   export VFIO_STEALTH_DMI_SYS_VENDOR="${_dmi_sys_vendor:-American Megatrends Inc.}"
   export VFIO_STEALTH_DMI_PRODUCT="${_dmi_product:-ROG STRIX B550-F}"
   export VFIO_STEALTH_DMI_BIOS_VENDOR="${_dmi_bios_vendor:-American Megatrends Inc.}"
   export VFIO_STEALTH_DMI_BIOS_VERSION="${_dmi_bios_version:-1802}"
   export VFIO_STEALTH_DMI_BIOS_DATE="${_dmi_bios_date:-12/12/2023}"
+  export VFIO_STEALTH_DMI_BOARD_VENDOR="${_dmi_board_vendor:-ASUSTeK COMPUTER INC.}"
+  export VFIO_STEALTH_DMI_BOARD_NAME="${_dmi_board_name:-TUF GAMING X570-PLUS}"
+  export VFIO_STEALTH_DMI_BOARD_VERSION="${_dmi_board_version:-Rev 1.xx}"
+  export VFIO_STEALTH_DMI_CHASSIS_VENDOR="${_dmi_chassis_vendor:-${_dmi_sys_vendor:-ASUSTeK COMPUTER INC.}}"
   if [[ -n "$_dmi_sys_vendor" || -n "$_dmi_product" ]]; then
     note "Spoofing SMBIOS from host DMI: $_dmi_sys_vendor $_dmi_product (BIOS $_dmi_bios_vendor $_dmi_bios_version)"
+    note "  Baseboard: $_dmi_board_vendor $_dmi_board_name  |  Chassis: $_dmi_chassis_vendor"
   else
     note "DMI unreadable; using hardcoded SMBIOS defaults (ASUS ROG STRIX B550-F / AMI 1802)."
   fi
@@ -15434,6 +15450,29 @@ if devices is not None:
         if model is not None and model.get('type') == 'virtio': model.set('type', 'e1000e'); changed = True
         driver = iface.find('driver')
         if driver is not None and driver.get('name') == 'vhost': iface.remove(driver); changed = True
+        # R48g: MAC OUI spoof. libvirt assigns the QEMU/KVM OUI 52:54:00 by
+        # default, which is the single most reliable automated VM tell — a real
+        # desktop NIC never has that prefix. Replace it with a real-vendor OUI
+        # (Intel/ASUS/Realtek/Gigabyte pool) + deterministic last-3-octets
+        # derived from the VM UUID so a re-tune does NOT churn the MAC (keeps
+        # DHCP leases / Windows network profile stable). Only replace the QEMU
+        # OUI (52:54:00) or 00:15:5d (Hyper-V) / 08:00:27 (VirtualBox) prefixes;
+        # leave any other (real/user-set) MAC untouched.
+        mac_el = iface.find('mac')
+        if mac_el is not None:
+            cur_mac = (mac_el.get('address') or '').lower().strip()
+            vm_uuid = (root.findtext('uuid') or '').strip().lower()
+            _QEMU_OUIS = ('52:54:00', '00:15:5d', '08:00:27', '00:50:56', '00:0c:29', '00:1c:42')
+            if cur_mac.startswith(_QEMU_OUIS) and vm_uuid:
+                # Real-vendor OUI pool (registered, in-use desktop NIC prefixes).
+                _real_ouis = ('00:1a:a0', '00:e0:81', 'ac:1f:6b', '00:24:8c', '50:9a:4c', '04:d9:f5', '00:19:99')
+                import hashlib as _hl
+                _h = _hl.sha256(vm_uuid.encode()).digest()
+                _oui = _real_ouis[_h[0] % len(_real_ouis)]
+                _tail = '%02x:%02x:%02x' % (_h[1], _h[2], _h[3])
+                _new_mac = _oui + ':' + _tail
+                if cur_mac != _new_mac:
+                    mac_el.set('address', _new_mac); changed = True
     for disk in devices.findall('disk'):
         if disk.find('serial') is None:
             ds = "Samsung_" + "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
@@ -15471,6 +15510,13 @@ dmi_prod = os.environ.get('VFIO_STEALTH_DMI_PRODUCT', 'ROG STRIX B550-F')
 dmi_bv = os.environ.get('VFIO_STEALTH_DMI_BIOS_VENDOR', 'American Megatrends Inc.')
 dmi_bver = os.environ.get('VFIO_STEALTH_DMI_BIOS_VERSION', '1802')
 dmi_bdate = os.environ.get('VFIO_STEALTH_DMI_BIOS_DATE', '12/12/2023')
+# R48g: board (type 2) + chassis (type 3) DMI so Win32_BaseBoard /
+# Win32_SystemEnclosure no longer report QEMU defaults. Falls back to hardcoded
+# defaults (ASUS TUF X570-PLUS) if the host DMI is unreadable.
+dmi_board_v = os.environ.get('VFIO_STEALTH_DMI_BOARD_VENDOR', 'ASUSTeK COMPUTER INC.')
+dmi_board_p = os.environ.get('VFIO_STEALTH_DMI_BOARD_NAME', 'TUF GAMING X570-PLUS')
+dmi_board_ver = os.environ.get('VFIO_STEALTH_DMI_BOARD_VERSION', 'Rev 1.xx')
+dmi_chassis_v = os.environ.get('VFIO_STEALTH_DMI_CHASSIS_VENDOR', dmi_sv)
 qemu_cmd = get_or_create_qemu_commandline(root)
 # #2: dedupe the stealth -cpu + -smbios pairs (idempotent re-run) WITHOUT
 # wiping other user args (Looking Glass kvmfr, vendor-specific, etc.).
@@ -15480,9 +15526,30 @@ ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-cpu"})
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on"})
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=0,vendor={dmi_bv},version={dmi_bver},date={dmi_bdate}"})
-smbios_serial = secrets.token_hex(5).upper(); smbios_uuid = uuid.uuid4()
+# R48g: derive stable per-VM serials from the VM UUID hash so a re-tune does
+# NOT churn the SMBIOS serials (keeps Windows HW fingerprint / digital license
+# stable across re-tunes). secrets.token_hex would change every run -> churn.
+import hashlib as _smbios_hl
+_vm_uuid_lc = (root.findtext('uuid') or '').strip().lower()
+_smbios_seed = _smbios_hl.sha256(_vm_uuid_lc.encode()).digest() if _vm_uuid_lc else _smbios_hl.sha256(b'stealth').digest()
+smbios_serial = '%02X%02X%02X%02X%02X' % (_smbios_seed[0], _smbios_seed[1], _smbios_seed[2], _smbios_seed[3], _smbios_seed[4])
+smbios_uuid = uuid.UUID(bytes=_smbios_seed[:16]) if _vm_uuid_lc else uuid.uuid4()
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
 ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=1,manufacturer={dmi_sv},product={dmi_prod},serial={smbios_serial},uuid={smbios_uuid}"})
+# R48g: SMBIOS type 2 (baseboard) + type 3 (chassis) + type 17 (memory). These
+# close the gap that left Windows reporting VM=yes despite the type-0/1 spoof:
+# Win32_BaseBoard.Manufacturer / Win32_SystemEnclosure.Manufacturer / physical
+# memory arrays were still QEMU defaults. type 3 type=3 = Desktop; type 17 speed
+# = a plausible DDR4/5 MT/s. Serials derived from the VM UUID hash (stable).
+_base_serial = '%02X%02X%02X%02X%02X%02X' % (_smbios_seed[5], _smbios_seed[6], _smbios_seed[7], _smbios_seed[8], _smbios_seed[9], _smbios_seed[10])
+_chassis_serial = '%02X%02X%02X%02X%02X%02X' % (_smbios_seed[11], _smbios_seed[12], _smbios_seed[13], _smbios_seed[14], _smbios_seed[15], _smbios_seed[16])
+_mem_serial = '%02X%02X%02X%02X%02X%02X' % (_smbios_seed[17], _smbios_seed[18], _smbios_seed[19], _smbios_seed[20], _smbios_seed[21], _smbios_seed[22])
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=2,manufacturer={dmi_board_v},product={dmi_board_p},version={dmi_board_ver},serial={_base_serial}"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=3,manufacturer={dmi_chassis_v},type=3,version={dmi_board_ver},serial={_chassis_serial}"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': "-smbios"})
+ET.SubElement(qemu_cmd, f"{{{QEMU_NS}}}arg", {'value': f"type=17,manufacturer=Kingston,speed=3600,serial={_mem_serial}"})
 changed = True
 # --- perf ---
 if root.find('iothreads') is None:
@@ -15582,8 +15649,10 @@ PYEOF
     say "  ✔ vmport state=off (VMware backdoor port disabled — stops \"Is Virtual Machine: yes\")"
     say "  ✔ CPU host-passthrough + hypervisor CPUID bit disabled"
     say "  ✔ SMBIOS spoofed from host DMI: ${_dmi_sys_vendor:-<default>} ${_dmi_product:-<default>} (BIOS ${_dmi_bios_version:-<default>})"
-    say "  ✔ QEMU -cpu host,kvm=off,hypervisor=off + -smbios type=0/type=1 args"
-    say "  ✔ NIC -> e1000e; disk serials randomized; memballoon=none"
+    say "  ✔ SMBIOS type 0/1/2/3/17 (BIOS + system + baseboard + chassis + memory) + stable per-VM serials"
+    say "  ✔ QEMU -cpu host,kvm=off,hypervisor=off + -smbios type=0/1/2/3/17 args"
+    say "  ✔ NIC -> e1000e AND MAC OUI spoofed (52:54:00 QEMU prefix -> real-vendor OUI)"
+    say "  ✔ disk serials randomized; memballoon=none"
     say "  ✔ hypervclock off; TSC native; serial/console + tablet removed"
     say "  ✔ perf: iothreads=1, host-aware cputune, disk iothread assignment"
     say "  Backup of original XML: $_backup_xml"
@@ -16556,18 +16625,16 @@ _lg_setup_security() {
   fi
 }
 
-# Read a VM's existing looking-glass shmem size (MB) from its persistent XML.
-_lg_vm_shmem_size() {
-  local dom="$1"
-  virsh -c qemu:///system dumpxml --inactive "$dom" 2>/dev/null \
-    | grep -oE "<size unit='M'>[0-9]+" | grep -oE '[0-9]+$' | head -n1
-}
-
-# 0 if the VM persistent XML already has a looking-glass shmem device.
+# 0 if the VM persistent XML still has a looking-glass shmem device. R48g:
+# anchored to the shmem named 'looking-glass' specifically (NOT any ivshmem-plain)
+# so the _lg_remove_shmem_from_vm dedup loop only keeps going while a REAL
+# looking-glass shmem exists — a VM with a different ivshmem device no longer
+# makes the loop spin on failed detach attempts. Handles both libvirt
+# single-quote (post-define) and ElementTree double-quote (pre-define) styles.
 _lg_vm_has_shmem() {
   local dom="$1"
   virsh -c qemu:///system dumpxml --inactive "$dom" 2>/dev/null \
-    | grep -q "model type='ivshmem-plain'"
+    | grep -Eq "name=[\"']looking-glass[\"']"
 }
 
 # Attach (or replace) the <shmem name='looking-glass'> ivshmem-plain device.
@@ -16637,6 +16704,33 @@ _lg_vm_has_rebar() {
   local dom="$1"
   virsh -c qemu:///system dumpxml --inactive "$dom" 2>/dev/null \
     | grep -q 'opt/ovmf/X-PciMmio64Mb'
+}
+
+# R48g: Single source of truth for Looking Glass shmem detection. Given a VM
+# dumpxml ($1), prints "1\t<size>\t<unit>" if a <shmem name='looking-glass'>
+# ivshmem-plain device exists, else "0\t\t". Anchored to the looking-glass
+# shmem SPECIFICALLY (not any ivshmem-plain) and pulls the size from THAT
+# element, so a VM with a different ivshmem device no longer false-positives as
+# Looking Glass and the reported size is the real LG size (the old code grabbed
+# the size from any <size> element in the whole XML). Handles both libvirt
+# single-quote (post-define) and ElementTree double-quote (pre-define) attribute
+# styles. Read-only; never fails (returns "0\t\t" on any parse miss).
+_lg_vm_shmem_info() {
+  local _xml="$1" _block _sz _unit
+  _block="$(printf '%s' "$_xml" | awk '
+    /<shmem/ { in_sh=1; blk="" }
+    in_sh { blk = blk $0 "\n" }
+    /<\/shmem>/ { if (in_sh) { if (blk ~ /looking-glass/) { printf "%s", blk } } in_sh=0; blk="" }
+  ' 2>/dev/null || true)"
+  if [[ -z "$_block" ]] || ! grep -q 'ivshmem-plain' <<<"$_block" 2>/dev/null; then
+    printf '0\t\t'
+    return 0
+  fi
+  _sz="$(grep -oE "<size[^>]*>[[:space:]]*[0-9]+" <<<"$_block" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)"
+  _unit="$(grep -oE "<size[^>]*unit=[\"']?[A-Za-z]+" <<<"$_block" 2>/dev/null | grep -oE "[A-Za-z]+$" | head -n1)"
+  [[ -n "$_sz" ]] || _sz='?'
+  [[ -n "$_unit" ]] || _unit='M'
+  printf '1\t%s\t%s' "$_sz" "$_unit"
 }
 
 # Enable ReBAR 64-bit MMIO (64GB aperture) on a VM via qemu:commandline fw_cfg.
@@ -17322,6 +17416,33 @@ install_looking_glass() {
   note "vBIOS is NOT touched here (use --vbios / the wizard for vBIOS injection)."
   note "The client binary is NOT auto-installed; use --install-looking-glass-client (or the menu) to compile it."
   say
+  # R48g: prominent PREREQUISITE disclaimer — the VM-side shmem setup below is
+  # useless without the looking-glass-client binary compiled/installed on the
+  # HOST first. The shared-memory device only exposes the VM's framebuffer to
+  # the host; it is the CLIENT binary that reads it and renders the window. A
+  # user who sets up LG without the client gets a black window / "cannot find
+  # shared memory" and nothing to view. Warn up-front (color-coded) and name
+  # the exact command / menu option to install it.
+  if (( ENABLE_COLOR )); then
+    note "${C_BOLD}${C_YELLOW}PREREQUISITE:${C_RESET} Looking Glass needs the ${C_BOLD}looking-glass-client${C_RESET} binary"
+  else
+    note "PREREQUISITE: Looking Glass needs the looking-glass-client binary"
+  fi
+  note "compiled/installed on this HOST to actually view the VM's display. The VM-side"
+  note "<shmem> setup below only exposes the framebuffer — the CLIENT reads it. Without"
+  note "the client you will see a black window / 'cannot find shared memory' and nothing."
+  if [[ -x "$LG_CLIENT_BIN" ]]; then
+    if (( ENABLE_COLOR )); then
+      note "  ${C_GREEN}✔${C_RESET} looking-glass-client is already installed at $LG_CLIENT_BIN — you're good."
+    else
+      note "  ✔ looking-glass-client is already installed at $LG_CLIENT_BIN — you're good."
+    fi
+  else
+    note "  ✖ looking-glass-client is NOT installed yet. Install it FIRST (or right after this):"
+    note "      sudo $SCRIPT_NAME --install-looking-glass-client"
+    note "    (or use the --menu, option 18: 'Install (compile) looking-glass-client'.)"
+  fi
+  say
 
   # Shmem size menu (64/128/256/512 MB by target resolution).
   local -a size_opts=("64 MB  — Full HD / 1080p" "128 MB — 1440p / QHD" "256 MB — 4K / UHD" "512 MB — Ultrawide 4K / High Refresh")
@@ -17535,14 +17656,19 @@ remove_looking_glass() {
 looking_glass_status() {
   if ! readable_file "$CONF_FILE"; then return 0; fi
   have_cmd virsh || return 0
-  local _guest_gpu _dom _xml _sz _has_shmem _has_rebar
+  local _guest_gpu _dom _xml _sz _unit _has_shmem _has_rebar
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
   while IFS= read -r -d '' _dom; do
     IFS= read -r -d '' _xml || continue
-    _sz="$(grep -oE "<size unit='M'>[0-9]+" <<<"$_xml" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)"
-    _has_shmem=0; _has_rebar=0
-    grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null && _has_shmem=1
+    # R48g: anchor LG detection to the looking-glass shmem specifically + pull
+    # the size from THAT element (was: any ivshmem-plain / any <size>).
+    local _lg_info
+    _lg_info="$(_lg_vm_shmem_info "$_xml")"
+    _has_shmem="${_lg_info%%$'\t'*}"
+    _sz="$(printf '%s' "$_lg_info" | cut -f2)"
+    _unit="$(printf '%s' "$_lg_info" | cut -f3)"
+    _has_rebar=0
     grep -q 'opt/ovmf/X-PciMmio64Mb' <<<"$_xml" 2>/dev/null && _has_rebar=1
     # R40b: also report video=none + spice local-only state.
     local _has_video_none=0 _has_spice_local=0
@@ -17560,7 +17686,7 @@ looking_glass_status() {
     fi
     local _tag="not configured"
     if (( _has_shmem )); then
-      _tag="shmem ${_sz}MB${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none}${_has_spice_local:+, spice=local}"
+      _tag="shmem ${_sz}${_unit}B${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none}${_has_spice_local:+, spice=local}"
     fi
     if (( ENABLE_COLOR )); then
       say "${C_GREEN}✔${C_RESET}: VM '$_dom' Looking Glass: $_tag"
@@ -28280,12 +28406,12 @@ _vm_checklist_records() {
   libvirt_runtime_ok || return 0
   local _vw_iso1="${VIRTIO_WIN_ISO_PATH:-}" _vw_iso2="${VIRTIO_WIN_FALLBACK_ISO:-}"
   local _la_list="${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
-  local _dom _xml _has_hvhide _has_stealthtune _has_perf _has_shmem _has_rebar _has_video_none _sz
+  local _dom _xml _has_hvhide _has_stealthtune _has_perf _has_shmem _has_rebar _has_video_none _sz _unit _lg_info
   local _has_vbios _has_liveattach _has_hugepages _has_virtio_iso _has_sata_disk
   local _n_sata _n_cdrom _line1 _line2
   while IFS= read -r -d '' _dom; do
     IFS= read -r -d '' _xml || continue
-    _has_hvhide=0; _has_stealthtune=0; _has_perf=0; _has_shmem=0; _has_rebar=0; _has_video_none=0; _sz=""
+    _has_hvhide=0; _has_stealthtune=0; _has_perf=0; _has_shmem=0; _has_rebar=0; _has_video_none=0; _sz=""; _unit=""
     _has_vbios=0; _has_liveattach=0; _has_hugepages=0; _has_virtio_iso=0; _has_sata_disk=0
     # Line 1 features: hypervisor-hide / stealth-tune / ultimate-perf / looking-glass.
     # hypervisor-hide (CORE): vendor_id=GENUINE00000 + kvm=off,hypervisor=off.
@@ -28295,10 +28421,17 @@ _vm_checklist_records() {
     # alongside the hide, but detected separately so a hide-only VM shows tune ✖.
     grep -Fq 'type=1,manufacturer=' <<<"$_xml" 2>/dev/null && _has_stealthtune=1
     grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && grep -Fq '<cputune>' <<<"$_xml" 2>/dev/null && _has_perf=1
-    grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null && _has_shmem=1
+    # R48g: Looking Glass detection anchored to the shmem named 'looking-glass'
+    # specifically (NOT any ivshmem-plain) + the size pulled from THAT element.
+    # The old grep matched any ivshmem-plain and grabbed size from any <size> in
+    # the whole XML, so a different ivshmem device false-positived as LG and the
+    # size could be wrong. _lg_vm_shmem_info returns "1\t<size>\t<unit>" or "0\t\t".
+    _lg_info="$(_lg_vm_shmem_info "$_xml")"
+    _has_shmem="${_lg_info%%$'\t'*}"
+    _sz="$(printf '%s' "$_lg_info" | cut -f2)"
+    _unit="$(printf '%s' "$_lg_info" | cut -f3)"
     grep -q 'opt/ovmf/X-PciMmio64Mb' <<<"$_xml" 2>/dev/null && _has_rebar=1
     grep -q "<model type='none'" <<<"$_xml" 2>/dev/null && _has_video_none=1
-    _sz="$(grep -oE "<size unit='M'>[0-9]+" <<<"$_xml" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)"
     # Line 2 features: vBIOS / live-attach / hugepages / virtio-win ISO / disks.
     grep -Eq '<rom file=' <<<"$_xml" 2>/dev/null && _has_vbios=1
     [[ -f "$_la_list" ]] && grep -Fixq "$_dom" "$_la_list" 2>/dev/null && _has_liveattach=1
@@ -28323,7 +28456,7 @@ _vm_checklist_records() {
     (( _has_perf )) && _p_sym="✔"
     if (( _has_shmem )); then
       _l_sym="✔"
-      _lg_detail=" (shmem ${_sz}MB${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none})"
+      _lg_detail=" (shmem ${_sz}${_unit}B${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none})"
     fi
     (( _has_vbios )) && _vb_sym="✔"
     (( _has_liveattach )) && _la_sym="✔"

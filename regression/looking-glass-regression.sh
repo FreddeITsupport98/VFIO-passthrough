@@ -125,6 +125,15 @@ assert_contains_file "R48d status block line 2 has hugepages" 'hugepages $_hp_sy
 assert_contains_file "R48d status block line 2 has virtio-win" 'virtio-win $_vw_sym' "$VFIO_SCRIPT"
 assert_contains_file "R48d status block line 2 has disks-virtio" 'disks-virtio $_dk_sym' "$VFIO_SCRIPT"
 assert_contains_file "R48d status block line 1 uses ultimate-perf label" 'ultimate-perf $_p_sym' "$VFIO_SCRIPT"
+# R48g: LG detection is now anchored to the shmem named 'looking-glass'
+# specifically (a shared _lg_vm_shmem_info helper) instead of matching ANY
+# ivshmem-plain + grabbing the size from any <size> element. Also the
+# install_looking_glass header now warns the user to compile the client FIRST.
+assert_contains_file "R48g _lg_vm_shmem_info helper defined" '_lg_vm_shmem_info() {' "$VFIO_SCRIPT"
+assert_contains_file "R48g _lg_vm_shmem_info anchors to looking-glass name" 'blk ~ /looking-glass/' "$VFIO_SCRIPT"
+assert_contains_file "R48g checklist uses _lg_vm_shmem_info (not any ivshmem-plain)" '_lg_vm_shmem_info "$_xml"' "$VFIO_SCRIPT"
+assert_contains_file "R48g install_looking_glass has compile-client-first disclaimer" 'PREREQUISITE: Looking Glass needs the looking-glass-client binary' "$VFIO_SCRIPT"
+assert_contains_file "R48g install_looking_glass disclaimer names the client install flag" '--install-looking-glass-client' "$VFIO_SCRIPT"
 # R44/live-attach: _lg_set_vm_display_live_attach helper (the live-attach boot-
 # display path, never video=none) MUST be defined, and install_looking_glass
 # MUST branch on the live-attach mode (video=none for cold-attach / boot display

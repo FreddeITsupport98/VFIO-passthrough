@@ -1076,6 +1076,203 @@ assert_contains_text \
   "R48e checklist line 2 has disks-virtio" \
   'disks-virtio $_dk_sym' \
   "$_checklist_fn"
+
+# --- R48g: stealth MAC OUI spoof + SMBIOS type 2/3/17 + LG detection anchored
+# to name='looking-glass' + the LG 'compile client first' disclaimer. These close
+# the residual Windows VM=yes gap (MAC 52:54:00 QEMU OUI + missing SMBIOS
+# baseboard/chassis/memory) and fix the checklist false-positive (any ivshmem
+# matched as Looking Glass). ---
+assert_contains_file \
+  "R48g stealth patcher spoofs the QEMU MAC OUI" \
+  "_QEMU_OUIS = ('52:54:00'" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g stealth patcher sets a real-vendor OUI MAC" \
+  "mac_el.set('address', _new_mac)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g stealth patcher emits SMBIOS type=2 (baseboard)" \
+  'type=2,manufacturer=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g stealth patcher emits SMBIOS type=3 (chassis)" \
+  'type=3,manufacturer=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g stealth patcher emits SMBIOS type=17 (memory)" \
+  'type=17,manufacturer=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g stealth patcher derives stable serials from VM UUID hash" \
+  '_smbios_seed = _smbios_hl.sha256' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g bash wrapper exports VFIO_STEALTH_DMI_BOARD_VENDOR" \
+  'VFIO_STEALTH_DMI_BOARD_VENDOR=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g bash wrapper exports VFIO_STEALTH_DMI_CHASSIS_VENDOR" \
+  'VFIO_STEALTH_DMI_CHASSIS_VENDOR=' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g _lg_vm_shmem_info helper defined (anchored LG detection)" \
+  '_lg_vm_shmem_info() {' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R48g _lg_vm_shmem_info anchors to the looking-glass shmem name" \
+  'blk ~ /looking-glass/' \
+  "$(sed -n '/^_lg_vm_shmem_info()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48g checklist consumes _lg_vm_shmem_info (no longer any ivshmem-plain)" \
+  '_lg_vm_shmem_info "$_xml"' \
+  "$_checklist_fn"
+assert_contains_file \
+  "R48g looking_glass_status consumes _lg_vm_shmem_info" \
+  '_lg_vm_shmem_info "$_xml"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g install_looking_glass has the compile-client-first PREREQUISITE disclaimer" \
+  'PREREQUISITE: Looking Glass needs the looking-glass-client binary' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48g install_looking_glass disclaimer points at --install-looking-glass-client" \
+  '--install-looking-glass-client' \
+  "$VFIO_SCRIPT"
+
+# --- R48g functional: stealth patcher spoofs MAC + adds SMBIOS 2/3/17 ---
+# Extract the embedded python heredoc and run it on a mock VM XML with a QEMU
+# 52:54:00 MAC + a virtio NIC, then assert the MAC is no longer the QEMU OUI and
+# SMBIOS type 2/3/17 args are present.
+_r48g_root="$(mktemp -d)"
+_r48g_stealth_py="$_r48g_root/stealth.py"
+awk '/^install_stealth_vm_tuning/ {in_fn=1} in_fn && /<<.PYEOF./ {grab=1; next} grab && /^PYEOF$/ {grab=0; in_fn=0} grab {print}' "$VFIO_SCRIPT" >"$_r48g_stealth_py" 2>/dev/null || true
+if python3 -m py_compile "$_r48g_stealth_py" 2>/dev/null; then
+  printf 'PASS: R48g stealth patcher python compiles (py_compile)\n'
+else
+  printf 'FAIL: R48g stealth patcher python does not compile\n' >&2
+  record_failure "R48g stealth patcher python compiles"
+fi
+_r48g_mock="$_r48g_root/mock.xml"
+cat >"$_r48g_mock" <<'XEOF'
+<domain type='kvm'>
+  <name>testvm</name>
+  <uuid>11111111-2222-3333-4444-555555555555</uuid>
+  <memory unit='KiB'>8388608</memory>
+  <vcpu placement='static'>4</vcpu>
+  <features><acpi/><apic/><hyperv mode='custom'><relaxed state='on'/></hyperv></features>
+  <clock offset='localtime'/>
+  <devices>
+    <interface type='network'>
+      <mac address='52:54:00:29:f7:ac'/>
+      <model type='virtio'/>
+    </interface>
+    <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><target dev='vda' bus='virtio'/></disk>
+    <memballoon model='virtio'/>
+  </devices>
+</domain>
+XEOF
+VFIO_STEALTH_DMI_SYS_VENDOR='ASUS' VFIO_STEALTH_DMI_PRODUCT='ROG' \
+  VFIO_STEALTH_DMI_BIOS_VENDOR='AMI' VFIO_STEALTH_DMI_BIOS_VERSION='1802' \
+  VFIO_STEALTH_DMI_BIOS_DATE='12/12/2023' VFIO_STEALTH_DMI_BOARD_VENDOR='ASUSTeK' \
+  VFIO_STEALTH_DMI_BOARD_NAME='TUF' VFIO_STEALTH_DMI_BOARD_VERSION='Rev1' \
+  VFIO_STEALTH_DMI_CHASSIS_VENDOR='ASUSTeK' \
+  python3 - "$_r48g_mock" <"$_r48g_stealth_py" >/dev/null 2>&1 || true
+if grep -qi '52:54:00' "$_r48g_mock" 2>/dev/null; then
+  printf 'FAIL: R48g stealth patcher left the QEMU MAC OUI 52:54:00 in place\n' >&2
+  record_failure "R48g stealth patcher spoofs the QEMU MAC OUI"
+else
+  printf 'PASS: R48g stealth patcher replaced the QEMU MAC OUI with a real-vendor OUI\n'
+fi
+if grep -q 'type=2,manufacturer=' "$_r48g_mock" 2>/dev/null; then
+  printf 'PASS: R48g stealth patcher added SMBIOS type=2 (baseboard)\n'
+else
+  printf 'FAIL: R48g stealth patcher did NOT add SMBIOS type=2 (baseboard)\n' >&2
+  record_failure "R48g stealth patcher adds SMBIOS type=2"
+fi
+if grep -q 'type=3,manufacturer=' "$_r48g_mock" 2>/dev/null; then
+  printf 'PASS: R48g stealth patcher added SMBIOS type=3 (chassis)\n'
+else
+  printf 'FAIL: R48g stealth patcher did NOT add SMBIOS type=3 (chassis)\n' >&2
+  record_failure "R48g stealth patcher adds SMBIOS type=3"
+fi
+if grep -q 'type=17,manufacturer=' "$_r48g_mock" 2>/dev/null; then
+  printf 'PASS: R48g stealth patcher added SMBIOS type=17 (memory)\n'
+else
+  printf 'FAIL: R48g stealth patcher did NOT add SMBIOS type=17 (memory)\n' >&2
+  record_failure "R48g stealth patcher adds SMBIOS type=17"
+fi
+# Idempotency: re-running must NOT churn the MAC (the spoofed OUI is not a QEMU
+# prefix, so the guard skips it) and must keep the same SMBIOS serials (UUID hash).
+_r48g_mock2="$_r48g_root/mock2.xml"
+cp "$_r48g_mock" "$_r48g_mock2"
+_mac1="$(grep -oiE "mac address='[^']*'|mac address=\"[^\"]*\"" "$_r48g_mock" 2>/dev/null | head -n1 || true)"
+VFIO_STEALTH_DMI_SYS_VENDOR='ASUS' VFIO_STEALTH_DMI_PRODUCT='ROG' \
+  VFIO_STEALTH_DMI_BIOS_VENDOR='AMI' VFIO_STEALTH_DMI_BIOS_VERSION='1802' \
+  VFIO_STEALTH_DMI_BIOS_DATE='12/12/2023' VFIO_STEALTH_DMI_BOARD_VENDOR='ASUSTeK' \
+  VFIO_STEALTH_DMI_BOARD_NAME='TUF' VFIO_STEALTH_DMI_BOARD_VERSION='Rev1' \
+  VFIO_STEALTH_DMI_CHASSIS_VENDOR='ASUSTeK' \
+  python3 - "$_r48g_mock2" <"$_r48g_stealth_py" >/dev/null 2>&1 || true
+_mac2="$(grep -oiE "mac address='[^']*'|mac address=\"[^\"]*\"" "$_r48g_mock2" 2>/dev/null | head -n1 || true)"
+if [[ "$_mac1" == "$_mac2" && -n "$_mac1" ]]; then
+  printf 'PASS: R48g stealth patcher is idempotent (MAC stable across re-tunes)\n'
+else
+  printf 'FAIL: R48g stealth patcher churned the MAC on re-tune (mac1=%s mac2=%s)\n' "$_mac1" "$_mac2" >&2
+  record_failure "R48g stealth patcher is idempotent (MAC stable)"
+fi
+
+# --- R48g functional: _lg_vm_shmem_info anchors to name='looking-glass' ---
+# A VM with a looking-glass shmem (64M) AND a DIFFERENT ivshmem-plain (128M) must
+# report the looking-glass size (64), not the other device's size (128). And a
+# VM with ONLY a non-looking-glass ivshmem must report NOT configured (0).
+_r48g_lg_xml="$_r48g_root/lg.xml"
+cat >"$_r48g_lg_xml" <<'XEOF'
+<domain type='kvm'>
+  <name>testvm</name>
+  <devices>
+    <shmem name='looking-glass'>
+      <model type='ivshmem-plain'/>
+      <size unit='M'>64</size>
+    </shmem>
+    <shmem name='other-ivshmem'>
+      <model type='ivshmem-plain'/>
+      <size unit='M'>128</size>
+    </shmem>
+  </devices>
+</domain>
+XEOF
+# _lg_vm_shmem_info takes $1 = xml string (not stdin).
+_r48g_lg_info="$(_lg_vm_shmem_info "$(cat "$_r48g_lg_xml")" 2>/dev/null || true)"
+_r48g_lg_has="${_r48g_lg_info%%$'\t'*}"
+_r48g_lg_sz="$(printf '%s' "$_r48g_lg_info" | cut -f2)"
+if [[ "$_r48g_lg_has" == "1" && "$_r48g_lg_sz" == "64" ]]; then
+  printf 'PASS: R48g _lg_vm_shmem_info reports the looking-glass size (64), not the other ivshmem (128)\n'
+else
+  printf 'FAIL: R48g _lg_vm_shmem_info reported has=%s size=%s (expected has=1 size=64)\n' "$_r48g_lg_has" "$_r48g_lg_sz" >&2
+  record_failure "R48g _lg_vm_shmem_info anchors to the looking-glass shmem"
+fi
+# Negative: a VM with ONLY a non-looking-glass ivshmem must report 0 (not LG).
+_r48g_nol_lg_xml="$_r48g_root/nolg.xml"
+cat >"$_r48g_nol_lg_xml" <<'XEOF'
+<domain type='kvm'>
+  <name>testvm</name>
+  <devices>
+    <shmem name='other-ivshmem'>
+      <model type='ivshmem-plain'/>
+      <size unit='M'>128</size>
+    </shmem>
+  </devices>
+</domain>
+XEOF
+_r48g_nol_info="$(_lg_vm_shmem_info "$(cat "$_r48g_nol_lg_xml")" 2>/dev/null || true)"
+_r48g_nol_has="${_r48g_nol_info%%$'\t'*}"
+if [[ "$_r48g_nol_has" == "0" ]]; then
+  printf 'PASS: R48g _lg_vm_shmem_info reports NOT configured for a non-looking-glass ivshmem\n'
+else
+  printf 'FAIL: R48g _lg_vm_shmem_info false-positived a non-looking-glass ivshmem as LG (has=%s)\n' "$_r48g_nol_has" >&2
+  record_failure "R48g _lg_vm_shmem_info rejects a non-looking-glass ivshmem"
+fi
+rm -rf "$_r48g_root"
+
 _vm_summary_fn="$(sed -n '/^_menu_vm_status_summary()/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_vm_summary_fn" ]]; then
   printf 'PASS: R48e _menu_vm_status_summary body extracted\n'

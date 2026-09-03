@@ -404,6 +404,38 @@ else
   record_failure "both dynamic paths honor ULTIMATE_PERF_VM_TUNING_OVERRIDE"
 fi
 
+# ===================== R48c: wizard runs VM-customization in BOTH binding modes =====================
+# Root-cause fix: in apply_configuration the entire VM-customization block
+# (preflight VM gate + vBIOS + stealth/hypervisor-hide + ultimate-perf + Looking
+# Glass) was nested INSIDE the `if binding_mode == DYNAMIC` guard, so an EARLY-
+# binding install (or a --recommended run that picked early) NEVER applied
+# hypervisor hide to the VM -> the VM kept showing red/green stripes in virt-
+# manager and the AMD driver would not install, forcing a re-run of dynamic
+# binding. R48c closes the DYNAMIC guard right after the dynamic-only installs
+# so the VM block runs regardless of binding mode. Assert the guard is closed
+# BEFORE the preflight gate (the gate sits at top level, not inside the if).
+_apply_fn="$(sed -n '/^apply_configuration()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48c wizard closes the DYNAMIC guard before the VM gate" \
+  'install_park_keepalive_monitor
+  fi
+  # R48c: VM-customization' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48c wizard runs the preflight VM gate outside the DYNAMIC guard" \
+  '# R45: preflight — only run the VM-customization steps if a guest-GPU VM exists.' \
+  "$_apply_fn"
+# The preflight gate line must appear AFTER the closing `fi` of the DYNAMIC
+# guard (i.e. at the function's 4-space indent, inside the `if _vm_gate` block
+# which itself is no longer nested under DYNAMIC). Confirm the gate is not
+# indented under the DYNAMIC if (8-space would mean it is still nested).
+if grep -qE '^        _preflight_guest_gpu_vm_gate' "$VFIO_SCRIPT" 2>/dev/null; then
+  printf 'FAIL: R48c preflight VM gate is still nested 8-space (inside DYNAMIC if)\n' >&2
+  record_failure "R48c preflight VM gate runs outside the DYNAMIC guard"
+else
+  printf 'PASS: R48c preflight VM gate runs outside the DYNAMIC guard (not 8-space indented)\n'
+fi
+
 # ===================== Live-attach-aware detection (R35 design fix) =====================
 # _vm_is_guest_gpu_vm detects a guest-GPU VM by BDF match OR membership in the
 # live-attach VM list. Live-attach strips the GPU hostdev from the persistent

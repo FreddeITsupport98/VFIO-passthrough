@@ -912,6 +912,110 @@ assert_contains_text \
   'Exiting vfio.sh menu.' \
   "$_menu_fn"
 
+# --- R48b: vfio_menu header + dialog prompt show a context-aware ReBAR
+# disclaimer so the GUI operator is told about the Resizable BAR / AMD
+# black-screen caveat (and that NVIDIA/Intel handle a resized BAR cleanly)
+# before picking an action. Mirrors the tray applet's R45 ReBAR warning;
+# read-only (conf + /proc/cmdline). ---
+assert_contains_file \
+  "R48b _menu_rebar_disclaimer function defined" \
+  '_menu_rebar_disclaimer()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R48b vfio_menu calls _menu_rebar_disclaimer full in the header" \
+  '_menu_rebar_disclaimer full' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48b vfio menu embeds the compact disclaimer in the select_from_list prompt" \
+  '_menu_rebar_disclaimer compact' \
+  "$_menu_fn"
+_rebar_fn="$(sed -n '/^_menu_rebar_disclaimer()/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_rebar_fn" ]]; then
+  printf 'PASS: R48b _menu_rebar_disclaimer body extracted\n'
+else
+  printf 'FAIL: R48b _menu_rebar_disclaimer body extracted (empty)\n' >&2
+  record_failure "R48b _menu_rebar_disclaimer body extracted"
+fi
+assert_contains_text \
+  "R48b disclaimer is AMD-gated on vendor 1002" \
+  '1002)' \
+  "$_rebar_fn"
+assert_contains_text \
+  "R48b disclaimer covers NVIDIA (10de) / Intel (8086)" \
+  '10de|8086)' \
+  "$_rebar_fn"
+assert_contains_text \
+  "R48b disclaimer warns amdgpu auto-resizes BAR0 -> Windows display black" \
+  'breaks the Windows AMD' \
+  "$_rebar_fn"
+assert_contains_text \
+  "R48b disclaimer points at the --amd-rebar fix" \
+  '--install-dynamic-binding --amd-rebar' \
+  "$_rebar_fn"
+assert_contains_text \
+  "R48b disclaimer notes NVIDIA/Intel handle a resized BAR cleanly" \
+  'NVIDIA/Intel handle a resized BAR' \
+  "$_rebar_fn"
+assert_contains_text \
+  "R48b disclaimer OK path checks /proc/cmdline for amdgpu.rebar=0" \
+  'amdgpu.rebar=0' \
+  "$_rebar_fn"
+assert_contains_text \
+  "R48b disclaimer has a compact mode for the dialog prompt" \
+  'compact' \
+  "$_rebar_fn"
+
+# --- R48c: hypervisor-hide status in the menu status bar + a standalone
+# "Apply hypervisor hide / stealth" menu option (position 3) so the GUI operator
+# sees WHICH VM(s) have the hide applied and can apply it without re-running the
+# whole wizard. Also fixes the root cause: the wizard now runs VM-customization
+# in BOTH binding modes (asserted in ultimate-perf-regression.sh). ---
+assert_contains_file \
+  "R48c _menu_hypervisor_hide_summary function defined" \
+  '_menu_hypervisor_hide_summary()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R48c vfio_menu calls _menu_hypervisor_hide_summary in the header" \
+  '_menu_hypervisor_hide_summary' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48c menu offers the hypervisor hide / stealth option" \
+  'Apply hypervisor hide / stealth to detected guest-GPU VMs' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48c menu hypervisor-hide option calls install_stealth_vm_tuning" \
+  'Applying hypervisor hide / stealth to detected guest-GPU VMs' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48c menu Exit is now option 21 (renumbered from 20)" \
+  'Exiting vfio.sh menu.' \
+  "$_menu_fn"
+_hh_fn="$(sed -n '/^_menu_hypervisor_hide_summary()/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_hh_fn" ]]; then
+  printf 'PASS: R48c _menu_hypervisor_hide_summary body extracted\n'
+else
+  printf 'FAIL: R48c _menu_hypervisor_hide_summary body extracted (empty)\n' >&2
+  record_failure "R48c _menu_hypervisor_hide_summary body extracted"
+fi
+assert_contains_text \
+  "R48c summary scans guest-GPU VMs via _list_guest_gpu_vms" \
+  '_list_guest_gpu_vms' \
+  "$_hh_fn"
+assert_contains_text \
+  "R48c summary checks stealth via _vm_is_stealth_tuned" \
+  '_vm_is_stealth_tuned' \
+  "$_hh_fn"
+assert_contains_text \
+  "R48c summary reports the no-VM-detected case" \
+  'no guest-GPU VM detected' \
+  "$_hh_fn"
+# _vm_tuning_status_block per-VM line is relabeled 'hypervisor-hide' (from 'stealth')
+# so the post-action block is explicit about the red/green-stripe fix.
+assert_contains_file \
+  "R48c status block relabels per-VM line to hypervisor-hide" \
+  'hypervisor-hide $_s_sym' \
+  "$VFIO_SCRIPT"
+
 # --- R34: self-install (--install-self/--uninstall-self) + config pickup ---
 # --install-self copies this script to /usr/local/bin/vfio (on PATH as vfio) and
 # drops the fish/bash/zsh completions into their vendor auto-load dirs (no

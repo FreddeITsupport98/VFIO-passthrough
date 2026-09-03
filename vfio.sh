@@ -27131,6 +27131,16 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
     # Install the park-keepalive monitor (instant on, no prompt): proactively
     # recovers the guest GPU while it is parked on vfio-pci between VM sessions.
     install_park_keepalive_monitor
+  fi
+  # R48c: VM-customization (vBIOS, stealth/hypervisor-hide, ultimate-perf, Looking
+  # Glass) runs in BOTH binding modes — it edits the VM XML and is independent of
+  # how the GPU gets bound. Previously this block was nested inside the DYNAMIC
+  # guard above, so an EARLY-binding install (or a --recommended run that picked
+  # early) NEVER applied hypervisor hide to the VM -> the VM kept showing
+  # red/green stripes in virt-manager and the AMD driver would not install,
+  # forcing a re-run of dynamic binding. Now the preflight VM gate + every opt-in
+  # customization runs regardless of binding mode. (The block keeps its 4-space
+  # indent from the old nesting; that is cosmetic only and valid bash.)
     # R45: preflight — only run the VM-customization steps if a guest-GPU VM exists.
     local _vm_gate=0
     _preflight_guest_gpu_vm_gate && _vm_gate=1
@@ -27218,7 +27228,6 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
       note "Skipping Looking Glass. You can set it up later with: sudo $SCRIPT_NAME --install-looking-glass"
     fi
     fi
-  fi
   if (( INSTALL_GRAPHICS_DAEMON )); then
     install_graphics_protocol_daemon "$graphics_daemon_interval"
   else
@@ -27733,6 +27742,91 @@ maybe_pickup_leftover_conf() {
 # in one session. Root + writable-root are enforced by the main() --menu dispatch
 # (most actions write to /etc; that also preserves --menu across the sudo re-exec
 # that require_root performs). Read-only actions (verify/detect) run inside.
+# R48b: ReBAR disclaimer for the vfio_menu header + dialog prompt. Context-aware
+# so the GUI operator is told ABOUT the Resizable BAR caveat before picking an
+# action: AMD (1002) + amdgpu.rebar=0 MISSING -> WARN (amdgpu auto-resizes BAR0
+# to full VRAM on load -> the Windows AMD display driver fails and the display
+# goes black even though the driver loads) + point at --amd-rebar as the fix;
+# AMD + param present -> OK; NVIDIA (10de) / Intel (8086) -> OK with a note that
+# those vendors handle a resized BAR cleanly (the AMD black-screen issue does
+# NOT apply); no conf / unknown vendor -> silent. Read-only (no root): reads the
+# conf with awk + world-readable /proc/cmdline, mirroring live_attach_status's
+# R45 ReBAR check so the menu + the tray applet agree. $1=full (default: note()
+# lines for the header) | compact (one plain line for the select_from_list
+# prompt, NO color so whiptail does not truncate the label at an ESC byte).
+_menu_rebar_disclaimer() {
+  readable_file "$CONF_FILE" || return 0
+  local _mode="${1:-full}" _vendor _cmdline
+  _vendor="$(awk -F= '/^GUEST_GPU_VENDOR_ID=/{v=$2; gsub(/"/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+  _vendor="${_vendor#0x}"
+  case "${_vendor,,}" in
+    1002)
+      _cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+      if grep -Fq 'amdgpu.rebar=0' <<<"$_cmdline" 2>/dev/null; then
+        if [[ "$_mode" == "compact" ]]; then
+          printf 'ReBAR: OK (amdgpu.rebar=0 active; AMD black-screen fix in place).'
+        else
+          note "ReBAR: OK — amdgpu.rebar=0 active (BAR0 stays at the BIOS size; AMD black-screen fix in place)."
+        fi
+      else
+        if [[ "$_mode" == "compact" ]]; then
+          printf 'ReBAR: AT RISK on AMD — amdgpu auto-resizes BAR0 to full VRAM -> Windows display goes black. Fix: sudo vfio --install-dynamic-binding --amd-rebar. (NVIDIA/Intel are unaffected by this.)'
+        else
+          note "ReBAR: AT RISK — amdgpu auto-resizes BAR0 to full VRAM on load, which breaks the Windows AMD"
+          note "      display driver (the display goes black even though the driver loads)."
+          note "      FIX: 'sudo vfio --install-dynamic-binding --amd-rebar' (adds amdgpu.rebar=0 so BAR0 stays"
+          note "      at the BIOS size). NOTE: this is an AMD-only issue — NVIDIA/Intel handle a resized BAR"
+          note "      cleanly, so ReBAR is fine on those GPUs."
+        fi
+      fi
+      ;;
+    10de|8086)
+      local _vn="NVIDIA"
+      [[ "${_vendor,,}" == "8086" ]] && _vn="Intel"
+      if [[ "$_mode" == "compact" ]]; then
+        printf 'ReBAR: OK on %s (handles a resized BAR cleanly; the AMD black-screen issue does not apply).' "$_vn"
+      else
+        local _msg
+        printf -v _msg 'ReBAR: OK — %s handles a resized BAR cleanly (the AMD black-screen issue does not apply here).' "$_vn"
+        note "$_msg"
+      fi
+      ;;
+  esac
+}
+
+# R48c: Hypervisor-hide status summary for the vfio_menu status bar. Scans every
+# guest-GPU VM (_list_guest_gpu_vms) and checks whether stealth/hypervisor-hide
+# is applied (_vm_is_stealth_tuned), then prints one compact line the operator
+# can read at a glance in the menu header: 'Hypervisor hide: win11 ✔, win10 ✖'
+# (✔ = vendor_id=GENUINE00000 + kvm=off,hypervisor=off + SMBIOS spoofing applied
+# = no red/green stripes in virt-manager); or 'no guest-GPU VM detected' when no
+# qualifying VM exists. Read-only (virsh dumpxml + world-readable conf); no root.
+# Mirrors the per-VM check _vm_tuning_status_block uses, so the header + the
+# post-action block agree.
+_menu_hypervisor_hide_summary() {
+  readable_file "$CONF_FILE" || { printf 'Hypervisor hide: no config'; return 0; }
+  have_cmd virsh || { printf 'Hypervisor hide: virsh unavailable'; return 0; }
+  libvirt_runtime_ok || { printf 'Hypervisor hide: libvirt not reachable'; return 0; }
+  local _dom _xml _sym _parts=()
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
+    if _vm_is_stealth_tuned "$_dom" "$_xml"; then
+      _sym="✔"
+    else
+      _sym="✖"
+    fi
+    _parts+=("$_dom $_sym")
+  done < <(_list_guest_gpu_vms)
+  if (( ${#_parts[@]} == 0 )); then
+    printf 'Hypervisor hide: no guest-GPU VM detected'
+    return 0
+  fi
+  local _joined
+  printf -v _joined '%s, ' "${_parts[@]}"
+  _joined="${_joined%, }"
+  printf 'Hypervisor hide: %s' "$_joined"
+}
+
 vfio_menu() {
   local _menu_opts _choice _conf_present _bmode
 
@@ -27753,6 +27847,7 @@ vfio_menu() {
       "Full configure (the guided wizard — pick GPUs, audio, binding mode)"
       "Full configure (recommended defaults — auto-answers after GPU pick)"
       "Switch to dynamic binding (RX 9070 / RDNA4 recommended)"
+      "Apply hypervisor hide / stealth to detected guest-GPU VMs (removes red/green stripes in virt-manager)"
       "Switch to early binding (boot-time, classic)"
       "Set up live-attach / hotswap (VM starts without GPU, then hot-attached + auto-installs Looking Glass)"
       "Attach virtio-win guest-agent ISO (smart handoff via guest-ping)"
@@ -27775,8 +27870,30 @@ vfio_menu() {
     say
     hdr "vfio.sh menu"
     note "Config present: $_conf_present | Binding mode: $_bmode"
+    # R48c: hypervisor-hide status in the status bar so the operator sees at a
+    # glance WHICH VM(s) have the hide applied (✔ = no red/green stripes in
+    # virt-manager) and which do not (✖) before picking an action.
+    local _hh_summary
+    _hh_summary="$(_menu_hypervisor_hide_summary)"
+    note "$_hh_summary"
+    # R48b: context-aware ReBAR disclaimer — full note() lines here for the
+    # CLI/plain-text path, plus a compact line embedded in the select_from_list
+    # prompt below so it is visible inside the whiptail dialog too (the header
+    # notes render on the terminal behind the dialog). Tells the operator ReBAR
+    # breaks the AMD Windows display driver (black screen) + that NVIDIA/Intel
+    # handle a resized BAR cleanly.
+    _menu_rebar_disclaimer full
     note "Pick an action (or Exit to quit):"
-    _choice="$(select_from_list "What do you want to do?" "vfio.sh menu" "${_menu_opts[@]}")"
+    local _rebar_compact _menu_prompt
+    _rebar_compact="$(_menu_rebar_disclaimer compact)"
+    if [[ -n "$_rebar_compact" ]]; then
+      _menu_prompt="What do you want to do?
+
+$_rebar_compact"
+    else
+      _menu_prompt="What do you want to do?"
+    fi
+    _choice="$(select_from_list "$_menu_prompt" "vfio.sh menu" "${_menu_opts[@]}")"
     case "$_choice" in
       0)
         # Full configure — the existing wizard (mirrors the main() fallthrough).
@@ -27805,13 +27922,34 @@ vfio_menu() {
         install_dynamic_binding_from_existing_config
         ;;
       3)
+        # R48c: Apply hypervisor hide / stealth to detected guest-GPU VMs.
+        # Makes the VM look like a real desktop PC (vendor_id=GENUINE00000 +
+        # kvm hidden + hypervisor CPUID bit off + SMBIOS spoofing + e1000e NIC +
+        # randomized disk serials + vmport off) so virt-manager does NOT show
+        # the red/green hypervisor stripes and the AMD Windows driver installs.
+        # Same action as option 7 (stealth/perf VM tuning); placed here so the
+        # dynamic-binding -> hypervisor-hide workflow is linear.
+        say
+        note "Applying hypervisor hide / stealth to detected guest-GPU VMs..."
+        if ! readable_file "$CONF_FILE"; then
+          note "Missing $CONF_FILE. Run option 0 (Full configure) or option 2 (Switch to dynamic binding) first."
+        elif ! libvirt_runtime_ok; then
+          note "WARN: libvirt is not reachable; hypervisor hide / stealth needs libvirt to dump/define VM XML."
+          if prompt_yn "Continue anyway?" N "Hypervisor hide / stealth"; then
+            install_stealth_vm_tuning
+          fi
+        else
+          install_stealth_vm_tuning
+        fi
+        ;;
+      4)
         # Switch to early binding.
         say
         note "Switching to early binding..."
         require_systemd
         install_early_binding_from_existing_config
         ;;
-      4)
+      5)
         # Set up live-attach / hotswap.
         say
         note "Setting up live-attach / hotswap..."
@@ -27826,7 +27964,7 @@ vfio_menu() {
           install_live_attach
         fi
         ;;
-      5)
+      6)
         # Attach virtio-win guest-agent ISO.
         say
         note "Attaching virtio-win guest-agent ISO..."
@@ -27841,7 +27979,7 @@ vfio_menu() {
           install_virtio_win_guest_agent
         fi
         ;;
-      6)
+      7)
         # Apply stealth/perf VM tuning.
         say
         note "Applying stealth/perf VM tuning..."
@@ -27856,7 +27994,7 @@ vfio_menu() {
           install_stealth_vm_tuning
         fi
         ;;
-      7)
+      8)
         # Revert stealth/perf VM tuning.
         say
         note "Reverting stealth/perf VM tuning..."
@@ -27871,7 +28009,7 @@ vfio_menu() {
           reset_stealth_vm_tuning
         fi
         ;;
-      8)
+      9)
         # Apply ultimate-perf VM tuning (stealth-safe).
         say
         note "Applying ultimate-performance VM tuning..."
@@ -27886,7 +28024,7 @@ vfio_menu() {
           install_ultimate_perf_vm_tuning
         fi
         ;;
-      9)
+      10)
         # Revert ultimate-perf VM tuning.
         say
         note "Reverting ultimate-performance VM tuning..."
@@ -27901,7 +28039,7 @@ vfio_menu() {
           reset_ultimate_perf_vm_tuning
         fi
         ;;
-      10)
+      11)
         # Verify setup (read-only).
         say
         note "Verifying setup..."
@@ -27915,7 +28053,7 @@ vfio_menu() {
           _verdict_popup "Verify setup" "FAIL" "One or more checks failed (rc=$_verify_rc). See the full report above."
         fi
         ;;
-      11)
+      12)
         # Detect / health check (read-only). Subshell isolates the conf source.
         say
         note "Running detect + health check..."
@@ -27945,7 +28083,7 @@ vfio_menu() {
           *)    _verdict_popup "Detect + health check" "COMPLETE" "Detection complete. Health status could not be determined." ;;
         esac
         ;;
-      12)
+      13)
         # Reset everything.
         say
         note "Resetting everything..."
@@ -27960,19 +28098,19 @@ vfio_menu() {
           note "Reset cancelled."
         fi
         ;;
-      13)
+      14)
         # Install vfio.sh to a stable PATH location + shell completions.
         say
         note "Installing vfio.sh to /usr/local/sbin + shell completions..."
         install_self
         ;;
-      14)
+      15)
         # Uninstall the self-installed vfio.sh + completions.
         say
         note "Uninstalling the self-installed vfio.sh + completions..."
         uninstall_self
         ;;
-      15)
+      16)
         # Set up Looking Glass (host-side VM setup).
         say
         note "Setting up Looking Glass..."
@@ -27987,25 +28125,25 @@ vfio_menu() {
           install_looking_glass
         fi
         ;;
-      16)
+      17)
         # Remove Looking Glass.
         say
         note "Removing Looking Glass host-side setup..."
         remove_looking_glass
         ;;
-      17)
+      18)
         # Install (compile) looking-glass-client binary.
         say
         note "Installing/compiling looking-glass-client..."
         install_looking_glass_client
         ;;
-      18)
+      19)
         # Remove looking-glass-client binary.
         say
         note "Removing looking-glass-client binary..."
         remove_looking_glass_client
         ;;
-      19)
+      20)
         # Toggle live-attach hotplug on/off (real mode switch, not backup-restore).
         say
         note "Toggling live-attach hotplug..."
@@ -28020,7 +28158,7 @@ vfio_menu() {
           live_attach_toggle toggle
         fi
         ;;
-      20)
+      21)
         # Exit.
         say
         say "Exiting vfio.sh menu."
@@ -28073,7 +28211,7 @@ _vm_tuning_status_block() {
       _l_sym="✔"
       _lg_detail=" (shmem ${_sz}MB${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none})"
     fi
-    _line="$_dom:  stealth $_s_sym  perf $_p_sym  looking-glass $_l_sym$_lg_detail"
+    _line="$_dom:  hypervisor-hide $_s_sym  perf $_p_sym  looking-glass $_l_sym$_lg_detail"
     _body+=("$_line")
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
   (( _found )) || return 0

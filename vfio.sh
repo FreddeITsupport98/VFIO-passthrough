@@ -4408,6 +4408,18 @@ backup_file() {
   local bak
   bak="${f}.bak.${RUN_TS}"
 
+  # R45: rotate — keep exactly ONE backup per file. Delete any prior
+  # ${f}.bak.* from earlier runs before writing the new one, so repeated
+  # --install-self / --reset / re-runs no longer accumulate dozens of
+  # timestamped .bak files (observed: 435 vfio*.bak.* in /usr/local/bin,
+  # which fish then offered as command completions). One backup per file =
+  # a single known location the rollback path remembers.
+  local _old
+  for _old in "${f}".bak.*; do
+    [[ -f "$_old" ]] || continue
+    rm -f "$_old"
+  done
+
   BACKUP_MAP[$f]="$bak"
   BACKUP_ENTRIES+=("$f::$bak")
 
@@ -4416,6 +4428,10 @@ backup_file() {
   fi
 
   cp -a "$f" "$bak"
+  # R45: make the backup NON-executable (0644) so a .bak file in a PATH
+  # dir (e.g. /usr/local/bin/vfio.bak.<ts>) is NOT offered as a shell
+  # command completion. Restore sites re-apply the exec bit where needed.
+  chmod 0644 "$bak" 2>/dev/null || true
 }
 
 trim() {
@@ -21133,6 +21149,7 @@ install_early_binding_from_existing_config() {
     if [[ -n "$_hook_bak" ]]; then
       note "Restoring pre-existing libvirt qemu hook from $(basename "$_hook_bak")"
       run cp -a "$_hook_bak" "$LIBVIRT_HOOK_ENTRY"
+      chmod 0755 "$LIBVIRT_HOOK_ENTRY" 2>/dev/null || true
     else
       run rm -f "$LIBVIRT_HOOK_ENTRY"
     fi
@@ -24708,6 +24725,15 @@ generate_rollback_script() {
     rr+="if [ -f '$bak' ]; then cp -a '$bak' '$p'; else rm -f '$p'; fi\n"
   done
 
+  # R45: backups are stored 0644 (non-executable) so .bak files in PATH dirs
+  # are not offered as shell command completions. Re-apply the exec bit to
+  # the scripts/hooks the rollback restores so they run again.
+  local _xp
+  for _xp in "$BIND_SCRIPT" "$GRAPHICS_DAEMON_SCRIPT" "$USB_BT_SCRIPT" \
+             "$LIBVIRT_HOOK_SCRIPT" "$LIBVIRT_HOOK_ENTRY" "$bootlog_bin"; do
+    rr+="if [ -f '$_xp' ]; then chmod 0755 '$_xp'; fi\n"
+  done
+
   write_file_atomic "$path" 0700 "root:root" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -25298,6 +25324,24 @@ _wipe_vm_stage_backups() {
   note "Removed ALL VM-XML stage backups (stealth/perf/live-attach) for a fresh start: $_stealth_dir, $_perf_dir, $_la_dir live-attach variants + legacy $_legacy_dir. The VM XMLs themselves are NOT reverted — run --reset-stealth-vm-tuning / --reset-ultimate-perf-vm-tuning / --install-dynamic-binding (reverts live-attach) to revert them BEFORE --reset, since the backups are deleted here."
 }
 
+# R45: sweep timestamped .bak.* backups of every script-managed file so
+# --reset (and --reset --full) leaves no accumulating litter. The
+# backup_file rotation now keeps only ONE backup per file going forward;
+# this sweep cleans the pre-rotation litter (e.g. 435 vfio*.bak.* in
+# /usr/local/bin from repeated --install-self runs) in one pass. Best-effort.
+_wipe_script_backups() {
+  local _r _old _n=0
+  for _r in "$@"; do
+    [[ -n "$_r" ]] || continue
+    for _old in "${_r}".bak.*; do
+      [[ -f "$_old" ]] || continue
+      rm -f "$_old" 2>/dev/null || true
+      _n=$((_n + 1))
+    done
+  done
+  (( _n )) && note "Removed $_n timestamped .bak backup file(s) (one-backup-per-file rotation keeps only the latest)."
+}
+
 # R45: enumerate which of the passed managed-file paths currently exist on disk,
 # so the operator sees EXACTLY what --reset will remove BEFORE typing the confirm
 # phrase (preview), and so a partial removal is visible AFTERWARD instead of
@@ -25379,6 +25423,10 @@ reset_vfio_all() {
   note "      for a clean slate (one pristine backup per stage, rebuilt from the live"
   note "      VM XML on re-install). Revert VM XMLs from backup FIRST (the commands"
   note "      above) — the backups are deleted by --reset."
+  note "NOTE: --reset now ALSO removes every script-managed file's timestamped"
+  note "      .bak.* backup (the one-backup-per-file rotation keeps only the latest"
+  note "      going forward; this sweep clears pre-rotation litter like the"
+  note "      vfio*.bak.* files that accumulated in /usr/local/bin)."
   if [[ "$_full" == "full" ]]; then
     note "NOTE: full --reset ALSO removes the installed 'vfio' CLI + completions."
     note "      If you want to re-run vfio afterward, invoke the repo script directly"
@@ -25469,6 +25517,13 @@ reset_vfio_all() {
   # conf keys). Live-attach artifacts are also removed by remove_live_attach
   # above; this is the defense-in-depth fresh-start sweep for every stage.
   _wipe_vm_stage_backups
+  # R45: wipe timestamped .bak.* backups of every script-managed file (the
+  # backup_file rotation now keeps only 1 per file going forward; this cleans
+  # pre-rotation litter). Full reset also cleans the self-installed CLI
+  # backups (added in the full branch below).
+  _wipe_script_backups "${_rm_paths[@]}" \
+    /etc/default/grub /etc/kernel/cmdline \
+    "$LIBVIRT_HOOK_ENTRY" "$OPENBOX_AUTOSTART_FILE"
   # R40: remove Looking Glass host-side setup (shmem device + shared-memory node +
   # security rules + user config). Must run before $CONF_FILE is deleted (it reads
   # GUEST_GPU_BDF to find guest-GPU VMs). Best-effort.
@@ -25491,6 +25546,7 @@ reset_vfio_all() {
     if [[ -n "$_hook_bak" ]]; then
       note "Reset mode: restoring pre-existing libvirt qemu hook from $(basename "$_hook_bak")"
       run cp -a "$_hook_bak" "$LIBVIRT_HOOK_ENTRY"
+      chmod 0755 "$LIBVIRT_HOOK_ENTRY" 2>/dev/null || true
     else
       run rm -f "$LIBVIRT_HOOK_ENTRY"
     fi
@@ -25746,6 +25802,11 @@ reset_vfio_all() {
           "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
           "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
         note "Removed self-installed 'vfio' CLI command + shell completions (full reset). Repo script untouched."
+        # R45: full reset also wipes the self-installed CLI + completion .bak.* litter.
+        _wipe_script_backups "$SELF_INSTALL_BIN" \
+          "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" \
+          "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
+          "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
       else
         note "DRY-RUN: would remove $SELF_INSTALL_BIN + 3 completion files (full reset). Repo script untouched."
       fi
@@ -27290,6 +27351,8 @@ uninstall_self() {
     "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
     "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
   say "Removed self-installed vfio + completion files."
+  # R45: also remove the self-installed CLI's timestamped .bak.* litter.
+  _wipe_script_backups "$SELF_INSTALL_BIN"
   say
   note "If vfio was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
   note "The VFIO config ($CONF_FILE) is untouched — use --reset to remove it."

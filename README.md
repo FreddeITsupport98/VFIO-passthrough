@@ -106,6 +106,8 @@ A **one-pristine-backup-per-stage + reset fresh-start** model (R43) governs ever
 
 A **Looking Glass ReBAR vendor gate + explicit `<video>` default** (R44/LG) makes the Looking Glass setup AMD-safe: the optional ReBAR 64-bit MMIO sub-prompt (`-fw_cfg opt/ovmf/X-PciMmio64Mb,string=65536`, the 64GB aperture that lets a resized BAR0 map into the guest) is now offered **only for NVIDIA (10de) / Intel (8086)** guest GPUs. On AMD (1002) a resized BAR0 breaks the Windows driver on cards like the RX 6900 / 9070 — the driver loads ("the device is working properly") but the display engine fails to initialize and the physical monitor stays black, confirmed empirically — so ReBAR is **not offered** for AMD (an operator with a specific need can still add the fw_cfg manually). The LG `<video>` model default is also now explicit: **`none` for cold-attach** (the GPU is present at boot = the only display via Looking Glass; no competing virtual card), while a **virtio-gpu boot display is kept ONLY for live-attach mode=on** (the proven black-screen fix — in live-attach the GPU is absent at boot, so `video=none` would leave Windows headless and the hot-attached GPU's display would silently fail). The live-attach virtio exception is intentionally preserved.
 
+The stealth tuning now also **spoofs the MAC OUI** (the QEMU `52:54:00` prefix → a real-vendor OUI, stable per VM) and adds **SMBIOS type 2 (baseboard) / 3 (chassis) / 17 (memory)** spoofing from the host DMI (R48g) — closing the residual Windows `VM=yes` gap the MAC + missing baseboard/chassis left open. The per-VM status checklist now splits **hypervisor-hide** (the core stripes fix) from **stealth-tune** (the cosmetic extension) into separate ✔/✖ items (R48f), anchors Looking Glass detection to the `<shmem name='looking-glass'>` device specifically (no more false-positive on a different ivshmem), and appends a **`compiled ✔/✖`** marker to the Looking Glass detail showing whether the host `looking-glass-client` binary is built (R48h). The Looking Glass setup now shows a **smart compile-client-first disclaimer** — silent (one green ✔) when the client is already compiled, a full `PREREQUISITE` banner + the install command only when it is not. See [Stealth/perf VM tuning](#stealthperf-vm-tuning-smbios--cpu--nic--disk-serials--iothreads) and [Interactive menu status panel](#interactive-menu-status-panel-r48br48h).
+
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
 > **The practical result — on an RX 9070 / 9070 XT / 9070 GRE passed through to a Windows guest:**
@@ -334,12 +336,15 @@ vfio --live-attach-status        # read-only state (no root needed)
 vfio 6.0 also absorbs the Stealthy-VM tuning (MIT-licensed, by Fredrik Bäckström) so a Windows guest looks more like a real desktop PC and gets perf tuning — applied directly to the detected guest-GPU VMs at install time, with verification before anything is redefined.
 
 **What it does** (to each shut-off VM that has the guest GPU attached):
-- **Hypervisor hide**: `hyperv vendor_id=GENUINE00000` + `kvm hidden` (so the AMD Windows driver installs the real display driver).
+- **Hypervisor hide** (the core): `hyperv vendor_id=GENUINE00000` + `kvm hidden` + `vmport off` (so the AMD Windows driver installs the real display driver and the VMware backdoor port does not report a VM).
 - **CPU**: `host-passthrough` + the `hypervisor` CPUID bit disabled; QEMU `-cpu host,kvm=off,hypervisor=off,hv_vendor_id=null,invtsc=on`.
-- **SMBIOS spoofing** from the **host's real DMI** (`/sys/class/dmi/id/*`) — BIOS vendor/version/date + system manufacturer/product with a randomized serial/UUID — so the VM's SMBIOS matches your actual hardware, not a generic ASUS B550 (falls back to defaults if DMI is unreadable).
-- **Devices**: virtio NIC → `e1000e`; randomized disk serials; `memballoon=none`; tablet input removed (USB mouse kept); `hypervclock` off; TSC native.
+- **SMBIOS spoofing** from the **host's real DMI** (`/sys/class/dmi/id/*`) — BIOS vendor/version/date + system manufacturer/product + **baseboard** (type 2) + **chassis** (type 3) + **memory** (type 17), all with **stable per-VM serials** derived from the VM UUID hash so a re-tune does NOT churn the Windows hardware fingerprint / digital license. So the VM's SMBIOS matches your actual hardware, not a generic ASUS B550 (falls back to defaults if DMI is unreadable).
+- **MAC OUI spoof** (R48g): the NIC model → `e1000e` AND the MAC address is replaced — the QEMU/KVM OUI prefix `52:54:00` (the single most reliable automated VM tell; a real desktop NIC never has it) is swapped for a real-vendor OUI (Intel/ASUS/Realtek/Gigabyte) with deterministic last-3-octets from the VM UUID, so a re-tune keeps the same MAC (DHCP leases / Windows network profile stay stable). A real/user-set MAC is left untouched.
+- **Devices**: randomized disk serials; `memballoon=none`; tablet input removed (USB mouse kept); `hypervclock` off; TSC native.
 - **Perf**: `iothreads=1`, host-aware `cputune` (vCPU/emulator/iothread pinning based on host core count), disk iothread assignment.
 - **Preserves your existing `<qemu:commandline>` args** (e.g. Looking Glass `kvmfr`) — it dedupes its own `-cpu`/`-smbios` pairs instead of wiping the commandline, so re-running is idempotent.
+
+**Honest ceiling (R48g).** The XML-level stealth above defeats the *casual* VM detection (CPUID hypervisor bit + SMBIOS 0/1/2/3/17 + MAC OUI + NIC model + vmport). Deeper tells — the SMBIOS VM bit, BIOS vendor `SeaBIOS`, ACPI OEM `BOCHS`, the FADT `QEMU` hypervisor-vendor string, the disk model `QEMU HARDDISK`, the `QEMU0001/0002/VGID` ACPI device _HIDs — require a **patched QEMU binary** (e.g. `dsecuma/qemu-anti-detection`) and cannot be defeated from libvirt XML alone. Timing attacks (RDTSC) cannot be fully hidden at all. This is cosmetic realism + perf tuning, **not** an anti-cheat bypass. (Note: "Virtualization: Enabled" in Task Manager / `msinfo32` is the CPU SVM/VT-x bit, which every modern physical PC shows — it is NOT a VM tell; `host-passthrough` deliberately passes it through so the VM looks consistent with bare metal.)
 
 **Safety / verify-before-define**: for each VM it dumps + backs up the XML, runs the tuning on a temp copy, validates with `virt-xml-validate`, and prompts before `virsh define`. Running VMs are skipped. `--dry-run` shows a `diff -u` of the changes.
 
@@ -806,20 +811,24 @@ Menu options (0-indexed, as shown in the TUI):
 21. **Show VFIO status** — re-opens the per-VM tuning checklist + ReBAR status panel on demand (R48e).
 22. **Exit menu**.
 
-#### Interactive menu status panel (R48b–R48e)
+#### Interactive menu status panel (R48b–R48h)
 
 On menu entry (and after any action that changes VM state), a **VFIO status** panel shows a full per-VM checklist of every customization the script can apply, plus the ReBAR caveat — so you see what is applied (✔) vs not (✖) before picking an action:
 
 ```text path=null start=null
-win11:  hypervisor-hide ✔  ultimate-perf ✖  looking-glass ✔ (shmem 64MB + ReBAR, video=none)
-       vBIOS ✔  live-attach ✖  hugepages ✖  virtio-win ✔  disks-virtio ✔
+win11:  hypervisor-hide ✔  stealth-tune ✔  ultimate-perf ✖  looking-glass ✔ (shmem 64MB + ReBAR, video=none, compiled ✔)
+       vBIOS ✔  live-attach ✔  hugepages ✖  virtio-win ✔  disks-virtio ✖
 
 ReBAR: OK (amdgpu.rebar=0 active; AMD black-screen fix in place).
 ```
 
-The 8 features detected from the live VM XML (`virsh dumpxml`, read-only, no root): **hypervisor-hide** (`vendor_id=GENUINE00000` + `kvm=off,hypervisor=off` + SMBIOS spoofing), **ultimate-perf** (`cache=none` + `io=native` + `<cputune>`), **looking-glass** (`<shmem>` ivshmem-plain + size/ReBAR/video=none), **vBIOS** (`<rom file>`), **live-attach** (enrolled in `/var/lib/vfio-dynamic/live-attach-vms`), **hugepages** (`<memoryBacking><hugepages>`), **virtio-win** (cdrom sourcing the virtio-win ISO), **disks-virtio** (no unconverted SATA hard disks).
+The **9 features** detected from the live VM XML (`virsh dumpxml`, read-only, no root): **hypervisor-hide** (the core — `vendor_id=GENUINE00000` + `kvm=off,hypervisor=off`; removes the red/green stripes so the AMD Windows driver installs), **stealth-tune** (the cosmetic extension — SMBIOS type-1 spoofing + e1000e NIC + randomized disk serials + memballoon/clock/timer tweaks + QEMU `-cpu`/`-smbios` args; detected separately via `type=1,manufacturer=` so a hide-only VM shows tune ✖ — R48f), **ultimate-perf** (`cache=none` + `io=native` + `<cputune>`), **looking-glass** (a `<shmem name='looking-glass'>` ivshmem-plain + its real size/ReBAR/video=none detail + a host-level **`compiled ✔/✖`** marker showing whether `looking-glass-client` is built — R48g/R48h), **vBIOS** (`<rom file>`), **live-attach** (enrolled in `/var/lib/vfio-dynamic/live-attach-vms`), **hugepages** (`<memoryBacking><hugepages>`), **virtio-win** (cdrom sourcing the virtio-win ISO), **disks-virtio** (no unconverted SATA hard disks).
+
+The Looking Glass detail is anchored to the `<shmem name='looking-glass'>` device **specifically** (R48g) — a VM with a *different* ivshmem device no longer false-positives as Looking Glass, and the reported size is the real LG size (was: any `ivshmem-plain` matched, size grabbed from any `<size>` element). The `compiled ✔/✖` marker (R48h) tells you at a glance whether the VM-side `<shmem>` is actually usable — without the `looking-glass-client` binary the framebuffer is exposed but nothing reads it (black window / "cannot find shared memory"). It uses the same ELF check (`_lg_binary_valid`) as the install and the smart disclaimer, so all three always agree.
 
 The panel auto-shows once on menu entry and re-shows only when VM state changes (e.g. after **Apply hypervisor hide** the ✖ flips to ✔). To bring it back on demand at any time, pick **option 21 (Show VFIO status)**. The ReBAR line is vendor-aware: AMD + `amdgpu.rebar=0` missing → AT RISK warning (amdgpu auto-resizes BAR0 → Windows black screen) + the `--amd-rebar` fix; NVIDIA/Intel → OK (handle a resized BAR cleanly). All whiptail dialogs are now dynamically sized to the content (R48e), so the long checklist line no longer truncates.
+
+**Smart Looking-Glass disclaimer (R48g/R48h).** When you set up Looking Glass (`--install-looking-glass` / menu option 16, or the wizard/install-flow prompt), the script checks whether `looking-glass-client` is compiled: if it is, it prints one brief green `✔ already compiled` line and moves on (no noise on re-runs); if it is NOT, it pops a prominent `PREREQUISITE` banner explaining the `<shmem>` only exposes the framebuffer — the *client* reads it — and names the exact command to compile it (`sudo vfio --install-looking-glass-client` / menu option 18). A matching one-line heads-up also fires before the wizard/install-flow "Set up Looking Glass?" decision prompt (silent when the client is already built), so you can compile first instead of setting up a useless shmem.
 
 ```fish path=null start=null
 sudo ./vfio.sh --menu

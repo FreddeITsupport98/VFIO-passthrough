@@ -28177,10 +28177,14 @@ $_rebar_compact"
   done
 }
 
-# R40b: Consolidated VM tuning status block — one framed card (CLI) or popup
-# (GUI) showing per guest-GPU VM: stealth ✔/✖, ultimate-perf ✔/✖, looking-glass
-# ✔/✖ (+ shmem size + ReBAR + video=none). Replaces the three separate scattered
-# status sections in --detect/--verify with a single compact block.
+# R40b/R48d: Consolidated VM tuning status block — one framed card (CLI) or
+# popup (GUI) showing per guest-GPU VM a FULL checklist of every VM
+# customization the script can apply, so the operator sees at a glance what is
+# applied (✔) vs not (✖) and it updates after every menu action. 8 features:
+#   hypervisor-hide (stealth)   ultimate-perf          looking-glass (+detail)
+#   vBIOS ROM injection          live-attach enrolled   hugepages (memoryBacking)
+#   virtio-win guest-agent ISO   disks-virtio (no SATA hard disks)
+# Replaces the three separate scattered status sections in --detect/--verify.
 _vm_tuning_status_block() {
   if ! readable_file "$CONF_FILE"; then return 0; fi
   have_cmd virsh || return 0
@@ -28188,7 +28192,13 @@ _vm_tuning_status_block() {
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
   if ! libvirt_runtime_ok; then return 0; fi
-  local _dom _xml _has_stealth _has_perf _has_shmem _has_rebar _has_video_none _sz _line
+  # R48d: read the script-global ISO paths + the live-attach VM list so we can
+  # detect the virtio-win guest-agent ISO cdrom + live-attach enrollment.
+  local _vw_iso1="${VIRTIO_WIN_ISO_PATH:-}" _vw_iso2="${VIRTIO_WIN_FALLBACK_ISO:-}"
+  local _la_list="${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
+  local _dom _xml _has_stealth _has_perf _has_shmem _has_rebar _has_video_none _sz
+  local _has_vbios _has_liveattach _has_hugepages _has_virtio_iso _has_sata_disk
+  local _n_sata _n_cdrom _line1 _line2
   local -a _body=()
   local _found=0
   while IFS= read -r _dom; do
@@ -28198,21 +28208,47 @@ _vm_tuning_status_block() {
     _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
     _found=1
     _has_stealth=0; _has_perf=0; _has_shmem=0; _has_rebar=0; _has_video_none=0; _sz=""
+    _has_vbios=0; _has_liveattach=0; _has_hugepages=0; _has_virtio_iso=0; _has_sata_disk=0
+    # Line 1 features: hypervisor-hide / ultimate-perf / looking-glass.
     grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && grep -Fq 'type=1,manufacturer=' <<<"$_xml" 2>/dev/null && _has_stealth=1
     grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && grep -Fq '<cputune>' <<<"$_xml" 2>/dev/null && _has_perf=1
     grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null && _has_shmem=1
     grep -q 'opt/ovmf/X-PciMmio64Mb' <<<"$_xml" 2>/dev/null && _has_rebar=1
     grep -q "<model type='none'" <<<"$_xml" 2>/dev/null && _has_video_none=1
     _sz="$(grep -oE "<size unit='M'>[0-9]+" <<<"$_xml" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)"
+    # Line 2 features: vBIOS / live-attach / hugepages / virtio-win ISO / disks.
+    grep -Eq '<rom file=' <<<"$_xml" 2>/dev/null && _has_vbios=1
+    [[ -f "$_la_list" ]] && grep -Fixq "$_dom" "$_la_list" 2>/dev/null && _has_liveattach=1
+    grep -q '<hugepages' <<<"$_xml" 2>/dev/null && _has_hugepages=1
+    if [[ -n "$_vw_iso1" ]] && grep -Fq "$_vw_iso1" <<<"$_xml" 2>/dev/null; then
+      _has_virtio_iso=1
+    elif [[ -n "$_vw_iso2" ]] && grep -Fq "$_vw_iso2" <<<"$_xml" 2>/dev/null; then
+      _has_virtio_iso=1
+    fi
+    # Disks: if more bus='sata' targets than cdroms, there are unconverted SATA
+    # hard disks (each cdrom accounts for one bus='sata'; the excess is SATA disks).
+    _n_sata="$(grep -cE "bus='sata'" <<<"$_xml" 2>/dev/null || true)"
+    _n_cdrom="$(grep -cE "device='cdrom'" <<<"$_xml" 2>/dev/null || true)"
+    [[ "$_n_sata" =~ ^[0-9]+$ ]] || _n_sata=0
+    [[ "$_n_cdrom" =~ ^[0-9]+$ ]] || _n_cdrom=0
+    (( _n_sata > _n_cdrom )) && _has_sata_disk=1
+    # Build the 2-line checklist for this VM.
     local _s_sym="✖" _p_sym="✖" _l_sym="✖" _lg_detail=""
+    local _vb_sym="✖" _la_sym="✖" _hp_sym="✖" _vw_sym="✖" _dk_sym="✖"
     (( _has_stealth )) && _s_sym="✔"
     (( _has_perf )) && _p_sym="✔"
     if (( _has_shmem )); then
       _l_sym="✔"
       _lg_detail=" (shmem ${_sz}MB${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none})"
     fi
-    _line="$_dom:  hypervisor-hide $_s_sym  perf $_p_sym  looking-glass $_l_sym$_lg_detail"
-    _body+=("$_line")
+    (( _has_vbios )) && _vb_sym="✔"
+    (( _has_liveattach )) && _la_sym="✔"
+    (( _has_hugepages )) && _hp_sym="✔"
+    (( _has_virtio_iso )) && _vw_sym="✔"
+    (( ! _has_sata_disk )) && _dk_sym="✔"
+    _line1="$_dom:  hypervisor-hide $_s_sym  ultimate-perf $_p_sym  looking-glass $_l_sym$_lg_detail"
+    _line2="       vBIOS $_vb_sym  live-attach $_la_sym  hugepages $_hp_sym  virtio-win $_vw_sym  disks-virtio $_dk_sym"
+    _body+=("$_line1" "$_line2")
   done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
   (( _found )) || return 0
   if (( HAS_TUI )); then

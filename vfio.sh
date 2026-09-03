@@ -49,6 +49,11 @@ GRAPHICS_DAEMON_WANTS_LINK="/etc/systemd/system/multi-user.target.wants/vfio-gra
 LIBVIRT_HOOK_DIR="/etc/libvirt/hooks"
 LIBVIRT_HOOK_ENTRY="$LIBVIRT_HOOK_DIR/qemu"
 LIBVIRT_HOOK_SCRIPT="/usr/local/sbin/vfio-libvirt-hook.sh"
+# Append-only runtime logs the generated libvirt hook + live-attach helper write
+# at VM start/stop time. Removed by --reset (R47) so /var/log keeps no stale
+# VFIO logs after a clean removal.
+VFIO_HOOK_LOG="/var/log/vfio-libvirt-hook.log"
+VFIO_LIVE_ATTACH_LOG="/var/log/vfio-live-attach.log"
 # Plasma/KWin Wayland session env drop-in that pins the compositor's render
 # device to the HOST GPU. Without this, on a dual-GPU setup where the guest GPU
 # is Boot VGA (boot_vga=1), KWin renders on the guest GPU and binding it to
@@ -129,6 +134,11 @@ VBIOS_RUNTIME_DIR="/var/lib/libvirt/vbios"
 # constants below). --reset removes every managed file inside it and then
 # best-effort rmdir's the now-empty dir (R46) so no empty litter remains.
 VFIO_DYNAMIC_DIR="/var/lib/vfio-dynamic"
+# Bind-script runtime state (written by the generated vfio-bind-selected-gpu.sh
+# at --release / --bind-now time inside the dynamic dir). Removed by --reset
+# (R47) so the dynamic dir can be rmdir'd empty instead of leaving these behind.
+VFIO_COOLDOWN_TS_FILE="${VFIO_DYNAMIC_DIR}/last-vm-stop.ts"
+VFIO_DRIVER_STATUS_FILE="${VFIO_DYNAMIC_DIR}/amd-driver-status"
 LIVE_ATTACH_HELPER="/usr/local/sbin/vfio-live-attach.sh"
 LIVE_ATTACH_GPU_XML="/var/lib/vfio-dynamic/live-attach-gpu.xml"
 LIVE_ATTACH_AUDIO_XML="/var/lib/vfio-dynamic/live-attach-audio.xml"
@@ -10464,6 +10474,22 @@ EOF
   note "  Verify: sudo semodule -l | grep vfio_virtqemud"
   note "  If virtqemud_t was put in permissive mode to work around the denials, you can"
   note "  now return it to enforcing: sudo semanage permissive -d virtqemud_t"
+}
+
+# R47: remove the targeted SELinux policy module install_selinux_virtqemud_policy
+# installs (Fedora/RHEL), so --reset / --install-early-binding do not leave a
+# now-unused policy module behind (it only existed to let virtqemud_t run the
+# libvirt qemu hook). Best-effort: no-op on non-SELinux systems, when semodule
+# is missing, or when the module was never installed. Never fatal.
+remove_selinux_virtqemud_policy() {
+  command -v semodule >/dev/null 2>&1 || return 0
+  if ! command -v selinuxenabled >/dev/null 2>&1 || ! selinuxenabled 2>/dev/null; then
+    return 0
+  fi
+  if semodule -l 2>/dev/null | grep -qx 'vfio_virtqemud'; then
+    note "Reset mode: removing SELinux policy module 'vfio_virtqemud' (no longer needed without the libvirt hook)."
+    run semodule -r vfio_virtqemud 2>/dev/null || true
+  fi
 }
 
 install_libvirt_hook() {
@@ -21187,6 +21213,9 @@ install_early_binding_from_existing_config() {
   fi
   run rm -f "$LIBVIRT_HOOK_SCRIPT"
   say "Removed libvirt qemu hook."
+  # R47: the SELinux vfio_virtqemud policy module only existed to let
+  # virtqemud_t run the libvirt hook; with the hook removed it is dead weight.
+  remove_selinux_virtqemud_policy
 
   # 3b. Remove the KDE/KWin Wayland HOST-GPU render-device pin: early binding
   #     parks the guest GPU on vfio-pci at boot (before the compositor starts),
@@ -24747,6 +24776,10 @@ generate_rollback_script() {
     "$USB_BT_STATE_FILE"
     "$GRAPHICS_DAEMON_WANTS_LINK"
     "$SDDM_PLASMA_WAYLAND_CONF"
+    "$VFIO_COOLDOWN_TS_FILE"
+    "$VFIO_DRIVER_STATUS_FILE"
+    "$VFIO_HOOK_LOG"
+    "$VFIO_LIVE_ATTACH_LOG"
     "$LIGHTDM_FALLBACK_CONF"
     "/etc/systemd/system/vfio-dump-boot-log.service"
     "$bootlog_bin"
@@ -25316,6 +25349,49 @@ remove_user_audio_unit() {
   fi
 }
 
+# R47: sweep the per-user runtime DATA the graphics daemon + boot-log dumper
+# produce under each desktop user's home (the watchdog log dir + the boot-log
+# tree), plus the rootless fallback watchdog dir. The generating scripts/units
+# are removed by the _rm_paths list; these are the runtime artifacts they
+# emitted, which would otherwise linger in user homes after --reset. Best-
+# effort, never fatal. Scoped to the two script-owned directory names
+# (vfio-graphics-protocol / vfio-boot-logs) so a user's other files are never
+# touched; rm -rf is safe because those exact dir names are created only by
+# this script.
+_wipe_user_runtime_artifacts() {
+  local _users=() _u _home _pair _d _dir_n=0
+  _pair="$(resolve_desktop_user_home 2>/dev/null || true)"
+  [[ -n "$_pair" ]] && _users+=( "${_pair%%$'\t'*}" )
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    _users+=( "${SUDO_USER}" )
+  fi
+  for _d in /home/*; do
+    [[ -d "$_d" ]] && _users+=( "$(basename "$_d")" )
+  done
+  for _u in "${_users[@]}"; do
+    [[ -n "$_u" ]] || continue
+    _home="$(getent passwd "$_u" 2>/dev/null | cut -d: -f6 || true)"
+    [[ -n "$_home" && -d "$_home" ]] || continue
+    if [[ -d "$_home/.local/state/vfio-graphics-protocol" ]]; then
+      run rm -rf "$_home/.local/state/vfio-graphics-protocol" 2>/dev/null || true
+      _dir_n=$((_dir_n + 1))
+    fi
+    if [[ -d "$_home/Desktop/vfio-boot-logs" ]]; then
+      run rm -rf "$_home/Desktop/vfio-boot-logs" 2>/dev/null || true
+      _dir_n=$((_dir_n + 1))
+    fi
+  done
+  # Rootless fallback watchdog dir (used when no user home was resolvable).
+  if [[ -d /home/vfio-graphics-protocol ]]; then
+    run rm -rf /home/vfio-graphics-protocol 2>/dev/null || true
+    _dir_n=$((_dir_n + 1))
+  fi
+  if (( _dir_n > 0 )) && (( ! DRY_RUN )); then
+    note "Removed $_dir_n user-runtime artifact dir(s) (graphics-daemon watchdog log + boot-log tree) under user homes."
+  fi
+  return 0
+}
+
 # R43: Fresh-start wipe of EVERY VM-XML stage backup this script creates, so
 # --reset clears the slate in one place and a re-install rebuilds each stage's
 # single pristine backup from the live VM XML. Unifies + supersedes the R37
@@ -25468,6 +25544,14 @@ reset_vfio_all() {
   note "      session drop-in, and (via the live-attach revert) the fedorapeople"
   note "      virtio-win repo file; the now-empty /var/lib/vfio-dynamic dir is"
   note "      best-effort rmdir'd so no empty litter remains."
+  note "NOTE: --reset now ALSO completes R47 leftovers: strips the amdgpu.rebar=0"
+  note "      kernel param (added for the Windows AMD driver but never stripped"
+  note "      before), removes the libvirt-hook + live-attach runtime logs"
+  note "      (/var/log/vfio-libvirt-hook.log / vfio-live-attach.log), the bind-"
+  note "      script cooldown/driver-state files in /var/lib/vfio-dynamic, the"
+  note "      SELinux vfio_virtqemud policy module, the graphics-daemon watchdog"
+  note "      log + boot-log tree under each user home, and the /root/vfio-"
+  note "      rollback-*.sh install-time rollback scripts."
   if [[ "$_full" == "full" ]]; then
     note "NOTE: full --reset ALSO removes the installed 'vfio' CLI + completions."
     note "      If you want to re-run vfio afterward, invoke the repo script directly"
@@ -25500,6 +25584,8 @@ reset_vfio_all() {
     "$LIVE_ATTACH_HELPER" "$LIVE_ATTACH_GPU_XML" "$LIVE_ATTACH_AUDIO_XML" "$LIVE_ATTACH_VM_LIST"
     "$LIVE_ATTACH_MODE_FILE" "$LIVE_ATTACH_TRAY" "$LIVE_ATTACH_POLKIT"
     "$USB_BT_STATE_FILE" "$GRAPHICS_DAEMON_WANTS_LINK" "$SDDM_PLASMA_WAYLAND_CONF"
+    "$VFIO_COOLDOWN_TS_FILE" "$VFIO_DRIVER_STATUS_FILE"
+    "$VFIO_HOOK_LOG" "$VFIO_LIVE_ATTACH_LOG"
     "$bootlog_unit" "$bootlog_bin"
   )
   note "Preview of managed files this reset will remove:"
@@ -25575,6 +25661,9 @@ reset_vfio_all() {
   # which would starve the VM of normal memory). Unconditionally frees the
   # pool, drops owned files + registry, and removes the boot-reserve service.
   _reset_perf_hugepages_all
+  # R47: remove the targeted SELinux policy module (only needed while the
+  # libvirt hook runs; with the hook going away below it is dead weight).
+  remove_selinux_virtqemud_policy
 
   # Libvirt hook cleanup: restore pre-existing user-managed qemu hook or remove our managed entry.
   if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
@@ -25628,6 +25717,23 @@ reset_vfio_all() {
     remove_user_audio_unit "$u"
   done
 
+  # R47: sweep per-user runtime DATA (graphics-daemon watchdog log dir + boot-
+  # log tree) the removed scripts/units emitted under each user home.
+  _wipe_user_runtime_artifacts
+  # R47: sweep the install-time rollback scripts this script generated in /root
+  # (one per install: /root/vfio-rollback-<RUN_TS>.sh). After --reset they are
+  # redundant (reset is the undo), so remove them for a complete cleanup. Best-
+  # effort glob; never fatal. A fresh one is generated on the next install.
+  local _rbk _rbk_n=0
+  for _rbk in /root/vfio-rollback-*.sh; do
+    [[ -f "$_rbk" ]] || continue
+    run rm -f "$_rbk" 2>/dev/null || true
+    _rbk_n=$((_rbk_n + 1))
+  done
+  if (( _rbk_n > 0 )) && (( ! DRY_RUN )); then
+    note "Removed $_rbk_n install-time rollback script(s) from /root (redundant after reset; a fresh one is generated on your next install)."
+  fi
+
   local grub_changed=0
   local opensuse_cmdline_present=0
 
@@ -25679,6 +25785,7 @@ reset_vfio_all() {
     new="$(remove_param_all "$new" "amdgpu.noretry=0")"
     new="$(remove_param_all "$new" "vfio-pci.disable_idle_d3=1")"
     new="$(remove_param_all "$new" "pcie_port_pm=off")"
+    new="$(remove_param_all "$new" "amdgpu.rebar=0")"
 
     if [[ "$(trim "$new")" != "$(trim "$current")" ]]; then
       grub_write_cmdline_in_place "$key" "$new"
@@ -25730,6 +25837,7 @@ reset_vfio_all() {
     knew="$(remove_param_all "$knew" "amdgpu.noretry=0")"
     knew="$(remove_param_all "$knew" "vfio-pci.disable_idle_d3=1")"
     knew="$(remove_param_all "$knew" "pcie_port_pm=off")"
+    knew="$(remove_param_all "$knew" "amdgpu.rebar=0")"
     if ! cmdline_get_key_value_token "$knew" "root" >/dev/null 2>&1; then
       local reset_recovered_opts reset_recovered_cmdline reset_recovered_root_tok
       reset_recovered_opts="$(bls_find_boot_metadata_options 2>/dev/null || true)"

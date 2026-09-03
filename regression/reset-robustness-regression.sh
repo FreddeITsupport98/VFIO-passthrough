@@ -226,6 +226,22 @@ _vwga_fn="$(sed -n '/^remove_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
 assert_non_empty "P3 remove_virtio_win_guest_agent body extracted" "$_vwga_fn"
 assert_contains_text "P3 remove_virtio_win_guest_agent sweeps the repo file" '$VIRTIO_WIN_REPO_FILE' "$_vwga_fn"
 assert_contains_text "P3 remove_virtio_win_guest_agent guards on the fedorapeople URL" 'fedorapeople' "$_vwga_fn"
+# R47: reset must sweep the bind-script runtime state + the hook/live-attach logs.
+assert_contains_text "P3 reset _rm_paths includes VFIO_COOLDOWN_TS_FILE" '$VFIO_COOLDOWN_TS_FILE' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes VFIO_DRIVER_STATUS_FILE" '$VFIO_DRIVER_STATUS_FILE' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes VFIO_HOOK_LOG" '$VFIO_HOOK_LOG' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes VFIO_LIVE_ATTACH_LOG" '$VFIO_LIVE_ATTACH_LOG' "$_reset_fn"
+# R47: reset strips amdgpu.rebar=0 (added by the installer but never stripped before).
+assert_contains_text "P3 reset strips amdgpu.rebar=0 from GRUB cmdline" 'remove_param_all "$new" "amdgpu.rebar=0"' "$_reset_fn"
+assert_contains_text "P3 reset strips amdgpu.rebar=0 from /etc/kernel/cmdline" 'remove_param_all "$knew" "amdgpu.rebar=0"' "$_reset_fn"
+# R47: reset removes the SELinux module + sweeps user-home runtime artifacts + /root rollback scripts.
+assert_contains_file "P3 remove_selinux_virtqemud_policy defined" 'remove_selinux_virtqemud_policy()' "$VFIO_SCRIPT"
+assert_contains_text "P3 reset calls remove_selinux_virtqemud_policy" 'remove_selinux_virtqemud_policy' "$_reset_fn"
+assert_contains_file "P3 _wipe_user_runtime_artifacts defined" '_wipe_user_runtime_artifacts()' "$VFIO_SCRIPT"
+assert_contains_text "P3 reset calls _wipe_user_runtime_artifacts" '_wipe_user_runtime_artifacts' "$_reset_fn"
+assert_contains_text "P3 reset sweeps /root vfio-rollback scripts" '/root/vfio-rollback-*.sh' "$_reset_fn"
+_early_fn="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text "P3 install-early-binding removes the SELinux module" 'remove_selinux_virtqemud_policy' "$_early_fn"
 
 _prev_line="$(printf '%s\n' "$_reset_fn" | grep -nF '_reset_preview_paths "Managed files"' | awk -F: 'NR==1{print $1}')"
 _conf_line="$(printf '%s\n' "$_reset_fn" | grep -nF 'confirm_phrase "To continue, confirm reset." "RESET VFIO"' | awk -F: 'NR==1{print $1}')"
@@ -283,6 +299,8 @@ remove_looking_glass() { :; }
 _reset_perf_hugepages_all() { :; }
 remove_openbox_autostart_hook() { :; }
 remove_user_audio_unit() { :; }
+remove_selinux_virtqemud_policy() { :; }
+_wipe_user_runtime_artifacts() { :; }
 unmask_plymouth_services() { :; }
 detect_bootloader() { echo "none"; }
 maybe_update_initramfs() { :; }
@@ -309,7 +327,8 @@ prep_eo_fixtures() {
             PARK_KEEPALIVE_SCRIPT PARK_KEEPALIVE_UNIT PARK_KEEPALIVE_CHECK_UNIT \
             PARK_KEEPALIVE_RESUME_HOOK PARK_KEEPALIVE_UDEV_RULE PARK_KEEPALIVE_STATE_FILE \
             LIVE_ATTACH_HELPER LIVE_ATTACH_GPU_XML LIVE_ATTACH_AUDIO_XML LIVE_ATTACH_VM_LIST \
-            LIVE_ATTACH_MODE_FILE LIVE_ATTACH_TRAY LIVE_ATTACH_POLKIT; do
+            LIVE_ATTACH_MODE_FILE LIVE_ATTACH_TRAY LIVE_ATTACH_POLKIT \
+            VFIO_HOOK_LOG VFIO_LIVE_ATTACH_LOG; do
     declare -g "$_g"="$root/$_g"
     : >"$root/$_g"
   done
@@ -317,6 +336,13 @@ prep_eo_fixtures() {
   # file fixture — create it empty so the mock `run rmdir` can remove it.
   declare -g VFIO_DYNAMIC_DIR="$root/VFIO_DYNAMIC_DIR"
   mkdir -p "$VFIO_DYNAMIC_DIR"
+  # R47: the two bind-script runtime state files live INSIDE VFIO_DYNAMIC_DIR
+  # (matching the real ${VFIO_DYNAMIC_DIR}/... paths) so the rmdir assertion
+  # also proves the rm block empties the dir before rmdir removes it.
+  declare -g VFIO_COOLDOWN_TS_FILE="$VFIO_DYNAMIC_DIR/last-vm-stop.ts"
+  declare -g VFIO_DRIVER_STATUS_FILE="$VFIO_DYNAMIC_DIR/amd-driver-status"
+  : >"$VFIO_COOLDOWN_TS_FILE"
+  : >"$VFIO_DRIVER_STATUS_FILE"
   printf 'GUEST_GPU_BDF="0000:01:00.0"\n' >"$CONF_FILE"
   declare -g LIBVIRT_HOOK_ENTRY="$root/no_such_hook_entry"
   declare -g SELF_INSTALL_BIN="$root/vfio"; : >"$SELF_INSTALL_BIN"
@@ -341,6 +367,10 @@ assert_file_missing "P4a removes USB_BT_SCRIPT fixture" "$EO_ROOT/USB_BT_SCRIPT"
 assert_file_missing "P4a removes USB_BT_STATE_FILE fixture (R46)" "$EO_ROOT/USB_BT_STATE_FILE"
 assert_file_missing "P4a removes GRAPHICS_DAEMON_WANTS_LINK fixture (R46)" "$EO_ROOT/GRAPHICS_DAEMON_WANTS_LINK"
 assert_file_missing "P4a removes SDDM_PLASMA_WAYLAND_CONF fixture (R46)" "$EO_ROOT/SDDM_PLASMA_WAYLAND_CONF"
+assert_file_missing "P4a removes VFIO_HOOK_LOG fixture (R47)" "$EO_ROOT/VFIO_HOOK_LOG"
+assert_file_missing "P4a removes VFIO_LIVE_ATTACH_LOG fixture (R47)" "$EO_ROOT/VFIO_LIVE_ATTACH_LOG"
+assert_file_missing "P4a removes VFIO_COOLDOWN_TS_FILE fixture (R47)" "$VFIO_COOLDOWN_TS_FILE"
+assert_file_missing "P4a removes VFIO_DRIVER_STATUS_FILE fixture (R47)" "$VFIO_DRIVER_STATUS_FILE"
 assert_file_missing "P4a rmdir's the VFIO_DYNAMIC_DIR fixture (R46)" "$EO_ROOT/VFIO_DYNAMIC_DIR"
 assert_contains_text "P4a rm log includes the SDDM fixture path (R46)" "$EO_ROOT/SDDM_PLASMA_WAYLAND_CONF" "$(cat "$EO_RUN_LOG")"
 assert_contains_text "P4a run log includes rmdir of the dynamic dir (R46)" "rmdir $EO_ROOT/VFIO_DYNAMIC_DIR" "$(cat "$EO_RUN_LOG")"

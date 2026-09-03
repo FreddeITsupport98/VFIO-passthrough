@@ -770,7 +770,7 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 
 ## Command‑line modes
 
-The script supports several modes controlled by flags. By default, with **no flag** it launches the **interactive menu** (`--menu`) — pick an action (full configure, switch binding, live-attach, verify, reset, install/uninstall `vfio`, …). The full guided wizard is menu option 1 (Full configure); or run any `--install-*` flag below to do one thing directly.
+The script supports several modes controlled by flags. By default, with **no flag** it launches the **interactive menu** (`--menu`) — pick an action (full configure, switch binding, live-attach, verify, reset, install/uninstall `vfio`, …). The full guided wizard is menu option 0 (Full configure); or run any `--install-*` flag below to do one thing directly.
 
 ```text
 ./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
@@ -780,11 +780,12 @@ The script supports several modes controlled by flags. By default, with **no fla
 
 `--menu` launches an interactive TUI menu (whiptail when available; plain-text numbered fallback under `--no-tui` or when whiptail is absent) so you can pick what to do without running the whole wizard or remembering individual flags. It **loops back after each action**, so you can do several things in one root session. Requires root (most actions write to `/etc`); the read-only actions (verify / detect) run inside the menu. Running `vfio` (or `./vfio.sh`) with **no arguments** also launches this menu — it is the default.
 
-Menu options:
+Menu options (0-indexed, as shown in the TUI):
 
-1. **Full configure** — the existing guided wizard (pick GPUs, audio, binding mode).
-2. **Full configure (recommended defaults)** — auto-answers every wizard prompt after the GPU pick (R39 `--recommended`).
-3. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
+0. **Full configure** — the guided wizard (pick GPUs, audio, binding mode). Applies VM customization (hypervisor hide, vBIOS, perf, Looking Glass) in BOTH binding modes (R48c).
+1. **Full configure (recommended defaults)** — auto-answers every wizard prompt after the GPU pick (R39 `--recommended`).
+2. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
+3. **Apply hypervisor hide / stealth to detected guest-GPU VMs** — removes the red/green hypervisor stripes in virt-manager so the AMD Windows driver installs (R48c).
 4. **Switch to early binding** — boot-time, classic.
 5. **Set up live-attach / hotswap** — VM starts without the GPU, then it is hot-attached.
 6. **Attach virtio-win guest-agent ISO** — smart handoff via `guest-ping`.
@@ -802,13 +803,29 @@ Menu options:
 18. **Install (compile) looking-glass-client binary**.
 19. **Remove looking-glass-client binary**.
 20. **Toggle live-attach hotplug on/off** — VM boots with vs without the GPU (R41).
-21. **Exit menu**.
+21. **Show VFIO status** — re-opens the per-VM tuning checklist + ReBAR status panel on demand (R48e).
+22. **Exit menu**.
+
+#### Interactive menu status panel (R48b–R48e)
+
+On menu entry (and after any action that changes VM state), a **VFIO status** panel shows a full per-VM checklist of every customization the script can apply, plus the ReBAR caveat — so you see what is applied (✔) vs not (✖) before picking an action:
+
+```text path=null start=null
+win11:  hypervisor-hide ✔  ultimate-perf ✖  looking-glass ✔ (shmem 64MB + ReBAR, video=none)
+       vBIOS ✔  live-attach ✖  hugepages ✖  virtio-win ✔  disks-virtio ✔
+
+ReBAR: OK (amdgpu.rebar=0 active; AMD black-screen fix in place).
+```
+
+The 8 features detected from the live VM XML (`virsh dumpxml`, read-only, no root): **hypervisor-hide** (`vendor_id=GENUINE00000` + `kvm=off,hypervisor=off` + SMBIOS spoofing), **ultimate-perf** (`cache=none` + `io=native` + `<cputune>`), **looking-glass** (`<shmem>` ivshmem-plain + size/ReBAR/video=none), **vBIOS** (`<rom file>`), **live-attach** (enrolled in `/var/lib/vfio-dynamic/live-attach-vms`), **hugepages** (`<memoryBacking><hugepages>`), **virtio-win** (cdrom sourcing the virtio-win ISO), **disks-virtio** (no unconverted SATA hard disks).
+
+The panel auto-shows once on menu entry and re-shows only when VM state changes (e.g. after **Apply hypervisor hide** the ✖ flips to ✔). To bring it back on demand at any time, pick **option 21 (Show VFIO status)**. The ReBAR line is vendor-aware: AMD + `amdgpu.rebar=0` missing → AT RISK warning (amdgpu auto-resizes BAR0 → Windows black screen) + the `--amd-rebar` fix; NVIDIA/Intel → OK (handle a resized BAR cleanly). All whiptail dialogs are now dynamically sized to the content (R48e), so the long checklist line no longer truncates.
 
 ```fish path=null start=null
 sudo ./vfio.sh --menu
 ```
 
-Each option dispatches to the **same installer function** the corresponding `--install-*` flag uses, with the same root / systemd / writable-root / libvirt / `$CONF_FILE` guards — so a menu action is equivalent to running that flag. The status header (config present + binding mode) refreshes on every loop, so it reflects changes after a reset or a binding-mode switch. ESC / Cancel exits the menu (same as the Exit option).
+Each option dispatches to the **same installer function** the corresponding `--install-*` flag uses, with the same root / systemd / writable-root / libvirt / `$CONF_FILE` guards — so a menu action is equivalent to running that flag. The status header (config present + binding mode) refreshes on every loop, so it reflects changes after a reset or a binding-mode switch. The VFIO status panel (above) also refreshes after each action. ESC / Cancel exits the menu (same as the Exit option).
 
 ### Self-install
 

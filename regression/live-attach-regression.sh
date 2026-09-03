@@ -2683,6 +2683,266 @@ if [[ -f "$_fn_profiles/win11/manifest" ]]; then ok_fn "per-domain manifest writ
 
 rm -rf "$_fn_root"
 
+# ===================== R48i: boot-display re-pinned off the GPU reserved bus =====================
+# ROOT CAUSE: after enabling performance tuning, hotplug broke with "XML error:
+# Attempt to double-use PCI address 0000:06:00.0". The perf patcher never touches
+# <video>, but a prior define (toggle/restore) had left the virtio-gpu boot
+# display on bus 0x06 (the GPU's reserved guest slot). In mode=on the GPU hostdev
+# is stripped so 0x06 is free at define time; the later GPU hot-attach at its
+# fixed guest address 0x06 then collides -> libvirt rejects it. R48i adds a shared
+# _la_repair_video_off_gpu_bus backstop that reads the reserved GPU+audio guest
+# buses DIRECTLY from the profile fragments (not only the env var) and re-pins
+# <video> off them on EVERY define of a live-attach VM (toggle, perf, LG restore).
+assert_contains_file \
+  "R48i _la_repair_video_off_gpu_bus helper defined" \
+  '_la_repair_video_off_gpu_bus() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48i helper documents the double-use PCI address root cause" \
+  'Attempt to double-use PCI address 0000:06:00.0' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48i helper reads the GPU fragment guest bus directly (not only env)" \
+  '_la_fragment_guest_bus "$_pdir/devices/gpu.xml"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48i helper reads the audio fragment guest bus directly" \
+  '_la_fragment_guest_bus "$_pdir/devices/gpu-audio.xml"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48i helper re-pins an already-addressed video off the reserved bus" \
+  "_va.set('bus', _pin)" \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48i helper skips video=none (no PCI address -> no collision)" \
+  'video=none has no PCI address' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48i helper skips when no reserved buses (not a live-attach VM w/ fragment)" \
+  'no reserved buses -> not a live-attach VM with a fragment' \
+  "$VFIO_SCRIPT"
+# The repair must be wired on EVERY define of a live-attach VM: 1 def + 4 calls
+# (profile_apply_mode after-safety + no-edit, perf patcher, remove_looking_glass
+# restore) = >=5 occurrences of the helper name.
+_r48i_calls="$(grep -cF '_la_repair_video_off_gpu_bus' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _r48i_calls >= 5 )); then
+  printf 'PASS: R48i repair wired in >=5 places (def + 4 call sites: toggle x2, perf, LG restore: %d)\n' "$_r48i_calls"
+else
+  printf 'FAIL: R48i repair wired in only %d places (expected >=5: def + 4 call sites)\n' "$_r48i_calls" >&2
+  record_failure "R48i repair wired on every live-attach VM define (toggle x2, perf, LG restore)"
+fi
+_pam_fn="$(sed -n '/^profile_apply_mode()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48i profile_apply_mode after-safety re-pins video before define" \
+  '_la_repair_video_off_gpu_bus "$_dom" "$_tmp"' \
+  "$_pam_fn"
+assert_contains_text \
+  "R48i profile_apply_mode no-edit case repairs video with a define-only pass" \
+  '_la_repair_video_off_gpu_bus "$_dom" "$_rtmp"' \
+  "$_pam_fn"
+_perf_fn="$(sed -n '/^install_ultimate_perf_vm_tuning()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48i perf patcher re-pins video before define" \
+  '_la_repair_video_off_gpu_bus "$_dom" "$_tmp"' \
+  "$_perf_fn"
+_rlg_fn="$(sed -n '/^remove_looking_glass()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48i remove_looking_glass re-pins the restored virtio video off the reserved bus" \
+  '_la_repair_video_off_gpu_bus "$_dom" "$_tmp"' \
+  "$_rlg_fn"
+
+# --- R48i functional: _la_repair_video_off_gpu_bus re-pins an on-reserved-bus video ---
+# Mock a mode=on live XML (GPU stripped): a virtio boot display sitting on the
+# GPU's reserved guest bus 0x06, plus 3 pcie-root-ports (index 1/5/6/7/9) so the
+# repair has free non-reserved root-ports. Provide a fragment whose guest bus
+# is 0x06 (the reserved slot). The repair must move the video off 0x06 to a
+# free non-reserved root-port (0x05 or 0x09).
+_r48i_root="$(mktemp -d)"
+_r48i_profiles="$_r48i_root/profiles"
+mkdir -p "$_r48i_profiles/win11/devices"
+_r48i_gpu_frag="$_r48i_profiles/win11/devices/gpu.xml"
+cat >"$_r48i_gpu_frag" <<'XEOF'
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source><address type='pci' domain='0x0000' bus='0x0e' slot='0x00' function='0x0'/></source>
+  <rom file='/var/lib/libvirt/vbios/live-0000:0e:00.0.rom'/>
+  <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+</hostdev>
+XEOF
+_r48i_live="$_r48i_root/win11.xml"
+cat >"$_r48i_live" <<'XEOF'
+<domain type='kvm'>
+  <name>win11</name>
+  <devices>
+    <controller type='pci' index='1' model='pcie-root-port'/>
+    <controller type='pci' index='5' model='pcie-root-port'/>
+    <controller type='pci' index='6' model='pcie-root-port'/>
+    <controller type='pci' index='7' model='pcie-root-port'/>
+    <controller type='pci' index='9' model='pcie-root-port'/>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+    </video>
+    <disk type='file' device='disk'><target dev='vda' bus='virtio'/></disk>
+  </devices>
+</domain>
+XEOF
+VFIO_LA_PROFILES_DIR="$_r48i_profiles" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; _la_repair_video_off_gpu_bus win11 '$_r48i_live'" >/dev/null 2>&1 || true
+# The video must still be present AND no longer on the reserved bus 0x06.
+_r48i_vid="$(sed -n '/<video>/,/<\/video>/p' "$_r48i_live" 2>/dev/null)"
+if [[ -n "$_r48i_vid" ]] && ! printf '%s' "$_r48i_vid" | grep -Eq "bus=[\"']0x06[\"']"; then
+  printf 'PASS: R48i repair re-pinned the on-reserved-bus video off 0x06\n'
+else
+  printf 'FAIL: R48i repair left the video on the reserved bus 0x06\n' >&2
+  record_failure "R48i repair re-pins an on-reserved-bus video off 0x06"
+fi
+# The video must still be present (not deleted) and on a non-reserved bus.
+if grep -Eq "model type=[\"']virtio[\"']" "$_r48i_live" 2>/dev/null; then
+  printf 'PASS: R48i repair kept the virtio video model\n'
+else
+  printf 'FAIL: R48i repair dropped the video model\n' >&2
+  record_failure "R48i repair keeps the video model intact"
+fi
+# Negative: a video=none XML must be a no-op (exit 3, no address added).
+_r48i_none="$_r48i_root/none.xml"
+cat >"$_r48i_none" <<'XEOF'
+<domain type='kvm'><name>win11</name><devices>
+  <controller type='pci' index='5' model='pcie-root-port'/>
+  <video><model type='none'/></video>
+</devices></domain>
+XEOF
+_r48i_none_rc=0
+VFIO_LA_PROFILES_DIR="$_r48i_profiles" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; _la_repair_video_off_gpu_bus win11 '$_r48i_none'" >/dev/null 2>&1 || _r48i_none_rc=$?
+if (( _r48i_none_rc == 3 )) && ! grep -Eq "<address" "$_r48i_none" 2>/dev/null; then
+  printf 'PASS: R48i repair is a no-op for video=none (exit 3, no address)\n'
+else
+  printf 'FAIL: R48i repair touched a video=none XML (rc=%s)\n' "$_r48i_none_rc" >&2
+  record_failure "R48i repair is a no-op for video=none"
+fi
+# Negative: no fragment + no env => no-op (not a live-attach VM).
+_r48i_nofrag="$_r48i_root/nofrag.xml"
+_r48i_empty="$_r48i_root/empty"
+mkdir -p "$_r48i_empty"
+cat >"$_r48i_nofrag" <<'XEOF'
+<domain type='kvm'><name>win11</name><devices>
+  <video><model type='virtio' heads='1' primary='yes'/></video>
+</devices></domain>
+XEOF
+_r48i_nofrag_rc=0
+VFIO_LA_PROFILES_DIR="$_r48i_empty" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; _la_repair_video_off_gpu_bus win11 '$_r48i_nofrag'" >/dev/null 2>&1 || _r48i_nofrag_rc=$?
+if (( _r48i_nofrag_rc == 3 )); then
+  printf 'PASS: R48i repair is a no-op with no fragment + no env (exit 3)\n'
+else
+  printf 'FAIL: R48i repair acted without any reserved buses (rc=%s)\n' "$_r48i_nofrag_rc" >&2
+  record_failure "R48i repair is a no-op when no reserved buses exist"
+fi
+rm -rf "$_r48i_root"
+
+# --- R48i functional: profile_apply_mode (toggle on) re-pins the boot display off the reserved bus ---
+# Reuse the R44 functional harness pattern: a live XML with a virtio boot display
+# on the GPU's reserved guest bus 0x06, a GPU hostdev, a disk + LG shmem, and
+# pcie-root-ports so the repair has a free non-reserved port to re-pin to. After
+# a toggle ON (strip the GPU), the boot display MUST be moved off 0x06 and the
+# disk + shmem MUST survive (the repair runs AFTER the safety invariant so it
+# cannot trip it).
+_r48it_root="$(mktemp -d)"
+_r48it_bin="$_r48it_root/bin"
+mkdir -p "$_r48it_bin"
+_r48it_live="$_r48it_root/win11.xml"
+cat >"$_r48it_live" <<'XMLEOF'
+<domain type='kvm'>
+  <name>win11</name>
+  <uuid>11111111-2222-3333-4444-555555555555</uuid>
+  <memory unit='KiB'>8388608</memory>
+  <vcpu placement='static'>4</vcpu>
+  <os><type arch='x86_64' machine='q35'>hvm</type><boot dev='hd'/></os>
+  <devices>
+    <controller type='pci' index='1' model='pcie-root-port'/>
+    <controller type='pci' index='5' model='pcie-root-port'/>
+    <controller type='pci' index='6' model='pcie-root-port'/>
+    <controller type='pci' index='7' model='pcie-root-port'/>
+    <controller type='pci' index='9' model='pcie-root-port'/>
+    <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><target dev='vda' bus='virtio'/></disk>
+    <shmem name='looking-glass'><model type='ivshmem-plain'/><size unit='M'>64</size></shmem>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+    </video>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source><address type='pci' domain='0x0000' bus='0x0e' slot='0x00' function='0x0'/></source>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+    </hostdev>
+  </devices>
+</domain>
+XMLEOF
+cat >"$_r48it_bin/virsh" <<'VIRSH'
+#!/usr/bin/env bash
+shift 2
+sub="$1"; shift
+case "$sub" in
+  list) echo win11 ;;
+  domstate) echo "shut off" ;;
+  dumpxml) cat "$VIRSH_LIVE" ;;
+  define) cp -f "$1" "$VIRSH_LIVE" ;;
+esac
+VIRSH
+chmod +x "$_r48it_bin/virsh"
+cat >"$_r48it_bin/virt-xml-validate" <<'VXV'
+#!/usr/bin/env bash
+exit 0
+VXV
+chmod +x "$_r48it_bin/virt-xml-validate"
+_r48it_conf="$_r48it_root/vfio.conf"
+cat >"$_r48it_conf" <<EOF
+GUEST_GPU_BDF="0000:0e:00.0"
+GUEST_AUDIO_BDFS_CSV=""
+VFIO_DYNAMIC_LIVE_ATTACH="1"
+EOF
+_r48it_profiles="$_r48it_root/profiles"
+mkdir -p "$_r48it_profiles"
+VIRSH_LIVE="$_r48it_live" PATH="$_r48it_bin:$PATH" \
+  DRY_RUN=0 CONF_FILE="$_r48it_conf" \
+  VFIO_LA_PROFILES_DIR="$_r48it_profiles" \
+  LIVE_ATTACH_MODE_FILE="$_r48it_root/la-mode" \
+  LIVE_ATTACH_VM_LIST="$_r48it_root/la-vms" \
+  LIVE_ATTACH_GPU_XML="$_r48it_root/la-gpu.xml" \
+  LIVE_ATTACH_AUDIO_XML="$_r48it_root/la-audio.xml" \
+  VFIO_LA_LEGACY_DIR="$_r48it_root/legacy" \
+  bash -c "source '$VFIO_SCRIPT' >/dev/null 2>&1; . '$_r48it_conf'; \
+    profile_recognize win11 >/dev/null; \
+    profile_apply_mode win11 on >/dev/null" >/dev/null 2>&1 || true
+# The boot display must be off 0x06 now.
+_r48it_vid_block="$(sed -n '/<video>/,/<\/video>/p' "$_r48it_live" 2>/dev/null)"
+if printf '%s' "$_r48it_vid_block" | grep -Eq "<address[^>]*bus=[\"']0x06[\"']"; then
+  printf 'FAIL: R48i toggle left the boot display on the reserved bus 0x06 (hotplug would collide)\n' >&2
+  record_failure "R48i profile_apply_mode re-pins the boot display off the reserved bus"
+else
+  printf 'PASS: R48i toggle re-pinned the boot display off the reserved bus 0x06\n'
+fi
+# The disk + LG shmem must survive (the repair did not trip the safety invariant).
+if grep -Eq "dev=[\"']vda[\"']" "$_r48it_live" 2>/dev/null; then
+  printf 'PASS: R48i toggle kept the extra disk (repair did not trip safety invariant)\n'
+else
+  printf 'FAIL: R48i toggle lost the extra disk (repair tripped the safety invariant)\n' >&2
+  record_failure "R48i toggle preserves unrelated devices (repair after safety check)"
+fi
+if grep -Eq "name=[\"']looking-glass[\"']" "$_r48it_live" 2>/dev/null; then
+  printf 'PASS: R48i toggle kept the LG shmem\n'
+else
+  printf 'FAIL: R48i toggle lost the LG shmem\n' >&2
+  record_failure "R48i toggle preserves the LG shmem through the repair"
+fi
+# GPU hostdev must be stripped (mode=on).
+if grep -Eq "bus=[\"']0x0e[\"']" "$_r48it_live" 2>/dev/null; then
+  printf 'FAIL: R48i toggle did not strip the GPU in mode=on\n' >&2
+  record_failure "R48i toggle strips the GPU in mode=on"
+else
+  printf 'PASS: R48i toggle stripped the GPU in mode=on\n'
+fi
+rm -rf "$_r48it_root"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for failed_assertion in "${FAILED_ASSERTIONS[@]}"; do

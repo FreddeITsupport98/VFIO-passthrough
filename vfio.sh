@@ -11674,6 +11674,141 @@ if hd is not None:
 PYEOF
 }
 
+# R48i: Re-pin the VM's <video> boot display OFF the GPU/audio reserved guest
+# buses so the later GPU hot-attach (keep-guest-address) does not collide with
+# a boot display sitting on the GPU's reserved slot (e.g. 0x06). ROOT CAUSE of
+# the "XML error: Attempt to double-use PCI address 0000:06:00.0" hotplug
+# failure that appeared after enabling performance tuning: the perf patcher
+# never touches <video>, but a prior define (toggle/restore) had left the
+# virtio-gpu boot display on bus 0x06 (the GPU's reserved guest slot, read from
+# the saved device fragment). In mode=on the GPU hostdev is stripped, so 0x06 is
+# free at define time and the boot display there is accepted; the later
+# live-attach hot-attach of the GPU at its fixed guest address 0x06 then
+# collides -> libvirt rejects it -> hotplug "does not work". This repair is the
+# single backstop that runs on EVERY define of a live-attach VM (toggle, perf
+# define, Looking Glass restore) so the boot display never occupies a reserved
+# bus regardless of whether the caller set VFIO_LA_RESERVED_GUEST_BUSES.
+# Reserved buses = the GPU+audio fragment guest buses (read DIRECTLY from the
+# profile fragments, so the toggle/restore paths that do NOT export the env var
+# still work) UNION VFIO_LA_RESERVED_GUEST_BUSES (env, set by the install paths)
+# UNION the buses of PCI hostdevs still in this XML (the GPU when cold-attached).
+# $1 = dom (to locate the profile fragments), $2 = path to a temp file holding
+# the VM dumpxml. Exit 0 = re-pinned (file written); 3 = already safe / no-op
+# (not a live-attach VM with a fragment, video=none, video already off every
+# reserved bus, or no free root-port to proactive-pin an address-less video);
+# 1 = the video sits ON a reserved bus but no free non-reserved pcie-root-port
+# was found to re-pin it (caller should warn / skip the define).
+_la_repair_video_off_gpu_bus() {
+  local _dom="$1" _xml_file="$2"
+  local _pdir _rgb_gpu _rgb_audio _rgb_env _reserved _rc
+  [[ -n "$_dom" && -n "$_xml_file" ]] || return 1
+  _pdir="$(_la_profile_dir "$_dom")"
+  _rgb_gpu="$(_la_fragment_guest_bus "$_pdir/devices/gpu.xml")"
+  _rgb_audio="$(_la_fragment_guest_bus "$_pdir/devices/gpu-audio.xml")"
+  _rgb_env="${VFIO_LA_RESERVED_GUEST_BUSES:-}"
+  # Join the non-empty reserved buses (fragments first, then env extras) into a
+  # CSV. Duplicates are harmless (the python side builds a set).
+  _reserved="${_rgb_gpu:+$_rgb_gpu,}${_rgb_audio:+$_rgb_audio,}${_rgb_env:+$_rgb_env}"
+  _reserved="${_reserved%,}"
+  _rc=0
+  python3 - "$_xml_file" "$_reserved" <<'PYEOF' || _rc=$?
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+reserved_csv = sys.argv[2] if len(sys.argv) > 2 else ''
+try:
+    tree = ET.parse(path); root = tree.getroot()
+except Exception:
+    sys.exit(1)
+devices = root.find('devices')
+if devices is None:
+    sys.exit(3)
+reserved = set()
+for _b in (reserved_csv or '').split(','):
+    _b = _b.strip().lower()
+    if _b:
+        reserved.add(_b)
+# Also reserve the buses of PCI hostdevs still in this XML (the GPU/audio when
+# cold-attached) so a re-pin never targets an occupied slot.
+for _hd in devices.findall('hostdev'):
+    if _hd.get('type') != 'pci':
+        continue
+    for _a in _hd.findall('address'):
+        if _a.get('type') == 'pci':
+            _b = (_a.get('bus') or '').lower()
+            if _b:
+                reserved.add(_b)
+if not reserved:
+    sys.exit(3)  # no reserved buses -> not a live-attach VM with a fragment
+video = devices.find('video')
+if video is None:
+    sys.exit(3)
+model = video.find('model')
+if model is None:
+    sys.exit(3)
+_mtype = (model.get('type') or '').lower()
+if _mtype in ('none', ''):
+    sys.exit(3)  # video=none has no PCI address -> no collision possible
+_va = video.find('address')
+_cur_bus = None
+if _va is not None and _va.get('type') == 'pci':
+    _cur_bus = (_va.get('bus') or '').lower()
+# Already pinned off every reserved bus -> nothing to do.
+if _cur_bus is not None and _cur_bus not in reserved:
+    sys.exit(3)
+# Buses already occupied by other devices (exclude the video itself).
+_in_use = set()
+for _d in list(devices):
+    if _d is video:
+        continue
+    _a = _d.find('address')
+    if _a is not None and _a.get('type') == 'pci':
+        _b = (_a.get('bus') or '').lower()
+        if _b:
+            _in_use.add(_b)
+# If the video has no PCI address yet (libvirt will auto-place it), only
+# proactive-pin when a reserved bus is currently FREE -- that is the only case
+# where libvirt could auto-place the video on a reserved slot. If every reserved
+# bus is already occupied (e.g. a cold-attach VM with the GPU+audio present),
+# there is no collision risk and we leave the video unpinned (no churn).
+if _cur_bus is None:
+    if not any(_b not in _in_use for _b in reserved):
+        sys.exit(3)
+def _child_bus(idx):
+    try:
+        return "0x%02x" % int(idx)
+    except Exception:
+        return None
+_cands = []
+for _c in devices.findall('controller'):
+    if _c.get('type') == 'pci' and _c.get('model') == 'pcie-root-port':
+        _cb = _child_bus(_c.get('index', ''))
+        if _cb and _cb not in reserved and _cb not in _in_use:
+            _cands.append((int(_c.get('index', '0') or 0), _cb))
+if not _cands:
+    # No free non-reserved root-port. An address-less video is left unpinned
+    # (legacy: libvirt auto-places; might collide but we cannot fix it here).
+    # A video already ON a reserved bus cannot be re-pinned -> signal failure.
+    if _cur_bus is None:
+        sys.exit(3)
+    sys.exit(1)
+_cands.sort()
+_pin = _cands[0][1]
+if _va is None:
+    ET.SubElement(video, 'address', {'type': 'pci', 'domain': '0x0000', 'bus': _pin, 'slot': '0x00', 'function': '0x0'})
+else:
+    for _k in list(_va.attrib):
+        del _va.attrib[_k]
+    _va.set('type', 'pci')
+    _va.set('domain', '0x0000')
+    _va.set('bus', _pin)
+    _va.set('slot', '0x00')
+    _va.set('function', '0x0')
+tree.write(path)
+sys.exit(0)
+PYEOF
+  return "$_rc"
+}
+
 # R44: stable fingerprint of every <devices> child EXCEPT PCI hostdevs whose
 # <source> BDF is in the exclude list ($1 = comma-separated BDFs). The toggle
 # only adds/removes the GPU/audio hostdevs, so the signature of everything ELSE
@@ -11965,12 +12100,45 @@ PYEOF
   if [[ -z "$_tmp" ]]; then
     if [[ "$_target" == "off" ]]; then _new_gpu=1; else _new_gpu=0; fi
     _la_manifest_write "$_dom" "mode=$_target" "has_gpu_hostdev=$_new_gpu" "updated=$(date -Is 2>/dev/null || echo unknown)"
+    # R48i: even with no hostdev edit needed (VM already in target mode), the
+    # <video> boot display may still sit on the GPU's reserved guest bus (left
+    # there by a prior define that ran without the reserved-bus pin). Repair it
+    # with a define-only pass so the later GPU hot-attach does not collide.
+    local _rtmp _vrep=0
+    _rtmp="$(mktemp)"; printf '%s\n' "$_xml" >"$_rtmp"
+    _la_repair_video_off_gpu_bus "$_dom" "$_rtmp" || _vrep=$?
+    if (( _vrep == 0 )); then
+      if virt-xml-validate "$_rtmp" 2>/dev/null; then
+        if (( DRY_RUN )); then
+          note "Dry run: would re-pin <video> off the reserved guest bus on '$_dom'."
+        elif virsh -c qemu:///system define "$_rtmp" 2>/dev/null; then
+          note "  '$_dom': re-pinned <video> off the GPU/audio reserved guest bus (hotplug collision fix)."
+        else
+          note "WARN: virsh define failed re-pinning <video> on '$_dom'; leaving the live XML as-is."
+        fi
+      fi
+    elif (( _vrep == 1 )); then
+      note "WARN: '$_dom' <video> sits on a reserved GPU/audio guest bus and no free pcie-root-port was found to re-pin it; hotplug may collide. Run --install-live-attach or add a pcie-root-port in virt-manager."
+    fi
+    rm -f "$_rtmp" 2>/dev/null || true
     return 0
   fi
   # Device-diff safety invariant: only the GPU/audio hostdevs may differ.
   _sig_after="$(_la_devices_signature "$_excl" <"$_tmp" 2>/dev/null || true)"
   if [[ "$_sig_before" != "$_sig_after" ]]; then
     note "REFUSE: toggling '$_dom' to mode=$_target would change devices other than the GPU/audio hostdevs (safety invariant). NOT defining. Inspect $_tmp."
+    rm -f "$_tmp" 2>/dev/null || true; return 1
+  fi
+  # R48i: re-pin the <video> boot display OFF the GPU/audio reserved guest
+  # buses BEFORE defining. Runs AFTER the device-diff safety invariant so it
+  # cannot trip it (the invariant already proved only the GPU/audio hostdev
+  # changed; this is an additional known-safe video-address fix). Without this,
+  # a boot display left on the GPU's reserved slot (0x06) makes the later GPU
+  # hot-attach collide ("double-use PCI address 0000:06:00.0").
+  local _vrep=0
+  _la_repair_video_off_gpu_bus "$_dom" "$_tmp" || _vrep=$?
+  if (( _vrep == 1 )); then
+    note "WARN: '$_dom' <video> sits on a reserved GPU/audio guest bus and no free pcie-root-port was found to re-pin it; NOT defining (would collide on hot-attach). Inspect $_tmp."
     rm -f "$_tmp" 2>/dev/null || true; return 1
   fi
   if ! virt-xml-validate "$_tmp" 2>/dev/null; then
@@ -17626,6 +17794,13 @@ remove_looking_glass() {
         # Restore video to virtio (exit 3 = not currently 'none', nothing to undo).
         _lg_restore_vm_display "$_tmp" || _vrs=$?
         (( _vrs == 0 )) && _changed=1
+        # R48i: _lg_restore_vm_display flips none->virtio with NO <address>, so
+        # libvirt would auto-place the restored boot display on the GPU's freed
+        # reserved slot (0x06) -> the next GPU hot-attach collides. Re-pin the
+        # restored virtio-gpu OFF the reserved guest buses (best-effort).
+        local _vrep=0
+        _la_repair_video_off_gpu_bus "$_dom" "$_tmp" || _vrep=$?
+        (( _vrep == 0 )) && _changed=1
         # Disable ReBAR if present (exit 3 = not present).
         if grep -q 'opt/ovmf/X-PciMmio64Mb' <<<"$_xml" 2>/dev/null; then
           _lg_disable_vm_rebar "$_tmp" || _rbs=$?
@@ -18408,6 +18583,17 @@ PYEOF
       if (( _hp_vm )) && (( ! DRY_RUN )); then _restore_host_hugepages_for_vm "$_backup_dir" "$_dom"; fi
       rm -f "$_tmp"
       continue
+    fi
+    # R48i: re-pin <video> off the GPU/audio reserved guest buses before define.
+    # The perf patcher never touches <video>, so a boot display left on the GPU's
+    # reserved slot (0x06) by a prior define would collide with the later GPU
+    # hot-attach. Best-effort: 0 = re-pinned, 3 = already safe, 1 = warn.
+    local _vrep=0
+    _la_repair_video_off_gpu_bus "$_dom" "$_tmp" || _vrep=$?
+    if (( _vrep == 0 )); then
+      say "  ✔ Re-pinned <video> off the GPU/audio reserved guest bus on '$_dom' (hotplug collision fix)."
+    elif (( _vrep == 1 )); then
+      note "WARN: '$_dom' <video> sits on a reserved GPU/audio guest bus and no free pcie-root-port was found to re-pin it; the define may collide on hot-attach. Inspect $_tmp."
     fi
     if ! virt-xml-validate "$_tmp" 2>/dev/null; then
       note "WARN: virt-xml-validate failed for tuned '$_dom'; skipping redefine (backup at $_backup_xml)."

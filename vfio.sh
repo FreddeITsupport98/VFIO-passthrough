@@ -27941,6 +27941,7 @@ vfio_menu() {
       "Install (compile) looking-glass-client binary"
       "Remove looking-glass-client binary"
       "Toggle live-attach hotplug on/off (VM boots with vs without GPU)"
+      "Show VFIO status (per-VM tuning checklist + ReBAR)"
       "Exit menu"
     )
     say
@@ -28241,6 +28242,29 @@ vfio_menu() {
         fi
         ;;
       21)
+        # R48e: re-show the VFIO status panel on demand (the "clickable" to
+        # bring it back). It is the same per-VM checklist + ReBAR shown on menu
+        # entry; selecting this re-opens it without doing anything. Sets
+        # _last_status so the next loop iteration does not auto-re-show a dup.
+        say
+        local _vm_c2 _rebar_c2 _sb2=""
+        _vm_c2="$(_menu_vm_status_summary compact)"
+        _rebar_c2="$(_menu_rebar_disclaimer compact)"
+        if [[ -n "$_vm_c2" && -n "$_rebar_c2" ]]; then
+          _sb2="$(printf '%s\n\n%s' "$_vm_c2" "$_rebar_c2")"
+        elif [[ -n "$_vm_c2" ]]; then
+          _sb2="$_vm_c2"
+        elif [[ -n "$_rebar_c2" ]]; then
+          _sb2="$_rebar_c2"
+        fi
+        if [[ -n "$_sb2" ]]; then
+          _last_status="$_sb2"
+          gui_msgbox "VFIO status" "$_sb2"
+        else
+          note "No VFIO status to show (no config / no guest-GPU VM / no ReBAR context)."
+        fi
+        ;;
+      22)
         # Exit.
         say
         say "Exiting vfio.sh menu."

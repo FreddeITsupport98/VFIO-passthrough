@@ -981,7 +981,15 @@ assert_contains_text \
   'Applying hypervisor hide / stealth to detected guest-GPU VMs' \
   "$_menu_fn"
 assert_contains_text \
-  "R48c menu Exit is now option 21 (renumbered from 20)" \
+  "R48c/R48e menu offers the Show VFIO status option" \
+  'Show VFIO status (per-VM tuning checklist + ReBAR)' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48e menu Show-VFIO-status option re-opens the panel (gui_msgbox)" \
+  'gui_msgbox "VFIO status"' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48c/R48e menu Exit is now option 22 (renumbered from 20)" \
   'Exiting vfio.sh menu.' \
   "$_menu_fn"
 # R48e: the shared detector + the first-page summary renderer.

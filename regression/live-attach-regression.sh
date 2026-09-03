@@ -965,19 +965,13 @@ assert_contains_text \
   'compact' \
   "$_rebar_fn"
 
-# --- R48c: hypervisor-hide status in the menu status bar + a standalone
-# "Apply hypervisor hide / stealth" menu option (position 3) so the GUI operator
-# sees WHICH VM(s) have the hide applied and can apply it without re-running the
-# whole wizard. Also fixes the root cause: the wizard now runs VM-customization
-# in BOTH binding modes (asserted in ultimate-perf-regression.sh). ---
-assert_contains_file \
-  "R48c _menu_hypervisor_hide_summary function defined" \
-  '_menu_hypervisor_hide_summary()' \
-  "$VFIO_SCRIPT"
-assert_contains_text \
-  "R48c vfio_menu calls _menu_hypervisor_hide_summary in the header" \
-  '_menu_hypervisor_hide_summary' \
-  "$_menu_fn"
+# --- R48c/R48e: a standalone "Apply hypervisor hide / stealth" menu option
+# (position 3) + the FULL 8-feature per-VM checklist on the menu's FIRST page
+# (header notes + the whiptail dialog prompt, right where the ReBAR disclaimer
+# is) so the GUI operator sees which VM is detected + what tuning is applied
+# (✔) vs not (✖) BEFORE picking an action — not hidden in a post-action popup.
+# Also fixes the root cause: the wizard now runs VM-customization in BOTH binding
+# modes (asserted in ultimate-perf-regression.sh). ---
 assert_contains_text \
   "R48c menu offers the hypervisor hide / stealth option" \
   'Apply hypervisor hide / stealth to detected guest-GPU VMs' \
@@ -990,30 +984,86 @@ assert_contains_text \
   "R48c menu Exit is now option 21 (renumbered from 20)" \
   'Exiting vfio.sh menu.' \
   "$_menu_fn"
-_hh_fn="$(sed -n '/^_menu_hypervisor_hide_summary()/,/^}/p' "$VFIO_SCRIPT")"
-if [[ -n "$_hh_fn" ]]; then
-  printf 'PASS: R48c _menu_hypervisor_hide_summary body extracted\n'
+# R48e: the shared detector + the first-page summary renderer.
+assert_contains_file \
+  "R48e _vm_checklist_records function defined" \
+  '_vm_checklist_records()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48e _menu_vm_status_summary function defined" \
+  '_menu_vm_status_summary()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R48e vfio_menu calls _menu_vm_status_summary full in the header" \
+  '_menu_vm_status_summary full' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48e vfio_menu embeds _menu_vm_status_summary compact in the dialog prompt" \
+  '_menu_vm_status_summary compact' \
+  "$_menu_fn"
+_checklist_fn="$(sed -n '/^_vm_checklist_records()/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_checklist_fn" ]]; then
+  printf 'PASS: R48e _vm_checklist_records body extracted\n'
 else
-  printf 'FAIL: R48c _menu_hypervisor_hide_summary body extracted (empty)\n' >&2
-  record_failure "R48c _menu_hypervisor_hide_summary body extracted"
+  printf 'FAIL: R48e _vm_checklist_records body extracted (empty)\n' >&2
+  record_failure "R48e _vm_checklist_records body extracted"
 fi
 assert_contains_text \
-  "R48c summary scans guest-GPU VMs via _list_guest_gpu_vms" \
+  "R48e checklist scans guest-GPU VMs via _list_guest_gpu_vms" \
   '_list_guest_gpu_vms' \
-  "$_hh_fn"
+  "$_checklist_fn"
 assert_contains_text \
-  "R48c summary checks stealth via _vm_is_stealth_tuned" \
-  '_vm_is_stealth_tuned' \
-  "$_hh_fn"
+  "R48e checklist detects hypervisor-hide (GENUINE00000 marker)" \
+  'GENUINE00000' \
+  "$_checklist_fn"
 assert_contains_text \
-  "R48c summary reports the no-VM-detected case" \
-  'no guest-GPU VM detected' \
-  "$_hh_fn"
-# _vm_tuning_status_block per-VM line is relabeled 'hypervisor-hide' (from 'stealth')
-# so the post-action block is explicit about the red/green-stripe fix.
-assert_contains_file \
-  "R48c status block relabels per-VM line to hypervisor-hide" \
+  "R48e checklist line 1 has hypervisor-hide label" \
   'hypervisor-hide $_s_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48e checklist line 1 has ultimate-perf label" \
+  'ultimate-perf $_p_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48e checklist line 2 has vBIOS" \
+  'vBIOS $_vb_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48e checklist line 2 has live-attach" \
+  'live-attach $_la_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48e checklist line 2 has hugepages" \
+  'hugepages $_hp_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48e checklist line 2 has virtio-win" \
+  'virtio-win $_vw_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48e checklist line 2 has disks-virtio" \
+  'disks-virtio $_dk_sym' \
+  "$_checklist_fn"
+_vm_summary_fn="$(sed -n '/^_menu_vm_status_summary()/,/^}/p' "$VFIO_SCRIPT")"
+if [[ -n "$_vm_summary_fn" ]]; then
+  printf 'PASS: R48e _menu_vm_status_summary body extracted\n'
+else
+  printf 'FAIL: R48e _menu_vm_status_summary body extracted (empty)\n' >&2
+  record_failure "R48e _menu_vm_status_summary body extracted"
+fi
+assert_contains_text \
+  "R48e summary reports the no-VM-detected case" \
+  'no guest-GPU VM detected' \
+  "$_vm_summary_fn"
+assert_contains_text \
+  "R48e summary has a compact mode for the dialog prompt" \
+  'compact' \
+  "$_vm_summary_fn"
+# _vm_tuning_status_block consumes the shared detector (still renders the
+# post-action popup/card) so header + popup agree.
+assert_contains_file \
+  "R48e status block consumes _vm_checklist_records" \
+  '_vm_checklist_records' \
   "$VFIO_SCRIPT"
 
 # --- R34: self-install (--install-self/--uninstall-self) + config pickup ---

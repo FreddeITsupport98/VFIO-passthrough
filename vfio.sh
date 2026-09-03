@@ -27870,12 +27870,12 @@ vfio_menu() {
     say
     hdr "vfio.sh menu"
     note "Config present: $_conf_present | Binding mode: $_bmode"
-    # R48c: hypervisor-hide status in the status bar so the operator sees at a
-    # glance WHICH VM(s) have the hide applied (✔ = no red/green stripes in
-    # virt-manager) and which do not (✖) before picking an action.
-    local _hh_summary
-    _hh_summary="$(_menu_hypervisor_hide_summary)"
-    note "$_hh_summary"
+    # R48e: FULL per-VM checklist (8 features incl hypervisor-hide) on the FIRST
+    # page (header notes here + compact lines in the dialog prompt below, right
+    # where the ReBAR disclaimer is) so the operator sees which VM is detected
+    # + what tuning is applied (✔) vs not (✖) BEFORE picking an action — not
+    # hidden in a post-action popup.
+    _menu_vm_status_summary full
     # R48b: context-aware ReBAR disclaimer — full note() lines here for the
     # CLI/plain-text path, plus a compact line embedded in the select_from_list
     # prompt below so it is visible inside the whiptail dialog too (the header
@@ -27884,15 +27884,15 @@ vfio_menu() {
     # handle a resized BAR cleanly.
     _menu_rebar_disclaimer full
     note "Pick an action (or Exit to quit):"
-    local _rebar_compact _menu_prompt
+    # R48e: embed the FULL per-VM checklist + the ReBAR compact line in the
+    # select_from_list prompt so BOTH are visible inside the whiptail dialog on
+    # the first page (the header notes render on the terminal behind it).
+    local _vm_compact _rebar_compact _menu_prompt
+    _vm_compact="$(_menu_vm_status_summary compact)"
     _rebar_compact="$(_menu_rebar_disclaimer compact)"
-    if [[ -n "$_rebar_compact" ]]; then
-      _menu_prompt="What do you want to do?
-
-$_rebar_compact"
-    else
-      _menu_prompt="What do you want to do?"
-    fi
+    _menu_prompt="What do you want to do?"
+    [[ -n "$_vm_compact" ]] && _menu_prompt="$_menu_prompt\n\n$_vm_compact"
+    [[ -n "$_rebar_compact" ]] && _menu_prompt="$_menu_prompt\n\n$_rebar_compact"
     _choice="$(select_from_list "$_menu_prompt" "vfio.sh menu" "${_menu_opts[@]}")"
     case "$_choice" in
       0)
@@ -28177,36 +28177,30 @@ $_rebar_compact"
   done
 }
 
-# R40b/R48d: Consolidated VM tuning status block — one framed card (CLI) or
-# popup (GUI) showing per guest-GPU VM a FULL checklist of every VM
-# customization the script can apply, so the operator sees at a glance what is
-# applied (✔) vs not (✖) and it updates after every menu action. 8 features:
+# R48e: Shared per-VM checklist detector. Scans every guest-GPU VM
+# (_list_guest_gpu_vms) + its dumpxml and emits NUL-delimited records on stdout:
+#   <dom>\0<line1>\0<line2>\0
+# where line1/line2 are the 8-feature checklist (✔ applied / ✖ not). Read-only
+# (virsh dumpxml + world-readable conf); no root. Single source of truth for the
+# detection so the menu header status bar (_menu_vm_status_summary) and the
+# post-action popup (_vm_tuning_status_block) always agree. 8 features:
 #   hypervisor-hide (stealth)   ultimate-perf          looking-glass (+detail)
 #   vBIOS ROM injection          live-attach enrolled   hugepages (memoryBacking)
 #   virtio-win guest-agent ISO   disks-virtio (no SATA hard disks)
-# Replaces the three separate scattered status sections in --detect/--verify.
-_vm_tuning_status_block() {
+_vm_checklist_records() {
   if ! readable_file "$CONF_FILE"; then return 0; fi
   have_cmd virsh || return 0
   local _guest_gpu
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
-  if ! libvirt_runtime_ok; then return 0; fi
-  # R48d: read the script-global ISO paths + the live-attach VM list so we can
-  # detect the virtio-win guest-agent ISO cdrom + live-attach enrollment.
+  libvirt_runtime_ok || return 0
   local _vw_iso1="${VIRTIO_WIN_ISO_PATH:-}" _vw_iso2="${VIRTIO_WIN_FALLBACK_ISO:-}"
   local _la_list="${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
   local _dom _xml _has_stealth _has_perf _has_shmem _has_rebar _has_video_none _sz
   local _has_vbios _has_liveattach _has_hugepages _has_virtio_iso _has_sata_disk
   local _n_sata _n_cdrom _line1 _line2
-  local -a _body=()
-  local _found=0
-  while IFS= read -r _dom; do
-    [[ -n "$_dom" ]] || continue
-    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
-    [[ -n "$_xml" ]] || continue
-    _vm_is_guest_gpu_vm "$_dom" "$_xml" || continue
-    _found=1
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
     _has_stealth=0; _has_perf=0; _has_shmem=0; _has_rebar=0; _has_video_none=0; _sz=""
     _has_vbios=0; _has_liveattach=0; _has_hugepages=0; _has_virtio_iso=0; _has_sata_disk=0
     # Line 1 features: hypervisor-hide / ultimate-perf / looking-glass.
@@ -28248,8 +28242,68 @@ _vm_tuning_status_block() {
     (( ! _has_sata_disk )) && _dk_sym="✔"
     _line1="$_dom:  hypervisor-hide $_s_sym  ultimate-perf $_p_sym  looking-glass $_l_sym$_lg_detail"
     _line2="       vBIOS $_vb_sym  live-attach $_la_sym  hugepages $_hp_sym  virtio-win $_vw_sym  disks-virtio $_dk_sym"
-    _body+=("$_line1" "$_line2")
-  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+    printf '%s\0%s\0%s\0' "$_dom" "$_line1" "$_line2"
+  done < <(_list_guest_gpu_vms)
+}
+
+# R48e: Menu first-page VM status summary. Emits the FULL 8-feature per-VM
+# checklist so the operator sees it on the menu's FIRST page (the header + the
+# whiptail dialog prompt, right where the ReBAR disclaimer is) — not hidden in a
+# post-action popup. $1=full (default: note() lines for the header) | compact
+# (plain lines, NO color, for the select_from_list prompt so whiptail does not
+# truncate at an ESC byte). Falls back to 'no guest-GPU VM detected' / 'no
+# config' / 'libvirt not reachable' so the line is always informative.
+_menu_vm_status_summary() {
+  local _mode="${1:-full}"
+  if ! readable_file "$CONF_FILE"; then
+    if [[ "$_mode" == "compact" ]]; then
+      printf 'VM status: no config'
+    else
+      note 'VM status: no config'
+    fi
+    return 0
+  fi
+  if ! have_cmd virsh; then
+    if [[ "$_mode" == "compact" ]]; then printf 'VM status: virsh unavailable'; else note 'VM status: virsh unavailable'; fi
+    return 0
+  fi
+  if ! libvirt_runtime_ok; then
+    if [[ "$_mode" == "compact" ]]; then printf 'VM status: libvirt not reachable'; else note 'VM status: libvirt not reachable'; fi
+    return 0
+  fi
+  local _dom _l1 _l2 _found=0
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _l1 || continue
+    IFS= read -r -d '' _l2 || continue
+    _found=1
+    if [[ "$_mode" == "compact" ]]; then
+      printf '%s\n%s\n' "$_l1" "$_l2"
+    else
+      note "$_l1"
+      note "$_l2"
+    fi
+  done < <(_vm_checklist_records)
+  if (( ! _found )); then
+    if [[ "$_mode" == "compact" ]]; then
+      printf 'VM status: no guest-GPU VM detected'
+    else
+      note 'VM status: no guest-GPU VM detected'
+    fi
+  fi
+}
+
+# R40b/R48d/R48e: Consolidated VM tuning status block — one framed card (CLI)
+# or popup (GUI) shown BELOW the menu after each action. Consumes the shared
+# _vm_checklist_records detector so it always agrees with the first-page summary.
+_vm_tuning_status_block() {
+  local _dom _l1 _l2 _found=0
+  local -a _body=()
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _l1 || continue
+    IFS= read -r -d '' _l2 || continue
+    _found=1
+    _body+=("$_l1" "$_l2")
+  done < <(_vm_checklist_records)
   (( _found )) || return 0
   if (( HAS_TUI )); then
     local _msg=""

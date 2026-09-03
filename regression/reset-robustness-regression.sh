@@ -98,6 +98,16 @@ assert_file_missing() {
   fi
 }
 
+assert_non_empty() {
+  local name="$1" value="$2"
+  if [[ -n "$value" ]]; then
+    printf 'PASS: %s\n' "$name"
+  else
+    printf 'FAIL: %s (output was empty)\n' "$name" >&2
+    record_failure "$name"
+  fi
+}
+
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -207,6 +217,15 @@ assert_contains_text "P3 reset previews managed files before confirm" '_reset_pr
 assert_contains_text "P3 reset keeps the RESET VFIO confirm gate" 'confirm_phrase "To continue, confirm reset." "RESET VFIO"' "$_reset_fn"
 assert_contains_text "P3 reset rm uses the _rm_paths array" 'rm -f "${_rm_paths[@]}"' "$_reset_fn"
 assert_contains_text "P3 reset verifies before complete" '_reset_verify_paths "Managed files"' "$_reset_fn"
+# R46: reset must sweep the previously-left-behind artifacts too.
+assert_contains_text "P3 reset _rm_paths includes USB_BT_STATE_FILE" '$USB_BT_STATE_FILE' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes GRAPHICS_DAEMON_WANTS_LINK" '$GRAPHICS_DAEMON_WANTS_LINK' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes SDDM_PLASMA_WAYLAND_CONF" '$SDDM_PLASMA_WAYLAND_CONF' "$_reset_fn"
+assert_contains_text "P3 reset rmdir's the now-empty VFIO_DYNAMIC_DIR" 'rmdir "$VFIO_DYNAMIC_DIR"' "$_reset_fn"
+_vwga_fn="$(sed -n '/^remove_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"
+assert_non_empty "P3 remove_virtio_win_guest_agent body extracted" "$_vwga_fn"
+assert_contains_text "P3 remove_virtio_win_guest_agent sweeps the repo file" '$VIRTIO_WIN_REPO_FILE' "$_vwga_fn"
+assert_contains_text "P3 remove_virtio_win_guest_agent guards on the fedorapeople URL" 'fedorapeople' "$_vwga_fn"
 
 _prev_line="$(printf '%s\n' "$_reset_fn" | grep -nF '_reset_preview_paths "Managed files"' | awk -F: 'NR==1{print $1}')"
 _conf_line="$(printf '%s\n' "$_reset_fn" | grep -nF 'confirm_phrase "To continue, confirm reset." "RESET VFIO"' | awk -F: 'NR==1{print $1}')"
@@ -248,6 +267,12 @@ run() {
         if [[ "$p" == "$EO_ROOT"* ]]; then rm -f "$p" 2>/dev/null || true; fi
       done
       ;;
+    rmdir)
+      local p
+      for p in "$@"; do
+        if [[ "$p" == "$EO_ROOT"* ]]; then rmdir "$p" 2>/dev/null || true; fi
+      done
+      ;;
     *) return 0 ;;
   esac
 }
@@ -275,8 +300,10 @@ prep_eo_fixtures() {
             LIBVIRT_HOOK_SCRIPT CONF_FILE MODULES_LOAD BLACKLIST_FILE \
             SOFTDEP_FILE DRACUT_VFIO_CONF UDEV_ISOLATION_RULE \
             USB_BT_SCRIPT USB_BT_SYSTEMD_UNIT USB_BT_UDEV_RULE USB_BT_MATCH_CONF \
-            GRAPHICS_DAEMON_SCRIPT GRAPHICS_DAEMON_UNIT \
+            USB_BT_STATE_FILE \
+            GRAPHICS_DAEMON_SCRIPT GRAPHICS_DAEMON_UNIT GRAPHICS_DAEMON_WANTS_LINK \
             LIGHTDM_FALLBACK_CONF XORG_HOST_GPU_CONF LIGHTDM_HOST_GPU_CONF \
+            SDDM_PLASMA_WAYLAND_CONF \
             KWIN_RENDER_PIN_FILE WLR_RENDER_PIN_FILE \
             REBOOT_FLR_SCRIPT REBOOT_FLR_UNIT \
             PARK_KEEPALIVE_SCRIPT PARK_KEEPALIVE_UNIT PARK_KEEPALIVE_CHECK_UNIT \
@@ -286,6 +313,10 @@ prep_eo_fixtures() {
     declare -g "$_g"="$root/$_g"
     : >"$root/$_g"
   done
+  # R46: VFIO_DYNAMIC_DIR is a directory (rmdir'd at the end of reset), not a
+  # file fixture — create it empty so the mock `run rmdir` can remove it.
+  declare -g VFIO_DYNAMIC_DIR="$root/VFIO_DYNAMIC_DIR"
+  mkdir -p "$VFIO_DYNAMIC_DIR"
   printf 'GUEST_GPU_BDF="0000:01:00.0"\n' >"$CONF_FILE"
   declare -g LIBVIRT_HOOK_ENTRY="$root/no_such_hook_entry"
   declare -g SELF_INSTALL_BIN="$root/vfio"; : >"$SELF_INSTALL_BIN"
@@ -307,6 +338,12 @@ assert_file_missing "P4a removes CONF_FILE fixture" "$EO_ROOT/CONF_FILE"
 assert_file_missing "P4a removes LIVE_ATTACH_TRAY fixture (the original bug)" "$EO_ROOT/LIVE_ATTACH_TRAY"
 assert_file_missing "P4a removes LIVE_ATTACH_POLKIT fixture" "$EO_ROOT/LIVE_ATTACH_POLKIT"
 assert_file_missing "P4a removes USB_BT_SCRIPT fixture" "$EO_ROOT/USB_BT_SCRIPT"
+assert_file_missing "P4a removes USB_BT_STATE_FILE fixture (R46)" "$EO_ROOT/USB_BT_STATE_FILE"
+assert_file_missing "P4a removes GRAPHICS_DAEMON_WANTS_LINK fixture (R46)" "$EO_ROOT/GRAPHICS_DAEMON_WANTS_LINK"
+assert_file_missing "P4a removes SDDM_PLASMA_WAYLAND_CONF fixture (R46)" "$EO_ROOT/SDDM_PLASMA_WAYLAND_CONF"
+assert_file_missing "P4a rmdir's the VFIO_DYNAMIC_DIR fixture (R46)" "$EO_ROOT/VFIO_DYNAMIC_DIR"
+assert_contains_text "P4a rm log includes the SDDM fixture path (R46)" "$EO_ROOT/SDDM_PLASMA_WAYLAND_CONF" "$(cat "$EO_RUN_LOG")"
+assert_contains_text "P4a run log includes rmdir of the dynamic dir (R46)" "rmdir $EO_ROOT/VFIO_DYNAMIC_DIR" "$(cat "$EO_RUN_LOG")"
 assert_file_missing "P4a removes the self-installed CLI fixture" "$SELF_INSTALL_BIN"
 assert_file_missing "P4a removes the fish completion fixture" "$FISH_COMPLETION_DIR/$_ic_main.fish"
 assert_file_missing "P4a removes the bash completion fixture" "$BASH_COMPLETION_DIR/$_ic_main"

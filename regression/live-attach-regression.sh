@@ -704,10 +704,12 @@ assert_contains_text \
   'zypper --non-interactive in virtio-win' \
   "$_vw_fn"
 # R30: on Fedora, virtio-win is NOT in the default repos — the script adds the
-# fedorapeople repo first, then `dnf install virtio-win` (the proven fix).
+# fedorapeople repo first, then `dnf install virtio-win` (the proven fix). R46:
+# the repo file path is now the VIRTIO_WIN_REPO_FILE constant (not a literal),
+# so remove_virtio_win_guest_agent can sweep the same path on cleanup.
 assert_contains_text \
   "R30 adds the virtio-win repo on Fedora before dnf install" \
-  'curl -fsSL -o /etc/yum.repos.d/virtio-win.repo "$VIRTIO_WIN_REPO_URL"' \
+  'curl -fsSL -o "$VIRTIO_WIN_REPO_FILE" "$VIRTIO_WIN_REPO_URL"' \
   "$_vw_fn"
 assert_contains_text \
   "R30 picks up a user-provided ISO at the fallback path" \
@@ -739,6 +741,12 @@ assert_contains_file \
 assert_contains_file \
   "R30 VIRTIO_WIN_RPM_URL constant defined" \
   'VIRTIO_WIN_RPM_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.noarch.rpm"' \
+  "$VFIO_SCRIPT"
+# R46: the on-disk repo file path constant (used by install + remove so both
+# agree on the path; --reset sweeps it via remove_virtio_win_guest_agent).
+assert_contains_file \
+  "R46 VIRTIO_WIN_REPO_FILE constant defined" \
+  'VIRTIO_WIN_REPO_FILE="/etc/yum.repos.d/virtio-win.repo"' \
   "$VFIO_SCRIPT"
 assert_contains_text \
   "R27 install_virtio_win_guest_agent attaches a cdrom disk" \

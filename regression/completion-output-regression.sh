@@ -164,6 +164,26 @@ assert_contains_text "fish completion includes helper header" "# fish completion
 assert_contains_text "fish completion includes boot-vga-policy value list" "-a 'auto strict'" "$fish_out"
 assert_shell_covers_help_options "fish" "$fish_out"
 
+# R46: bare-space TAB must list every flag (fish only offers -l options once a
+# dash is typed, so a conditional -a line carries the full flag set on a bare
+# `vfio <TAB>`). Drift guard: that bare-space -a flag set must exactly equal the
+# set of per-flag -l declarations (catches a flag added to one but not the other).
+fish_baretab_line="$(grep -F "string match -vq -- '-*' (commandline -ct)" <<<"$fish_out" || true)"
+assert_non_empty "fish completion has bare-space tab flag-list line" "$fish_baretab_line"
+mapfile -t _fish_l_flags < <(grep -E -- '^complete -c ' <<<"$fish_out" | grep -Eo -- '-l [a-z0-9-]+' | awk '{print $2}' | sort -u || true)
+mapfile -t _fish_bare_flags < <(printf '%s\n' "$fish_baretab_line" | grep -Eo -- '--[a-z0-9][a-z0-9-]*' | sed 's/^--//' | sort -u || true)
+if (( ${#_fish_l_flags[@]} >= 1 && ${#_fish_bare_flags[@]} == ${#_fish_l_flags[@]} )); then
+  if diff <(printf '%s\n' "${_fish_l_flags[@]}") <(printf '%s\n' "${_fish_bare_flags[@]}") >/dev/null 2>&1; then
+    printf 'PASS: fish bare-space -a flag set matches per-flag -l set (%d flags)\n' "${#_fish_l_flags[@]}"
+  else
+    printf 'FAIL: fish bare-space -a flag set matches per-flag -l set (sets differ)\n' >&2
+    record_failure "fish bare-space -a flag set matches per-flag -l set"
+  fi
+else
+  printf 'FAIL: fish bare-space -a flag set matches per-flag -l set (-l=%d, bare=%d)\n' "${#_fish_l_flags[@]}" "${#_fish_bare_flags[@]}" >&2
+  record_failure "fish bare-space -a flag set matches per-flag -l set"
+fi
+
 bash_out="$(capture_completion_mode --print-bash-completion)"
 assert_non_empty "bash completion output is non-empty" "$bash_out"
 assert_contains_text "bash completion includes function wrapper" "_vfio_sh_complete()" "$bash_out"

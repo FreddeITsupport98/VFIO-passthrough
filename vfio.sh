@@ -4567,7 +4567,39 @@ _role_tag() {
 gui_msgbox() {
   local title="${1:-vfio.sh}" msg="${2:-}"
   if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
-    whiptail --title "$title" --msgbox "$msg" 18 72 3>&1 1>&2 2>&3 || true
+    # R48e: size the msgbox DYNAMICALLY from the message content so a long
+    # multi-line status panel (the per-VM checklist + ReBAR) does not truncate
+    # at the old fixed 18x72 box. Width = longest line + borders, capped to the
+    # terminal; height = line count + overhead, capped to the terminal.
+    local _tc=80 _tl=24
+    if [[ -n "${COLUMNS:-}" ]] && [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]]; then _tc="$COLUMNS"; fi
+    if [[ -n "${LINES:-}" ]] && [[ "${LINES:-}" =~ ^[0-9]+$ ]]; then _tl="$LINES"; fi
+    if command -v tput >/dev/null 2>&1; then
+      local _c _l
+      _c="$(tput cols 2>/dev/null || true)"; _l="$(tput lines 2>/dev/null || true)"
+      [[ "$_c" =~ ^[0-9]+$ ]] && _tc="$_c"
+      [[ "$_l" =~ ^[0-9]+$ ]] && _tl="$_l"
+    fi
+    (( _tc < 60 )) && _tc=60
+    (( _tl < 12 )) && _tl=12
+    local _ll=0 _line _w
+    while IFS= read -r _line; do
+      _line="$(printf '%s' "$_line" | _ansi_strip)"
+      (( ${#_line} > _ll )) && _ll=${#_line}
+    done <<<"$msg"
+    _w=$(( _ll + 6 ))
+    (( _w > _tc - 2 )) && _w=$(( _tc - 2 ))
+    (( _w < 60 )) && _w=60
+    (( _w > 130 )) && _w=130
+    local _nl
+    _nl="$(printf '%s\n' "$msg" | wc -l | tr -d '[:space:]')"
+    [[ "$_nl" =~ ^[0-9]+$ ]] || _nl=1
+    (( _nl < 1 )) && _nl=1
+    local _h=$(( _nl + 6 ))
+    (( _h > _tl - 2 )) && _h=$(( _tl - 2 ))
+    (( _h < 8 )) && _h=8
+    (( _h > 48 )) && _h=48
+    whiptail --title "$title" --msgbox "$msg" "$_h" "$_w" 3>&1 1>&2 2>&3 || true
   else
     say
     hdr "$title"
@@ -27872,7 +27904,7 @@ _menu_hypervisor_hide_summary() {
 }
 
 vfio_menu() {
-  local _menu_opts _choice _conf_present _bmode
+  local _menu_opts _choice _conf_present _bmode _last_status=""
 
   while :; do
     # Refresh each iteration so the header reflects state changes (e.g. after a
@@ -27914,30 +27946,36 @@ vfio_menu() {
     say
     hdr "vfio.sh menu"
     note "Config present: $_conf_present | Binding mode: $_bmode"
-    # R48e: FULL per-VM checklist (8 features incl hypervisor-hide) on the FIRST
-    # page (header notes here + compact lines in the dialog prompt below, right
-    # where the ReBAR disclaimer is) so the operator sees which VM is detected
-    # + what tuning is applied (✔) vs not (✖) BEFORE picking an action — not
-    # hidden in a post-action popup.
-    _menu_vm_status_summary full
-    # R48b: context-aware ReBAR disclaimer — full note() lines here for the
-    # CLI/plain-text path, plus a compact line embedded in the select_from_list
-    # prompt below so it is visible inside the whiptail dialog too (the header
-    # notes render on the terminal behind the dialog). Tells the operator ReBAR
-    # breaks the AMD Windows display driver (black screen) + that NVIDIA/Intel
-    # handle a resized BAR cleanly.
-    _menu_rebar_disclaimer full
+    # R48e: the FULL per-VM checklist (8 features incl hypervisor-hide) + the
+    # ReBAR disclaimer are shown as a SEPARATE panel (a "div") on the FIRST
+    # page BEFORE the action menu, so the operator sees which VM is detected +
+    # what tuning is applied (✔) vs not (✖) before picking. In the TUI path it
+    # is a dedicated whiptail --msgbox (gui_msgbox, dynamically sized) shown
+    # when the status changed since the last iteration — so it is NOT a popup
+    # to dismiss every single loop, only on menu entry + after an action that
+    # changed VM state. In the CLI path the same info prints as header note()
+    # lines (the terminal has no popup to hide behind).
+    local _vm_c _rebar_c _status_block=""
+    _vm_c="$(_menu_vm_status_summary compact)"
+    _rebar_c="$(_menu_rebar_disclaimer compact)"
+    if [[ -n "$_vm_c" && -n "$_rebar_c" ]]; then
+      _status_block="$(printf '%s\n\n%s' "$_vm_c" "$_rebar_c")"
+    elif [[ -n "$_vm_c" ]]; then
+      _status_block="$_vm_c"
+    elif [[ -n "$_rebar_c" ]]; then
+      _status_block="$_rebar_c"
+    fi
+    if (( HAS_TUI )); then
+      if [[ -n "$_status_block" && "$_status_block" != "$_last_status" ]]; then
+        _last_status="$_status_block"
+        gui_msgbox "VFIO status" "$_status_block"
+      fi
+    else
+      _menu_vm_status_summary full
+      _menu_rebar_disclaimer full
+    fi
     note "Pick an action (or Exit to quit):"
-    # R48e: embed the FULL per-VM checklist + the ReBAR compact line in the
-    # select_from_list prompt so BOTH are visible inside the whiptail dialog on
-    # the first page (the header notes render on the terminal behind it).
-    local _vm_compact _rebar_compact _menu_prompt
-    _vm_compact="$(_menu_vm_status_summary compact)"
-    _rebar_compact="$(_menu_rebar_disclaimer compact)"
-    _menu_prompt="What do you want to do?"
-    [[ -n "$_vm_compact" ]] && _menu_prompt="$_menu_prompt\n\n$_vm_compact"
-    [[ -n "$_rebar_compact" ]] && _menu_prompt="$_menu_prompt\n\n$_rebar_compact"
-    _choice="$(select_from_list "$_menu_prompt" "vfio.sh menu" "${_menu_opts[@]}")"
+    _choice="$(select_from_list "What do you want to do?" "vfio.sh menu" "${_menu_opts[@]}")"
     case "$_choice" in
       0)
         # Full configure — the existing wizard (mirrors the main() fallthrough).

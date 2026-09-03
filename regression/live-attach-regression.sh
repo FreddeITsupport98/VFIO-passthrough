@@ -994,13 +994,27 @@ assert_contains_file \
   '_menu_vm_status_summary()' \
   "$VFIO_SCRIPT"
 assert_contains_text \
-  "R48e vfio_menu calls _menu_vm_status_summary full in the header" \
-  '_menu_vm_status_summary full' \
-  "$_menu_fn"
-assert_contains_text \
-  "R48e vfio_menu embeds _menu_vm_status_summary compact in the dialog prompt" \
+  "R48e vfio_menu builds the compact status block" \
   '_menu_vm_status_summary compact' \
   "$_menu_fn"
+assert_contains_text \
+  "R48e vfio_menu shows the status as a separate gui_msgbox panel" \
+  'gui_msgbox "VFIO status"' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48e vfio_menu tracks _last_status so the panel only re-shows on change" \
+  '_last_status' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48e vfio_menu CLI path still prints the full header notes" \
+  '_menu_vm_status_summary full' \
+  "$_menu_fn"
+# gui_msgbox is now dynamically sized (width from longest line, height from
+# line count) so the long status panel does not truncate at a fixed 18x72 box.
+assert_contains_file \
+  "R48e gui_msgbox sizes dynamically from content" \
+  'whiptail --title "$title" --msgbox "$msg" "$_h" "$_w"' \
+  "$VFIO_SCRIPT"
 _checklist_fn="$(sed -n '/^_vm_checklist_records()/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_checklist_fn" ]]; then
   printf 'PASS: R48e _vm_checklist_records body extracted\n'

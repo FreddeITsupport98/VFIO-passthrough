@@ -16805,6 +16805,26 @@ _lg_binary_valid() {
   return 0
 }
 
+# R48h: Smart one-line warning printed BEFORE a Looking Glass decision prompt
+# (wizard / install flow / menu) so the user knows the client is NOT compiled
+# yet — at the decision point, before they answer. SILENT (returns 0, prints
+# nothing) when the client IS compiled, so a re-run on an already-set-up host
+# produces no noise. Uses the same _lg_binary_valid ELF check as the
+# install_looking_glass disclaimer + the per-VM checklist, so all three always
+# agree on the compiled state. Best-effort: never aborts the caller.
+_lg_client_warn_if_missing() {
+  if _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
+    return 0
+  fi
+  if (( ENABLE_COLOR )); then
+    note "${C_BOLD}${C_YELLOW}NOTE:${C_RESET} the ${C_BOLD}looking-glass-client${C_RESET} binary is NOT compiled on this host yet."
+  else
+    note "NOTE: the looking-glass-client binary is NOT compiled on this host yet."
+  fi
+  note "  Looking Glass only mirrors the display once you compile/install the client:"
+  note "    sudo $SCRIPT_NAME --install-looking-glass-client   (or --menu, option 18)"
+}
+
 # R40b: Install/compile the looking-glass-client binary. Tries the distro
 # package first (dnf COPR / pacman AUR), falls back to source compilation.
 # Shows a green ✔ checkmark when the binary is valid after the attempt.
@@ -17416,28 +17436,30 @@ install_looking_glass() {
   note "vBIOS is NOT touched here (use --vbios / the wizard for vBIOS injection)."
   note "The client binary is NOT auto-installed; use --install-looking-glass-client (or the menu) to compile it."
   say
-  # R48g: prominent PREREQUISITE disclaimer — the VM-side shmem setup below is
-  # useless without the looking-glass-client binary compiled/installed on the
-  # HOST first. The shared-memory device only exposes the VM's framebuffer to
-  # the host; it is the CLIENT binary that reads it and renders the window. A
-  # user who sets up LG without the client gets a black window / "cannot find
-  # shared memory" and nothing to view. Warn up-front (color-coded) and name
-  # the exact command / menu option to install it.
-  if (( ENABLE_COLOR )); then
-    note "${C_BOLD}${C_YELLOW}PREREQUISITE:${C_RESET} Looking Glass needs the ${C_BOLD}looking-glass-client${C_RESET} binary"
-  else
-    note "PREREQUISITE: Looking Glass needs the looking-glass-client binary"
-  fi
-  note "compiled/installed on this HOST to actually view the VM's display. The VM-side"
-  note "<shmem> setup below only exposes the framebuffer — the CLIENT reads it. Without"
-  note "the client you will see a black window / 'cannot find shared memory' and nothing."
-  if [[ -x "$LG_CLIENT_BIN" ]]; then
+  # R48h: SMART prerequisite check — the VM-side shmem setup is useless without
+  # the looking-glass-client binary on the HOST (the shmem only exposes the
+  # framebuffer; the CLIENT reads it -> black window / 'cannot find shared
+  # memory' without it). But re-printing the full warning EVERY run is noisy
+  # once the user HAS compiled it. So: if the client is valid (ELF present),
+  # emit ONE brief green ✔ and move on; only pop the full yellow PREREQUISITE
+  # banner + the install command when it is NOT compiled. _lg_binary_valid is
+  # the same ELF check install_looking_glass_client uses, so the disclaimer and
+  # the summary always agree.
+  if _lg_binary_valid "$LG_CLIENT_BIN"; then
     if (( ENABLE_COLOR )); then
-      note "  ${C_GREEN}✔${C_RESET} looking-glass-client is already installed at $LG_CLIENT_BIN — you're good."
+      note "  ${C_GREEN}✔${C_RESET} looking-glass-client already compiled at $LG_CLIENT_BIN — ready to view the VM display."
     else
-      note "  ✔ looking-glass-client is already installed at $LG_CLIENT_BIN — you're good."
+      note "  ✔ looking-glass-client already compiled at $LG_CLIENT_BIN — ready to view the VM display."
     fi
   else
+    if (( ENABLE_COLOR )); then
+      note "${C_BOLD}${C_YELLOW}PREREQUISITE:${C_RESET} Looking Glass needs the ${C_BOLD}looking-glass-client${C_RESET} binary"
+    else
+      note "PREREQUISITE: Looking Glass needs the looking-glass-client binary"
+    fi
+    note "compiled/installed on this HOST to actually view the VM's display. The VM-side"
+    note "<shmem> setup below only exposes the framebuffer — the CLIENT reads it. Without"
+    note "the client you will see a black window / 'cannot find shared memory' and nothing."
     note "  ✖ looking-glass-client is NOT installed yet. Install it FIRST (or right after this):"
     note "      sudo $SCRIPT_NAME --install-looking-glass-client"
     note "    (or use the --menu, option 18: 'Install (compile) looking-glass-client'.)"
@@ -21273,6 +21295,10 @@ install_dynamic_binding_from_existing_config() {
   #      is NOT touched here (vfio.sh already does vBIOS injection). The client
   #      binary is NOT auto-installed (install_looking_glass prints hints).
   #      Default N. Run later with: sudo $SCRIPT_NAME --install-looking-glass.
+  # R48h: smart heads-up BEFORE the decision — silent if the client is already
+  #      compiled; a one-line NOTE + the install command if not, so the user can
+  #      choose to compile first (option 18) instead of setting up a useless shmem.
+  _lg_client_warn_if_missing
   if prompt_yn "Set up Looking Glass (shared-memory display mirror) for the guest-GPU VM now?" N "Looking Glass"; then
     install_looking_glass
   else
@@ -27424,6 +27450,9 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
     # shared memory + <shmem name='looking-glass'> ivshmem-plain device on each
     # shut-off guest-GPU VM + user config. vBIOS NOT touched (vfio.sh already
     # does vBIOS injection). Client binary NOT auto-installed. Default N.
+    # R48h: smart heads-up BEFORE the decision — silent if the client is already
+    # compiled; a one-line NOTE + the install command if not.
+    _lg_client_warn_if_missing
     if prompt_yn "Set up Looking Glass (shared-memory display mirror) for the guest-GPU VM now?" N "Looking Glass"; then
       install_looking_glass
     else
@@ -28397,6 +28426,13 @@ vfio_menu() {
 #   hypervisor-hide   stealth-tune   ultimate-perf   looking-glass (+detail)
 #   vBIOS ROM injection   live-attach enrolled   hugepages (memoryBacking)
 #   virtio-win guest-agent ISO   disks-virtio (no SATA hard disks)
+# R48h: the looking-glass detail now also shows whether the HOST-side
+# looking-glass-client BINARY is compiled (✔) or not (✖), so the operator sees
+# at a glance — without running install_looking_glass — whether the VM-side
+# shmem is actually usable (the client reads the framebuffer; without it the
+# shmem is useless -> black window). Host-level (one binary for all VMs),
+# computed once via _lg_binary_valid (same ELF check the disclaimer + the
+# install use, so all three always agree). Only appended when the VM HAS LG.
 _vm_checklist_records() {
   if ! readable_file "$CONF_FILE"; then return 0; fi
   have_cmd virsh || return 0
@@ -28406,6 +28442,11 @@ _vm_checklist_records() {
   libvirt_runtime_ok || return 0
   local _vw_iso1="${VIRTIO_WIN_ISO_PATH:-}" _vw_iso2="${VIRTIO_WIN_FALLBACK_ISO:-}"
   local _la_list="${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
+  # R48h: host-level looking-glass-client compiled check (one for all VMs).
+  local _lg_compiled_sym="✖"
+  if _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
+    _lg_compiled_sym="✔"
+  fi
   local _dom _xml _has_hvhide _has_stealthtune _has_perf _has_shmem _has_rebar _has_video_none _sz _unit _lg_info
   local _has_vbios _has_liveattach _has_hugepages _has_virtio_iso _has_sata_disk
   local _n_sata _n_cdrom _line1 _line2
@@ -28456,7 +28497,10 @@ _vm_checklist_records() {
     (( _has_perf )) && _p_sym="✔"
     if (( _has_shmem )); then
       _l_sym="✔"
-      _lg_detail=" (shmem ${_sz}${_unit}B${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none})"
+      # R48h: append the host-side client-compiled status to the LG detail so a
+      # VM with a shmem but no client shows 'compiled ✖' (run
+      # --install-looking-glass-client) — the shmem alone is useless without it.
+      _lg_detail=" (shmem ${_sz}${_unit}B${_has_rebar:+ + ReBAR}${_has_video_none:+, video=none}, compiled $_lg_compiled_sym)"
     fi
     (( _has_vbios )) && _vb_sym="✔"
     (( _has_liveattach )) && _la_sym="✔"

@@ -134,6 +134,20 @@ assert_contains_file "R48g _lg_vm_shmem_info anchors to looking-glass name" 'blk
 assert_contains_file "R48g checklist uses _lg_vm_shmem_info (not any ivshmem-plain)" '_lg_vm_shmem_info "$_xml"' "$VFIO_SCRIPT"
 assert_contains_file "R48g install_looking_glass has compile-client-first disclaimer" 'PREREQUISITE: Looking Glass needs the looking-glass-client binary' "$VFIO_SCRIPT"
 assert_contains_file "R48g install_looking_glass disclaimer names the client install flag" '--install-looking-glass-client' "$VFIO_SCRIPT"
+# R48h: the disclaimer is SMART (silent ✔ when compiled, full warning only when
+# not) + a new _lg_client_warn_if_missing helper wired before the LG prompts +
+# the per-VM checklist appends 'compiled ✔/✖' to the LG detail.
+assert_contains_file "R48h _lg_client_warn_if_missing helper defined" '_lg_client_warn_if_missing() {' "$VFIO_SCRIPT"
+assert_contains_file "R48h smart disclaimer prints the brief ✔-compiled branch" 'already compiled at $LG_CLIENT_BIN' "$VFIO_SCRIPT"
+assert_contains_file "R48h checklist appends compiled marker to LG detail" 'compiled $_lg_compiled_sym' "$VFIO_SCRIPT"
+assert_contains_file "R48h checklist computes compiled marker via _lg_binary_valid" '_lg_binary_valid "${LG_CLIENT_BIN' "$VFIO_SCRIPT"
+_lg_warn_count="$(grep -cF '_lg_client_warn_if_missing' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _lg_warn_count >= 3 )); then
+  printf 'PASS: R48h _lg_client_warn_if_missing wired in >=3 places (def + 2 prompts: %d)\n' "$_lg_warn_count"
+else
+  printf 'FAIL: R48h _lg_client_warn_if_missing wired in only %d places (expected >=3)\n' "$_lg_warn_count" >&2
+  record_failure "R48h _lg_client_warn_if_missing wired before the LG prompts"
+fi
 # R44/live-attach: _lg_set_vm_display_live_attach helper (the live-attach boot-
 # display path, never video=none) MUST be defined, and install_looking_glass
 # MUST branch on the live-attach mode (video=none for cold-attach / boot display

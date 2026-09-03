@@ -1138,6 +1138,47 @@ assert_contains_file \
   "R48g install_looking_glass disclaimer points at --install-looking-glass-client" \
   '--install-looking-glass-client' \
   "$VFIO_SCRIPT"
+# R48h: the disclaimer is now SMART — silent (a brief ✔) when the client IS
+# compiled, full warning only when not. Plus a new host-level helper
+# _lg_client_warn_if_missing wired before the wizard/install-flow LG prompts,
+# and the per-VM checklist now appends 'compiled ✔/✖' to the LG detail.
+assert_contains_file \
+  "R48h _lg_client_warn_if_missing helper defined" \
+  '_lg_client_warn_if_missing() {' \
+  "$VFIO_SCRIPT"
+_r48h_warn_fn="$(sed -n '/^_lg_client_warn_if_missing()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48h _lg_client_warn_if_missing checks _lg_binary_valid" \
+  '_lg_binary_valid "${LG_CLIENT_BIN' \
+  "$_r48h_warn_fn"
+assert_contains_text \
+  "R48h _lg_client_warn_if_missing is silent when compiled (early return 0)" \
+  'return 0' \
+  "$_r48h_warn_fn"
+assert_contains_text \
+  "R48h smart disclaimer prints the brief ✔-compiled branch" \
+  'already compiled at $LG_CLIENT_BIN' \
+  "$(sed -n '/^install_looking_glass()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48h smart disclaimer still prints the full PREREQUISITE when not compiled" \
+  'PREREQUISITE: Looking Glass needs the looking-glass-client binary' \
+  "$(sed -n '/^install_looking_glass()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48h checklist appends the compiled ✔/✖ marker to the LG detail" \
+  'compiled $_lg_compiled_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48h checklist computes the compiled marker via _lg_binary_valid" \
+  '_lg_binary_valid "${LG_CLIENT_BIN' \
+  "$_checklist_fn"
+# The smart helper is wired before BOTH wizard/install-flow LG prompts.
+_lg_warn_count="$(grep -cF '_lg_client_warn_if_missing' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _lg_warn_count >= 3 )); then
+  printf 'PASS: R48h _lg_client_warn_if_missing wired in >=3 places (def + 2 prompts: %d)\n' "$_lg_warn_count"
+else
+  printf 'FAIL: R48h _lg_client_warn_if_missing wired in only %d places (expected >=3: def + 2 prompts)\n' "$_lg_warn_count" >&2
+  record_failure "R48h _lg_client_warn_if_missing wired before the LG prompts"
+fi
 
 # --- R48g functional: stealth patcher spoofs MAC + adds SMBIOS 2/3/17 ---
 # Extract the embedded python heredoc and run it on a mock VM XML with a QEMU

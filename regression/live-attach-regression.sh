@@ -1065,6 +1065,26 @@ assert_contains_file \
   "R48e status block consumes _vm_checklist_records" \
   '_vm_checklist_records' \
   "$VFIO_SCRIPT"
+# R48e: select_from_list now sizes the whiptail dialog DYNAMICALLY from the
+# prompt content (longest line + line count) so the multi-line VM checklist +
+# ReBAR prompt no longer truncate at the old fixed 78-col width.
+_sfl_fn="$(sed -n '/^select_from_list()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48e select_from_list computes a dynamic dialog width" \
+  '_maxw' \
+  "$_sfl_fn"
+assert_contains_text \
+  "R48e select_from_list computes a dynamic dialog height" \
+  '_nh' \
+  "$_sfl_fn"
+assert_contains_text \
+  "R48e select_from_list reads terminal cols via COLUMNS/tput" \
+  'tput cols' \
+  "$_sfl_fn"
+assert_contains_text \
+  "R48e select_from_list no longer hardcodes 20 78 10" \
+  '"$_nh" "$_maxw" "$_lh"' \
+  "$_sfl_fn"
 
 # --- R34: self-install (--install-self/--uninstall-self) + config pickup ---
 # --install-self copies this script to /usr/local/bin/vfio (on PATH as vfio) and

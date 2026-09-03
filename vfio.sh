@@ -4834,8 +4834,52 @@ select_from_list() {
       menu_args+=("$i" "$first_line")
     done
 
+    # R48e: dynamic dialog sizing so a multi-line prompt (the per-VM checklist
+    # + ReBAR disclaimer) does not truncate at a fixed 78-col width. Compute the
+    # width from the longest line (prompt + option labels) and the height from
+    # the line count, both capped to the terminal size with sane fallbacks.
+    local _maxw=78 _nh=20 _lh=10
+    local _tc=80 _tl=24
+    if [[ -n "${COLUMNS:-}" ]] && [[ "${COLUMNS:-}" =~ ^[0-9]+$ ]]; then _tc="$COLUMNS"; fi
+    if [[ -n "${LINES:-}" ]] && [[ "${LINES:-}" =~ ^[0-9]+$ ]]; then _tl="$LINES"; fi
+    if command -v tput >/dev/null 2>&1; then
+      local _tput_c _tput_l
+      _tput_c="$(tput cols 2>/dev/null || true)"
+      _tput_l="$(tput lines 2>/dev/null || true)"
+      [[ "$_tput_c" =~ ^[0-9]+$ ]] && _tc="$_tput_c"
+      [[ "$_tput_l" =~ ^[0-9]+$ ]] && _tl="$_tput_l"
+    fi
+    (( _tc < 60 )) && _tc=60
+    (( _tl < 12 )) && _tl=12
+    # longest line across the prompt + the option first-lines.
+    local _ll=0 _w
+    while IFS= read -r _w; do
+      _w="$(printf '%s' "$_w" | _ansi_strip)"
+      (( ${#_w} > _ll )) && _ll=${#_w}
+    done <<<"$prompt"
+    for i in "${!options[@]}"; do
+      _w="$(printf '%s' "${options[$i]%%$'\n'*}" | _ansi_strip)"
+      (( ${#_w} > _ll )) && _ll=${#_w}
+    done
+    # width = longest line + padding for the "N " tag + dialog borders.
+    _maxw=$(( _ll + 8 ))
+    (( _maxw > _tc - 2 )) && _maxw=$(( _tc - 2 ))
+    (( _maxw < 60 )) && _maxw=60
+    (( _maxw > 130 )) && _maxw=130
+    # height = prompt line count + options + overhead (title/borders/prompt gap).
+    local _pl
+    _pl="$(printf '%s\n' "$prompt" | wc -l | tr -d '[:space:]')"
+    [[ "$_pl" =~ ^[0-9]+$ ]] || _pl=1
+    (( _pl < 1 )) && _pl=1
+    _nh=$(( _pl + ${#options[@]} + 6 ))
+    _lh=${#options[@]}
+    (( _lh > _tl - _pl - 6 )) && _lh=$(( _tl - _pl - 6 ))
+    (( _lh < 4 )) && _lh=4
+    (( _nh > _tl - 2 )) && _nh=$(( _tl - 2 ))
+    (( _nh < 12 )) && _nh=12
+    (( _nh > 48 )) && _nh=48
     local choice
-    choice=$(whiptail --title "$title" --menu "$prompt" 20 78 10 "${menu_args[@]}" 3>&1 1>&2 2>&3) || die "Selection cancelled."
+    choice=$(whiptail --title "$title" --menu "$prompt" "$_nh" "$_maxw" "$_lh" "${menu_args[@]}" 3>&1 1>&2 2>&3) || die "Selection cancelled."
     # choice is already the zero-based index as a string.
     echo "$choice"
     return 0

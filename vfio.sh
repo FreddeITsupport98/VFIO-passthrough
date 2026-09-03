@@ -27870,39 +27870,6 @@ _menu_rebar_disclaimer() {
   esac
 }
 
-# R48c: Hypervisor-hide status summary for the vfio_menu status bar. Scans every
-# guest-GPU VM (_list_guest_gpu_vms) and checks whether stealth/hypervisor-hide
-# is applied (_vm_is_stealth_tuned), then prints one compact line the operator
-# can read at a glance in the menu header: 'Hypervisor hide: win11 ✔, win10 ✖'
-# (✔ = vendor_id=GENUINE00000 + kvm=off,hypervisor=off + SMBIOS spoofing applied
-# = no red/green stripes in virt-manager); or 'no guest-GPU VM detected' when no
-# qualifying VM exists. Read-only (virsh dumpxml + world-readable conf); no root.
-# Mirrors the per-VM check _vm_tuning_status_block uses, so the header + the
-# post-action block agree.
-_menu_hypervisor_hide_summary() {
-  readable_file "$CONF_FILE" || { printf 'Hypervisor hide: no config'; return 0; }
-  have_cmd virsh || { printf 'Hypervisor hide: virsh unavailable'; return 0; }
-  libvirt_runtime_ok || { printf 'Hypervisor hide: libvirt not reachable'; return 0; }
-  local _dom _xml _sym _parts=()
-  while IFS= read -r -d '' _dom; do
-    IFS= read -r -d '' _xml || continue
-    if _vm_is_stealth_tuned "$_dom" "$_xml"; then
-      _sym="✔"
-    else
-      _sym="✖"
-    fi
-    _parts+=("$_dom $_sym")
-  done < <(_list_guest_gpu_vms)
-  if (( ${#_parts[@]} == 0 )); then
-    printf 'Hypervisor hide: no guest-GPU VM detected'
-    return 0
-  fi
-  local _joined
-  printf -v _joined '%s, ' "${_parts[@]}"
-  _joined="${_joined%, }"
-  printf 'Hypervisor hide: %s' "$_joined"
-}
-
 vfio_menu() {
   local _menu_opts _choice _conf_present _bmode _last_status=""
 
@@ -28283,15 +28250,26 @@ vfio_menu() {
   done
 }
 
-# R48e: Shared per-VM checklist detector. Scans every guest-GPU VM
+# R48e/R48f: Shared per-VM checklist detector. Scans every guest-GPU VM
 # (_list_guest_gpu_vms) + its dumpxml and emits NUL-delimited records on stdout:
 #   <dom>\0<line1>\0<line2>\0
-# where line1/line2 are the 8-feature checklist (✔ applied / ✖ not). Read-only
+# where line1/line2 are the 9-feature checklist (✔ applied / ✖ not). Read-only
 # (virsh dumpxml + world-readable conf); no root. Single source of truth for the
-# detection so the menu header status bar (_menu_vm_status_summary) and the
-# post-action popup (_vm_tuning_status_block) always agree. 8 features:
-#   hypervisor-hide (stealth)   ultimate-perf          looking-glass (+detail)
-#   vBIOS ROM injection          live-attach enrolled   hugepages (memoryBacking)
+# detection so the menu first-page summary (_menu_vm_status_summary) and the
+# post-action popup (_vm_tuning_status_block) always agree.
+# R48f: hypervisor-hide and stealth-tune are SEPARATE items — they are NOT the
+# same thing. hypervisor-hide is the CORE detection defeat (vendor_id=GENUINE00000
+# + kvm hidden + CPUID hypervisor bit off + vmport off = removes the red/green
+# stripes in virt-manager so the AMD Windows driver installs). stealth-tune is
+# the EXTENSION (SMBIOS type-1 spoofing + e1000e NIC + randomized disk serials
+# + memballoon=none + clock/timer tweaks + qemu:commandline -cpu/-smbios args =
+# makes the VM look like a real desktop PC). A VM can have the hide WITHOUT the
+# full cosmetic tune, so they are detected independently:
+#   hypervisor-hide ✔ + stealth-tune ✖ = only the core stripes fix applied
+#   hypervisor-hide ✔ + stealth-tune ✔ = the full stealth/perf tuning applied
+# 9 features:
+#   hypervisor-hide   stealth-tune   ultimate-perf   looking-glass (+detail)
+#   vBIOS ROM injection   live-attach enrolled   hugepages (memoryBacking)
 #   virtio-win guest-agent ISO   disks-virtio (no SATA hard disks)
 _vm_checklist_records() {
   if ! readable_file "$CONF_FILE"; then return 0; fi
@@ -28302,15 +28280,20 @@ _vm_checklist_records() {
   libvirt_runtime_ok || return 0
   local _vw_iso1="${VIRTIO_WIN_ISO_PATH:-}" _vw_iso2="${VIRTIO_WIN_FALLBACK_ISO:-}"
   local _la_list="${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
-  local _dom _xml _has_stealth _has_perf _has_shmem _has_rebar _has_video_none _sz
+  local _dom _xml _has_hvhide _has_stealthtune _has_perf _has_shmem _has_rebar _has_video_none _sz
   local _has_vbios _has_liveattach _has_hugepages _has_virtio_iso _has_sata_disk
   local _n_sata _n_cdrom _line1 _line2
   while IFS= read -r -d '' _dom; do
     IFS= read -r -d '' _xml || continue
-    _has_stealth=0; _has_perf=0; _has_shmem=0; _has_rebar=0; _has_video_none=0; _sz=""
+    _has_hvhide=0; _has_stealthtune=0; _has_perf=0; _has_shmem=0; _has_rebar=0; _has_video_none=0; _sz=""
     _has_vbios=0; _has_liveattach=0; _has_hugepages=0; _has_virtio_iso=0; _has_sata_disk=0
-    # Line 1 features: hypervisor-hide / ultimate-perf / looking-glass.
-    grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && grep -Fq 'type=1,manufacturer=' <<<"$_xml" 2>/dev/null && _has_stealth=1
+    # Line 1 features: hypervisor-hide / stealth-tune / ultimate-perf / looking-glass.
+    # hypervisor-hide (CORE): vendor_id=GENUINE00000 + kvm=off,hypervisor=off.
+    grep -Fq 'GENUINE00000' <<<"$_xml" 2>/dev/null && grep -Fq 'kvm=off,hypervisor=off' <<<"$_xml" 2>/dev/null && _has_hvhide=1
+    # stealth-tune (EXTENSION): SMBIOS type-1 spoofing (manufacturer=) — the
+    # cosmetic layer beyond the core hide. Always added by install_stealth_vm_tuning
+    # alongside the hide, but detected separately so a hide-only VM shows tune ✖.
+    grep -Fq 'type=1,manufacturer=' <<<"$_xml" 2>/dev/null && _has_stealthtune=1
     grep -Fq "cache='none'" <<<"$_xml" 2>/dev/null && grep -Fq "io='native'" <<<"$_xml" 2>/dev/null && grep -Fq '<cputune>' <<<"$_xml" 2>/dev/null && _has_perf=1
     grep -q "model type='ivshmem-plain'" <<<"$_xml" 2>/dev/null && _has_shmem=1
     grep -q 'opt/ovmf/X-PciMmio64Mb' <<<"$_xml" 2>/dev/null && _has_rebar=1
@@ -28333,9 +28316,10 @@ _vm_checklist_records() {
     [[ "$_n_cdrom" =~ ^[0-9]+$ ]] || _n_cdrom=0
     (( _n_sata > _n_cdrom )) && _has_sata_disk=1
     # Build the 2-line checklist for this VM.
-    local _s_sym="✖" _p_sym="✖" _l_sym="✖" _lg_detail=""
+    local _hh_sym="✖" _st_sym="✖" _p_sym="✖" _l_sym="✖" _lg_detail=""
     local _vb_sym="✖" _la_sym="✖" _hp_sym="✖" _vw_sym="✖" _dk_sym="✖"
-    (( _has_stealth )) && _s_sym="✔"
+    (( _has_hvhide )) && _hh_sym="✔"
+    (( _has_stealthtune )) && _st_sym="✔"
     (( _has_perf )) && _p_sym="✔"
     if (( _has_shmem )); then
       _l_sym="✔"
@@ -28346,13 +28330,13 @@ _vm_checklist_records() {
     (( _has_hugepages )) && _hp_sym="✔"
     (( _has_virtio_iso )) && _vw_sym="✔"
     (( ! _has_sata_disk )) && _dk_sym="✔"
-    _line1="$_dom:  hypervisor-hide $_s_sym  ultimate-perf $_p_sym  looking-glass $_l_sym$_lg_detail"
+    _line1="$_dom:  hypervisor-hide $_hh_sym  stealth-tune $_st_sym  ultimate-perf $_p_sym  looking-glass $_l_sym$_lg_detail"
     _line2="       vBIOS $_vb_sym  live-attach $_la_sym  hugepages $_hp_sym  virtio-win $_vw_sym  disks-virtio $_dk_sym"
     printf '%s\0%s\0%s\0' "$_dom" "$_line1" "$_line2"
   done < <(_list_guest_gpu_vms)
 }
 
-# R48e: Menu first-page VM status summary. Emits the FULL 8-feature per-VM
+# R48e: Menu first-page VM status summary. Emits the FULL 9-feature per-VM
 # checklist so the operator sees it on the menu's FIRST page (the header + the
 # whiptail dialog prompt, right where the ReBAR disclaimer is) — not hidden in a
 # post-action popup. $1=full (default: note() lines for the header) | compact

@@ -107,8 +107,11 @@ assert_contains_file "usage one-liner includes --remove-looking-glass-client" '[
 assert_contains_file "remove_looking_glass_client checks rpm -qf" 'rpm -qf' "$VFIO_SCRIPT"
 assert_contains_file "remove_looking_glass_client checks dpkg -S" 'dpkg -S' "$VFIO_SCRIPT"
 assert_contains_file "_vm_tuning_status_block called below menu" '_vm_tuning_status_block' "$VFIO_SCRIPT"
-# R48d: the status block now shows a FULL 8-feature per-VM checklist (not just
-# stealth/perf/LG). Assert the detection markers for the 5 new features exist.
+# R48d/R48f: the status block now shows a FULL 9-feature per-VM checklist (not just
+# stealth/perf/LG). R48f split hypervisor-hide (core) and stealth-tune (cosmetic
+# extension) into separate items. Assert the detection markers for the new features.
+assert_contains_file "R48f status block line 1 has hypervisor-hide label" 'hypervisor-hide $_hh_sym' "$VFIO_SCRIPT"
+assert_contains_file "R48f status block line 1 has stealth-tune label" 'stealth-tune $_st_sym' "$VFIO_SCRIPT"
 assert_contains_file "R48d status block detects vBIOS ROM injection" '<rom file=' "$VFIO_SCRIPT"
 assert_contains_file "R48d status block detects live-attach enrollment" '_la_list' "$VFIO_SCRIPT"
 assert_contains_file "R48d status block detects hugepages" "<hugepages" "$VFIO_SCRIPT"

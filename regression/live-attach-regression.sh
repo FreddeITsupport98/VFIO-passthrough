@@ -965,13 +965,15 @@ assert_contains_text \
   'compact' \
   "$_rebar_fn"
 
-# --- R48c/R48e: a standalone "Apply hypervisor hide / stealth" menu option
-# (position 3) + the FULL 8-feature per-VM checklist on the menu's FIRST page
+# --- R48c/R48e/R48f: a standalone "Apply hypervisor hide / stealth" menu option
+# (position 3) + the FULL 9-feature per-VM checklist on the menu's FIRST page
 # (header notes + the whiptail dialog prompt, right where the ReBAR disclaimer
 # is) so the GUI operator sees which VM is detected + what tuning is applied
 # (✔) vs not (✖) BEFORE picking an action — not hidden in a post-action popup.
 # Also fixes the root cause: the wizard now runs VM-customization in BOTH binding
-# modes (asserted in ultimate-perf-regression.sh). ---
+# modes (asserted in ultimate-perf-regression.sh). R48f SPLIT hypervisor-hide
+# (the core stripes fix) and stealth-tune (the cosmetic SMBIOS/NIC/serial
+# extension) into SEPARATE checklist items — they are not the same thing. ---
 assert_contains_text \
   "R48c menu offers the hypervisor hide / stealth option" \
   'Apply hypervisor hide / stealth to detected guest-GPU VMs' \
@@ -1035,12 +1037,20 @@ assert_contains_text \
   '_list_guest_gpu_vms' \
   "$_checklist_fn"
 assert_contains_text \
-  "R48e checklist detects hypervisor-hide (GENUINE00000 marker)" \
+  "R48f checklist detects hypervisor-hide (GENUINE00000 + kvm hidden)" \
   'GENUINE00000' \
   "$_checklist_fn"
 assert_contains_text \
-  "R48e checklist line 1 has hypervisor-hide label" \
-  'hypervisor-hide $_s_sym' \
+  "R48f checklist line 1 has hypervisor-hide label (core stripes fix)" \
+  'hypervisor-hide $_hh_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48f checklist line 1 has stealth-tune label (cosmetic extension)" \
+  'stealth-tune $_st_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48f checklist detects stealth-tune via SMBIOS type-1 spoofing" \
+  'type=1,manufacturer=' \
   "$_checklist_fn"
 assert_contains_text \
   "R48e checklist line 1 has ultimate-perf label" \

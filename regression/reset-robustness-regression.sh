@@ -242,6 +242,22 @@ assert_contains_text "P3 reset calls _wipe_user_runtime_artifacts" '_wipe_user_r
 assert_contains_text "P3 reset sweeps /root vfio-rollback scripts" '/root/vfio-rollback-*.sh' "$_reset_fn"
 _early_fn="$(sed -n '/^install_early_binding_from_existing_config()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text "P3 install-early-binding removes the SELinux module" 'remove_selinux_virtqemud_policy' "$_early_fn"
+# R48: standalone systemd-boot entry reset helper + reset_vfio_all auto-invocation.
+assert_contains_file "P3 reset_systemd_boot_entries defined" 'reset_systemd_boot_entries()' "$VFIO_SCRIPT"
+_rsbe_fn="$(sed -n '/^reset_systemd_boot_entries()/,/^}/p' "$VFIO_SCRIPT")"
+assert_non_empty "P3 reset_systemd_boot_entries body extracted" "$_rsbe_fn"
+assert_contains_text "P3 reset_systemd_boot_entries strips amdgpu.rebar=0" 'remove_param_all "$_new" "amdgpu.rebar=0"' "$_rsbe_fn"
+assert_contains_text "P3 reset_systemd_boot_entries strips vfio-pci.ids prefix" 'remove_param_prefix "$_new" "vfio-pci.ids="' "$_rsbe_fn"
+assert_contains_text "P3 reset_systemd_boot_entries skips snapper entries" '== snapper-*' "$_rsbe_fn"
+assert_contains_text "P3 reset_systemd_boot_entries uses the shared writer" 'systemd_boot_write_options "$_entry" "$_new"' "$_rsbe_fn"
+assert_contains_text "P3 reset_vfio_all auto-invokes it for standalone systemd-boot" 'reset_systemd_boot_entries no-confirm' "$_reset_fn"
+assert_contains_text "P3 reset gates the systemd-boot call on detect_bootloader" '$reset_bl" == "systemd-boot"' "$_reset_fn"
+# R48: standalone --reset-systemd-boot-entries CLI flag wiring.
+assert_contains_file "P3 parse_args handles --reset-systemd-boot-entries" '--reset-systemd-boot-entries)' "$VFIO_SCRIPT"
+assert_contains_file "P3 MODE comment lists reset-systemd-boot-entries" '| reset-systemd-boot-entries |' "$VFIO_SCRIPT"
+assert_contains_file "P3 fish completion includes --reset-systemd-boot-entries" '-l reset-systemd-boot-entries' "$VFIO_SCRIPT"
+assert_contains_file "P3 bash completion opts include --reset-systemd-boot-entries" ' --reset-systemd-boot-entries ' "$VFIO_SCRIPT"
+assert_contains_file "P3 main dispatch wires reset-systemd-boot-entries" 'MODE" == "reset-systemd-boot-entries"' "$VFIO_SCRIPT"
 
 _prev_line="$(printf '%s\n' "$_reset_fn" | grep -nF '_reset_preview_paths "Managed files"' | awk -F: 'NR==1{print $1}')"
 _conf_line="$(printf '%s\n' "$_reset_fn" | grep -nF 'confirm_phrase "To continue, confirm reset." "RESET VFIO"' | awk -F: 'NR==1{print $1}')"

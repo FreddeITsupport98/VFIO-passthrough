@@ -580,6 +580,50 @@ set -e
 assert_eq "live-attach display patcher exit 0 on pin run (video=none -> virtio + pin)" "0" "$rc_la5"
 assert_contains_file "live-attach boot display pinned off GPU/audio bus (to 0x05)" 'bus="0x05"' "$la5"
 
+# ===================== R48j: Fedora build-deps before source compile + build log on failure =====================
+# Bug: on the Fedora/dnf path, when the COPR package failed and the code fell
+# back to _lg_compile_from_source, it NEVER installed the Fedora build deps
+# (the apt branch installs deps first; the dnf branch did not), so the clone +
+# cmake + make died on missing headers and the binary was never produced. Also
+# _lg_compile_from_source fully silenced every step (> /dev/null 2>&1), so the
+# user only ever saw "build failed, check dependencies" with NO clue which
+# header/command was missing. R48j installs the official Looking Glass wiki
+# Fedora client-build dependency list BEFORE the compile fallback, and captures
+# the clone/cmake/make output to a build log + prints the tail on failure.
+assert_contains_file "R48j dnf fallback installs Fedora build deps" 'Installing Looking Glass client build dependencies (Fedora)' "$VFIO_SCRIPT"
+assert_contains_file "R48j dnf fallback installs spice-protocol" 'spice-protocol' "$VFIO_SCRIPT"
+assert_contains_file "R48j dnf fallback installs libglvnd-devel" 'libglvnd-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j dnf fallback installs wayland-protocols-devel" 'wayland-protocols-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j dnf fallback installs pipewire-devel" 'pipewire-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j dnf fallback installs libdecor-devel" 'libdecor-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper defines build log path" '/tmp/looking-glass-client-build.log' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper redirects clone to log" 'git clone --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" >>"$_log"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper redirects cmake to log" 'cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) >>"$_log"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper redirects make to log" '"$_builder" -j"$_nproc") >>"$_log"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper prints log tail on clone failure" '_lg_dump_log_tail "$_log"' "$VFIO_SCRIPT"
+assert_contains_file "R48j _lg_dump_log_tail helper defined" '_lg_dump_log_tail() {' "$VFIO_SCRIPT"
+assert_contains_file "R48j _lg_dump_log_tail prints log path note" 'Full build log kept at' "$VFIO_SCRIPT"
+# The old full-silence redirect on every step must be gone (no bare >/dev/null 2>&1
+# after the git clone/cmake/make lines in the compile helper).
+_lg_old_silence_count="$(awk '/_lg_compile_from_source\(\)/{in_fn=1} in_fn&&/git clone --recurse-submodules.*>\/dev\/null 2>&1/{c++} in_fn&&/cmake -G.*>\/dev\/null 2>&1/{c++} in_fn&&/"\$_builder" -j.*>\/dev\/null 2>&1/{c++} /^}/{if(in_fn){in_fn=0}} END{print c+0}' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _lg_old_silence_count == 0 )); then
+  printf 'PASS: R48j compile helper no longer fully silences clone/cmake/make (%d old-redirects)\n' "$_lg_old_silence_count"
+else
+  printf 'FAIL: R48j compile helper still fully silences clone/cmake/make (%d old-redirects remain)\n' "$_lg_old_silence_count" >&2
+  record_failure "R48j compile helper no longer fully silences clone/cmake/make"
+fi
+# Sanity: the build log is actually USED (output captured via $_log redirects,
+# not dropped). The literal path appears once (the local var decl); the
+# redirects use "$_log", so count lines referencing $_log inside the compile
+# helper (the : >"$_log" init + clone/cmake/make/cp redirects + the tail call).
+_lg_log_redirects="$(awk '/_lg_compile_from_source\(\)/{in_fn=1} in_fn&&/\$_log/{c++} in_fn&&/^}/{in_fn=0} END{print c+0}' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _lg_log_redirects >= 5 )); then
+  printf 'PASS: R48j build log referenced on %d line(s) inside compile helper (init + clone + cmake + make + cp + tail)\n' "$_lg_log_redirects"
+else
+  printf 'FAIL: R48j build log referenced on only %d line(s) (expected >=5: init + clone + cmake + make + cp/tail)\n' "$_lg_log_redirects" >&2
+  record_failure "R48j build log referenced on enough lines inside compile helper"
+fi
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

@@ -17031,9 +17031,24 @@ install_looking_glass_client() {
         _ok=1
       fi
     fi
-    # Fall back to source compile if the package failed.
+    # Fall back to source compile if the package failed. Install the Fedora
+    # build deps (the official Looking Glass wiki Fedora client-build list)
+    # FIRST so the clone+cmake+make succeeds instead of dying on a missing
+    # header. Previously a failed COPR package jumped straight to compile with
+    # NO deps installed, so the build silently failed and left no binary.
     if (( ! _ok )); then
       note "COPR package unavailable or failed; falling back to source compilation."
+      if (( ! DRY_RUN )); then
+        note "Installing Looking Glass client build dependencies (Fedora)..."
+        run dnf install -y cmake gcc gcc-c++ make git ninja-build \
+          pkgconf-pkg-config binutils-devel libglvnd-devel fontconfig-devel \
+          spice-protocol nettle-devel libXi-devel libXinerama-devel \
+          libXcursor-devel libXpresent-devel libxkbcommon-x11-devel \
+          wayland-devel wayland-protocols-devel libXScrnSaver-devel \
+          libXrandr-devel libdecor-devel dejavu-sans-mono-fonts \
+          pipewire-devel pulseaudio-libs-devel libsamplerate-devel \
+          >/dev/null 2>&1 || true
+      fi
       _ok=$(_lg_compile_from_source)
     fi
   elif have_cmd pacman; then
@@ -17096,9 +17111,17 @@ install_looking_glass_client() {
 # R40b: Compile looking-glass-client from source (git clone gnif/LookingGlass +
 # cmake + ninja/make + install to /usr/local/bin). Helper for
 # install_looking_glass_client. Prints 0 on success, 1 on failure. DRY_RUN-aware.
+# R48j: capture the clone/cmake/make output to a log file and print the tail on
+# failure instead of fully silencing it (> /dev/null 2>&1 on every step hid the
+# real error, so the user only ever saw "build failed, check dependencies"
+# with no clue which header/command was missing). The log survives the src rm
+# so the tail is still readable from the failure branch.
 _lg_compile_from_source() {
   local _src="/tmp/looking-glass-setup-src"
   local _build="$_src/client/build"
+  local _log="/tmp/looking-glass-client-build.log"
+  local _nproc
+  _nproc="$(nproc 2>/dev/null || echo 2)"
   if (( DRY_RUN )); then
     note "[DRY-RUN] would: git clone --recurse-submodules gnif/LookingGlass + cmake + make + install to $LG_CLIENT_BIN"
     printf '0'
@@ -17114,10 +17137,12 @@ _lg_compile_from_source() {
     printf '1'
     return
   fi
+  : >"$_log" 2>/dev/null || true
   note "Cloning Looking Glass source + submodules..."
   rm -rf "$_src"
-  if ! git clone --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" >/dev/null 2>&1; then
+  if ! git clone --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" >>"$_log" 2>&1; then
     note "ERROR: failed to clone the Looking Glass repository."
+    _lg_dump_log_tail "$_log"
     rm -rf "$_src"
     printf '1'
     return
@@ -17128,22 +17153,25 @@ _lg_compile_from_source() {
     _gen="Ninja"; _builder="ninja"
   fi
   note "Configuring build (cmake -G $_gen)..."
-  if ! (cd "$_build" && cmake -G "$_gen" -DENABLE_BACKTRACE=no ../ >/dev/null 2>&1); then
+  if ! (cd "$_build" && cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) >>"$_log" 2>&1; then
     note "ERROR: cmake configuration failed. Check build dependencies."
+    _lg_dump_log_tail "$_log"
     rm -rf "$_src"
     printf '1'
     return
   fi
-  note "Building (this may take a few minutes)..."
-  if ! (cd "$_build" && "$_builder" -j"$(nproc 2>/dev/null || echo 2)" >/dev/null 2>&1); then
+  note "Building with $_builder -j$_nproc (this may take a few minutes)..."
+  if ! (cd "$_build" && "$_builder" -j"$_nproc") >>"$_log" 2>&1; then
     note "ERROR: build failed. Check dependencies and try again."
+    _lg_dump_log_tail "$_log"
     rm -rf "$_src"
     printf '1'
     return
   fi
   note "Installing binary to $LG_CLIENT_BIN..."
-  if ! cp "$_build/looking-glass-client" "$LG_CLIENT_BIN" 2>/dev/null; then
+  if ! cp "$_build/looking-glass-client" "$LG_CLIENT_BIN" 2>>"$_log"; then
     note "ERROR: failed to install binary to $LG_CLIENT_BIN."
+    _lg_dump_log_tail "$_log"
     rm -rf "$_src"
     printf '1'
     return
@@ -17151,6 +17179,23 @@ _lg_compile_from_source() {
   chmod +x "$LG_CLIENT_BIN" 2>/dev/null || true
   rm -rf "$_src"
   printf '0'
+}
+
+# R48j: Print the tail of a Looking Glass build log so the operator can see the
+# REAL error (missing header, missing command, linker failure, ...) instead of
+# the generic "build failed" message. Best-effort: never fails the caller.
+_lg_dump_log_tail() {
+  local _log="$1"
+  [[ -f "$_log" ]] || return 0
+  local _lines
+  _lines="$(wc -l < "$_log" 2>/dev/null || echo 0)"
+  if (( _lines > 0 )); then
+    note "  Last ${_lines} line(s) of build log ($_log):"
+    tail -n 40 "$_log" 2>/dev/null | while IFS= read -r _l; do
+      say "    $_l"
+    done
+  fi
+  note "  Full build log kept at: $_log"
 }
 
 # R40b: Remove the looking-glass-client binary. Stops any running instance,

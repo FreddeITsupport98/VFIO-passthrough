@@ -922,13 +922,14 @@ assert_contains_file \
   "R48b _menu_rebar_disclaimer function defined" \
   '_menu_rebar_disclaimer()' \
   "$VFIO_SCRIPT"
+_status_fn="$(sed -n '/^_menu_build_vfio_status_block()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "R48b vfio_menu calls _menu_rebar_disclaimer full in the header" \
-  '_menu_rebar_disclaimer full' \
-  "$_menu_fn"
-assert_contains_text \
-  "R48b vfio menu embeds the compact disclaimer in the select_from_list prompt" \
+  "R48b/R48k _menu_build_vfio_status_block embeds the compact disclaimer" \
   '_menu_rebar_disclaimer compact' \
+  "$_status_fn"
+assert_contains_text \
+  "R48b vfio_menu CLI fallback still calls _menu_rebar_disclaimer full" \
+  '_menu_rebar_disclaimer full' \
   "$_menu_fn"
 _rebar_fn="$(sed -n '/^_menu_rebar_disclaimer()/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_rebar_fn" ]]; then
@@ -1011,9 +1012,9 @@ assert_contains_file \
   '_menu_vm_status_summary()' \
   "$VFIO_SCRIPT"
 assert_contains_text \
-  "R48e vfio_menu builds the compact status block" \
+  "R48e/R48k _menu_build_vfio_status_block builds the compact status block" \
   '_menu_vm_status_summary compact' \
-  "$_menu_fn"
+  "$_status_fn"
 assert_contains_text \
   "R48e vfio_menu shows the status as a separate gui_msgbox panel" \
   'gui_msgbox "VFIO status"' \
@@ -1234,6 +1235,102 @@ if printf '%s\n' "$_menu_fn" | grep -Fq 'Toggle live-attach hotplug on/off (VM b
 else
   printf 'PASS: R48k old flat toggle entry removed from vfio_menu\n'
 fi
+# R48k follow-up: the no-config path now DETECTS the operator's guest-GPU VM from
+# libvirt and writes a minimal conf (so VM customizations work in early binding
+# WITHOUT the full wizard); a GPU hook checkmark shows in the Modify-VM headers;
+# and the Show-VFIO-status option is reachable from inside the Modify VM hub.
+assert_contains_file \
+  "R48k _menu_gpu_hook_status helper defined" \
+  '_menu_gpu_hook_status() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_build_vfio_status_block helper defined" \
+  '_menu_build_vfio_status_block() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_show_vfio_status helper defined" \
+  '_menu_show_vfio_status() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_detect_guest_gpu_vm_candidates helper defined" \
+  '_menu_detect_guest_gpu_vm_candidates() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_offer_minimal_conf_from_vm helper defined" \
+  '_menu_offer_minimal_conf_from_vm() {' \
+  "$VFIO_SCRIPT"
+_hook_fn="$(sed -n '/^_menu_gpu_hook_status()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48k GPU hook status checks LIBVIRT_HOOK_SCRIPT" \
+  '$LIBVIRT_HOOK_SCRIPT' \
+  "$_hook_fn"
+assert_contains_text \
+  "R48k GPU hook status checks LIBVIRT_HOOK_ENTRY" \
+  '$LIBVIRT_HOOK_ENTRY' \
+  "$_hook_fn"
+assert_contains_text \
+  "R48k GPU hook status has a compact mode" \
+  'compact' \
+  "$_hook_fn"
+assert_contains_text \
+  "R48k Modify-VM hub shows the GPU hook status" \
+  '_menu_gpu_hook_status full' \
+  "$_mod_fn"
+assert_contains_text \
+  "R48k Apply sub-menu shows the GPU hook status" \
+  '_menu_gpu_hook_status full' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k Revert sub-menu shows the GPU hook status" \
+  '_menu_gpu_hook_status full' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k Modify-VM hub offers Show VFIO status" \
+  'Show VFIO status (per-VM tuning checklist + ReBAR)' \
+  "$_mod_fn"
+assert_contains_text \
+  "R48k Modify-VM hub dispatches _menu_show_vfio_status" \
+  '_menu_show_vfio_status' \
+  "$_mod_fn"
+assert_contains_text \
+  "R48k top-level Show-status uses the shared build helper" \
+  '_menu_build_vfio_status_block' \
+  "$_menu_fn"
+_detect_fn="$(sed -n '/^_menu_detect_guest_gpu_vm_candidates()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48k detect-candidates scans virsh list --all --name" \
+  'virsh -c qemu:///system list --all --name' \
+  "$_detect_fn"
+assert_contains_text \
+  "R48k detect-candidates filters display class 0x03" \
+  '03' \
+  "$_detect_fn"
+_minconf_fn="$(sed -n '/^_menu_offer_minimal_conf_from_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48k minimal-conf asks the user to confirm the VM" \
+  'Is' \
+  "$_minconf_fn"
+assert_contains_text \
+  "R48k minimal-conf writes GUEST_GPU_BDF" \
+  'GUEST_GPU_BDF=' \
+  "$_minconf_fn"
+assert_contains_text \
+  "R48k minimal-conf writes VFIO_BINDING_MODE=early" \
+  'VFIO_BINDING_MODE="early"' \
+  "$_minconf_fn"
+_guard_fn="$(sed -n '/^_menu_vm_guarded()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48k guard offers detection when conf is missing" \
+  '_menu_offer_minimal_conf_from_vm' \
+  "$_guard_fn"
+assert_contains_text \
+  "R48k guard offers detection only when virsh+lspci+libvirt available" \
+  'have_cmd virsh && have_cmd lspci && libvirt_runtime_ok' \
+  "$_guard_fn"
+assert_contains_text \
+  "R48k guard notes customizations work regardless of hook (no false blocking)" \
+  'apply regardless of whether dynamic binding or the dynamic' \
+  "$(sed -n '/^# R48k: Shared guard for the Modify-VM/,/^_menu_vm_guarded()/p' "$VFIO_SCRIPT")"
 
 # --- R48g: stealth MAC OUI spoof + SMBIOS type 2/3/17 + LG detection anchored
 # to name='looking-glass' + the LG 'compile client first' disclaimer. These close

@@ -28256,20 +28256,228 @@ _menu_rebar_disclaimer() {
   esac
 }
 
+# R48k: GPU hook (libvirt qemu hook) status indicator for the Modify-VM menu
+# header. Prints a one-line ✔/✖ so the operator sees at a glance whether the
+# dynamic-binding hook is installed (the engine that switches the GPU to vfio-
+# pci at VM start). $1=full (default: a note() line for the header) | compact
+# (one plain line, NO color, for embedding in a select_from_list prompt so
+# whiptail does not truncate at an ESC byte). Read-only (checks the two managed
+# paths); no root.
+_menu_gpu_hook_status() {
+  local _mode="${1:-full}" _sym _msg _c
+  if [[ -x "$LIBVIRT_HOOK_SCRIPT" && -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+    _sym="✔"; _msg="enabled (libvirt qemu hook installed)"; _c="$C_GREEN"
+  else
+    _sym="✖"; _msg="not installed (early binding, or hook missing)"; _c="$C_YELLOW"
+  fi
+  if [[ "$_mode" == "compact" ]]; then
+    printf 'GPU hook: %s %s' "$_sym" "$_msg"
+  elif (( ENABLE_COLOR )); then
+    note "GPU hook: ${_c}${_sym}${C_RESET} ${_msg}"
+  else
+    note "GPU hook: $_sym $_msg"
+  fi
+}
+
+# R48k: Build the VFIO status block (per-VM checklist + ReBAR disclaimer) as a
+# single string on stdout. Shared by the top-level "Show VFIO status" option and
+# the Modify-VM hub's status option so both render the identical block. Read-only.
+_menu_build_vfio_status_block() {
+  local _vm_c _rebar_c
+  _vm_c="$(_menu_vm_status_summary compact)"
+  _rebar_c="$(_menu_rebar_disclaimer compact)"
+  if [[ -n "$_vm_c" && -n "$_rebar_c" ]]; then
+    printf '%s\n\n%s' "$_vm_c" "$_rebar_c"
+  elif [[ -n "$_vm_c" ]]; then
+    printf '%s' "$_vm_c"
+  elif [[ -n "$_rebar_c" ]]; then
+    printf '%s' "$_rebar_c"
+  fi
+}
+
+# R48k: Show the VFIO status panel (per-VM checklist + ReBAR) in a popup/msgbox.
+# Used by the Modify-VM hub's "Show VFIO status" option. Read-only; no root.
+_menu_show_vfio_status() {
+  local _sb
+  _sb="$(_menu_build_vfio_status_block)"
+  if [[ -n "$_sb" ]]; then
+    gui_msgbox "VFIO status" "$_sb"
+  else
+    note "No VFIO status to show (no config / no guest-GPU VM / no ReBAR context)."
+  fi
+}
+
+# R48k: Scan libvirt for every VM that has a GPU (PCI hostdev whose source is a
+# display controller, class 0x03) and emit one TSV line per candidate:
+#   <dom>\t<gpu_bdf>\t<vendor_id>\t<device_id>
+# Used by _menu_offer_minimal_conf_from_vm so an operator with NO $CONF_FILE can
+# still apply VM customizations: pick their guest-GPU VM from the detected
+# candidates and a minimal conf is written from it. Read-only (virsh dumpxml +
+# lspci/sysfs); no root. Returns 1 if libvirt/virsh/lspci unavailable.
+_menu_detect_guest_gpu_vm_candidates() {
+  have_cmd virsh || return 1
+  have_cmd lspci || return 1
+  libvirt_runtime_ok || return 1
+  local _dom _xml _src_bdfs _bdf _cls _vid _pid _line
+  while IFS= read -r _dom; do
+    [[ -n "$_dom" ]] || continue
+    _xml="$(virsh -c qemu:///system dumpxml "$_dom" 2>/dev/null || true)"
+    [[ -n "$_xml" ]] || continue
+    # Extract the SOURCE (host) BDF of each PCI hostdev — that is the host GPU
+    # being passed through, so it is what GUEST_GPU_BDF should be. Only grab
+    # addresses inside <source>...</source> (NOT the guest <address>) so a VM
+    # with the GPU on a different guest bus still reports the real host BDF.
+    _src_bdfs="$(printf '%s' "$_xml" | awk '
+      /<hostdev/ { in_hostdev=1; in_src=0 }
+      in_hostdev && /<source/ { in_src=1 }
+      in_src && /<address/ {
+        line=$0; dom=""; bus=""; slot=""; fn=""
+        if (match(line, /domain=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^domain=./,"",s); sub(/^0x/,"",s); dom=s }
+        if (match(line, /bus=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^bus=./,"",s); sub(/^0x/,"",s); bus=s }
+        if (match(line, /slot=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^slot=./,"",s); sub(/^0x/,"",s); slot=s }
+        if (match(line, /function=.0x[0-9a-fA-F]+/)) { s=substr(line,RSTART,RLENGTH); sub(/^function=./,"",s); sub(/^0x/,"",s); fn=s }
+        if (dom != "" && bus != "" && slot != "" && fn != "") {
+          while (length(dom) < 4) dom = "0" dom
+          while (length(bus) < 2) bus = "0" bus
+          while (length(slot) < 2) slot = "0" slot
+          printf "%s:%s:%s.%s\n", dom, bus, slot, fn
+        }
+      }
+      /<\/source>/ { in_src=0 }
+      /<\/hostdev>/ { in_hostdev=0; in_src=0 }
+    ' 2>/dev/null)"
+    [[ -n "$_src_bdfs" ]] || continue
+    while IFS= read -r _bdf; do
+      [[ -n "$_bdf" ]] || continue
+      # lspci -s <bdf> -n -> "<bdf> <class> <vendor:device>"; class 0x03xx = display.
+      _line="$(lspci -s "$_bdf" -n 2>/dev/null || true)"
+      _cls="$(printf '%s' "$_line" | awk '{print $2}')"
+      [[ "$_cls" =~ ^03 ]] || continue
+      _vid="$(sysfs_read "$_bdf" vendor)"
+      _pid="$(sysfs_read "$_bdf" device)"
+      printf '%s\t%s\t%s\t%s\n' "$_dom" "$_bdf" "$_vid" "$_pid"
+      break  # one GPU per VM is enough for the candidate list
+    done <<<"$_src_bdfs"
+  done < <(virsh -c qemu:///system list --all --name 2>/dev/null)
+  return 0
+}
+
+# R48k: When $CONF_FILE is missing, offer to detect the operator's guest-GPU VM
+# from libvirt and write a MINIMAL conf from it (GUEST_GPU_BDF + vendor/device +
+# VFIO_BINDING_MODE=early) so the VM-customization install functions (which all
+# read GUEST_GPU_BDF from the conf) can run — without forcing the operator to
+# run the full wizard first. Asks the user to confirm the VM ("is this your
+# guest-GPU VM?"). Returns 0 if the conf is now usable, 1 if the user declined
+# / no candidate / libvirt unavailable. Honors DRY_RUN.
+_menu_offer_minimal_conf_from_vm() {
+  say
+  hdr "No VFIO config — detect your guest-GPU VM"
+  note "No $CONF_FILE found. I can scan libvirt for a VM that has a GPU attached and"
+  note "create a minimal config from it so you can apply VM customizations (early binding)."
+  local _cands _n
+  _cands="$(_menu_detect_guest_gpu_vm_candidates 2>/dev/null || true)"
+  if [[ -z "$_cands" ]]; then
+    note "No libvirt VM with a GPU (display controller) hostdev was detected."
+    note "Create a VM in virt-manager, attach the GPU to it as a PCI hostdev, shut it off,"
+    note "then re-run --menu -> Modify VM."
+    return 1
+  fi
+  _n="$(printf '%s\n' "$_cands" | wc -l | tr -d '[:space:]')"
+  local _pick _dom _bdf _vid _pid
+  if (( _n == 1 )); then
+    _dom="$(printf '%s' "$_cands" | cut -f1)"
+    _bdf="$(printf '%s' "$_cands" | cut -f2)"
+    _vid="$(printf '%s' "$_cands" | cut -f3)"
+    _pid="$(printf '%s' "$_cands" | cut -f4)"
+    say "  Found 1 candidate: VM '${_dom}' with GPU ${_bdf} (${_vid}:${_pid})"
+    if prompt_yn "Is '${_dom}' your guest-GPU VM? (this creates a minimal $CONF_FILE)" Y "Confirm guest-GPU VM"; then
+      _pick="$_dom"
+    else
+      note "Skipping (VM not confirmed)."
+      return 1
+    fi
+  else
+    local -a _opts=() _c
+    while IFS=$'\t' read -r _c _bdf _vid _pid; do
+      _opts+=("VM '$_c' — GPU $_bdf (${_vid}:${_pid})")
+    done <<<"$_cands"
+    _opts+=("None of these — cancel")
+    note "Multiple VMs with a GPU detected. Pick yours:"
+    local _idx
+    _idx="$(select_from_list "Which VM is your guest-GPU VM?" "Confirm guest-GPU VM" "${_opts[@]}")"
+    if (( _idx >= ${#_opts[@]} - 1 )); then
+      note "Skipping (no VM selected)."
+      return 1
+    fi
+    _pick="$(printf '%s' "$_cands" | sed -n "$((_idx + 1))p" | cut -f1)"
+    _bdf="$(printf '%s' "$_cands" | sed -n "$((_idx + 1))p" | cut -f2)"
+    _vid="$(printf '%s' "$_cands" | sed -n "$((_idx + 1))p" | cut -f3)"
+    _pid="$(printf '%s' "$_cands" | sed -n "$((_idx + 1))p" | cut -f4)"
+  fi
+  [[ -n "$_pick" && -n "$_bdf" ]] || { note "No VM selected."; return 1; }
+  note "Creating a minimal $CONF_FILE from VM '$_pick' (GPU $_bdf)..."
+  if (( DRY_RUN )); then
+    note "[DRY-RUN] would write minimal $CONF_FILE: GUEST_GPU_BDF=$_bdf VENDOR=$_vid DEVICE=$_pid MODE=early"
+    return 0
+  fi
+  backup_file "$CONF_FILE" 2>/dev/null || true
+  write_file_atomic "$CONF_FILE" 0644 "root:root" <<EOF
+# Minimal config created by $SCRIPT_NAME --menu (Modify VM) on $(date -Is)
+# Auto-generated from the detected guest-GPU VM '$_pick'.
+# Run Full configure (menu option 0) later to add host GPU / audio / kernel params.
+GUEST_GPU_BDF="$_bdf"
+GUEST_GPU_VENDOR_ID="$_vid"
+GUEST_GPU_DEVICE_ID="$_pid"
+HOST_GPU_BDF=""
+HOST_AUDIO_BDFS_CSV=""
+GUEST_AUDIO_BDFS_CSV=""
+HOST_AUDIO_NODE_NAME=""
+VFIO_BINDING_MODE="early"
+EOF
+  if (( ENABLE_COLOR )); then
+    say "  ${C_GREEN}✔${C_RESET} Created minimal $(_link "$CONF_FILE") (GUEST_GPU_BDF=$_bdf, mode=early)"
+  else
+    say "  ✔ Created minimal $CONF_FILE (GUEST_GPU_BDF=$_bdf, mode=early)"
+  fi
+  note "  You can now apply VM customizations. Run Full configure later for host GPU/audio/kernel params."
+  return 0
+}
+
 # R48k: Shared guard for the Modify-VM sub-actions. Most VM customizations
 # (hypervisor hide / stealth / ultimate-perf / Looking Glass / virtio-win guest-
 # agent / looking-glass-client) work in BOTH early and dynamic binding because
 # they only edit VM XML (virsh dump/define) and do NOT depend on the libvirt
-# qemu hook. live-attach + its toggle are the ONLY DYNAMIC-only actions (they
-# rely on the libvirt qemu hook installed by --install-dynamic-binding). This
-# helper returns 0 (ok to proceed) / 1 (caller should skip) and prints the right
-# missing-config / libvirt-unreachable / wrong-binding-mode note. $1 = action
-# title, $2 = "dynamic" to require dynamic binding (empty = either mode).
+# qemu hook — so they apply regardless of whether dynamic binding or the dynamic
+# hook is present. live-attach + its toggle are the ONLY DYNAMIC-only actions
+# (they rely on the libvirt qemu hook installed by --install-dynamic-binding).
+# When $CONF_FILE is missing, instead of just refusing, this guard offers to
+# DETECT the operator's guest-GPU VM from libvirt and write a minimal conf so
+# the customizations can run (early binding) — the operator does not have to run
+# the full wizard first. Returns 0 (ok to proceed) / 1 (caller should skip) and
+# prints the right missing-config / libvirt-unreachable / wrong-binding-mode note.
+# $1 = action title, $2 = "dynamic" to require dynamic binding (empty = either).
 _menu_vm_guarded() {
   local _title="$1" _req_mode="${2:-}"
   if ! readable_file "$CONF_FILE"; then
-    note "Missing $CONF_FILE. Run Full configure first (menu option 0 / 1, or --install-dynamic-binding / --install-early-binding)."
-    return 1
+    note "No $CONF_FILE found."
+    # R48k: instead of just refusing, offer to detect the operator's guest-GPU
+    # VM from libvirt and write a minimal conf so VM customizations can run
+    # (early binding) without forcing the full wizard first.
+    if have_cmd virsh && have_cmd lspci && libvirt_runtime_ok; then
+      if prompt_yn "Detect your guest-GPU VM from libvirt and create a minimal config now?" Y "Detect guest-GPU VM"; then
+        if _menu_offer_minimal_conf_from_vm; then
+          : # conf now exists; fall through to the normal checks below
+        else
+          return 1
+        fi
+      else
+        note "Missing $CONF_FILE. Run Full configure first (menu option 0 / 1, or --install-dynamic-binding / --install-early-binding)."
+        return 1
+      fi
+    else
+      note "Missing $CONF_FILE and libvirt/virsh/lspci unavailable. Run Full configure first (menu option 0 / 1)."
+      return 1
+    fi
   fi
   if [[ -n "$_req_mode" ]]; then
     local _cur_mode
@@ -28313,6 +28521,7 @@ _menu_apply_to_vm() {
     say
     hdr "Modify VM — Apply to VM"
     note "Pick a VM customization to APPLY. Most work in BOTH binding modes; live-attach needs dynamic."
+    _menu_gpu_hook_status full
     _achoice="$(select_from_list "Apply what to the guest-GPU VM?" "Apply to VM" "${_apply_opts[@]}")"
     case "$_achoice" in
       0)
@@ -28386,6 +28595,7 @@ _menu_revert_on_vm() {
     say
     hdr "Modify VM — Revert changes on VM"
     note "Pick a VM customization to REVERT. Most work in BOTH binding modes; live-attach needs dynamic."
+    _menu_gpu_hook_status full
     _rchoice="$(select_from_list "Revert what on the guest-GPU VM?" "Revert on VM" "${_rev_opts[@]}")"
     case "$_rchoice" in
       0)
@@ -28428,26 +28638,32 @@ _menu_revert_on_vm() {
   done
 }
 
-# R48k: "Modify VM" hub — one prominent entry that opens a sub-menu with two
-# categories: Apply to VM (every install action) and Revert changes on VM (every
-# revert/remove action). Loops back so the operator can do several before
-# returning to the main menu.
+# R48k: "Modify VM" hub — one prominent entry that opens a sub-menu with three
+# categories: Apply to VM (every install action), Revert changes on VM (every
+# revert/remove action), and Show VFIO status (the per-VM checklist + ReBAR).
+# Shows the GPU hook checkmark in the header so the operator sees at a glance
+# whether the libvirt qemu hook is installed. Loops back so the operator can do
+# several actions before returning to the main menu.
 _menu_modify_vm() {
   local _mod_opts _mchoice
   _mod_opts=(
     "Apply to VM (hypervisor hide / stealth / ultimate-perf / Looking Glass / virtio-win / live-attach)"
     "Revert changes on VM (undo any of the above)"
+    "Show VFIO status (per-VM tuning checklist + ReBAR)"
     "Back to main menu"
   )
   while :; do
     say
     hdr "Modify VM"
-    note "Tune, hide, mirror, or revert the detected guest-GPU VM. Most options work in BOTH binding modes."
+    note "Tune, hide, mirror, revert, or check status of the detected guest-GPU VM."
+    note "Most options work in BOTH binding modes (early OR dynamic); live-attach needs dynamic."
+    _menu_gpu_hook_status full
     _mchoice="$(select_from_list "What do you want to do with the VM?" "Modify VM" "${_mod_opts[@]}")"
     case "$_mchoice" in
       0) _menu_apply_to_vm ;;
       1) _menu_revert_on_vm ;;
-      2) say; say "Returning to main menu."; return 0 ;;
+      2) say; _menu_show_vfio_status ;;
+      3) say; say "Returning to main menu."; return 0 ;;
       *) note "Invalid selection." ;;
     esac
   done
@@ -28495,16 +28711,11 @@ vfio_menu() {
     # to dismiss every single loop, only on menu entry + after an action that
     # changed VM state. In the CLI path the same info prints as header note()
     # lines (the terminal has no popup to hide behind).
-    local _vm_c _rebar_c _status_block=""
-    _vm_c="$(_menu_vm_status_summary compact)"
-    _rebar_c="$(_menu_rebar_disclaimer compact)"
-    if [[ -n "$_vm_c" && -n "$_rebar_c" ]]; then
-      _status_block="$(printf '%s\n\n%s' "$_vm_c" "$_rebar_c")"
-    elif [[ -n "$_vm_c" ]]; then
-      _status_block="$_vm_c"
-    elif [[ -n "$_rebar_c" ]]; then
-      _status_block="$_rebar_c"
-    fi
+    # R48k: the block is built by the shared _menu_build_vfio_status_block so
+    # the main menu, the top-level Show-status option, and the Modify-VM hub
+    # status option all render the identical panel.
+    local _status_block=""
+    _status_block="$(_menu_build_vfio_status_block)"
     if (( HAS_TUI )); then
       if [[ -n "$_status_block" && "$_status_block" != "$_last_status" ]]; then
         _last_status="$_status_block"
@@ -28632,22 +28843,16 @@ vfio_menu() {
         # bring it back). It is the same per-VM checklist + ReBAR shown on menu
         # entry; selecting this re-opens it without doing anything. Sets
         # _last_status so the next loop iteration does not auto-re-show a dup.
+        # R48k: the block is built by the shared _menu_build_vfio_status_block
+        # helper so the top-level option and the Modify-VM hub status option
+        # always render the identical panel.
         say
-        local _vm_c2 _rebar_c2 _sb2=""
-        _vm_c2="$(_menu_vm_status_summary compact)"
-        _rebar_c2="$(_menu_rebar_disclaimer compact)"
-        if [[ -n "$_vm_c2" && -n "$_rebar_c2" ]]; then
-          _sb2="$(printf '%s\n\n%s' "$_vm_c2" "$_rebar_c2")"
-        elif [[ -n "$_vm_c2" ]]; then
-          _sb2="$_vm_c2"
-        elif [[ -n "$_rebar_c2" ]]; then
-          _sb2="$_rebar_c2"
-        fi
-        if [[ -n "$_sb2" ]]; then
-          _last_status="$_sb2"
-          gui_msgbox "VFIO status" "$_sb2"
+        _last_status="$(_menu_build_vfio_status_block)"
+        if [[ -n "$_last_status" ]]; then
+          gui_msgbox "VFIO status" "$_last_status"
         else
           note "No VFIO status to show (no config / no guest-GPU VM / no ReBAR context)."
+          _last_status=""
         fi
         ;;
       11)

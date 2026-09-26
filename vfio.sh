@@ -224,6 +224,10 @@ LG_APPARMOR_LOCAL="/etc/apparmor.d/local/abstractions/libvirt-qemu"
 LG_USER_INI=".looking-glass-client.ini"
 LG_CLIENT_BIN="/usr/local/bin/looking-glass-client"
 LG_DEFAULT_SIZE=64
+# R48j: where _lg_compile_from_source tees the clone/cmake/make output so the
+# operator sees live progress AND the failure tail is preserved. Truncated at the
+# start of each compile attempt.
+LG_BUILD_LOG="/tmp/looking-glass-client-build.log"
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
 # PATH for both root and users; the generated boot-time helpers stay in
 # /usr/local/sbin) and drops the
@@ -17036,10 +17040,13 @@ install_looking_glass_client() {
     # FIRST so the clone+cmake+make succeeds instead of dying on a missing
     # header. Previously a failed COPR package jumped straight to compile with
     # NO deps installed, so the build silently failed and left no binary.
+    # R48j-fix: show the deps install progress live (dnf's own progress bar)
+    # and call _lg_compile_from_source via EXIT CODE (not stdout capture, which
+    # used to swallow all the build output + diagnostics into $_ok).
     if (( ! _ok )); then
       note "COPR package unavailable or failed; falling back to source compilation."
       if (( ! DRY_RUN )); then
-        note "Installing Looking Glass client build dependencies (Fedora)..."
+        note "Installing Looking Glass client build dependencies (Fedora — dnf shows download progress)..."
         run dnf install -y cmake gcc gcc-c++ make git ninja-build \
           pkgconf-pkg-config binutils-devel libglvnd-devel fontconfig-devel \
           spice-protocol nettle-devel libXi-devel libXinerama-devel \
@@ -17047,9 +17054,9 @@ install_looking_glass_client() {
           wayland-devel wayland-protocols-devel libXScrnSaver-devel \
           libXrandr-devel libdecor-devel dejavu-sans-mono-fonts \
           pipewire-devel pulseaudio-libs-devel libsamplerate-devel \
-          >/dev/null 2>&1 || true
+          || true
       fi
-      _ok=$(_lg_compile_from_source)
+      _lg_compile_from_source && _ok=1 || _ok=0
     fi
   elif have_cmd pacman; then
     note "Detected Arch-family (pacman)."
@@ -17076,14 +17083,15 @@ install_looking_glass_client() {
       note "[DRY-RUN] would: apt-get install build deps + compile from source"
       _ok=1
     else
-      run apt-get update >/dev/null 2>&1 || true
+      run apt-get update || true
+      note "Installing Looking Glass client build dependencies (Debian/Ubuntu — apt shows download progress)..."
       run apt-get install -y build-essential pkg-config binutils-dev cmake \
         ninja-build fonts-freefont-ttf libsdl2-dev libsdl2-ttf-dev \
         libspice-protocol-dev libfontconfig1-dev libgmp-dev libfuse3-dev \
         libwayland-dev wayland-protocols libx11-dev libxext-dev libxfixes-dev \
         libxi-dev libxinerama-dev libxss-dev libxcursor-dev libxpresent-dev \
-        libxkbcommon-dev libglvnd-dev libegl1-mesa-dev >/dev/null 2>&1 || true
-      _ok=$(_lg_compile_from_source)
+        libxkbcommon-dev libglvnd-dev libegl1-mesa-dev || true
+      _lg_compile_from_source && _ok=1 || _ok=0
     fi
   else
     note "ERROR: no recognized package manager (dnf/pacman/apt) detected."
@@ -17110,82 +17118,80 @@ install_looking_glass_client() {
 
 # R40b: Compile looking-glass-client from source (git clone gnif/LookingGlass +
 # cmake + ninja/make + install to /usr/local/bin). Helper for
-# install_looking_glass_client. Prints 0 on success, 1 on failure. DRY_RUN-aware.
-# R48j: capture the clone/cmake/make output to a log file and print the tail on
-# failure instead of fully silencing it (> /dev/null 2>&1 on every step hid the
-# real error, so the user only ever saw "build failed, check dependencies"
-# with no clue which header/command was missing). The log survives the src rm
-# so the tail is still readable from the failure branch.
+# install_looking_glass_client. Returns 0 on success, 1 on failure. DRY_RUN-aware.
+# R48j: the clone/cmake/make output is tee'd to BOTH the terminal (so the
+# operator sees live progress — git's clone %, cmake config, make compiling each
+# file) AND $LG_BUILD_LOG (so the failure tail is preserved). A step indicator
+# (1/4 ... 4/4) is printed before each step as a lightweight progress marker.
+# R48j-fix: the old version returned 0/1 via `printf '0'`/`printf '1'` on
+# STDOUT, and the caller did `_ok=$(_lg_compile_from_source)` which captures ALL
+# of stdout — so every note() + the build output + the log tail were SWALLOWED
+# into $_ok and never reached the terminal (the user saw nothing for minutes,
+# then just the final error). Now the function returns via EXIT CODE, so stdout
+# is free for the live progress + diagnostics the operator sees.
 _lg_compile_from_source() {
   local _src="/tmp/looking-glass-setup-src"
   local _build="$_src/client/build"
-  local _log="/tmp/looking-glass-client-build.log"
   local _nproc
   _nproc="$(nproc 2>/dev/null || echo 2)"
   if (( DRY_RUN )); then
     note "[DRY-RUN] would: git clone --recurse-submodules gnif/LookingGlass + cmake + make + install to $LG_CLIENT_BIN"
-    printf '0'
-    return
+    return 0
   fi
   if ! have_cmd git; then
     note "ERROR: git is not installed. Cannot clone the Looking Glass source."
-    printf '1'
-    return
+    return 1
   fi
   if ! have_cmd cmake; then
     note "ERROR: cmake is not installed. Cannot configure the build."
-    printf '1'
-    return
+    return 1
   fi
-  : >"$_log" 2>/dev/null || true
-  note "Cloning Looking Glass source + submodules..."
+  : >"$LG_BUILD_LOG" 2>/dev/null || true
+  note "Step 1/4: Cloning Looking Glass source + submodules (git --progress)..."
   rm -rf "$_src"
-  if ! git clone --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" >>"$_log" 2>&1; then
+  if ! git clone --progress --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" 2>&1 | tee -a "$LG_BUILD_LOG"; then
     note "ERROR: failed to clone the Looking Glass repository."
-    _lg_dump_log_tail "$_log"
+    _lg_dump_log_tail "$LG_BUILD_LOG"
     rm -rf "$_src"
-    printf '1'
-    return
+    return 1
   fi
   rm -rf "$_build"; mkdir -p "$_build"
   local _gen="Unix Makefiles" _builder="make"
   if command -v ninja >/dev/null 2>&1; then
     _gen="Ninja"; _builder="ninja"
   fi
-  note "Configuring build (cmake -G $_gen)..."
-  if ! (cd "$_build" && cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) >>"$_log" 2>&1; then
+  note "Step 2/4: Configuring build (cmake -G $_gen)..."
+  if ! (cd "$_build" && cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) 2>&1 | tee -a "$LG_BUILD_LOG"; then
     note "ERROR: cmake configuration failed. Check build dependencies."
-    _lg_dump_log_tail "$_log"
+    _lg_dump_log_tail "$LG_BUILD_LOG"
     rm -rf "$_src"
-    printf '1'
-    return
+    return 1
   fi
-  note "Building with $_builder -j$_nproc (this may take a few minutes)..."
-  if ! (cd "$_build" && "$_builder" -j"$_nproc") >>"$_log" 2>&1; then
+  note "Step 3/4: Building with $_builder -j$_nproc (this may take a few minutes)..."
+  if ! (cd "$_build" && "$_builder" -j"$_nproc") 2>&1 | tee -a "$LG_BUILD_LOG"; then
     note "ERROR: build failed. Check dependencies and try again."
-    _lg_dump_log_tail "$_log"
+    _lg_dump_log_tail "$LG_BUILD_LOG"
     rm -rf "$_src"
-    printf '1'
-    return
+    return 1
   fi
-  note "Installing binary to $LG_CLIENT_BIN..."
-  if ! cp "$_build/looking-glass-client" "$LG_CLIENT_BIN" 2>>"$_log"; then
+  note "Step 4/4: Installing binary to $LG_CLIENT_BIN..."
+  if ! cp "$_build/looking-glass-client" "$LG_CLIENT_BIN" 2>&1 | tee -a "$LG_BUILD_LOG"; then
     note "ERROR: failed to install binary to $LG_CLIENT_BIN."
-    _lg_dump_log_tail "$_log"
+    _lg_dump_log_tail "$LG_BUILD_LOG"
     rm -rf "$_src"
-    printf '1'
-    return
+    return 1
   fi
   chmod +x "$LG_CLIENT_BIN" 2>/dev/null || true
   rm -rf "$_src"
-  printf '0'
+  return 0
 }
 
 # R48j: Print the tail of a Looking Glass build log so the operator can see the
 # REAL error (missing header, missing command, linker failure, ...) instead of
 # the generic "build failed" message. Best-effort: never fails the caller.
+# Uses $LG_BUILD_LOG (the same file _lg_compile_from_source tees to).
 _lg_dump_log_tail() {
-  local _log="$1"
+  local _log="${1:-$LG_BUILD_LOG}"
   [[ -f "$_log" ]] || return 0
   local _lines
   _lines="$(wc -l < "$_log" 2>/dev/null || echo 0)"

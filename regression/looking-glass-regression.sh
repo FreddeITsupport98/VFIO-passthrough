@@ -580,29 +580,50 @@ set -e
 assert_eq "live-attach display patcher exit 0 on pin run (video=none -> virtio + pin)" "0" "$rc_la5"
 assert_contains_file "live-attach boot display pinned off GPU/audio bus (to 0x05)" 'bus="0x05"' "$la5"
 
-# ===================== R48j: Fedora build-deps before source compile + build log on failure =====================
-# Bug: on the Fedora/dnf path, when the COPR package failed and the code fell
+# ===================== R48j: Fedora build-deps before source compile + LIVE build output + progress =====================
+# Bug 1: on the Fedora/dnf path, when the COPR package failed and the code fell
 # back to _lg_compile_from_source, it NEVER installed the Fedora build deps
 # (the apt branch installs deps first; the dnf branch did not), so the clone +
-# cmake + make died on missing headers and the binary was never produced. Also
-# _lg_compile_from_source fully silenced every step (> /dev/null 2>&1), so the
-# user only ever saw "build failed, check dependencies" with NO clue which
-# header/command was missing. R48j installs the official Looking Glass wiki
-# Fedora client-build dependency list BEFORE the compile fallback, and captures
-# the clone/cmake/make output to a build log + prints the tail on failure.
-assert_contains_file "R48j dnf fallback installs Fedora build deps" 'Installing Looking Glass client build dependencies (Fedora)' "$VFIO_SCRIPT"
+# cmake + make died on missing headers and the binary was never produced.
+# Bug 2: _lg_compile_from_source returned 0/1 via `printf '0'`/`printf '1'` on
+# STDOUT, and the caller did `_ok=$(_lg_compile_from_source)` which captures ALL
+# of stdout — so every note() + the build output + the log tail were SWALLOWED
+# into $_ok and never reached the terminal (the user saw nothing for minutes,
+# then just the final error). R48j-fix: the function now returns via EXIT CODE,
+# tees the clone/cmake/make output to BOTH the terminal (live progress — git's
+# clone %, cmake config, make compiling each file) AND $LG_BUILD_LOG (failure
+# tail preserved), adds --progress to git clone, and prints step indicators
+# (1/4 ... 4/4). The deps install also shows dnf/apt's own download progress.
+assert_contains_file "R48j dnf fallback installs Fedora build deps" 'Installing Looking Glass client build dependencies (Fedora' "$VFIO_SCRIPT"
+assert_contains_file "R48j dnf fallback deps note mentions dnf download progress" 'dnf shows download progress' "$VFIO_SCRIPT"
 assert_contains_file "R48j dnf fallback installs spice-protocol" 'spice-protocol' "$VFIO_SCRIPT"
 assert_contains_file "R48j dnf fallback installs libglvnd-devel" 'libglvnd-devel' "$VFIO_SCRIPT"
 assert_contains_file "R48j dnf fallback installs wayland-protocols-devel" 'wayland-protocols-devel' "$VFIO_SCRIPT"
 assert_contains_file "R48j dnf fallback installs pipewire-devel" 'pipewire-devel' "$VFIO_SCRIPT"
 assert_contains_file "R48j dnf fallback installs libdecor-devel" 'libdecor-devel' "$VFIO_SCRIPT"
-assert_contains_file "R48j compile helper defines build log path" '/tmp/looking-glass-client-build.log' "$VFIO_SCRIPT"
-assert_contains_file "R48j compile helper redirects clone to log" 'git clone --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" >>"$_log"' "$VFIO_SCRIPT"
-assert_contains_file "R48j compile helper redirects cmake to log" 'cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) >>"$_log"' "$VFIO_SCRIPT"
-assert_contains_file "R48j compile helper redirects make to log" '"$_builder" -j"$_nproc") >>"$_log"' "$VFIO_SCRIPT"
-assert_contains_file "R48j compile helper prints log tail on clone failure" '_lg_dump_log_tail "$_log"' "$VFIO_SCRIPT"
+assert_contains_file "R48j apt fallback deps note mentions apt download progress" 'apt shows download progress' "$VFIO_SCRIPT"
+assert_contains_file "R48j LG_BUILD_LOG constant defined" 'LG_BUILD_LOG="/tmp/looking-glass-client-build.log"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper tees clone to terminal + log" 'git clone --progress --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" 2>&1 | tee -a "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper tees cmake to terminal + log" 'cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) 2>&1 | tee -a "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper tees make to terminal + log" '"$_builder" -j"$_nproc") 2>&1 | tee -a "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper prints log tail on clone failure" '_lg_dump_log_tail "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
 assert_contains_file "R48j _lg_dump_log_tail helper defined" '_lg_dump_log_tail() {' "$VFIO_SCRIPT"
 assert_contains_file "R48j _lg_dump_log_tail prints log path note" 'Full build log kept at' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper prints Step 1/4 clone indicator" 'Step 1/4: Cloning Looking Glass source' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper prints Step 3/4 build indicator" 'Step 3/4: Building with' "$VFIO_SCRIPT"
+assert_contains_file "R48j compile helper prints Step 4/4 install indicator" 'Step 4/4: Installing binary to' "$VFIO_SCRIPT"
+# R48j-fix: the function must return via EXIT CODE, not stdout printf. The old
+# `printf '0'`/`printf '1'` on stdout got captured by `_ok=$(...)` and hid all
+# the diagnostics. Assert the stdout-printf return is GONE.
+if grep -Fq "printf '0'" "$VFIO_SCRIPT" && grep -nq "printf '0'" <(sed -n '/^_lg_compile_from_source()/,/^}/p' "$VFIO_SCRIPT"); then
+  printf 'FAIL: R48j-fix _lg_compile_from_source still returns via stdout printf (swallowed diagnostics)\n' >&2
+  record_failure "R48j-fix compile helper returns via exit code (no stdout printf)"
+else
+  printf 'PASS: R48j-fix compile helper returns via exit code (no stdout printf)\n'
+fi
+# The caller must NOT capture stdout (the old `_ok=$(_lg_compile_from_source)`);
+# it should use the exit code so diagnostics reach the terminal.
+assert_contains_file "R48j-fix dnf caller uses exit code (no stdout capture)" '_lg_compile_from_source && _ok=1 || _ok=0' "$VFIO_SCRIPT"
 # The old full-silence redirect on every step must be gone (no bare >/dev/null 2>&1
 # after the git clone/cmake/make lines in the compile helper).
 _lg_old_silence_count="$(awk '/_lg_compile_from_source\(\)/{in_fn=1} in_fn&&/git clone --recurse-submodules.*>\/dev\/null 2>&1/{c++} in_fn&&/cmake -G.*>\/dev\/null 2>&1/{c++} in_fn&&/"\$_builder" -j.*>\/dev\/null 2>&1/{c++} /^}/{if(in_fn){in_fn=0}} END{print c+0}' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
@@ -612,15 +633,14 @@ else
   printf 'FAIL: R48j compile helper still fully silences clone/cmake/make (%d old-redirects remain)\n' "$_lg_old_silence_count" >&2
   record_failure "R48j compile helper no longer fully silences clone/cmake/make"
 fi
-# Sanity: the build log is actually USED (output captured via $_log redirects,
-# not dropped). The literal path appears once (the local var decl); the
-# redirects use "$_log", so count lines referencing $_log inside the compile
-# helper (the : >"$_log" init + clone/cmake/make/cp redirects + the tail call).
-_lg_log_redirects="$(awk '/_lg_compile_from_source\(\)/{in_fn=1} in_fn&&/\$_log/{c++} in_fn&&/^}/{in_fn=0} END{print c+0}' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
-if (( _lg_log_redirects >= 5 )); then
-  printf 'PASS: R48j build log referenced on %d line(s) inside compile helper (init + clone + cmake + make + cp + tail)\n' "$_lg_log_redirects"
+# Sanity: the build log is actually USED (output tee'd via $LG_BUILD_LOG, not
+# dropped). Count lines referencing LG_BUILD_LOG inside the compile helper (the
+# : >"$LG_BUILD_LOG" init + clone/cmake/make/cp tee redirects + the tail call).
+_lg_log_refs="$(awk '/_lg_compile_from_source\(\)/{in_fn=1} in_fn&&/LG_BUILD_LOG/{c++} in_fn&&/^}/{in_fn=0} END{print c+0}' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
+if (( _lg_log_refs >= 5 )); then
+  printf 'PASS: R48j build log referenced on %d line(s) inside compile helper (init + clone + cmake + make + cp + tail)\n' "$_lg_log_refs"
 else
-  printf 'FAIL: R48j build log referenced on only %d line(s) (expected >=5: init + clone + cmake + make + cp/tail)\n' "$_lg_log_redirects" >&2
+  printf 'FAIL: R48j build log referenced on only %d line(s) (expected >=5: init + clone + cmake + make + cp/tail)\n' "$_lg_log_refs" >&2
   record_failure "R48j build log referenced on enough lines inside compile helper"
 fi
 

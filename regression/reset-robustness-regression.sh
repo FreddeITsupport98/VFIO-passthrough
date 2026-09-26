@@ -312,6 +312,7 @@ remove_vbios_romfile() { :; }
 remove_live_attach() { :; }
 _wipe_vm_stage_backups() { :; }
 remove_looking_glass() { :; }
+remove_looking_glass_client() { :; }
 _reset_perf_hugepages_all() { :; }
 remove_openbox_autostart_hook() { :; }
 remove_user_audio_unit() { :; }
@@ -344,7 +345,8 @@ prep_eo_fixtures() {
             PARK_KEEPALIVE_RESUME_HOOK PARK_KEEPALIVE_UDEV_RULE PARK_KEEPALIVE_STATE_FILE \
             LIVE_ATTACH_HELPER LIVE_ATTACH_GPU_XML LIVE_ATTACH_AUDIO_XML LIVE_ATTACH_VM_LIST \
             LIVE_ATTACH_MODE_FILE LIVE_ATTACH_TRAY LIVE_ATTACH_POLKIT \
-            VFIO_HOOK_LOG VFIO_LIVE_ATTACH_LOG; do
+            VFIO_HOOK_LOG VFIO_LIVE_ATTACH_LOG \
+            LG_CLIENT_BIN LG_CLIENT_DESKTOP; do
     declare -g "$_g"="$root/$_g"
     : >"$root/$_g"
   done
@@ -388,6 +390,8 @@ assert_file_missing "P4a removes VFIO_LIVE_ATTACH_LOG fixture (R47)" "$EO_ROOT/V
 assert_file_missing "P4a removes VFIO_COOLDOWN_TS_FILE fixture (R47)" "$VFIO_COOLDOWN_TS_FILE"
 assert_file_missing "P4a removes VFIO_DRIVER_STATUS_FILE fixture (R47)" "$VFIO_DRIVER_STATUS_FILE"
 assert_file_missing "P4a rmdir's the VFIO_DYNAMIC_DIR fixture (R46)" "$EO_ROOT/VFIO_DYNAMIC_DIR"
+assert_file_missing "P4a removes LG_CLIENT_BIN fixture (R48m)" "$EO_ROOT/LG_CLIENT_BIN"
+assert_file_missing "P4a removes LG_CLIENT_DESKTOP fixture (R48m)" "$EO_ROOT/LG_CLIENT_DESKTOP"
 assert_contains_text "P4a rm log includes the SDDM fixture path (R46)" "$EO_ROOT/SDDM_PLASMA_WAYLAND_CONF" "$(cat "$EO_RUN_LOG")"
 assert_contains_text "P4a run log includes rmdir of the dynamic dir (R46)" "rmdir $EO_ROOT/VFIO_DYNAMIC_DIR" "$(cat "$EO_RUN_LOG")"
 assert_file_missing "P4a removes the self-installed CLI fixture" "$SELF_INSTALL_BIN"

@@ -228,6 +228,11 @@ LG_DEFAULT_SIZE=64
 # operator sees live progress AND the failure tail is preserved. Truncated at the
 # start of each compile attempt.
 LG_BUILD_LOG="/tmp/looking-glass-client-build.log"
+# R48m: the application-menu shortcut for looking-glass-client, so the operator
+# can launch Looking Glass from the desktop application menu (GNOME/KDE/etc.)
+# instead of having to remember the binary path. Created after a successful
+# compile/install; removed by remove_looking_glass_client.
+LG_CLIENT_DESKTOP="/usr/share/applications/looking-glass-client.desktop"
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
 # PATH for both root and users; the generated boot-time helpers stay in
 # /usr/local/sbin) and drops the
@@ -16997,17 +17002,197 @@ _lg_client_warn_if_missing() {
   note "    sudo $SCRIPT_NAME --install-looking-glass-client   (or --menu, option 18)"
 }
 
+# R48m: Auto-recover the Looking Glass .desktop shortcut if the user accidentally
+# deleted it. If the binary IS valid but the system .desktop is MISSING, recreate
+# it (and re-copy to the localized desktop). Called from the read-only status /
+# detect / verify paths so a re-run of the full install is NOT required to get the
+# shortcut back. Root-gated: when not root, just reports the missing shortcut
+# (the recovery write needs root); when root, silently recreates it. Best-effort:
+# never fails the caller.
+_lg_recover_desktop_entry_if_missing() {
+  if ! _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
+    return 0
+  fi
+  if [[ -f "$LG_CLIENT_DESKTOP" ]]; then
+    return 0
+  fi
+  # Binary is valid but the shortcut is missing -> the user deleted it.
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    note "NOTE: looking-glass-client desktop shortcut is missing (was deleted). Re-run as root to auto-recover it, or: sudo $SCRIPT_NAME --install-looking-glass-client"
+    return 0
+  fi
+  _lg_install_desktop_entry
+}
+
+# R48m: Install a .desktop application-menu shortcut for looking-glass-client so
+# the operator can launch Looking Glass from the GNOME/KDE application menu
+# instead of typing the binary path. ALSO copies the shortcut to the operator's
+# ACTUAL desktop folder — which is LOCALIZED per the user's language (Swedish
+# "Skrivbord", German "Schreibtisch", French "Bureau", etc.), detected via the
+# XDG user-dirs spec (~/.config/user-dirs.dirs -> XDG_DESKTOP_DIR), NOT a
+# hardcoded ~/Desktop. Reports the detected locale so the operator sees what
+# language the desktop is in. Idempotent (overwrites = shortcut recovery on re-run).
+# DRY_RUN-aware. Best-effort: never fails the caller.
+_lg_install_desktop_entry() {
+  local _apps_dir
+  _apps_dir="$(dirname "$LG_CLIENT_DESKTOP")"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$_apps_dir" 2>/dev/null || true
+  fi
+  # 1. System-wide application-menu shortcut (/usr/share/applications).
+  if [[ -d "$_apps_dir" || -w "$_apps_dir" ]]; then
+    write_file_atomic "$LG_CLIENT_DESKTOP" 0644 "root:root" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Looking Glass
+Comment=Low-latency KVM display mirror for VFIO GPU passthrough
+Exec=$LG_CLIENT_BIN
+Icon=video-display
+Terminal=false
+Categories=System;Utility;Emulator;
+Keywords=vfio;gpu;passthrough;kvm;mirror;display;
+EOF
+    if (( ENABLE_COLOR )); then
+      say "  ${C_GREEN}✔${C_RESET} Installed application-menu shortcut: $(_link "$LG_CLIENT_DESKTOP")"
+    else
+      say "  ✔ Installed application-menu shortcut: $LG_CLIENT_DESKTOP"
+    fi
+  else
+    note "WARN: $_apps_dir not writable; skipping system application-menu shortcut."
+  fi
+
+  # 2. Copy the shortcut to the operator's ACTUAL desktop folder (localized).
+  # R48m: the desktop folder is language-specific (Skrivbord / Schreibtisch /
+  # Bureau / Työpöytä / ...). Detect it via the XDG user-dirs spec, NOT a
+  # hardcoded ~/Desktop. Resolve the desktop user (SUDO_USER when run via sudo),
+  # their home, their ~/.config/user-dirs.dirs -> XDG_DESKTOP_DIR, and their
+  # locale (~/.config/user-dirs.locale or $LANG). Best-effort: falls back to
+  # $HOME/Desktop when user-dirs.dirs is absent (e.g. a headless / minimal
+  # setup that never ran xdg-user-dirs-update).
+  local _user="${SUDO_USER:-}"
+  [[ -n "$_user" && "$_user" != "root" ]] || _user=""
+  local _home
+  if [[ -n "$_user" ]]; then
+    _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  [[ -n "$_home" && -d "$_home" ]] || _home="$HOME"
+  local _user_dirs="$_home/.config/user-dirs.dirs"
+  local _desktop_dir="$_home/Desktop"
+  local _locale
+  # Read XDG_DESKTOP_DIR from the user's user-dirs.dirs (shell format, safe
+  # parse with awk — never source it as root, it's user-owned).
+  if [[ -f "$_user_dirs" ]]; then
+    _desktop_dir="$(awk -F= '/^XDG_DESKTOP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_user_dirs" 2>/dev/null || true)"
+    # Expand $HOME -> the user's actual home (awk leaves $HOME literal).
+    _desktop_dir="${_desktop_dir//\$HOME/$_home}"
+  fi
+  [[ -n "$_desktop_dir" ]] || _desktop_dir="$_home/Desktop"
+  # Detect the locale: prefer ~/.config/user-dirs.locale (xdg-user-dirs
+  # writes it on first run), fall back to $LANG.
+  if [[ -f "$_home/.config/user-dirs.locale" ]]; then
+    _locale="$(head -1 "$_home/.config/user-dirs.locale" 2>/dev/null || true)"
+  fi
+  [[ -n "$_locale" ]] || _locale="${LANG:-}"
+  if [[ -n "$_locale" ]]; then
+    note "  Desktop language: $_locale (desktop folder: $_desktop_dir)"
+  else
+    note "  Desktop folder: $_desktop_dir (locale not detected)"
+  fi
+  if (( ! DRY_RUN )); then
+    mkdir -p "$_desktop_dir" 2>/dev/null || true
+  fi
+  if [[ -d "$_desktop_dir" || -w "$_desktop_dir" ]]; then
+    local _user_desktop
+    _user_desktop="$_desktop_dir/$(basename "$LG_CLIENT_DESKTOP")"
+    if (( ! DRY_RUN )); then
+      cp -a "$LG_CLIENT_DESKTOP" "$_user_desktop" 2>/dev/null || true
+      # Make sure the user owns the copy on their desktop.
+      [[ -n "$_user" ]] && chown "$_user:$(id -gn "$_user" 2>/dev/null || echo "$_user")" "$_user_desktop" 2>/dev/null || true
+      chmod 0644 "$_user_desktop" 2>/dev/null || true
+    fi
+    if (( ENABLE_COLOR )); then
+      say "  ${C_GREEN}✔${C_RESET} Copied shortcut to desktop: $(_link "$_user_desktop")"
+    else
+      say "  ✔ Copied shortcut to desktop: $_user_desktop"
+    fi
+  else
+    note "  Desktop folder '$_desktop_dir' not writable; skipping desktop copy (application-menu shortcut still installed)."
+  fi
+  note "  Launch Looking Glass from your application menu, your desktop, or run: $LG_CLIENT_BIN"
+  return 0
+}
+
+# R48m: Remove the .desktop application-menu shortcut for looking-glass-client
+# AND the copy on the operator's localized desktop folder. Best-effort: never
+# fails the caller. Only removes OUR file (by exact basename
+# looking-glass-client.desktop), never touches a user's custom desktop file with
+# a different name.
+_lg_remove_desktop_entry() {
+  # 1. System application-menu shortcut.
+  if [[ -f "$LG_CLIENT_DESKTOP" ]]; then
+    run rm -f "$LG_CLIENT_DESKTOP" 2>/dev/null || true
+    if [[ ! -f "$LG_CLIENT_DESKTOP" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "  ${C_GREEN}✔${C_RESET} Removed application-menu shortcut: $LG_CLIENT_DESKTOP"
+      else
+        say "  ✔ Removed application-menu shortcut: $LG_CLIENT_DESKTOP"
+      fi
+    else
+      note "WARN: failed to remove $LG_CLIENT_DESKTOP."
+    fi
+  fi
+  # 2. Copy on the operator's localized desktop folder (same detection as install).
+  local _user="${SUDO_USER:-}"
+  [[ -n "$_user" && "$_user" != "root" ]] || _user=""
+  local _home
+  if [[ -n "$_user" ]]; then
+    _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+  fi
+  [[ -n "$_home" && -d "$_home" ]] || _home="$HOME"
+  local _user_dirs="$_home/.config/user-dirs.dirs"
+  local _desktop_dir="$_home/Desktop"
+  if [[ -f "$_user_dirs" ]]; then
+    _desktop_dir="$(awk -F= '/^XDG_DESKTOP_DIR=/{v=$2; gsub(/"/,"",v); print v; exit}' "$_user_dirs" 2>/dev/null || true)"
+    _desktop_dir="${_desktop_dir//\$HOME/$_home}"
+  fi
+  [[ -n "$_desktop_dir" ]] || _desktop_dir="$_home/Desktop"
+  local _user_desktop
+  _user_desktop="$_desktop_dir/$(basename "$LG_CLIENT_DESKTOP")"
+  if [[ -f "$_user_desktop" ]]; then
+    run rm -f "$_user_desktop" 2>/dev/null || true
+    if [[ ! -f "$_user_desktop" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "  ${C_GREEN}✔${C_RESET} Removed desktop shortcut: $_user_desktop"
+      else
+        say "  ✔ Removed desktop shortcut: $_user_desktop"
+      fi
+    else
+      note "WARN: failed to remove $_user_desktop."
+    fi
+  fi
+  return 0
+}
+
 # R40b: Install/compile the looking-glass-client binary. Tries the distro
 # package first (dnf COPR / pacman AUR), falls back to source compilation.
 # Shows a green ✔ checkmark when the binary is valid after the attempt.
 # Honors DRY_RUN. Returns 0 on success, 1 on failure.
+# R48m: after a successful install/compile, also installs a .desktop
+# application-menu shortcut so the operator can launch Looking Glass from the
+# desktop menu (GNOME/KDE) instead of typing the binary path.
 install_looking_glass_client() {
   if _lg_binary_valid "$LG_CLIENT_BIN"; then
+    # R48m: show the shortcut-present checkmark (✔ present / ✖ missing) and
+    # recover it if missing, so a re-run on an already-compiled host still
+    # restores a deleted desktop shortcut.
+    local _sc_sym="✖"
+    if [[ -f "$LG_CLIENT_DESKTOP" ]]; then _sc_sym="✔"; fi
     if (( ENABLE_COLOR )); then
-      say "  ${C_GREEN}✔${C_RESET} looking-glass-client already installed and valid: $LG_CLIENT_BIN"
+      say "  ${C_GREEN}✔${C_RESET} looking-glass-client already installed and valid: $LG_CLIENT_BIN  ${C_BOLD}shortcut:${C_RESET} ${_sc_sym}"
     else
-      say "  ✔ looking-glass-client already installed and valid: $LG_CLIENT_BIN"
+      say "  ✔ looking-glass-client already installed and valid: $LG_CLIENT_BIN  shortcut: $_sc_sym"
     fi
+    _lg_install_desktop_entry
     return 0
   fi
   say
@@ -17177,11 +17362,17 @@ install_looking_glass_client() {
   fi
 
   if _lg_binary_valid "$LG_CLIENT_BIN"; then
+    # R48m: show a shortcut-present checkmark next to the compiled checkmark so
+    # the operator sees at a glance whether the desktop shortcut exists (✔) or
+    # not (✖), then (re)install it so a re-run recovers a deleted shortcut.
+    local _sc_sym="✖"
+    if [[ -f "$LG_CLIENT_DESKTOP" ]]; then _sc_sym="✔"; fi
     if (( ENABLE_COLOR )); then
-      say "  ${C_GREEN}✔ looking-glass-client installed: $LG_CLIENT_BIN${C_RESET}"
+      say "  ${C_GREEN}✔ looking-glass-client installed: $LG_CLIENT_BIN${C_RESET}  ${C_BOLD}shortcut:${C_RESET} ${_sc_sym}"
     else
-      say "  ✔ looking-glass-client installed: $LG_CLIENT_BIN"
+      say "  ✔ looking-glass-client installed: $LG_CLIENT_BIN  shortcut: $_sc_sym"
     fi
+    _lg_install_desktop_entry
     return 0
   fi
   if (( ENABLE_COLOR )); then
@@ -17636,6 +17827,8 @@ remove_looking_glass_client() {
   else
     note "WARN: failed to remove $LG_CLIENT_BIN."
   fi
+  # R48m: also remove the .desktop application-menu shortcut we installed.
+  _lg_remove_desktop_entry
 }
 
 # R40b/R42: Set the VM's <video> model to 'none' (no virtual video card — the
@@ -18289,6 +18482,10 @@ remove_looking_glass() {
 looking_glass_status() {
   if ! readable_file "$CONF_FILE"; then return 0; fi
   have_cmd virsh || return 0
+  # R48m: auto-recover the .desktop shortcut if the user deleted it (binary
+  # valid + shortcut missing -> recreate). Root-gated; best-effort. Runs in
+  # --detect/--verify so a re-run of the full install is NOT required.
+  _lg_recover_desktop_entry_if_missing
   local _guest_gpu _dom _xml _sz _unit _has_shmem _has_rebar
   _guest_gpu="$(awk -F= '/^GUEST_GPU_BDF=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   [[ -n "$_guest_gpu" ]] || return 0
@@ -26562,6 +26759,11 @@ reset_vfio_all() {
     "$VFIO_COOLDOWN_TS_FILE" "$VFIO_DRIVER_STATUS_FILE"
     "$VFIO_HOOK_LOG" "$VFIO_LIVE_ATTACH_LOG"
     "$bootlog_unit" "$bootlog_bin"
+    # R48m: the Looking Glass client binary + its .desktop shortcut are swept by
+    # --reset so a clean reset removes them too (the desktop copy is removed
+    # by _lg_remove_desktop_entry via remove_looking_glass_client below, but
+    # add them here too so the preview + verify + the rm list all agree).
+    "$LG_CLIENT_BIN" "$LG_CLIENT_DESKTOP"
   )
   note "Preview of managed files this reset will remove:"
   _reset_preview_paths "Managed files" "${_rm_paths[@]}"
@@ -26631,6 +26833,10 @@ reset_vfio_all() {
   # security rules + user config). Must run before $CONF_FILE is deleted (it reads
   # GUEST_GPU_BDF to find guest-GPU VMs). Best-effort.
   remove_looking_glass
+  # R48m: remove the Looking Glass client binary + the .desktop shortcut (system
+  # menu + the user's localized desktop copy). Best-effort; stops any running
+  # instance first. Must run before $CONF_FILE is deleted (it is self-contained).
+  remove_looking_glass_client
   # R39c: release any host hugepages pinned by a prior ultimate-perf run
   # (including an ORPHANED pool whose VM XML no longer carries <hugepages>,
   # which would starve the VM of normal memory). Unconditionally frees the
@@ -28682,6 +28888,10 @@ _menu_gpu_hook_status() {
 # single string on stdout. Shared by the top-level "Show VFIO status" option and
 # the Modify-VM hub's status option so both render the identical block. Read-only.
 _menu_build_vfio_status_block() {
+  # R48m: auto-recover the .desktop shortcut if the user deleted it, every
+  # time the status panel is built (menu entry / Show-VFIO-status / Modify-VM
+  # hub). Root-gated; best-effort; silent when already present.
+  _lg_recover_desktop_entry_if_missing
   local _vm_c _rebar_c
   _vm_c="$(_menu_vm_status_summary compact)"
   _rebar_c="$(_menu_rebar_disclaimer compact)"

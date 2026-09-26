@@ -759,6 +759,54 @@ assert_contains_file "R48j-selfheal zypper branch sets _lg_pm=zypper" '_lg_pm="z
 assert_contains_file "R48j-selfheal xbps branch sets _lg_pm=xbps-install" '_lg_pm="xbps-install"' "$VFIO_SCRIPT"
 assert_contains_file "R48j-selfheal emerge branch sets _lg_pm=emerge" '_lg_pm="emerge"' "$VFIO_SCRIPT"
 
+# ===================== R48m: Looking Glass desktop shortcut + localized desktop detection =====================
+# After a successful compile/install, the script now installs a .desktop
+# application-menu shortcut AND copies it to the operator's ACTUAL desktop folder
+# — which is LOCALIZED per the user's language (Swedish "Skrivbord", German
+# "Schreibtisch", French "Bureau", etc.), detected via the XDG user-dirs spec
+# (~/.config/user-dirs.dirs -> XDG_DESKTOP_DIR), NOT a hardcoded ~/Desktop.
+# Reports the detected locale. Idempotent (overwrites = shortcut recovery on
+# re-run). Removed by remove_looking_glass_client (both the system menu entry
+# AND the desktop copy).
+assert_contains_file "R48m LG_CLIENT_DESKTOP constant defined" 'LG_CLIENT_DESKTOP="/usr/share/applications/looking-glass-client.desktop"' "$VFIO_SCRIPT"
+assert_contains_file "R48m _lg_install_desktop_entry helper defined" '_lg_install_desktop_entry() {' "$VFIO_SCRIPT"
+assert_contains_file "R48m _lg_remove_desktop_entry helper defined" '_lg_remove_desktop_entry() {' "$VFIO_SCRIPT"
+assert_contains_file "R48m install_looking_glass_client calls _lg_install_desktop_entry" '_lg_install_desktop_entry' "$VFIO_SCRIPT"
+assert_contains_file "R48m remove_looking_glass_client calls _lg_remove_desktop_entry" '_lg_remove_desktop_entry' "$VFIO_SCRIPT"
+# The desktop entry has the right Exec + Name + Icon.
+assert_contains_file "R48m desktop entry Exec points at LG_CLIENT_BIN" 'Exec=$LG_CLIENT_BIN' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop entry Name is Looking Glass" 'Name=Looking Glass' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop entry Icon is video-display" 'Icon=video-display' "$VFIO_SCRIPT"
+# The helper detects the localized desktop folder via XDG user-dirs (NOT hardcoded).
+assert_contains_file "R48m desktop helper reads XDG_DESKTOP_DIR from user-dirs.dirs" 'XDG_DESKTOP_DIR=' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper parses user-dirs.dirs with awk (not source)" 'awk -F= '"'"'/^XDG_DESKTOP_DIR=/' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper detects locale from user-dirs.locale" 'user-dirs.locale' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper falls back to LANG for locale" 'LANG' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper resolves SUDO_USER home" 'SUDO_USER' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper reports the detected locale" 'Desktop language:' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper copies shortcut to the desktop folder" 'Copied shortcut to desktop:' "$VFIO_SCRIPT"
+assert_contains_file "R48m desktop helper chowns the desktop copy to the user" 'chown' "$VFIO_SCRIPT"
+# The remove helper also cleans up the desktop copy (same localized detection).
+assert_contains_file "R48m remove helper removes the desktop copy" 'Removed desktop shortcut:' "$VFIO_SCRIPT"
+# The install output shows a shortcut-present checkmark (✔/✖) next to the
+# compiled line so the operator sees at a glance whether the shortcut exists.
+assert_contains_file "R48m install shows shortcut checkmark (✔/✖)" 'shortcut:' "$VFIO_SCRIPT"
+assert_contains_file "R48m install computes shortcut symbol from LG_CLIENT_DESKTOP" 'if [[ -f "$LG_CLIENT_DESKTOP" ]]; then _sc_sym' "$VFIO_SCRIPT"
+# R48m: auto-recovery helper — if the binary is valid but the .desktop is
+# missing (user deleted it), recreate it. Root-gated; best-effort.
+assert_contains_file "R48m _lg_recover_desktop_entry_if_missing helper defined" '_lg_recover_desktop_entry_if_missing() {' "$VFIO_SCRIPT"
+assert_contains_file "R48m recovery helper checks _lg_binary_valid" '_lg_binary_valid' "$VFIO_SCRIPT"
+assert_contains_file "R48m recovery helper checks LG_CLIENT_DESKTOP missing" 'if [[ -f "$LG_CLIENT_DESKTOP" ]]; then' "$VFIO_SCRIPT"
+assert_contains_file "R48m recovery helper root-gated (non-root just reports)" 'EUID' "$VFIO_SCRIPT"
+assert_contains_file "R48m recovery helper calls _lg_install_desktop_entry" '_lg_install_desktop_entry' "$VFIO_SCRIPT"
+# Wired into the read-only status path + the shared menu status-block builder.
+assert_contains_file "R48m looking_glass_status calls recovery helper" '_lg_recover_desktop_entry_if_missing' "$VFIO_SCRIPT"
+assert_contains_file "R48m _menu_build_vfio_status_block calls recovery helper" '_lg_recover_desktop_entry_if_missing' "$VFIO_SCRIPT"
+# --reset sweeps the binary + the system .desktop file.
+assert_contains_file "R48m reset _rm_paths includes LG_CLIENT_BIN" '"$LG_CLIENT_BIN"' "$VFIO_SCRIPT"
+assert_contains_file "R48m reset _rm_paths includes LG_CLIENT_DESKTOP" '"$LG_CLIENT_DESKTOP"' "$VFIO_SCRIPT"
+assert_contains_file "R48m reset calls remove_looking_glass_client" 'remove_looking_glass_client' "$VFIO_SCRIPT"
+
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2
   for _a in "${FAILED_ASSERTIONS[@]}"; do printf ' - %s\n' "$_a" >&2; done

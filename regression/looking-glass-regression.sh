@@ -50,6 +50,15 @@ assert_not_contains_file() {
     printf 'PASS: %s\n' "$name"
   fi
 }
+assert_contains_text() {
+  local name="$1" pattern="$2" haystack="$3"
+  if grep -Fq -- "$pattern" <<<"$haystack"; then
+    printf 'PASS: %s\n' "$name"
+  else
+    printf 'FAIL: %s (pattern not found: %s)\n' "$name" "$pattern" >&2
+    record_failure "$name"
+  fi
+}
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -604,7 +613,11 @@ assert_contains_file "R48j dnf fallback installs libdecor-devel" 'libdecor-devel
 assert_contains_file "R48j apt fallback deps note mentions apt download progress" 'apt shows download progress' "$VFIO_SCRIPT"
 assert_contains_file "R48j LG_BUILD_LOG constant defined" 'LG_BUILD_LOG="/tmp/looking-glass-client-build.log"' "$VFIO_SCRIPT"
 assert_contains_file "R48j compile helper tees clone to terminal + log" 'git clone --progress --recurse-submodules https://github.com/gnif/LookingGlass.git "$_src" 2>&1 | tee -a "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
-assert_contains_file "R48j compile helper tees cmake to terminal + log" 'cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) 2>&1 | tee -a "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
+_cmretry_fn="$(sed -n '/^_lg_cmake_with_retry()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48j/R48j-cross _lg_cmake_with_retry tees cmake to terminal + log" \
+  'cmake -G "$_gen" "$@" ../) 2>&1 | tee -a "$LG_BUILD_LOG"' \
+  "$_cmretry_fn"
 assert_contains_file "R48j compile helper tees make to terminal + log" '"$_builder" -j"$_nproc") 2>&1 | tee -a "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
 assert_contains_file "R48j compile helper prints log tail on clone failure" '_lg_dump_log_tail "$LG_BUILD_LOG"' "$VFIO_SCRIPT"
 assert_contains_file "R48j _lg_dump_log_tail helper defined" '_lg_dump_log_tail() {' "$VFIO_SCRIPT"
@@ -614,8 +627,9 @@ assert_contains_file "R48j compile helper prints Step 3/4 build indicator" 'Step
 assert_contains_file "R48j compile helper prints Step 4/4 install indicator" 'Step 4/4: Installing binary to' "$VFIO_SCRIPT"
 # R48j-fix: the function must return via EXIT CODE, not stdout printf. The old
 # `printf '0'`/`printf '1'` on stdout got captured by `_ok=$(...)` and hid all
-# the diagnostics. Assert the stdout-printf return is GONE.
-if grep -Fq "printf '0'" "$VFIO_SCRIPT" && grep -nq "printf '0'" <(sed -n '/^_lg_compile_from_source()/,/^}/p' "$VFIO_SCRIPT"); then
+# the diagnostics. Assert the stdout-printf return is GONE from the function body.
+_lg_compile_fn_body="$(sed -n '/^_lg_compile_from_source()/,/^}/p' "$VFIO_SCRIPT")"
+if printf '%s\n' "$_lg_compile_fn_body" | grep -Fq "printf '0'"; then
   printf 'FAIL: R48j-fix _lg_compile_from_source still returns via stdout printf (swallowed diagnostics)\n' >&2
   record_failure "R48j-fix compile helper returns via exit code (no stdout printf)"
 else
@@ -643,6 +657,107 @@ else
   printf 'FAIL: R48j build log referenced on only %d line(s) (expected >=5: init + clone + cmake + make + cp/tail)\n' "$_lg_log_refs" >&2
   record_failure "R48j build log referenced on enough lines inside compile helper"
 fi
+
+# ===================== R48j-cross: openSUSE / Void / Gentoo build-dep branches =====================
+# The compile fallback previously only handled dnf / pacman / apt. R48j-cross
+# adds the official Looking Glass wiki build-dependency lists for openSUSE
+# (zypper), Void (xbps-install), and Gentoo (emerge), and aligns the Arch list
+# with the wiki (libgl/libegl, ttf-dejavu, libsamplerate). Each branch shows the
+# package manager's own download progress live and then calls the shared
+# _lg_compile_from_source (exit-code return) so diagnostics reach the terminal.
+assert_contains_file "R48j-cross detects openSUSE (zypper)" 'Detected openSUSE-family (zypper).' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper installs spice-protocol-devel" 'spice-protocol-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper installs libglvnd-devel" 'libglvnd-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper installs wayland-protocols-devel" 'wayland-protocols-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper installs libdecor-devel" 'libdecor-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper installs pipewire-devel" 'pipewire-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper installs libsamplerate-devel" 'libsamplerate-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross zypper notes download progress" 'zypper shows download progress' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross detects Void (xbps-install)" 'Detected Void Linux (xbps).' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps installs spice-protocol" 'spice-protocol' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps installs libglvnd-devel" 'libglvnd-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps installs wayland-devel" 'wayland-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps installs libdecor-devel" 'libdecor-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps installs pipewire-devel" 'pipewire-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps installs dejavu-fonts-ttf" 'dejavu-fonts-ttf' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross xbps notes download progress" 'xbps shows download progress' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross detects Gentoo (emerge)" 'Detected Gentoo (emerge).' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross emerge installs spice-protocol" 'app-emulation/spice-protocol' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross emerge installs libglvnd" 'media-libs/libglvnd' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross emerge installs wayland-protocols" 'dev-libs/wayland-protocols' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross emerge installs libdecor" 'gui-libs/libdecor' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross emerge installs libsamplerate" 'media-libs/libsamplerate' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross emerge notes build progress" 'emerge shows build progress' "$VFIO_SCRIPT"
+# Arch list aligned with the official wiki (libgl/libegl, ttf-dejavu, libsamplerate).
+assert_contains_file "R48j-cross Arch aligned: installs libgl" 'libgl libegl' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross Arch aligned: installs ttf-dejavu" 'ttf-dejavu' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross Arch aligned: installs libsamplerate" 'libsamplerate' "$VFIO_SCRIPT"
+assert_contains_file "R48j-cross Arch notes download progress" 'pacman shows download progress' "$VFIO_SCRIPT"
+# Each new branch must call _lg_compile_from_source (exit-code return) so the
+# live build output + diagnostics are NOT swallowed by stdout capture.
+assert_contains_file "R48j-cross zypper calls compile via exit code" '_lg_compile_from_source && _ok=1 || _ok=0' "$VFIO_SCRIPT"
+# The fallback error message must name all six package managers now.
+assert_contains_file "R48j-cross fallback error names all six package managers" 'dnf/pacman/apt/zypper/xbps-install/emerge' "$VFIO_SCRIPT"
+# Sanity: the install function body must reference all six package-manager checks.
+_lg_install_fn_body="$(sed -n '/^install_looking_glass_client()/,/^}/p' "$VFIO_SCRIPT")"
+_lg_pm_count="$(printf '%s\n' "$_lg_install_fn_body" | grep -cE 'have_cmd (dnf|pacman|apt-get|zypper|xbps-install|emerge)')"
+if (( _lg_pm_count >= 6 )); then
+  printf 'PASS: R48j-cross install body checks all 6 package managers (%d)\n' "$_lg_pm_count"
+else
+  printf 'FAIL: R48j-cross install body only checks %d package manager(s) (expected >=6)\n' "$_lg_pm_count" >&2
+  record_failure "R48j-cross install body checks all 6 package managers"
+fi
+
+# ===================== R48j-selfheal: auto-install missing deps + cmake retry =====================
+# Bug: the bleeding-edge Looking Glass master CMakeLists requires fuse3>=3.10
+# (via pkg_check_modules), which was NOT in any of the up-front dep lists, so
+# cmake configure died with "The following required packages were not found: -
+# fuse3>=3.10" and the build aborted. R48j-selfheal adds fuse3 to every distro's
+# up-front dep list AND makes cmake self-healing: on a missing pkg-config module
+# failure, parse the error, map the module(s) to distro packages, auto-install
+# them, and retry (caps at 3 attempts so a non-missing-module failure does not
+# loop forever).
+assert_contains_file "R48j-selfheal _lg_pkg_to_distro_pkg helper defined" '_lg_pkg_to_distro_pkg() {' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal _lg_install_pkgs helper defined" '_lg_install_pkgs() {' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal _lg_extract_missing_modules helper defined" '_lg_extract_missing_modules() {' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal _lg_cmake_with_retry helper defined" '_lg_cmake_with_retry() {' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal _lg_compile_from_source uses _lg_cmake_with_retry" '_lg_cmake_with_retry "$_build" "$_gen" -DENABLE_BACKTRACE=no' "$VFIO_SCRIPT"
+# fuse3 is now in EVERY distro's up-front dep list (so the known gap is closed).
+assert_contains_file "R48j-selfheal dnf installs fuse3-devel" 'fuse3-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal pacman installs fuse3" 'fuse3' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal apt installs libfuse3-dev" 'libfuse3-dev' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal zypper installs fuse3-devel" 'fuse3-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal xbps installs fuse3-devel" 'fuse3-devel' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal emerge installs sys-fs/fuse:3" 'sys-fs/fuse:3' "$VFIO_SCRIPT"
+# The extractor parses the cmake "required packages were not found" block.
+_extract_fn="$(sed -n '/^_lg_extract_missing_modules()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48j-selfheal extractor parses the missing-packages block" \
+  'The following required packages were not found:' \
+  "$_extract_fn"
+assert_contains_text \
+  "R48j-selfheal retry caps attempts at 3" \
+  '_max=3' \
+  "$_cmretry_fn"
+assert_contains_text \
+  "R48j-selfheal retry calls _lg_install_pkgs to auto-install" \
+  '_lg_install_pkgs "${_lg_pm:-}" $_pkgs' \
+  "$_cmretry_fn"
+assert_contains_text \
+  "R48j-selfheal retry prints the missing-modules display" \
+  'missing pkg-config module(s): $_miss_disp' \
+  "$_cmretry_fn"
+assert_contains_text \
+  "R48j-selfheal retry maps fuse3 module to dnf fuse3-devel" \
+  'fuse3-devel' \
+  "$(sed -n '/^_lg_pkg_to_distro_pkg()/,/^}/p' "$VFIO_SCRIPT")"
+# _lg_pm is set per-branch so the retry helper knows which package manager to use.
+assert_contains_file "R48j-selfheal dnf branch sets _lg_pm=dnf" '_lg_pm="dnf"' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal pacman branch sets _lg_pm=pacman" '_lg_pm="pacman"' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal apt branch sets _lg_pm=apt-get" '_lg_pm="apt-get"' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal zypper branch sets _lg_pm=zypper" '_lg_pm="zypper"' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal xbps branch sets _lg_pm=xbps-install" '_lg_pm="xbps-install"' "$VFIO_SCRIPT"
+assert_contains_file "R48j-selfheal emerge branch sets _lg_pm=emerge" '_lg_pm="emerge"' "$VFIO_SCRIPT"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

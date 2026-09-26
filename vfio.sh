@@ -17014,15 +17014,19 @@ install_looking_glass_client() {
   hdr "Install looking-glass-client"
   note "This will install the Looking Glass client binary. The preferred method is the"
   note "distro package (dnf COPR / AUR); if that is unavailable, it falls back to compiling"
-  note "from source (~500MB of build dependencies + git clone + cmake build)."
+  note "from source (build dependencies + git clone + cmake build). Cross-distro: detects"
+  note "dnf / pacman / apt / zypper / xbps-install / emerge and installs the official"
+  note "Looking Glass wiki build-dependency list for each before the compile."
   if ! prompt_yn "Proceed with installing looking-glass-client now?" Y "Looking Glass client"; then
     note "Skipped by user."
     return 1
   fi
 
   local _ok=0
+  local _lg_pm=""
   if have_cmd dnf; then
     note "Detected Fedora/RHEL-family (dnf)."
+    _lg_pm="dnf"
     # Try COPR package first.
     if (( DRY_RUN )); then
       note "[DRY-RUN] would: dnf copr enable -y agnelo/looking-glass && dnf install -y looking-glass-client"
@@ -17036,13 +17040,14 @@ install_looking_glass_client() {
       fi
     fi
     # Fall back to source compile if the package failed. Install the Fedora
-    # build deps (the official Looking Glass wiki Fedora client-build list)
-    # FIRST so the clone+cmake+make succeeds instead of dying on a missing
-    # header. Previously a failed COPR package jumped straight to compile with
-    # NO deps installed, so the build silently failed and left no binary.
+    # build deps (the official Looking Glass wiki Fedora client-build list +
+    # fuse3-devel, which the bleeding-edge master CMakeLists requires) FIRST
+    # so the clone+cmake+make succeeds instead of dying on a missing header.
     # R48j-fix: show the deps install progress live (dnf's own progress bar)
     # and call _lg_compile_from_source via EXIT CODE (not stdout capture, which
     # used to swallow all the build output + diagnostics into $_ok).
+    # R48j-cross: _lg_pm is set so _lg_cmake_with_retry can auto-install any
+    # OTHER missing module the up-front list missed, then retry cmake.
     if (( ! _ok )); then
       note "COPR package unavailable or failed; falling back to source compilation."
       if (( ! DRY_RUN )); then
@@ -17054,37 +17059,50 @@ install_looking_glass_client() {
           wayland-devel wayland-protocols-devel libXScrnSaver-devel \
           libXrandr-devel libdecor-devel dejavu-sans-mono-fonts \
           pipewire-devel pulseaudio-libs-devel libsamplerate-devel \
+          fuse3-devel \
           || true
       fi
       _lg_compile_from_source && _ok=1 || _ok=0
     fi
   elif have_cmd pacman; then
     note "Detected Arch-family (pacman)."
+    _lg_pm="pacman"
     if (( DRY_RUN )); then
       note "[DRY-RUN] would: install deps via pacman + looking-glass via yay/paru (AUR)"
       _ok=1
     else
-      run pacman -S --noconfirm --needed base-devel cmake gcc pkgconf sdl2 sdl2_ttf \
-        spice-protocol fontconfig fuse3 gmp wayland-protocols libx11 libxext \
-        libxfixes libxi libxinerama libxss libxcursor libxpresent libxkbcommon \
-        libglvnd >/dev/null 2>&1 || true
+      note "Installing Looking Glass client build dependencies (Arch — pacman shows download progress)..."
+      # R48j-cross: aligned with the official Looking Glass wiki Arch client-build
+      # list (libgl/libegl instead of sdl2; + ttf-dejavu + libsamplerate for audio)
+      # + fuse3 (the bleeding-edge master CMakeLists requires it).
+      run pacman -S --noconfirm --needed base-devel cmake gcc pkgconf \
+        libgl libegl fontconfig spice-protocol make nettle binutils \
+        libxi libxinerama libxss libxcursor libxpresent libxkbcommon \
+        wayland-protocols ttf-dejavu libsamplerate fuse3 || true
       local _aur_user="${SUDO_USER:-}"
       if [[ -n "$_aur_user" && "$_aur_user" != "root" ]] && command -v yay >/dev/null 2>&1; then
-        run sudo -u "$_aur_user" yay -S --noconfirm --needed looking-glass >/dev/null 2>&1 && _ok=1
+        run sudo -u "$_aur_user" yay -S --noconfirm --needed looking-glass && _ok=1
       elif [[ -n "$_aur_user" && "$_aur_user" != "root" ]] && command -v paru >/dev/null 2>&1; then
-        run sudo -u "$_aur_user" paru -S --noconfirm --needed looking-glass >/dev/null 2>&1 && _ok=1
+        run sudo -u "$_aur_user" paru -S --noconfirm --needed looking-glass && _ok=1
       else
         note "WARN: no AUR helper (yay/paru) or no non-root user; cannot install the AUR package automatically."
+      fi
+      # Fall back to source compile if the AUR package was not installed.
+      if (( ! _ok )); then
+        _lg_compile_from_source && _ok=1 || _ok=0
       fi
     fi
   elif have_cmd apt-get; then
     note "Detected Debian/Ubuntu-family (apt)."
+    _lg_pm="apt-get"
     if (( DRY_RUN )); then
       note "[DRY-RUN] would: apt-get install build deps + compile from source"
       _ok=1
     else
       run apt-get update || true
       note "Installing Looking Glass client build dependencies (Debian/Ubuntu — apt shows download progress)..."
+      # R48j-cross: libfuse3-dev added (the bleeding-edge master CMakeLists
+      # requires fuse3>=3.10 via pkg_check_modules).
       run apt-get install -y build-essential pkg-config binutils-dev cmake \
         ninja-build fonts-freefont-ttf libsdl2-dev libsdl2-ttf-dev \
         libspice-protocol-dev libfontconfig1-dev libgmp-dev libfuse3-dev \
@@ -17093,9 +17111,68 @@ install_looking_glass_client() {
         libxkbcommon-dev libglvnd-dev libegl1-mesa-dev || true
       _lg_compile_from_source && _ok=1 || _ok=0
     fi
+  elif have_cmd zypper; then
+    note "Detected openSUSE-family (zypper)."
+    _lg_pm="zypper"
+    if (( DRY_RUN )); then
+      note "[DRY-RUN] would: zypper install build deps + compile from source"
+      _ok=1
+    else
+      note "Installing Looking Glass client build dependencies (openSUSE — zypper shows download progress)..."
+      # R48j-cross: the official Looking Glass wiki openSUSE list (Tumbleweed
+      # superset; Leap may lack a few — the || true keeps a missing package from
+      # aborting the whole install). Includes pipewire + pulseaudio + libsamplerate
+      # for audio, libdecor for GNOME-on-Wayland, + fuse3-devel.
+      run zypper --non-interactive install binutils-devel make cmake \
+        fontconfig-devel spice-protocol-devel libX11-devel libnettle-devel \
+        wayland-protocols-devel libconfig-devel libXi-devel libXss-devel \
+        libwayland-egl-devel nettle libglvnd-devel libxkbcommon-devel \
+        libXpresent-devel libXrandr-devel libXScrnSaver-devel libdecor-devel \
+        dejavu-fonts pipewire-devel libpulse-devel libsamplerate-devel \
+        Mesa-libGL-devel fuse3-devel || true
+      _lg_compile_from_source && _ok=1 || _ok=0
+    fi
+  elif have_cmd xbps-install; then
+    note "Detected Void Linux (xbps)."
+    _lg_pm="xbps-install"
+    if (( DRY_RUN )); then
+      note "[DRY-RUN] would: xbps-install build deps + compile from source"
+      _ok=1
+    else
+      note "Installing Looking Glass client build dependencies (Void — xbps shows download progress)..."
+      # R48j-cross: the official Looking Glass wiki Void list (required + the
+      # optional X11/wayland/audio/libdecor/font sets, since the compile enables
+      # those features by default) + fuse3-devel.
+      run xbps-install -Sy cmake libglvnd-devel fontconfig-devel gmp-devel \
+        spice-protocol make nettle-devel pkg-config binutils-devel \
+        libX11-devel libXfixes-devel libXi-devel libXinerama-devel \
+        libXScrnSaver-devel libXcursor-devel libXpresent-devel \
+        libxkbcommon-devel wayland-devel libdecor-devel \
+        pipewire-devel libsamplerate-devel pulseaudio-devel \
+        dejavu-fonts-ttf fuse3-devel || true
+      _lg_compile_from_source && _ok=1 || _ok=0
+    fi
+  elif have_cmd emerge; then
+    note "Detected Gentoo (emerge)."
+    _lg_pm="emerge"
+    if (( DRY_RUN )); then
+      note "[DRY-RUN] would: emerge build deps + compile from source"
+      _ok=1
+    else
+      note "Installing Looking Glass client build dependencies (Gentoo — emerge shows build progress)..."
+      # R48j-cross: the official Looking Glass wiki Gentoo list. Gentoo builds
+      # from source so this also pulls the toolchain; libsamplerate for audio,
+      # + sys-fs/fuse:3 (the bleeding-edge master CMakeLists requires fuse3).
+      run emerge sys-devel/binutils dev-util/cmake media-fonts/freefonts \
+        app-emulation/spice-protocol media-libs/fontconfig dev-libs/nettle \
+        media-libs/libsamplerate media-libs/glu x11-libs/libXpresent \
+        media-libs/libglvnd x11-libs/libxkbcommon dev-libs/wayland-protocols \
+        gui-libs/libdecor sys-fs/fuse:3 || true
+      _lg_compile_from_source && _ok=1 || _ok=0
+    fi
   else
-    note "ERROR: no recognized package manager (dnf/pacman/apt) detected."
-    note "       Install looking-glass-client manually — see https://looking-glass.io/docs/"
+    note "ERROR: no recognized package manager (dnf/pacman/apt/zypper/xbps-install/emerge) detected."
+    note "       Install looking-glass-client manually — see https://looking-glass.io/docs/ for your distro."
     return 1
   fi
 
@@ -17129,6 +17206,311 @@ install_looking_glass_client() {
 # into $_ok and never reached the terminal (the user saw nothing for minutes,
 # then just the final error). Now the function returns via EXIT CODE, so stdout
 # is free for the live progress + diagnostics the operator sees.
+
+# R48j-cross: Map a pkg-config module name (e.g. "fuse3", "libpipewire-0.3",
+# "samplerate") to the distro package name for the detected package manager. $1 = the
+# module name (may carry a version constraint like "fuse3>=3.10" — stripped), $2 =
+# the package manager (dnf/pacman/apt-get/zypper/xbps-install/emerge). Prints
+# the package name on stdout (empty if the module is not in the table, so the
+# caller skips it). Covers every pkg-config module the Looking Glass CMakeLists
+# checks via pkg_check_modules (fontconfig, gl/egl/glesv2, nettle, gmp,
+# spice-protocol, xkbcommon, wayland-*, x11/xfixes/xi/xinerama/xscrnsaver/xcursor/
+# xpresent/xrandr, libpipewire-0.3, libpulse, samplerate, libusbredirparser,
+# libdecor, fuse3).
+_lg_pkg_to_distro_pkg() {
+  local _mod="$1" _pm="$2" _base
+  # Strip a version constraint (fuse3>=3.10 -> fuse3).
+  _base="${_mod%%[<>=]*}"
+  case "$_base" in
+    fontconfig)
+      case "$_pm" in
+        dnf) echo "fontconfig-devel" ;;
+        pacman) echo "fontconfig" ;;
+        apt-get) echo "libfontconfig1-dev" ;;
+        zypper) echo "fontconfig-devel" ;;
+        xbps-install) echo "fontconfig-devel" ;;
+        emerge) echo "media-libs/fontconfig" ;;
+      esac ;;
+    fuse3)
+      case "$_pm" in
+        dnf) echo "fuse3-devel" ;;
+        pacman) echo "fuse3" ;;
+        apt-get) echo "libfuse3-dev" ;;
+        zypper) echo "fuse3-devel" ;;
+        xbps-install) echo "fuse3-devel" ;;
+        emerge) echo "sys-fs/fuse:3" ;;
+      esac ;;
+    libpipewire-0.3)
+      case "$_pm" in
+        dnf) echo "pipewire-devel" ;;
+        pacman) echo "pipewire" ;;
+        apt-get) echo "libpipewire-0.3-dev" ;;
+        zypper) echo "pipewire-devel" ;;
+        xbps-install) echo "pipewire-devel" ;;
+        emerge) echo "media-video/pipewire" ;;
+      esac ;;
+    libpulse)
+      case "$_pm" in
+        dnf) echo "pulseaudio-libs-devel" ;;
+        pacman) echo "libpulse" ;;
+        apt-get) echo "libpulse-dev" ;;
+        zypper) echo "libpulse-devel" ;;
+        xbps-install) echo "pulseaudio-devel" ;;
+        emerge) echo "media-libs/libpulse" ;;
+      esac ;;
+    samplerate|libsamplerate)
+      case "$_pm" in
+        dnf) echo "libsamplerate-devel" ;;
+        pacman) echo "libsamplerate" ;;
+        apt-get) echo "libsamplerate0-dev" ;;
+        zypper) echo "libsamplerate-devel" ;;
+        xbps-install) echo "libsamplerate-devel" ;;
+        emerge) echo "media-libs/libsamplerate" ;;
+      esac ;;
+    nettle)
+      case "$_pm" in
+        dnf) echo "nettle-devel" ;;
+        pacman) echo "nettle" ;;
+        apt-get) echo "libnettle-dev" ;;
+        zypper) echo "libnettle-devel" ;;
+        xbps-install) echo "nettle-devel" ;;
+        emerge) echo "dev-libs/nettle" ;;
+      esac ;;
+    gmp)
+      case "$_pm" in
+        dnf) echo "gmp-devel" ;;
+        pacman) echo "gmp" ;;
+        apt-get) echo "libgmp-dev" ;;
+        zypper) echo "libgmp-devel" ;;
+        xbps-install) echo "gmp-devel" ;;
+        emerge) echo "dev-libs/gmp" ;;
+      esac ;;
+    spice-protocol|spice_protocol)
+      case "$_pm" in
+        dnf) echo "spice-protocol" ;;
+        pacman) echo "spice-protocol" ;;
+        apt-get) echo "libspice-protocol-dev" ;;
+        zypper) echo "spice-protocol-devel" ;;
+        xbps-install) echo "spice-protocol" ;;
+        emerge) echo "app-emulation/spice-protocol" ;;
+      esac ;;
+    xkbcommon|libxkbcommon)
+      case "$_pm" in
+        dnf) echo "libxkbcommon-devel" ;;
+        pacman) echo "libxkbcommon" ;;
+        apt-get) echo "libxkbcommon-dev" ;;
+        zypper) echo "libxkbcommon-devel" ;;
+        xbps-install) echo "libxkbcommon-devel" ;;
+        emerge) echo "x11-libs/libxkbcommon" ;;
+      esac ;;
+    wayland-client|wayland_scanner|wayland-protocols|wayland)
+      case "$_pm" in
+        dnf) echo "wayland-devel" ;;
+        pacman) echo "wayland" ;;
+        apt-get) echo "libwayland-dev" ;;
+        zypper) echo "wayland-devel" ;;
+        xbps-install) echo "wayland-devel" ;;
+        emerge) echo "dev-libs/wayland" ;;
+      esac ;;
+    libdecor)
+      case "$_pm" in
+        dnf) echo "libdecor-devel" ;;
+        pacman) echo "libdecor" ;;
+        apt-get) echo "libdecor-0-dev" ;;
+        zypper) echo "libdecor-devel" ;;
+        xbps-install) echo "libdecor-devel" ;;
+        emerge) echo "gui-libs/libdecor" ;;
+      esac ;;
+    x11|libx11)
+      case "$_pm" in
+        dnf) echo "libX11-devel" ;;
+        pacman) echo "libx11" ;;
+        apt-get) echo "libx11-dev" ;;
+        zypper) echo "libX11-devel" ;;
+        xbps-install) echo "libX11-devel" ;;
+        emerge) echo "x11-libs/libX11" ;;
+      esac ;;
+    xfixes|libxfixes)
+      case "$_pm" in
+        dnf) echo "libXfixes-devel" ;;
+        pacman) echo "libxfixes" ;;
+        apt-get) echo "libxfixes-dev" ;;
+        zypper) echo "libXfixes-devel" ;;
+        xbps-install) echo "libXfixes-devel" ;;
+        emerge) echo "x11-libs/libXfixes" ;;
+      esac ;;
+    xi|libxi)
+      case "$_pm" in
+        dnf) echo "libXi-devel" ;;
+        pacman) echo "libxi" ;;
+        apt-get) echo "libxi-dev" ;;
+        zypper) echo "libXi-devel" ;;
+        xbps-install) echo "libXi-devel" ;;
+        emerge) echo "x11-libs/libXi" ;;
+      esac ;;
+    xinerama|libxinerama)
+      case "$_pm" in
+        dnf) echo "libXinerama-devel" ;;
+        pacman) echo "libxinerama" ;;
+        apt-get) echo "libxinerama-dev" ;;
+        zypper) echo "libXinerama-devel" ;;
+        xbps-install) echo "libXinerama-devel" ;;
+        emerge) echo "x11-libs/libXinerama" ;;
+      esac ;;
+    xscrnsaver|libxscrnsaver|xss)
+      case "$_pm" in
+        dnf) echo "libXScrnSaver-devel" ;;
+        pacman) echo "libxss" ;;
+        apt-get) echo "libxss-dev" ;;
+        zypper) echo "libXss-devel" ;;
+        xbps-install) echo "libXScrnSaver-devel" ;;
+        emerge) echo "x11-libs/libXScrnSaver" ;;
+      esac ;;
+    xcursor|libxcursor)
+      case "$_pm" in
+        dnf) echo "libXcursor-devel" ;;
+        pacman) echo "libxcursor" ;;
+        apt-get) echo "libxcursor-dev" ;;
+        zypper) echo "libXcursor-devel" ;;
+        xbps-install) echo "libXcursor-devel" ;;
+        emerge) echo "x11-libs/libXcursor" ;;
+      esac ;;
+    xpresent|libxpresent)
+      case "$_pm" in
+        dnf) echo "libXpresent-devel" ;;
+        pacman) echo "libxpresent" ;;
+        apt-get) echo "libxpresent-dev" ;;
+        zypper) echo "libXpresent-devel" ;;
+        xbps-install) echo "libXpresent-devel" ;;
+        emerge) echo "x11-libs/libXpresent" ;;
+      esac ;;
+    xrandr|libxrandr)
+      case "$_pm" in
+        dnf) echo "libXrandr-devel" ;;
+        pacman) echo "libxrandr" ;;
+        apt-get) echo "libxrandr-dev" ;;
+        zypper) echo "libXrandr-devel" ;;
+        xbps-install) echo "libXrandr-devel" ;;
+        emerge) echo "x11-libs/libXrandr" ;;
+      esac ;;
+    gl|libgl|opengl)
+      case "$_pm" in
+        dnf) echo "libglvnd-devel" ;;
+        pacman) echo "libgl" ;;
+        apt-get) echo "libglvnd-dev" ;;
+        zypper) echo "libglvnd-devel" ;;
+        xbps-install) echo "libglvnd-devel" ;;
+        emerge) echo "media-libs/libglvnd" ;;
+      esac ;;
+    egl|libegl)
+      case "$_pm" in
+        dnf) echo "libglvnd-devel" ;;
+        pacman) echo "libegl" ;;
+        apt-get) echo "libegl1-mesa-dev" ;;
+        zypper) echo "libglvnd-devel" ;;
+        xbps-install) echo "libglvnd-devel" ;;
+        emerge) echo "media-libs/libglvnd" ;;
+      esac ;;
+    glesv2|libgles2|gles)
+      case "$_pm" in
+        dnf) echo "libglvnd-devel" ;;
+        pacman) echo "libgles" ;;
+        apt-get) echo "libgles2-mesa-dev" ;;
+        zypper) echo "libglvnd-devel" ;;
+        xbps-install) echo "libglvnd-devel" ;;
+        emerge) echo "media-libs/libglvnd" ;;
+      esac ;;
+    libusbredirparser|usbredirparser)
+      case "$_pm" in
+        dnf) echo "libusbredirparser-devel" ;;
+        pacman) echo "libusbredirparser" ;;
+        apt-get) echo "libusbredirparser-dev" ;;
+        zypper) echo "libusbredirparser-devel" ;;
+        xbps-install) echo "libusbredir-devel" ;;
+        emerge) echo "dev-libs/libusbredirparser" ;;
+      esac ;;
+  esac
+}
+
+# R48j-cross: Install one or more packages via the detected package manager.
+# $1 = pm (dnf/pacman/apt-get/zypper/xbps-install/emerge), $2.. = packages.
+# Best-effort: returns the PM's exit code. Honors DRY_RUN via `run`.
+_lg_install_pkgs() {
+  local _pm="$1"; shift
+  [[ -n "${1:-}" ]] || return 0
+  case "$_pm" in
+    dnf) run dnf install -y "$@" ;;
+    pacman) run pacman -S --noconfirm --needed "$@" ;;
+    apt-get) run apt-get install -y "$@" ;;
+    zypper) run zypper --non-interactive install "$@" ;;
+    xbps-install) run xbps-install -Sy "$@" ;;
+    emerge) run emerge "$@" ;;
+    *) note "WARN: unknown package manager '$_pm'; cannot auto-install: $*"; return 1 ;;
+  esac
+}
+
+# R48j-cross: Extract the missing pkg-config module names from a cmake log.
+# Parses the "The following required packages were not found:" error block cmake
+# emits on a REQUIRED pkg_check_modules failure, stripping version constraints.
+# Prints one module name per line on stdout (deduped). Empty = cmake failed for a
+# non-missing-module reason (the caller gives up with the manual-install hint).
+_lg_extract_missing_modules() {
+  local _log="$1"
+  [[ -f "$_log" ]] || return 0
+  awk '
+    /The following required packages were not found:/{ grab=1; next }
+    grab && /^ - / { sub(/^ - /, ""); sub(/[<>=].*/, ""); print }
+    grab && !/^ - / && !/^$/ { grab=0 }
+    /^$/ { grab=0 }
+  ' "$_log" 2>/dev/null | sort -u | grep -v '^$'
+}
+
+# R48j-cross: Self-healing cmake configure — run cmake; on a missing pkg-config
+# module failure, parse the error, map the module(s) to distro packages, auto-
+# install them via the detected package manager ($_lg_pm), and retry. Caps at
+# $_max attempts so a non-missing-module failure (or an unmappable module) does
+# not loop forever. $1 = build dir, $2 = cmake generator, $3.. = extra cmake args.
+# Tees output to BOTH the terminal (live progress) AND $LG_BUILD_LOG (failure
+# tail preserved). Returns 0 on success, 1 on failure.
+_lg_cmake_with_retry() {
+  local _bdir="$1" _gen="$2"; shift 2
+  local _attempt=0 _max=3 _missing _pkgs _mod _pkg
+  while (( _attempt < _max )); do
+    _attempt=$((_attempt + 1))
+    : >"$LG_BUILD_LOG" 2>/dev/null || true
+    if (cd "$_bdir" && cmake -G "$_gen" "$@" ../) 2>&1 | tee -a "$LG_BUILD_LOG"; then
+      return 0
+    fi
+    _missing="$(_lg_extract_missing_modules "$LG_BUILD_LOG")"
+    if [[ -z "$_missing" ]]; then
+      note "cmake configure failed (attempt $_attempt/$_max) — no missing pkg-config module identified in the error."
+      return 1
+    fi
+    # Build a quoted, space-joined display string (SC2086-clean; no unquoted word split).
+    local _miss_disp=""
+    for _mod in $_missing; do
+      _miss_disp="${_miss_disp:+$_miss_disp }$_mod"
+    done
+    note "cmake configure failed (attempt $_attempt/$_max); missing pkg-config module(s): $_miss_disp"
+    _pkgs=""
+    for _mod in $_missing; do
+      _pkg="$(_lg_pkg_to_distro_pkg "$_mod" "${_lg_pm:-}")"
+      [[ -n "$_pkg" ]] && _pkgs="${_pkgs:+$_pkgs }$_pkg"
+    done
+    if [[ -z "$_pkgs" ]]; then
+      note "ERROR: could not map missing module(s) to a distro package for '${_lg_pm:-<unknown package manager>}'."
+      note "       Missing: $_miss_disp. Install the matching dev package(s) manually and re-run."
+      return 1
+    fi
+    note "Auto-installing missing build dependency(ies) via ${_lg_pm:-<unknown>}: $_pkgs"
+    # shellcheck disable=SC2086 # intentional word-split: _pkgs is a space-joined package list
+    _lg_install_pkgs "${_lg_pm:-}" $_pkgs || true
+    note "Retrying cmake configure (attempt $((_attempt + 1))/${_max})..."
+  done
+  note "ERROR: cmake configure failed after $_max attempts (auto-install did not resolve it)."
+  return 1
+}
+
 _lg_compile_from_source() {
   local _src="/tmp/looking-glass-setup-src"
   local _build="$_src/client/build"
@@ -17160,9 +17542,12 @@ _lg_compile_from_source() {
   if command -v ninja >/dev/null 2>&1; then
     _gen="Ninja"; _builder="ninja"
   fi
-  note "Step 2/4: Configuring build (cmake -G $_gen)..."
-  if ! (cd "$_build" && cmake -G "$_gen" -DENABLE_BACKTRACE=no ../) 2>&1 | tee -a "$LG_BUILD_LOG"; then
-    note "ERROR: cmake configuration failed. Check build dependencies."
+  note "Step 2/4: Configuring build (cmake -G $_gen — auto-installs missing deps + retries)..."
+  # R48j-cross: self-healing cmake — on a missing pkg-config module failure,
+  # parse the error, map the module(s) to distro packages, auto-install them via
+  # $_lg_pm (set by the caller in install_looking_glass_client), and retry.
+  if ! _lg_cmake_with_retry "$_build" "$_gen" -DENABLE_BACKTRACE=no; then
+    note "ERROR: cmake configuration failed (missing deps auto-install did not resolve it)."
     _lg_dump_log_tail "$LG_BUILD_LOG"
     rm -rf "$_src"
     return 1

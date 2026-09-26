@@ -28895,6 +28895,13 @@ vfio_menu() {
 #   hypervisor-hide   stealth-tune   ultimate-perf   looking-glass (+detail)
 #   vBIOS ROM injection   live-attach enrolled   hugepages (memoryBacking)
 #   virtio-win guest-agent ISO   disks-virtio (no SATA hard disks)
+# R48k: hooked-gpu (host-level: is the libvirt qemu hook installed?) is a 10th
+# item on line 2 — ✔ = the dynamic-binding hook ($LIBVIRT_HOOK_SCRIPT +
+# $LIBVIRT_HOOK_ENTRY) is installed, ✖ = not installed (early binding, or the
+# hook is missing). Host-level (one hook for all VMs, same as the looking-glass-
+# client compiled check), computed once outside the per-VM loop. Lets the
+# operator see at a glance — right in the per-VM checklist — whether the GPU
+# switching hook that drives this VM is in place.
 # R48h: the looking-glass detail now also shows whether the HOST-side
 # looking-glass-client BINARY is compiled (✔) or not (✖), so the operator sees
 # at a glance — without running install_looking_glass — whether the VM-side
@@ -28915,6 +28922,15 @@ _vm_checklist_records() {
   local _lg_compiled_sym="✖"
   if _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
     _lg_compiled_sym="✔"
+  fi
+  # R48k: host-level GPU hook (libvirt qemu hook) installed check (one for all
+  # VMs). ✔ = the dynamic-binding hook is installed ($LIBVIRT_HOOK_SCRIPT is
+  # executable AND $LIBVIRT_HOOK_ENTRY exists), ✖ = not installed (early
+  # binding, or the hook is missing). Same source of truth as the
+  # _menu_gpu_hook_status header line so the checklist + the header always agree.
+  local _hk_sym="✖"
+  if [[ -x "$LIBVIRT_HOOK_SCRIPT" && -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+    _hk_sym="✔"
   fi
   local _dom _xml _has_hvhide _has_stealthtune _has_perf _has_shmem _has_rebar _has_video_none _sz _unit _lg_info
   local _has_vbios _has_liveattach _has_hugepages _has_virtio_iso _has_sata_disk
@@ -28977,15 +28993,15 @@ _vm_checklist_records() {
     (( _has_virtio_iso )) && _vw_sym="✔"
     (( ! _has_sata_disk )) && _dk_sym="✔"
     _line1="$_dom:  hypervisor-hide $_hh_sym  stealth-tune $_st_sym  ultimate-perf $_p_sym  looking-glass $_l_sym$_lg_detail"
-    _line2="       vBIOS $_vb_sym  live-attach $_la_sym  hugepages $_hp_sym  virtio-win $_vw_sym  disks-virtio $_dk_sym"
+    _line2="       vBIOS $_vb_sym  live-attach $_la_sym  hugepages $_hp_sym  virtio-win $_vw_sym  disks-virtio $_dk_sym  hooked-gpu $_hk_sym"
     printf '%s\0%s\0%s\0' "$_dom" "$_line1" "$_line2"
   done < <(_list_guest_gpu_vms)
 }
 
-# R48e: Menu first-page VM status summary. Emits the FULL 9-feature per-VM
-# checklist so the operator sees it on the menu's FIRST page (the header + the
-# whiptail dialog prompt, right where the ReBAR disclaimer is) — not hidden in a
-# post-action popup. $1=full (default: note() lines for the header) | compact
+# R48e: Menu first-page VM status summary. Emits the FULL 10-feature per-VM
+# checklist (R48k added hooked-gpu) so the operator sees it on the menu's FIRST
+# page (the header + the whiptail dialog prompt, right where the ReBAR
+# disclaimer is) — not hidden in a post-action popup. $1=full (default: note() lines for the header) | compact
 # (plain lines, NO color, for the select_from_list prompt so whiptail does not
 # truncate at an ESC byte). Falls back to 'no guest-GPU VM detected' / 'no
 # config' / 'libvirt not reachable' so the line is always informative.

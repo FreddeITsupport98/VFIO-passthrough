@@ -1331,6 +1331,21 @@ assert_contains_text \
   "R48k guard notes customizations work regardless of hook (no false blocking)" \
   'apply regardless of whether dynamic binding or the dynamic' \
   "$(sed -n '/^# R48k: Shared guard for the Modify-VM/,/^_menu_vm_guarded()/p' "$VFIO_SCRIPT")"
+# R48k: the per-VM checklist now has a 10th item — hooked-gpu (host-level: is the
+# libvirt qemu hook installed?) — on line 2, so the operator sees at a glance
+# whether the GPU switching hook is in place. ✔ = installed, ✖ = not installed.
+assert_contains_file \
+  "R48k checklist line 2 has hooked-gpu label" \
+  'hooked-gpu $_hk_sym' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R48k checklist hooked-gpu computed from LIBVIRT_HOOK_SCRIPT + ENTRY" \
+  '$LIBVIRT_HOOK_SCRIPT' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R48k checklist hooked-gpu checks LIBVIRT_HOOK_ENTRY" \
+  '$LIBVIRT_HOOK_ENTRY' \
+  "$_checklist_fn"
 
 # --- R48g: stealth MAC OUI spoof + SMBIOS type 2/3/17 + LG detection anchored
 # to name='looking-glass' + the LG 'compile client first' disclaimer. These close

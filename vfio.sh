@@ -379,16 +379,21 @@ run() {
 # (defaults to the path itself).
 _link() {
   local _path="$1" _text="${2:-$1}"
-  if (( ! ENABLE_COLOR )) || [[ ! -e "$_path" ]]; then
+  # R48m: skip the OSC 8 hyperlink escape when whiptail (TUI) is active —
+  # whiptail passes the raw \033]8;;... escapes through as literal ^[]8;;... text
+  # inside the dialog box, which corrupts the menu (observed on the Looking
+  # Glass desktop-shortcut install lines). Emit plain text in the TUI path;
+  # keep the clickable hyperlink for the CLI/plain-text path.
+  if (( ! ENABLE_COLOR )) || (( HAS_TUI )) || [[ ! -e "$_path" ]]; then
     printf '%s' "$_text"
     return 0
   fi
   local _abs
-  _abs="$(readlink -f "$_path" 2>/dev/null || echo "$_path")"
+  _abs="$(readlink -f "_path" 2>/dev/null || echo "$_path")"
   # The \\ in the printf below is intentional: it emits the OSC 8 hyperlink
   # ST (String Terminator) byte. It is NOT a mis-escaped single quote.
   # shellcheck disable=SC1003
-  printf '\033]8;;file://%s\033\\%s\033]8;;\033\\' "$_abs" "$_text"
+  printf '\033]8;;file://%s\033\\%s\033]8;;\033\\' "_abs" "_text"
 }
 # Like _link but prints with a trailing newline (for use with `say`-style lines).
 _saylink() {

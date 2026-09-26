@@ -806,6 +806,10 @@ assert_contains_file "R48m _menu_build_vfio_status_block calls recovery helper" 
 assert_contains_file "R48m reset _rm_paths includes LG_CLIENT_BIN" '"$LG_CLIENT_BIN"' "$VFIO_SCRIPT"
 assert_contains_file "R48m reset _rm_paths includes LG_CLIENT_DESKTOP" '"$LG_CLIENT_DESKTOP"' "$VFIO_SCRIPT"
 assert_contains_file "R48m reset calls remove_looking_glass_client" 'remove_looking_glass_client' "$VFIO_SCRIPT"
+# R48m: _link must NOT emit the OSC 8 hyperlink escape when whiptail (TUI) is
+# active — whiptail passes the raw escapes through as literal ^[]8;;... text and
+# corrupts the dialog. Emit plain text in the TUI path.
+assert_contains_file "R48m _link gates OSC 8 on HAS_TUI (no corruption in whiptail)" '(( HAS_TUI ))' "$VFIO_SCRIPT"
 
 if (( fail != 0 )); then
   printf '\nFAIL SUMMARY (%d)\n' "${#FAILED_ASSERTIONS[@]}" >&2

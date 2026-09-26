@@ -28424,6 +28424,14 @@ install_self() {
     fi
     run cp -a "$src" "$SELF_INSTALL_BIN"
     run chmod 0755 "$SELF_INSTALL_BIN"
+    # R48l: pkexec (used by the live-attach tray applet to run `vfio
+    # --live-attach-toggle` without a terminal) REFUSES to execute a binary
+    # that is not owned by root. `cp -a` preserves the source file's ownership,
+    # so when the operator runs `sudo ./vfio.sh --install-self` the installed
+    # CLI would inherit the user's `fb:fb` ownership and the tray toggle would
+    # fail with rc=127 ("Not authorized" / command not found). Force the
+    # installed CLI to root:root so pkexec accepts it.
+    run chown root:root "$SELF_INSTALL_BIN" 2>/dev/null || true
     say "Installed: $(_link "$SELF_INSTALL_BIN")"
   fi
 

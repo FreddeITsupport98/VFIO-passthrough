@@ -1722,6 +1722,14 @@ assert_contains_text \
   "R34 install_self chmods 0755" \
   'chmod 0755 "$SELF_INSTALL_BIN"' \
   "$_self_fn"
+# R48l: pkexec (used by the live-attach tray applet) refuses to run a binary
+# not owned by root, so install_self must chown the CLI root:root after the
+# cp -a (which preserves the source user ownership). Without this the tray
+# toggle fails with rc=127.
+assert_contains_text \
+  "R48l install_self chowns the CLI root:root (so pkexec accepts it)" \
+  'chown root:root "$SELF_INSTALL_BIN"' \
+  "$_self_fn"
 assert_contains_text \
   "R34 install_self has a same-file guard" \
   '-ef "$SELF_INSTALL_BIN"' \

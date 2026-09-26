@@ -28256,6 +28256,203 @@ _menu_rebar_disclaimer() {
   esac
 }
 
+# R48k: Shared guard for the Modify-VM sub-actions. Most VM customizations
+# (hypervisor hide / stealth / ultimate-perf / Looking Glass / virtio-win guest-
+# agent / looking-glass-client) work in BOTH early and dynamic binding because
+# they only edit VM XML (virsh dump/define) and do NOT depend on the libvirt
+# qemu hook. live-attach + its toggle are the ONLY DYNAMIC-only actions (they
+# rely on the libvirt qemu hook installed by --install-dynamic-binding). This
+# helper returns 0 (ok to proceed) / 1 (caller should skip) and prints the right
+# missing-config / libvirt-unreachable / wrong-binding-mode note. $1 = action
+# title, $2 = "dynamic" to require dynamic binding (empty = either mode).
+_menu_vm_guarded() {
+  local _title="$1" _req_mode="${2:-}"
+  if ! readable_file "$CONF_FILE"; then
+    note "Missing $CONF_FILE. Run Full configure first (menu option 0 / 1, or --install-dynamic-binding / --install-early-binding)."
+    return 1
+  fi
+  if [[ -n "$_req_mode" ]]; then
+    local _cur_mode
+    _cur_mode="$(awk -F= '/^VFIO_BINDING_MODE=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
+    _cur_mode="${_cur_mode:-early}"
+    _cur_mode="${_cur_mode,,}"
+    if [[ "$_cur_mode" != "$_req_mode" ]]; then
+      note "$_title needs DYNAMIC binding. Current mode: $_cur_mode."
+      note "Switch first: menu option 2 (Switch to dynamic binding), or 'sudo vfio --install-dynamic-binding'."
+      return 1
+    fi
+  fi
+  if ! libvirt_runtime_ok; then
+    note "WARN: libvirt is not reachable; $_title needs libvirt to dump/define VM XML."
+    if prompt_yn "Continue anyway?" N "$_title"; then
+      return 0
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# R48k: "Apply to VM" sub-menu — every VM-customization INSTALL action, all in
+# one place. Works in BOTH binding modes (early + dynamic) EXCEPT live-attach /
+# the toggle which are DYNAMIC-only (the libvirt qemu hook is the live-attach
+# engine). Loops back after each apply so the operator can apply several in one
+# root session.
+_menu_apply_to_vm() {
+  local _apply_opts _achoice
+  _apply_opts=(
+    "Hypervisor hide + stealth/perf tuning (SMBIOS/CPU/NIC/disk serials; works early OR dynamic)"
+    "Apply ultimate-perf VM tuning (stealth-safe: disk I/O, iothreads, pinning, hugepages opt-in; works early OR dynamic)"
+    "Set up Looking Glass (shared-memory display mirror; works early OR dynamic)"
+    "Install (compile) looking-glass-client binary (host side; works early OR dynamic)"
+    "Attach virtio-win guest-agent ISO (smart handoff via guest-ping; works early OR dynamic)"
+    "Set up live-attach / hotswap (VM starts without GPU, then hot-attached; DYNAMIC binding only)"
+    "Toggle live-attach hotplug on/off (VM boots with vs without GPU; DYNAMIC binding only)"
+    "Back to main menu"
+  )
+  while :; do
+    say
+    hdr "Modify VM — Apply to VM"
+    note "Pick a VM customization to APPLY. Most work in BOTH binding modes; live-attach needs dynamic."
+    _achoice="$(select_from_list "Apply what to the guest-GPU VM?" "Apply to VM" "${_apply_opts[@]}")"
+    case "$_achoice" in
+      0)
+        say; note "Applying hypervisor hide / stealth / perf to detected guest-GPU VMs..."
+        if _menu_vm_guarded "Hypervisor hide / stealth" ""; then
+          install_stealth_vm_tuning
+        fi
+        ;;
+      1)
+        say; note "Applying ultimate-performance VM tuning..."
+        if _menu_vm_guarded "Ultimate-perf VM tuning" ""; then
+          install_ultimate_perf_vm_tuning
+        fi
+        ;;
+      2)
+        say; note "Setting up Looking Glass host side..."
+        if _menu_vm_guarded "Looking Glass setup" ""; then
+          install_looking_glass
+        fi
+        ;;
+      3)
+        say; note "Installing/compiling looking-glass-client..."
+        install_looking_glass_client
+        ;;
+      4)
+        say; note "Attaching virtio-win guest-agent ISO..."
+        if _menu_vm_guarded "virtio-win guest agent" ""; then
+          install_virtio_win_guest_agent
+        fi
+        ;;
+      5)
+        say; note "Setting up live-attach / hotswap..."
+        if _menu_vm_guarded "Live-attach" "dynamic"; then
+          install_live_attach
+        fi
+        ;;
+      6)
+        say; note "Toggling live-attach hotplug..."
+        if _menu_vm_guarded "Live-attach toggle" "dynamic"; then
+          live_attach_toggle toggle
+        fi
+        ;;
+      7)
+        say; say "Returning to main menu."
+        return 0
+        ;;
+      *)
+        note "Invalid selection."
+        ;;
+    esac
+    say
+    note "Returning to Apply-to-VM menu..."
+    _vm_tuning_status_block
+  done
+}
+
+# R48k: "Revert changes on VM" sub-menu — every VM-customization REVERT / REMOVE
+# action, all in one place. Works in BOTH binding modes except remove-live-
+# attach (DYNAMIC-only, since live-attach only exists under dynamic binding).
+_menu_revert_on_vm() {
+  local _rev_opts _rchoice
+  _rev_opts=(
+    "Revert stealth/perf VM tuning (from backup XML; works early OR dynamic)"
+    "Revert ultimate-perf VM tuning (from backup XML, restores nr_hugepages; works early OR dynamic)"
+    "Remove Looking Glass host setup (detach shmem + shared-memory node + user config; works early OR dynamic)"
+    "Remove looking-glass-client binary (stops running instances first; works early OR dynamic)"
+    "Remove live-attach / hotswap (restores GPU to VM XML; DYNAMIC binding only)"
+    "Back to main menu"
+  )
+  while :; do
+    say
+    hdr "Modify VM — Revert changes on VM"
+    note "Pick a VM customization to REVERT. Most work in BOTH binding modes; live-attach needs dynamic."
+    _rchoice="$(select_from_list "Revert what on the guest-GPU VM?" "Revert on VM" "${_rev_opts[@]}")"
+    case "$_rchoice" in
+      0)
+        say; note "Reverting stealth/perf VM tuning..."
+        if _menu_vm_guarded "Revert stealth/perf VM tuning" ""; then
+          reset_stealth_vm_tuning
+        fi
+        ;;
+      1)
+        say; note "Reverting ultimate-performance VM tuning..."
+        if _menu_vm_guarded "Revert ultimate-perf VM tuning" ""; then
+          reset_ultimate_perf_vm_tuning
+        fi
+        ;;
+      2)
+        say; note "Removing Looking Glass host-side setup..."
+        remove_looking_glass
+        ;;
+      3)
+        say; note "Removing looking-glass-client binary..."
+        remove_looking_glass_client
+        ;;
+      4)
+        say; note "Removing live-attach / hotswap..."
+        if _menu_vm_guarded "Remove live-attach" "dynamic"; then
+          remove_live_attach
+        fi
+        ;;
+      5)
+        say; say "Returning to main menu."
+        return 0
+        ;;
+      *)
+        note "Invalid selection."
+        ;;
+    esac
+    say
+    note "Returning to Revert-on-VM menu..."
+    _vm_tuning_status_block
+  done
+}
+
+# R48k: "Modify VM" hub — one prominent entry that opens a sub-menu with two
+# categories: Apply to VM (every install action) and Revert changes on VM (every
+# revert/remove action). Loops back so the operator can do several before
+# returning to the main menu.
+_menu_modify_vm() {
+  local _mod_opts _mchoice
+  _mod_opts=(
+    "Apply to VM (hypervisor hide / stealth / ultimate-perf / Looking Glass / virtio-win / live-attach)"
+    "Revert changes on VM (undo any of the above)"
+    "Back to main menu"
+  )
+  while :; do
+    say
+    hdr "Modify VM"
+    note "Tune, hide, mirror, or revert the detected guest-GPU VM. Most options work in BOTH binding modes."
+    _mchoice="$(select_from_list "What do you want to do with the VM?" "Modify VM" "${_mod_opts[@]}")"
+    case "$_mchoice" in
+      0) _menu_apply_to_vm ;;
+      1) _menu_revert_on_vm ;;
+      2) say; say "Returning to main menu."; return 0 ;;
+      *) note "Invalid selection." ;;
+    esac
+  done
+}
+
 vfio_menu() {
   local _menu_opts _choice _conf_present _bmode _last_status=""
 
@@ -28275,25 +28472,14 @@ vfio_menu() {
     _menu_opts=(
       "Full configure (the guided wizard — pick GPUs, audio, binding mode)"
       "Full configure (recommended defaults — auto-answers after GPU pick)"
+      "Modify VM (apply / revert: hypervisor hide, stealth, ultimate-perf, Looking Glass, virtio-win, live-attach)"
       "Switch to dynamic binding (RX 9070 / RDNA4 recommended)"
-      "Apply hypervisor hide / stealth to detected guest-GPU VMs (removes red/green stripes in virt-manager)"
       "Switch to early binding (boot-time, classic)"
-      "Set up live-attach / hotswap (VM starts without GPU, then hot-attached + auto-installs Looking Glass)"
-      "Attach virtio-win guest-agent ISO (smart handoff via guest-ping)"
-      "Apply stealth/perf VM tuning (SMBIOS/CPU/NIC/disk serials)"
-      "Revert stealth/perf VM tuning (from backup XML)"
-      "Apply ultimate-perf VM tuning (stealth-safe: disk I/O, iothreads, pinning, hugepages opt-in)"
-      "Revert ultimate-perf VM tuning (from backup XML, restores nr_hugepages)"
       "Verify setup (read-only check)"
       "Detect / health check (read-only report)"
       "Reset everything (full cleanup, removes all VFIO config)"
       "Install vfio to /usr/local/bin (+ shell completions)"
       "Uninstall the self-installed vfio (+ completions)"
-      "Set up Looking Glass (shared-memory display mirror for the guest-GPU VM)"
-      "Remove Looking Glass (detach shmem + shared-memory node + user config)"
-      "Install (compile) looking-glass-client binary"
-      "Remove looking-glass-client binary"
-      "Toggle live-attach hotplug on/off (VM boots with vs without GPU)"
       "Show VFIO status (per-VM tuning checklist + ReBAR)"
       "Exit menu"
     )
@@ -28351,32 +28537,17 @@ vfio_menu() {
         apply_configuration
         ;;
       2)
+        # R48k: Modify VM — one sub-menu with Apply to VM + Revert changes on VM.
+        say
+        note "Opening the Modify VM sub-menu..."
+        _menu_modify_vm
+        ;;
+      3)
         # Switch to dynamic binding.
         say
         note "Switching to dynamic binding..."
         require_systemd
         install_dynamic_binding_from_existing_config
-        ;;
-      3)
-        # R48c: Apply hypervisor hide / stealth to detected guest-GPU VMs.
-        # Makes the VM look like a real desktop PC (vendor_id=GENUINE00000 +
-        # kvm hidden + hypervisor CPUID bit off + SMBIOS spoofing + e1000e NIC +
-        # randomized disk serials + vmport off) so virt-manager does NOT show
-        # the red/green hypervisor stripes and the AMD Windows driver installs.
-        # Same action as option 7 (stealth/perf VM tuning); placed here so the
-        # dynamic-binding -> hypervisor-hide workflow is linear.
-        say
-        note "Applying hypervisor hide / stealth to detected guest-GPU VMs..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 0 (Full configure) or option 2 (Switch to dynamic binding) first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; hypervisor hide / stealth needs libvirt to dump/define VM XML."
-          if prompt_yn "Continue anyway?" N "Hypervisor hide / stealth"; then
-            install_stealth_vm_tuning
-          fi
-        else
-          install_stealth_vm_tuning
-        fi
         ;;
       4)
         # Switch to early binding.
@@ -28386,96 +28557,6 @@ vfio_menu() {
         install_early_binding_from_existing_config
         ;;
       5)
-        # Set up live-attach / hotswap.
-        say
-        note "Setting up live-attach / hotswap..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 (Full configure) or option 3 (Switch to dynamic binding) first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; live-attach needs libvirt to modify VM XML."
-          if prompt_yn "Continue anyway?" N "Live-attach"; then
-            install_live_attach
-          fi
-        else
-          install_live_attach
-        fi
-        ;;
-      6)
-        # Attach virtio-win guest-agent ISO.
-        say
-        note "Attaching virtio-win guest-agent ISO..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 3 first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; virtio-win guest-agent setup needs libvirt to attach the ISO to VM XML."
-          if prompt_yn "Continue anyway?" N "virtio-win guest agent"; then
-            install_virtio_win_guest_agent
-          fi
-        else
-          install_virtio_win_guest_agent
-        fi
-        ;;
-      7)
-        # Apply stealth/perf VM tuning.
-        say
-        note "Applying stealth/perf VM tuning..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 3 first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; stealth/perf VM tuning needs libvirt to dump/define VM XML."
-          if prompt_yn "Continue anyway?" N "Stealth/perf VM tuning"; then
-            install_stealth_vm_tuning
-          fi
-        else
-          install_stealth_vm_tuning
-        fi
-        ;;
-      8)
-        # Revert stealth/perf VM tuning.
-        say
-        note "Reverting stealth/perf VM tuning..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 3 first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; stealth/perf VM revert needs libvirt to dump/define VM XML."
-          if prompt_yn "Continue anyway?" N "Revert stealth/perf VM tuning"; then
-            reset_stealth_vm_tuning
-          fi
-        else
-          reset_stealth_vm_tuning
-        fi
-        ;;
-      9)
-        # Apply ultimate-perf VM tuning (stealth-safe).
-        say
-        note "Applying ultimate-performance VM tuning..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 3 first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; ultimate-perf VM tuning needs libvirt to dump/define VM XML."
-          if prompt_yn "Continue anyway?" N "Ultimate-perf VM tuning"; then
-            install_ultimate_perf_vm_tuning
-          fi
-        else
-          install_ultimate_perf_vm_tuning
-        fi
-        ;;
-      10)
-        # Revert ultimate-perf VM tuning.
-        say
-        note "Reverting ultimate-performance VM tuning..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 or 3 first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; ultimate-perf VM revert needs libvirt to dump/define VM XML."
-          if prompt_yn "Continue anyway?" N "Revert ultimate-perf VM tuning"; then
-            reset_ultimate_perf_vm_tuning
-          fi
-        else
-          reset_ultimate_perf_vm_tuning
-        fi
-        ;;
-      11)
         # Verify setup (read-only).
         say
         note "Verifying setup..."
@@ -28489,7 +28570,7 @@ vfio_menu() {
           _verdict_popup "Verify setup" "FAIL" "One or more checks failed (rc=$_verify_rc). See the full report above."
         fi
         ;;
-      12)
+      6)
         # Detect / health check (read-only). Subshell isolates the conf source.
         say
         note "Running detect + health check..."
@@ -28519,7 +28600,7 @@ vfio_menu() {
           *)    _verdict_popup "Detect + health check" "COMPLETE" "Detection complete. Health status could not be determined." ;;
         esac
         ;;
-      13)
+      7)
         # Reset everything.
         say
         note "Resetting everything..."
@@ -28534,67 +28615,19 @@ vfio_menu() {
           note "Reset cancelled."
         fi
         ;;
-      14)
+      8)
         # Install vfio.sh to a stable PATH location + shell completions.
         say
         note "Installing vfio.sh to /usr/local/sbin + shell completions..."
         install_self
         ;;
-      15)
+      9)
         # Uninstall the self-installed vfio.sh + completions.
         say
         note "Uninstalling the self-installed vfio.sh + completions..."
         uninstall_self
         ;;
-      16)
-        # Set up Looking Glass (host-side VM setup).
-        say
-        note "Setting up Looking Glass..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 1 (Full configure) or option 3 (Switch to dynamic binding) first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; Looking Glass setup needs libvirt to dump/define VM XML."
-          if prompt_yn "Continue anyway?" N "Looking Glass"; then
-            install_looking_glass
-          fi
-        else
-          install_looking_glass
-        fi
-        ;;
-      17)
-        # Remove Looking Glass.
-        say
-        note "Removing Looking Glass host-side setup..."
-        remove_looking_glass
-        ;;
-      18)
-        # Install (compile) looking-glass-client binary.
-        say
-        note "Installing/compiling looking-glass-client..."
-        install_looking_glass_client
-        ;;
-      19)
-        # Remove looking-glass-client binary.
-        say
-        note "Removing looking-glass-client binary..."
-        remove_looking_glass_client
-        ;;
-      20)
-        # Toggle live-attach hotplug on/off (real mode switch, not backup-restore).
-        say
-        note "Toggling live-attach hotplug..."
-        if ! readable_file "$CONF_FILE"; then
-          note "Missing $CONF_FILE. Run option 4 (Set up live-attach) first."
-        elif ! libvirt_runtime_ok; then
-          note "WARN: libvirt is not reachable; the toggle needs libvirt to define VM XML."
-          if prompt_yn "Continue anyway?" N "Live-attach toggle"; then
-            live_attach_toggle toggle
-          fi
-        else
-          live_attach_toggle toggle
-        fi
-        ;;
-      21)
+      10)
         # R48e: re-show the VFIO status panel on demand (the "clickable" to
         # bring it back). It is the same per-VM checklist + ReBAR shown on menu
         # entry; selecting this re-opens it without doing anything. Sets
@@ -28617,7 +28650,7 @@ vfio_menu() {
           note "No VFIO status to show (no config / no guest-GPU VM / no ReBAR context)."
         fi
         ;;
-      22)
+      11)
         # Exit.
         say
         say "Exiting vfio.sh menu."

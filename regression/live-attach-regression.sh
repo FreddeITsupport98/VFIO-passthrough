@@ -895,10 +895,11 @@ assert_contains_text \
   "R33 vfio_menu dispatches dynamic binding" \
   'install_dynamic_binding_from_existing_config' \
   "$_menu_fn"
+_apply_fn="$(sed -n '/^_menu_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "R33 vfio_menu dispatches live-attach" \
+  "R33/R48k _menu_apply_to_vm dispatches live-attach" \
   'install_live_attach' \
-  "$_menu_fn"
+  "$_apply_fn"
 assert_contains_text \
   "R33 vfio_menu dispatches verify (read-only)" \
   'verify_setup' \
@@ -965,23 +966,29 @@ assert_contains_text \
   'compact' \
   "$_rebar_fn"
 
-# --- R48c/R48e/R48f: a standalone "Apply hypervisor hide / stealth" menu option
-# (position 3) + the FULL 9-feature per-VM checklist on the menu's FIRST page
-# (header notes + the whiptail dialog prompt, right where the ReBAR disclaimer
-# is) so the GUI operator sees which VM is detected + what tuning is applied
-# (✔) vs not (✖) BEFORE picking an action — not hidden in a post-action popup.
-# Also fixes the root cause: the wizard now runs VM-customization in BOTH binding
-# modes (asserted in ultimate-perf-regression.sh). R48f SPLIT hypervisor-hide
-# (the core stripes fix) and stealth-tune (the cosmetic SMBIOS/NIC/serial
+# --- R48c/R48e/R48f: R48k compacted the flat menu into a "Modify VM" sub-menu
+# (_menu_modify_vm -> _menu_apply_to_vm / _menu_revert_on_vm). The hypervisor-
+# hide / stealth INSTALL now lives in _menu_apply_to_vm (option 0 there), and the
+# per-VM checklist still shows on the menu's FIRST page. R48f SPLIT hypervisor-
+# hide (the core stripes fix) and stealth-tune (the cosmetic SMBIOS/NIC/serial
 # extension) into SEPARATE checklist items — they are not the same thing. ---
 assert_contains_text \
-  "R48c menu offers the hypervisor hide / stealth option" \
-  'Apply hypervisor hide / stealth to detected guest-GPU VMs' \
+  "R48c/R48k menu offers a Modify VM entry" \
+  'Modify VM' \
   "$_menu_fn"
+_mod_fn="$(sed -n '/^_menu_modify_vm()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "R48c menu hypervisor-hide option calls install_stealth_vm_tuning" \
-  'Applying hypervisor hide / stealth to detected guest-GPU VMs' \
-  "$_menu_fn"
+  "R48c/R48k Modify-VM hub offers Apply to VM" \
+  'Apply to VM' \
+  "$_mod_fn"
+assert_contains_text \
+  "R48c/R48k _menu_apply_to_vm offers the hypervisor hide / stealth option" \
+  'Hypervisor hide + stealth/perf tuning' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48c/R48k _menu_apply_to_vm hypervisor-hide option calls install_stealth_vm_tuning" \
+  'Applying hypervisor hide / stealth / perf to detected guest-GPU VMs' \
+  "$_apply_fn"
 assert_contains_text \
   "R48c/R48e menu offers the Show VFIO status option" \
   'Show VFIO status (per-VM tuning checklist + ReBAR)' \
@@ -991,7 +998,7 @@ assert_contains_text \
   'gui_msgbox "VFIO status"' \
   "$_menu_fn"
 assert_contains_text \
-  "R48c/R48e menu Exit is now option 22 (renumbered from 20)" \
+  "R48c/R48e menu Exit is now option 11 (compact menu renumbered from 22)" \
   'Exiting vfio.sh menu.' \
   "$_menu_fn"
 # R48e: the shared detector + the first-page summary renderer.
@@ -1076,6 +1083,157 @@ assert_contains_text \
   "R48e checklist line 2 has disks-virtio" \
   'disks-virtio $_dk_sym' \
   "$_checklist_fn"
+
+# --- R48k: the flat 23-option menu was compacted into a ~12-option top-level
+# menu with a prominent "Modify VM" entry that opens a sub-menu hub
+# (_menu_modify_vm) with two categories: "Apply to VM" (every install action:
+# hypervisor hide / stealth / ultimate-perf / Looking Glass / looking-glass-
+# client / virtio-win / live-attach + toggle) and "Revert changes on VM" (every
+# revert/remove action). Most VM customizations work in BOTH binding modes (they
+# only edit VM XML via virsh dump/define and do NOT need the libvirt qemu hook);
+# only live-attach + its toggle are DYNAMIC-only (they rely on the hook). The
+# shared _menu_vm_guarded helper enforces the conf + libvirt + binding-mode gate
+# so the early-binding operator can still use the customizations. ---
+assert_contains_file \
+  "R48k _menu_vm_guarded helper defined" \
+  '_menu_vm_guarded() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_apply_to_vm helper defined" \
+  '_menu_apply_to_vm() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_revert_on_vm helper defined" \
+  '_menu_revert_on_vm() {' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R48k _menu_modify_vm hub helper defined" \
+  '_menu_modify_vm() {' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R48k vfio_menu dispatches to _menu_modify_vm" \
+  '_menu_modify_vm' \
+  "$_menu_fn"
+assert_contains_text \
+  "R48k Modify-VM hub offers Revert changes on VM" \
+  'Revert changes on VM' \
+  "$_mod_fn"
+assert_contains_text \
+  "R48k Modify-VM hub has a Back-to-main-menu option" \
+  'Back to main menu' \
+  "$_mod_fn"
+# Apply sub-menu: every install action, with BOTH-modes / DYNAMIC-only notes.
+assert_contains_text \
+  "R48k apply sub-menu offers ultimate-perf (works early OR dynamic)" \
+  'Apply ultimate-perf VM tuning' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu offers Set up Looking Glass (works early OR dynamic)" \
+  'Set up Looking Glass' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu offers looking-glass-client compile (works early OR dynamic)" \
+  'Install (compile) looking-glass-client binary' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu offers virtio-win guest-agent (works early OR dynamic)" \
+  'Attach virtio-win guest-agent ISO' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu offers live-attach (DYNAMIC only)" \
+  'Set up live-attach / hotswap' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu live-attach marked DYNAMIC binding only" \
+  'DYNAMIC binding only' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu stealth option notes it works early OR dynamic" \
+  'works early OR dynamic' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu dispatches install_ultimate_perf_vm_tuning" \
+  'install_ultimate_perf_vm_tuning' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu dispatches install_looking_glass" \
+  'install_looking_glass' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu dispatches install_virtio_win_guest_agent" \
+  'install_virtio_win_guest_agent' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu dispatches install_looking_glass_client" \
+  'install_looking_glass_client' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu live-attach guarded dynamic via _menu_vm_guarded" \
+  '_menu_vm_guarded "Live-attach" "dynamic"' \
+  "$_apply_fn"
+assert_contains_text \
+  "R48k apply sub-menu stealth guarded with no mode requirement (either mode)" \
+  '_menu_vm_guarded "Hypervisor hide / stealth" ""' \
+  "$_apply_fn"
+# Revert sub-menu: every revert/remove action.
+_revert_fn="$(sed -n '/^_menu_revert_on_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R48k revert sub-menu offers revert stealth/perf" \
+  'Revert stealth/perf VM tuning' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu offers revert ultimate-perf" \
+  'Revert ultimate-perf VM tuning' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu offers remove Looking Glass" \
+  'Remove Looking Glass host setup' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu offers remove looking-glass-client" \
+  'Remove looking-glass-client binary' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu offers remove live-attach (DYNAMIC only)" \
+  'Remove live-attach / hotswap' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu dispatches reset_stealth_vm_tuning" \
+  'reset_stealth_vm_tuning' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu dispatches reset_ultimate_perf_vm_tuning" \
+  'reset_ultimate_perf_vm_tuning' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu dispatches remove_looking_glass" \
+  'remove_looking_glass' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu dispatches remove_looking_glass_client" \
+  'remove_looking_glass_client' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu dispatches remove_live_attach (dynamic guarded)" \
+  '_menu_vm_guarded "Remove live-attach" "dynamic"' \
+  "$_revert_fn"
+assert_contains_text \
+  "R48k revert sub-menu live-attach marked DYNAMIC binding only" \
+  'DYNAMIC binding only' \
+  "$_revert_fn"
+# The compact top-level menu must NOT still carry the old flat VM entries.
+if printf '%s\n' "$_menu_fn" | grep -Fq 'Apply hypervisor hide / stealth to detected guest-GPU VMs (removes'; then
+  printf 'FAIL: R48k old flat hypervisor-hide entry still in vfio_menu\n' >&2
+  record_failure "R48k old flat hypervisor-hide entry removed from vfio_menu"
+else
+  printf 'PASS: R48k old flat hypervisor-hide entry removed from vfio_menu\n'
+fi
+if printf '%s\n' "$_menu_fn" | grep -Fq 'Toggle live-attach hotplug on/off (VM boots with vs without GPU)'; then
+  printf 'FAIL: R48k old flat toggle entry still in vfio_menu\n' >&2
+  record_failure "R48k old flat toggle entry removed from vfio_menu"
+else
+  printf 'PASS: R48k old flat toggle entry removed from vfio_menu\n'
+fi
 
 # --- R48g: stealth MAC OUI spoof + SMBIOS type 2/3/17 + LG detection anchored
 # to name='looking-glass' + the LG 'compile client first' disclaimer. These close
@@ -2104,15 +2262,15 @@ assert_contains_file \
   "R41 tray autostart desktop file installed" \
   'vfio-hotplug-tray.desktop' \
   "$VFIO_SCRIPT"
-# Menu offers the toggle + dispatches live_attach_toggle.
+# Menu offers the toggle + dispatches live_attach_toggle (now via Modify-VM).
 assert_contains_text \
-  "R41 menu has a toggle hotplug entry" \
+  "R41/R48k _menu_apply_to_vm has a toggle hotplug entry" \
   'Toggle live-attach hotplug on/off' \
-  "$_menu_fn"
+  "$_apply_fn"
 assert_contains_text \
-  "R41 menu dispatches live_attach_toggle" \
+  "R41/R48k _menu_apply_to_vm dispatches live_attach_toggle" \
   'live_attach_toggle toggle' \
-  "$_menu_fn"
+  "$_apply_fn"
 
 # --- R41+ hardening: atomic mode-file write, polkit action-id DRY, --json status, tray single-instance ---
 assert_contains_file \

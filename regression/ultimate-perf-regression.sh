@@ -85,7 +85,7 @@ assert_contains_file "zsh completion includes --install-ultimate-perf-vm-tuning"
 assert_contains_file "main dispatch install-ultimate-perf-vm-tuning" '"install-ultimate-perf-vm-tuning"' "$VFIO_SCRIPT"
 assert_contains_file "main dispatch reset-ultimate-perf-vm-tuning" '"reset-ultimate-perf-vm-tuning"' "$VFIO_SCRIPT"
 assert_contains_file "menu has Apply ultimate-perf option" "Apply ultimate-perf VM tuning (stealth-safe" "$VFIO_SCRIPT"
-assert_contains_file "menu has Revert ultimate-perf option" "Revert ultimate-perf VM tuning (from backup XML, restores nr_hugepages)" "$VFIO_SCRIPT"
+assert_contains_file "menu has Revert ultimate-perf option" "Revert ultimate-perf VM tuning (from backup XML, restores nr_hugepages" "$VFIO_SCRIPT"
 assert_contains_file "detect calls ultimate_perf_vm_tuning_status" "ultimate_perf_vm_tuning_status || true" "$VFIO_SCRIPT"
 # Stealth-safe guarantee is documented in the function header.
 assert_contains_file "install fn documents stealth-safe guarantee" "STEALTH-SAFE" "$VFIO_SCRIPT"

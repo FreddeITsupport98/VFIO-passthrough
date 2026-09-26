@@ -108,6 +108,10 @@ A **Looking Glass ReBAR vendor gate + explicit `<video>` default** (R44/LG) make
 
 The stealth tuning now also **spoofs the MAC OUI** (the QEMU `52:54:00` prefix → a real-vendor OUI, stable per VM) and adds **SMBIOS type 2 (baseboard) / 3 (chassis) / 17 (memory)** spoofing from the host DMI (R48g) — closing the residual Windows `VM=yes` gap the MAC + missing baseboard/chassis left open. The per-VM status checklist now splits **hypervisor-hide** (the core stripes fix) from **stealth-tune** (the cosmetic extension) into separate ✔/✖ items (R48f), anchors Looking Glass detection to the `<shmem name='looking-glass'>` device specifically (no more false-positive on a different ivshmem), and appends a **`compiled ✔/✖`** marker to the Looking Glass detail showing whether the host `looking-glass-client` binary is built (R48h). The Looking Glass setup now shows a **smart compile-client-first disclaimer** — silent (one green ✔) when the client is already compiled, a full `PREREQUISITE` banner + the install command only when it is not. See [Stealth/perf VM tuning](#stealthperf-vm-tuning-smbios--cpu--nic--disk-serials--iothreads) and [Interactive menu status panel](#interactive-menu-status-panel-r48br48h).
 
+The **interactive `--menu` is now compact** (R48k): the flat 23-option menu is a 12-option top-level menu with one prominent **Modify VM** entry that opens a sub-menu hub — **Apply to VM** (every install action: hypervisor hide + stealth/perf, ultimate-perf, Looking Glass host setup, looking-glass-client compile, virtio-win guest-agent ISO, live-attach + toggle) and **Revert changes on VM** (every revert/remove action) + **Show VFIO status**. Most VM customizations work in **BOTH** binding modes (only live-attach needs dynamic); when there is no config yet, picking any Apply action **detects your guest-GPU VM from libvirt** and writes a minimal config so you can tune in early binding without the full wizard. The per-VM checklist gained a 10th item — **`hooked-gpu ✔/✖`** (host-level: is the libvirt qemu hook installed?) — and the Modify VM hub header shows a **GPU hook checkmark** so you see at a glance whether the dynamic-binding hook is in place. See [Interactive installer menu](#interactive-installer-menu).
+
+The **Looking Glass client compile is now self-healing, cross-distro, and shows live progress** (R48j): `--install-looking-glass-client` detects all six package managers (dnf / pacman / apt / zypper / xbps-install / emerge), installs the official Looking Glass wiki build-dependency list for each before the clone + cmake + make, tees the build output to the terminal AND `/tmp/looking-glass-client-build.log` with `Step 1/4` … `Step 4/4` indicators (instead of going silent for minutes), and is **self-healing** — if cmake configure fails on a missing pkg-config module (e.g. `fuse3>=3.10`), it parses the error, auto-installs the matching distro package, and retries (up to 3 attempts). See [Interactive menu status panel](#interactive-menu-status-panel-r48br48h).
+
 ### Keeping the RX 9070 alive: soft reboot, hard kill, and the zombie card
 
 > **The practical result — on an RX 9070 / 9070 XT / 9070 GRE passed through to a Windows guest:**
@@ -789,27 +793,22 @@ Menu options (0-indexed, as shown in the TUI):
 
 0. **Full configure** — the guided wizard (pick GPUs, audio, binding mode). Applies VM customization (hypervisor hide, vBIOS, perf, Looking Glass) in BOTH binding modes (R48c).
 1. **Full configure (recommended defaults)** — auto-answers every wizard prompt after the GPU pick (R39 `--recommended`).
-2. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
-3. **Apply hypervisor hide / stealth to detected guest-GPU VMs** — removes the red/green hypervisor stripes in virt-manager so the AMD Windows driver installs (R48c).
+2. **Modify VM** — opens a sub-menu hub (R48k) with three categories:
+   - **Apply to VM** — every install action: hypervisor hide + stealth/perf, ultimate-perf, Looking Glass host setup, looking-glass-client compile, virtio-win guest-agent ISO, live-attach + toggle. Most work in BOTH binding modes; live-attach needs dynamic.
+   - **Revert changes on VM** — every revert/remove action: revert stealth/perf, revert ultimate-perf, remove Looking Glass, remove looking-glass-client, remove live-attach.
+   - **Show VFIO status** — the per-VM checklist + ReBAR (also reachable from the top-level menu).
+   - When there is no `$CONF_FILE` yet, picking any Apply action offers to **detect your guest-GPU VM from libvirt** and write a minimal config from it, so you can tune in early binding without running the full wizard first (R48k).
+3. **Switch to dynamic binding** — RX 9070 / RDNA4 recommended.
 4. **Switch to early binding** — boot-time, classic.
-5. **Set up live-attach / hotswap** — VM starts without the GPU, then it is hot-attached.
-6. **Attach virtio-win guest-agent ISO** — smart handoff via `guest-ping`.
-7. **Apply stealth/perf VM tuning** — SMBIOS / CPU / NIC / disk serials.
-8. **Revert stealth/perf VM tuning** — from the backup XML.
-9. **Apply ultimate-perf VM tuning** — stealth-safe: disk I/O, iothreads, pinning, hugepages opt-in.
-10. **Revert ultimate-perf VM tuning** — from the backup XML (restores `nr_hugepages`).
-11. **Verify setup** — read-only check.
-12. **Detect / health check** — read-only report.
-13. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
-14. **Install vfio** to /usr/local/bin (+ shell completions).
-15. **Uninstall the self-installed vfio** (+ completions).
-16. **Set up Looking Glass** — shared-memory display mirror for the guest-GPU VM.
-17. **Remove Looking Glass** — detach shmem + shared-memory node + user config.
-18. **Install (compile) looking-glass-client binary**.
-19. **Remove looking-glass-client binary**.
-20. **Toggle live-attach hotplug on/off** — VM boots with vs without the GPU (R41).
-21. **Show VFIO status** — re-opens the per-VM tuning checklist + ReBAR status panel on demand (R48e).
-22. **Exit menu**.
+5. **Verify setup** — read-only check.
+6. **Detect / health check** — read-only report.
+7. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
+8. **Install vfio** to /usr/local/bin (+ shell completions).
+9. **Uninstall the self-installed vfio** (+ completions).
+10. **Show VFIO status** — re-opens the per-VM tuning checklist + ReBAR status panel on demand (R48e).
+11. **Exit menu**.
+
+The Modify VM hub header shows a **GPU hook checkmark**: `GPU hook: ✔ enabled (libvirt qemu hook installed)` / `✖ not installed (early binding, or hook missing)` so you see at a glance whether the dynamic-binding hook is in place (R48k).
 
 #### Interactive menu status panel (R48b–R48h)
 
@@ -817,18 +816,20 @@ On menu entry (and after any action that changes VM state), a **VFIO status** pa
 
 ```text path=null start=null
 win11:  hypervisor-hide ✔  stealth-tune ✔  ultimate-perf ✖  looking-glass ✔ (shmem 64MB + ReBAR, video=none, compiled ✔)
-       vBIOS ✔  live-attach ✔  hugepages ✖  virtio-win ✔  disks-virtio ✖
+       vBIOS ✔  live-attach ✔  hugepages ✖  virtio-win ✔  disks-virtio ✖  hooked-gpu ✔
 
 ReBAR: OK (amdgpu.rebar=0 active; AMD black-screen fix in place).
 ```
 
-The **9 features** detected from the live VM XML (`virsh dumpxml`, read-only, no root): **hypervisor-hide** (the core — `vendor_id=GENUINE00000` + `kvm=off,hypervisor=off`; removes the red/green stripes so the AMD Windows driver installs), **stealth-tune** (the cosmetic extension — SMBIOS type-1 spoofing + e1000e NIC + randomized disk serials + memballoon/clock/timer tweaks + QEMU `-cpu`/`-smbios` args; detected separately via `type=1,manufacturer=` so a hide-only VM shows tune ✖ — R48f), **ultimate-perf** (`cache=none` + `io=native` + `<cputune>`), **looking-glass** (a `<shmem name='looking-glass'>` ivshmem-plain + its real size/ReBAR/video=none detail + a host-level **`compiled ✔/✖`** marker showing whether `looking-glass-client` is built — R48g/R48h), **vBIOS** (`<rom file>`), **live-attach** (enrolled in `/var/lib/vfio-dynamic/live-attach-vms`), **hugepages** (`<memoryBacking><hugepages>`), **virtio-win** (cdrom sourcing the virtio-win ISO), **disks-virtio** (no unconverted SATA hard disks).
+The **10 features** detected from the live VM XML (`virsh dumpxml`, read-only, no root): **hypervisor-hide** (the core — `vendor_id=GENUINE00000` + `kvm=off,hypervisor=off`; removes the red/green stripes so the AMD Windows driver installs), **stealth-tune** (the cosmetic extension — SMBIOS type-1 spoofing + e1000e NIC + randomized disk serials + memballoon/clock/timer tweaks + QEMU `-cpu`/`-smbios` args; detected separately via `type=1,manufacturer=` so a hide-only VM shows tune ✖ — R48f), **ultimate-perf** (`cache=none` + `io=native` + `<cputune>`), **looking-glass** (a `<shmem name='looking-glass'>` ivshmem-plain + its real size/ReBAR/video=none detail + a host-level **`compiled ✔/✖`** marker showing whether `looking-glass-client` is built — R48g/R48h), **vBIOS** (`<rom file>`), **live-attach** (enrolled in `/var/lib/vfio-dynamic/live-attach-vms`), **hugepages** (`<memoryBacking><hugepages>`), **virtio-win** (cdrom sourcing the virtio-win ISO), **disks-virtio** (no unconverted SATA hard disks), **hooked-gpu** (host-level — ✔ = the libvirt qemu hook is installed; ✖ = not installed / early binding — R48k).
 
 The Looking Glass detail is anchored to the `<shmem name='looking-glass'>` device **specifically** (R48g) — a VM with a *different* ivshmem device no longer false-positives as Looking Glass, and the reported size is the real LG size (was: any `ivshmem-plain` matched, size grabbed from any `<size>` element). The `compiled ✔/✖` marker (R48h) tells you at a glance whether the VM-side `<shmem>` is actually usable — without the `looking-glass-client` binary the framebuffer is exposed but nothing reads it (black window / "cannot find shared memory"). It uses the same ELF check (`_lg_binary_valid`) as the install and the smart disclaimer, so all three always agree.
 
-The panel auto-shows once on menu entry and re-shows only when VM state changes (e.g. after **Apply hypervisor hide** the ✖ flips to ✔). To bring it back on demand at any time, pick **option 21 (Show VFIO status)**. The ReBAR line is vendor-aware: AMD + `amdgpu.rebar=0` missing → AT RISK warning (amdgpu auto-resizes BAR0 → Windows black screen) + the `--amd-rebar` fix; NVIDIA/Intel → OK (handle a resized BAR cleanly). All whiptail dialogs are now dynamically sized to the content (R48e), so the long checklist line no longer truncates.
+The panel auto-shows once on menu entry and re-shows only when VM state changes (e.g. after **Apply hypervisor hide** the ✖ flips to ✔). To bring it back on demand at any time, pick **option 10 (Show VFIO status)**, or **Modify VM → Show VFIO status** (R48k). The ReBAR line is vendor-aware: AMD + `amdgpu.rebar=0` missing → AT RISK warning (amdgpu auto-resizes BAR0 → Windows black screen) + the `--amd-rebar` fix; NVIDIA/Intel → OK (handle a resized BAR cleanly). All whiptail dialogs are now dynamically sized to the content (R48e), so the long checklist line no longer truncates.
 
-**Smart Looking-Glass disclaimer (R48g/R48h).** When you set up Looking Glass (`--install-looking-glass` / menu option 16, or the wizard/install-flow prompt), the script checks whether `looking-glass-client` is compiled: if it is, it prints one brief green `✔ already compiled` line and moves on (no noise on re-runs); if it is NOT, it pops a prominent `PREREQUISITE` banner explaining the `<shmem>` only exposes the framebuffer — the *client* reads it — and names the exact command to compile it (`sudo vfio --install-looking-glass-client` / menu option 18). A matching one-line heads-up also fires before the wizard/install-flow "Set up Looking Glass?" decision prompt (silent when the client is already built), so you can compile first instead of setting up a useless shmem.
+**Smart Looking-Glass disclaimer (R48g/R48h).** When you set up Looking Glass (`--install-looking-glass` / **Modify VM → Apply to VM → Set up Looking Glass**, or the wizard/install-flow prompt), the script checks whether `looking-glass-client` is compiled: if it is, it prints one brief green `✔ already compiled` line and moves on (no noise on re-runs); if it is NOT, it pops a prominent `PREREQUISITE` banner explaining the `<shmem>` only exposes the framebuffer — the *client* reads it — and names the exact command to compile it (`sudo vfio --install-looking-glass-client` / **Modify VM → Apply to VM → Install (compile) looking-glass-client binary**). A matching one-line heads-up also fires before the wizard/install-flow "Set up Looking Glass?" decision prompt (silent when the client is already built), so you can compile first instead of setting up a useless shmem.
+
+**Looking Glass client compile — self-healing, cross-distro, live progress (R48j).** `--install-looking-glass-client` first tries the distro package (dnf COPR / AUR); if that is unavailable, it falls back to compiling from source. The fallback now detects all six package managers (dnf / pacman / apt / zypper / xbps-install / emerge) and installs the official Looking Glass wiki build-dependency list for each **before** the clone + cmake + make, so the build no longer dies on a missing header. The compile shows **live progress** (git's clone %, cmake configure, make compiling each file — teed to the terminal AND `/tmp/looking-glass-client-build.log`) with `Step 1/4` … `Step 4/4` indicators, instead of going silent for minutes. It is also **self-healing**: if cmake configure fails on a missing pkg-config module (e.g. `fuse3>=3.10`), it parses the error, auto-installs the matching distro package, and retries (up to 3 attempts) — so a missing dependency no longer aborts the build. On any failure the real error tail + the log path are printed.
 
 ```fish path=null start=null
 sudo ./vfio.sh --menu

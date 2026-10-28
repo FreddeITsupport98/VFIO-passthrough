@@ -393,7 +393,7 @@ vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning ins
   - **Dynamic re-reserve at VM start**: the libvirt qemu hook's `prepare` phase now calls the same script's `--ensure-domain <dom>` mode (bounded timeout) **before** the GPU bind. It recomputes THIS VM's owned count from the live XML piped on stdin and grows `nr_hugepages` to cover the sum of all owned if needed (grow-only) — so a RAM change **without** a reboot is honored at the very moment qemu mmaps the backing store. No-op for non-hugepages VMs. On a fragmented-RAM shortfall it exits non-zero so libvirt aborts the VM start with a clear error instead of qemu's cryptic `unable to map backing store for guest RAM: Cannot allocate memory` — and **before** the GPU is ripped off the host, so a failed start leaves the host desktop untouched. (`VFIO_HOOK_HUGEPAGES_TIMEOUT` overrides the 10s ceiling.)
   - **1GB guard**: a 1GB page size (`1048576` KiB) cannot be reserved at runtime (the `nr_hugepages` knob only controls the 2MB pool); the helper warns and skips the runtime write, pointing at the `hugepagesz=1G hugepages=N` kernel-cmdline requirement.
 
-**Stealth coexistence guarantee**: the perf patcher only touches the elements above; it never reads/writes `features/hyperv/vendor_id`, `kvm/hidden`, `vmport`, `os/smbios`, `sysinfo`, `interface/model` (e1000e), `disk/serial`, `memballoon`, `clock/timer` (hypervclock/tsc), or `qemu:commandline` (-cpu/-smbios). Reverting perf restores the pre-perf XML backup (which still contains stealth), so stealth survives a perf revert.
+**Stealth coexistence guarantee**: the perf patcher only touches the elements above; it never reads/writes `features/hyperv/vendor_id`, `kvm/hidden`, `vmport`, `os/smbios`, `sysinfo`, `interface/model` (e1000e), `disk/serial`, `memballoon`, `clock/timer` (hypervclock/tsc), or `qemu:commandline` (-cpu/-smbios). Reverting perf restores the pre-perf XML backup (which still contains stealth), so stealth survives a perf revert. (R50 exception: the OPT-IN `virtio-net` conversion below is the ONE deliberate exception — it changes `interface/model` on purpose, only when you ask for it.)
 
 **Live-attach aware**: the tuner detects a guest-GPU VM by the GPU PCI hostdev in its XML **or** by membership in the live-attach VM list (`/var/lib/vfio-dynamic/live-attach-vms`). Live-attach strips the GPU hostdev from the persistent XML so the VM can boot without the GPU and hot-attach it later — so a hostdev-only check would miss an already-live-attach-configured VM and force you to revert live-attach before tuning. The live-attach fallback (shared with the stealth tuner and the virtio-win ISO installer) lets you tune a live-attach VM directly in its shut-off state without touching the live-attach setup. The perf, stealth, and status functions all use this shared detection.
 
@@ -403,6 +403,8 @@ vfio 7.1 adds a SEPARATE, more aggressive **ultimate-performance** VM tuning ins
 3. `sudo vfio --install-ultimate-perf-vm-tuning --ultimate-perf-virtio-disk` — now safe to convert
 
 Default OFF (a plain run never changes the disk bus). Idempotent (a re-run on an already-virtio disk is a no-op).
+
+**Emulated-NIC → virtio-net conversion (opt-in, R50)**: the emulated NIC models (`e1000`/`e1000e`/`rtl8139`/`pcnet`/…) are the old, slow, device-emulated ones. When you opt in (`--ultimate-perf-virtio-net` or the `ULTIMATE_PERF_VIRTIO_NET=1` conf key), the tuner converts each emulated NIC to `virtio-net` — the paravirtual fast path. Everything else on the `<interface>` is preserved (type/source/**MAC address**, incl. a spoofed stealth OUI — DHCP lease / Windows network profile stay stable). Idempotent (a re-run on an already-virtio NIC is a no-op). **DANGER: Windows needs the virtio-net (netkvm) driver installed FIRST** or the VM will have **NO network** — same sequence as the disk conversion: `--install-virtio-win-guest-agent` → boot → run `virtio-win-guest-tools.exe` inside Windows (installs netkvm + all virtio drivers) → shut down → re-run with this flag. **Stealth trade-off**: this deliberately replaces the stealth `e1000e` NIC model — a virtio NIC is itself a VM detection tell, so this is a perf-over-stealth choice you make explicitly. To make it stick across stealth re-runs, set `ULTIMATE_PERF_VIRTIO_NET=1` in `$CONF_FILE`: a stealth (re-)run then leaves virtio NICs alone (no e1000e downgrade, vhost driver kept) instead of reverting the perf choice; the MAC OUI spoof still applies either way.
 
 **Offered during dynamic binding setup**: `--install-dynamic-binding` (and the full wizard's dynamic path) now prompts for ultimate-performance VM tuning (default N) right after the stealth tuning opt-in — so a dynamic install can apply both the stealth layer AND the ultimate-perf layer in one pass. Honors `--ultimate-perf-vm-tuning` / `--no-ultimate-perf-vm-tuning` for non-interactive runs. (You can still apply it standalone later with `--install-ultimate-perf-vm-tuning`.)
 
@@ -420,6 +422,10 @@ sudo ./vfio.sh --install-ultimate-perf-vm-tuning --ultimate-perf-hugepages
 # or Windows BSODs INACCESSIBLE_BOOT_DEVICE on next boot):
 sudo ./vfio.sh --install-ultimate-perf-vm-tuning --ultimate-perf-virtio-disk
 
+# Same, but also convert emulated NICs (e1000/e1000e/rtl8139/pcnet) to virtio-net
+# (DANGER: install virtio-win-guest-tools.exe in Windows first or NO network):
+sudo ./vfio.sh --install-ultimate-perf-vm-tuning --ultimate-perf-virtio-net
+
 # Preview the changes without redefining (dry-run diff per VM):
 sudo ./vfio.sh --install-ultimate-perf-vm-tuning --dry-run
 
@@ -430,7 +436,7 @@ sudo ./vfio.sh --reset-ultimate-perf-vm-tuning
 sudo ./vfio.sh --verify
 ```
 
-Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` in **KiB** (default `2048` KiB = 2 MiB = the standard 2MB hugepage; `1048576` for 1GB pages — guarded, see above). SATA→virtio disk conversion is `ULTIMATE_PERF_VIRTIO_DISK` (default empty = opt-in prompt; `1` = convert, `0` = skip). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
+Backups go to `ULTIMATE_PERF_VM_BACKUP_DIR` (conf key, default `$HOME/Desktop`, falls back to `/var/lib/vfio-perf-vm/backups`), separate from `STEALTH_VM_BACKUP_DIR` so the two layers' backups never collide. Hugepages size is `ULTIMATE_PERF_HUGEPAGES_SIZE` in **KiB** (default `2048` KiB = 2 MiB = the standard 2MB hugepage; `1048576` for 1GB pages — guarded, see above). SATA→virtio disk conversion is `ULTIMATE_PERF_VIRTIO_DISK` (default empty = opt-in prompt; `1` = convert, `0` = skip). Emulated-NIC→virtio-net conversion is `ULTIMATE_PERF_VIRTIO_NET` (same semantics; `1` also makes stealth re-runs keep virtio NICs — see R50 above). `--reset` does NOT revert perf VM XMLs — use `--reset-ultimate-perf-vm-tuning` for that. Performance tuning ONLY.
 
 ### Why this matters for newer AMD cards
 

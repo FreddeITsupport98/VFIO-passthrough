@@ -3,6 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
+# Revision: R49 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -18,6 +19,10 @@ set -euo pipefail
 # - Sanity checks before writing config / enabling services.
 
 SCRIPT_NAME="$(basename "$0")"
+# R49: single source of truth for the script revision. Bump this (plus the
+# header comment above and changelog.md) on every change so `--help` shows
+# the exact revision the operator is running.
+SCRIPT_REVISION="R49"
 
 # --- Configuration ---
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
@@ -1722,6 +1727,7 @@ prompt_yn() {
 }
 
 usage() {
+  say "Revision: $SCRIPT_REVISION"
   cat <<EOF
 Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
@@ -29387,8 +29393,12 @@ vfio_menu() {
         note "Verifying setup..."
         # Run in a subshell so verify_setup's die() (exit 1, e.g. on a missing
         # $CONF_FILE) only ends the subshell and does NOT kill the whole menu.
-        ( verify_setup )
-        local _verify_rc=$?
+        # R49: the || guard is REQUIRED for that to actually hold — under
+        # `set -euo pipefail` a bare failing subshell ABORTS the whole script
+        # (verified empirically), so the old un-guarded `( verify_setup )` still
+        # killed the menu on a die. The guard makes the comment above true.
+        local _verify_rc=0
+        ( verify_setup ) || _verify_rc=$?
         if (( _verify_rc == 0 )); then
           _verdict_popup "Verify setup" "PASS" "Guest devices are on vfio-pci and host audio is not. See the full report above."
         else
@@ -29402,6 +29412,11 @@ vfio_menu() {
         detect_existing_vfio_report
         say
         hdr "Health check"
+        # R49: audit_vfio_health returns non-zero for WARN/FAIL (informational
+        # by design), and under `set -euo pipefail` that would abort the whole
+        # menu right after the report. The `|| true` guard keeps the menu alive
+        # so the verdict popup below renders and the menu loops back. (The
+        # subshell still isolates the conf source, as before.)
         (
           if readable_file "$CONF_FILE"; then
             # shellcheck disable=SC1090
@@ -29410,7 +29425,7 @@ vfio_menu() {
           else
             audit_vfio_health ""
           fi
-        )
+        ) || true
         # R39c: verdict popup so the GUI operator sees a clear result instead
         # of it scrolling away under the next menu render. vfio_config_health
         # is the same read-only health grader the report itself uses.
@@ -29426,15 +29441,29 @@ vfio_menu() {
         esac
         ;;
       7)
-        # Reset everything.
+        # R49: Reset everything — runs the EXACT code path of the CLI command
+        # `sudo vfio --reset --full` (main()'s reset branch with RESET_FULL=1 ->
+        # reset_vfio_all full), so the TUI menu and the command always reset
+        # identically:
+        # - the OLD handler gated the SAME confirm phrase TWICE (its own
+        #   confirm_phrase + the identical one inside reset_vfio_all) — the
+        #   redundant copy is gone, so like the CLI the destructive RESET VFIO
+        #   phrase is confirmed exactly ONCE (reset_vfio_all's own gate); the
+        #   default-NO yes/no stays as the menu selection guard and now names
+        #   the vfio CLI + completions in scope.
+        # - the reset runs in a SUBSHELL with the || guard so a declined phrase
+        #   or a failed reset (die -> exit 1) only ends the subshell and the
+        #   menu loops back instead of the whole TUI quitting (R49 set -e fix).
         say
-        note "Resetting everything..."
+        note "Running the full reset (same as: sudo vfio --reset --full)..."
         require_systemd
-        if prompt_yn "This will remove ALL VFIO config installed by this script. Continue?" N "Reset"; then
-          if confirm_phrase "To continue, confirm reset." "RESET VFIO"; then
-            reset_vfio_all full
+        if prompt_yn "This will remove ALL VFIO config installed by this script (also the self-installed vfio CLI + completions). Continue?" N "Reset"; then
+          local _reset_rc=0
+          ( reset_vfio_all full ) || _reset_rc=$?
+          if (( _reset_rc == 0 )); then
+            _verdict_popup "Reset everything" "OK" "Full reset complete (equivalent of: sudo vfio --reset --full). Reboot recommended. Repo copy of vfio.sh untouched."
           else
-            note "Reset cancelled (confirmation phrase not provided)."
+            _verdict_popup "Reset everything" "WARN" "Reset cancelled or failed (rc=$_reset_rc). The menu is still alive — see the report above."
           fi
         else
           note "Reset cancelled."

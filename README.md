@@ -802,7 +802,7 @@ Menu options (0-indexed, as shown in the TUI):
 4. **Switch to early binding** — boot-time, classic.
 5. **Verify setup** — read-only check.
 6. **Detect / health check** — read-only report.
-7. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required).
+7. **Reset everything** — full cleanup (removes all VFIO config; confirmation phrase required). Runs the **exact code path of `sudo vfio --reset --full`** (R49): the `RESET VFIO` phrase is confirmed exactly once (like the command — the old double phrase prompt is gone), the reset runs in a guarded subshell so cancelling or failing returns to the menu instead of quitting the TUI, and an OK/WARN verdict popup shows the result. Also removes the self-installed `vfio` CLI + completions (repo copy untouched).
 8. **Install vfio** to /usr/local/bin (+ shell completions).
 9. **Uninstall the self-installed vfio** (+ completions).
 10. **Show VFIO status** — re-opens the per-VM tuning checklist + ReBAR status panel on demand (R48e).
@@ -835,7 +835,7 @@ The panel auto-shows once on menu entry and re-shows only when VM state changes 
 sudo ./vfio.sh --menu
 ```
 
-Each option dispatches to the **same installer function** the corresponding `--install-*` flag uses, with the same root / systemd / writable-root / libvirt / `$CONF_FILE` guards — so a menu action is equivalent to running that flag. The status header (config present + binding mode) refreshes on every loop, so it reflects changes after a reset or a binding-mode switch. The VFIO status panel (above) also refreshes after each action. ESC / Cancel exits the menu (same as the Exit option).
+Each option dispatches to the **same installer function** the corresponding `--install-*` flag uses, with the same root / systemd / writable-root / libvirt / `$CONF_FILE` guards — so a menu action is equivalent to running that flag. The status header (config present + binding mode) refreshes on every loop, so it reflects changes after a reset or a binding-mode switch. The VFIO status panel (above) also refreshes after each action. ESC / Cancel exits the menu (same as the Exit option). A declined or failed action no longer quits the TUI either (R49): the reset, verify and health-check actions run in guarded subshells, so cancelling the `RESET VFIO` phrase, a failed verify, or a WARN/BAD health status (informational) returns to the menu with a verdict popup instead of aborting the whole session.
 
 ### Self-install
 

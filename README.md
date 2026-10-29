@@ -719,6 +719,7 @@ The script uses the following paths on the host:
 
 - **Backups and rollback**
   - `*.bak.<timestamp>` – backups of files the script edits (e.g. `/etc/default/grub.bak.20250101-120000`).
+  - **Dry runs never touch backups** (R52): `--dry-run` no longer deletes existing rotation `.bak.*` files, and `--reset --dry-run` previews the `.bak` sweep instead of performing it.
   - `/root/vfio-rollback-<timestamp>.sh` – rollback script that tries to restore backups, regenerate GRUB and rebuild initramfs.
 
 All writes are done via an **atomic helper** (`write_file_atomic`) to avoid leaving partial or truncated files during failures.

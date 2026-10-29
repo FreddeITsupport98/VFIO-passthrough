@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R51 — bumped on every change; the full history is in changelog.md.
+# Revision: R52 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -24,7 +24,8 @@ SCRIPT_NAME="$(basename "$0")"
 # the exact revision the operator is running.
 # R50: ultimate-perf opt-in emulated-NIC -> virtio-net conversion.
 # R51: menu state-leak + abort-survival fixes (see changelog).
-SCRIPT_REVISION="R51"
+# R52: set -e tail-short-circuit aborts + dry-run .bak deletion fixes.
+SCRIPT_REVISION="R52"
 
 # --- Configuration ---
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
@@ -4500,13 +4501,18 @@ backup_file() {
   # ${f}.bak.* from earlier runs before writing the new one, so repeated
   # --install-self / --reset / re-runs no longer accumulate dozens of
   # timestamped .bak files (observed: 435 vfio*.bak.* in /usr/local/bin,
-  # which fish then offered as command completions). One backup per file =
-  # a single known location the rollback path remembers.
+  # which fish then offered as command completions). One backup per file = a
+  # single known location the rollback path remembers.
+  # R52: DRY_RUN-gate the rotation rm — it used to run BEFORE the DRY_RUN
+  # return below, so a --dry-run run DELETED the existing rotation backups
+  # (a dry run must never modify the system).
   local _old
-  for _old in "${f}".bak.*; do
-    [[ -f "$_old" ]] || continue
-    rm -f "$_old"
-  done
+  if (( ! DRY_RUN )); then
+    for _old in "${f}".bak.*; do
+      [[ -f "$_old" ]] || continue
+      rm -f "$_old"
+    done
+  fi
 
   BACKUP_MAP[$f]="$bak"
   BACKUP_ENTRIES+=("$f::$bak")
@@ -13731,8 +13737,19 @@ DETACHEOF
     run rm -f "$VIRTIO_WIN_REPO_FILE" 2>/dev/null || true
     _removed=1
   fi
-  (( _removed )) && note "Removed virtio-win guest-agent ISO CD-ROM(s) + the downloaded fallback ISO (+ the fedorapeople repo file, when ours)."
-  (( ! _found )) && note "No VM with the script-attached virtio-win ISO found; nothing to detach."
+  # R52: explicit if + return 0 — the old `(( _removed )) && note` /
+  # `(( ! _found )) && note` tails made this best-effort helper RETURN 1
+  # whenever a VM WAS found with the ISO attached (_found=1 -> the last
+  # short-circuit returns 1), and its BARE call inside remove_live_attach
+  # then aborted the whole cleanup (reset / --install-early-binding / the
+  # dynamic opt-out) under `set -euo pipefail`.
+  if (( _removed )); then
+    note "Removed virtio-win guest-agent ISO CD-ROM(s) + the downloaded fallback ISO (+ the fedorapeople repo file, when ours)."
+  fi
+  if (( ! _found )); then
+    note "No VM with the script-attached virtio-win ISO found; nothing to detach."
+  fi
+  return 0
 }
 
 # Remove the live-attach workflow (called by --install-dynamic-binding to restore
@@ -16935,7 +16952,14 @@ XMLEOF
     fi
     rm -f "$tmp_xml"
   done
-  (( removed )) && say "  ✔ Removed $removed looking-glass shmem device(s) from '$dom'."
+  if (( removed )); then
+    say "  ✔ Removed $removed looking-glass shmem device(s) from '$dom'."
+  fi
+  # R52: explicit return 0 — the old `(( removed )) && say` tail returned 1
+  # whenever a VM had NO looking-glass shmem (common), and the BARE call in
+  # remove_looking_glass's per-VM loop aborted the whole LG removal / reset
+  # under `set -euo pipefail`.
+  return 0
 }
 
 # 0 if the VM persistent XML already has the ReBAR 64-bit MMIO fw_cfg arg.
@@ -21960,7 +21984,14 @@ remove_wayland_render_device_pin() {
     run rm -f "$WLR_RENDER_PIN_FILE"
     _removed=1
   fi
-  (( _removed )) && note "Removed Wayland render-device pins ($KWIN_RENDER_PIN_FILE, $WLR_RENDER_PIN_FILE)."
+  if (( _removed )); then
+    note "Removed Wayland render-device pins ($KWIN_RENDER_PIN_FILE, $WLR_RENDER_PIN_FILE)."
+  fi
+  # R52: explicit return 0 — the old `(( _removed )) && note` tail returned 1
+  # whenever NO pins existed (the common case on pin-less / non-Boot-VGA
+  # setups), and the BARE call in install_early_binding_from_existing_config
+  # aborted the whole early-binding switch under `set -euo pipefail`.
+  return 0
 }
 
 # Returns 0 if libvirt is reachable for dynamic binding, 1 otherwise.
@@ -26746,16 +26777,31 @@ _wipe_vm_stage_backups() {
 # this sweep cleans the pre-rotation litter (e.g. 435 vfio*.bak.* in
 # /usr/local/bin from repeated --install-self runs) in one pass. Best-effort.
 _wipe_script_backups() {
+  # R52: TWO fixes — this helper is invoked BARE by reset_vfio_all and
+  # uninstall_self under `set -euo pipefail`:
+  # (1) the old tail `(( _n )) && note ...` made the function RETURN 1
+  #     whenever NO .bak files existed (the common case), which ABORTED the
+  #     whole caller MID-RESET / MID-UNINSTALL (verified empirically: a
+  #     function whose last statement is a short-circuited && list returns
+  #     its rc). Explicit if + return 0 now.
+  # (2) the rm used to be a plain `rm -f`, so a --dry-run reset ACTUALLY
+  #     DELETED the real .bak files — now `run rm` (no-ops under DRY_RUN)
+  #     and the count only tallies real removals.
   local _r _old _n=0
   for _r in "$@"; do
     [[ -n "$_r" ]] || continue
     for _old in "${_r}".bak.*; do
       [[ -f "$_old" ]] || continue
-      rm -f "$_old" 2>/dev/null || true
-      _n=$((_n + 1))
+      if (( ! DRY_RUN )); then
+        run rm -f "$_old" 2>/dev/null || true
+        _n=$((_n + 1))
+      fi
     done
   done
-  (( _n )) && note "Removed $_n timestamped .bak backup file(s) (one-backup-per-file rotation keeps only the latest)."
+  if (( _n > 0 )); then
+    note "Removed $_n timestamped .bak backup file(s) (one-backup-per-file rotation keeps only the latest)."
+  fi
+  return 0
 }
 
 # R45: enumerate which of the passed managed-file paths currently exist on disk,

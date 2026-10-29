@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R52 — bumped on every change; the full history is in changelog.md.
+# Revision: R53 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -25,7 +25,8 @@ SCRIPT_NAME="$(basename "$0")"
 # R50: ultimate-perf opt-in emulated-NIC -> virtio-net conversion.
 # R51: menu state-leak + abort-survival fixes (see changelog).
 # R52: set -e tail-short-circuit aborts + dry-run .bak deletion fixes.
-SCRIPT_REVISION="R52"
+# R53: verify hook fix-hints + reset sweeps its own run's .bak files.
+SCRIPT_REVISION="R53"
 
 # --- Configuration ---
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
@@ -2810,6 +2811,34 @@ print_kv() {
 readable_file() {
   [[ -f "$1" && -r "$1" ]]
 }
+
+# R53b: existence check with a best-effort root fallback. /etc/libvirt/hooks is
+# root-only (0700) on many distros, so a NON-ROOT --verify / --detect run cannot
+# stat the hook files and FALSE-FAILED the "Libvirt qemu hook entry missing"
+# check (and misreported it in --detect) even when the entry was installed —
+# the whole verify verdict failed on an unverifiable check.
+# Return codes: 0 = exists, 1 = does not exist, 2 = UNKNOWN (cannot check:
+# not root, path not stat-able, no passwordless sudo). Callers treat 2 as INFO
+# (not FAIL) and tell the operator to re-run with sudo.
+path_exists_maybe_root() {
+  local p="$1"
+  if [[ -e "$p" ]]; then
+    return 0
+  fi
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    return 1
+  fi
+  # Non-root and the plain test failed: the file is either really absent, or
+  # it sits inside a root-only dir we cannot stat into. Distinguish via a
+  # best-effort passwordless sudo probe (-n never prompts).
+  if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    if sudo -n test -e "$p"; then
+      return 0
+    fi
+    return 1
+  fi
+  return 2
+}
 resolve_desktop_user_home() {
   # Resolve the primary desktop user and home directory.
   # 1) Prefer SUDO_USER when valid and mapped to an existing home.
@@ -4327,8 +4356,14 @@ detect_existing_vfio_report() {
   else
     print_kv "Libvirt hook script" "missing"
   fi
-  if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+  # R53b: root-fallback existence check (the root-only /etc/libvirt/hooks
+  # dir made a non-root --detect misreport an installed entry as "missing").
+  local _det_hook_st=0
+  path_exists_maybe_root "$LIBVIRT_HOOK_ENTRY" || _det_hook_st=$?
+  if (( _det_hook_st == 0 )); then
     print_kv "Libvirt qemu entry" "present ($LIBVIRT_HOOK_ENTRY)"
+  elif (( _det_hook_st == 2 )); then
+    print_kv "Libvirt qemu entry" "unknown (root-only dir; re-run with sudo)"
   else
     print_kv "Libvirt qemu entry" "missing"
   fi
@@ -25813,12 +25848,27 @@ verify_setup() {
         say "FAIL: Libvirt hook script missing: $LIBVIRT_HOOK_SCRIPT"
       fi
       ok=0
+      # R53: actionable fix hint (same style as the ip_forward precheck) — a
+      # missing hook script/entry is the #1 broken-dynamic-binding state and
+      # the FAIL alone gave the operator no repair path.
+      note "Fix: re-run 'sudo $SCRIPT_NAME --install-dynamic-binding' (reinstalls the hook script + qemu entry)."
     fi
-    if [[ -f "$LIBVIRT_HOOK_ENTRY" ]]; then
+    # R53b: root-fallback existence check — /etc/libvirt/hooks is root-only
+    # (0700), so a non-root run cannot stat the entry and used to FALSE-FAIL
+    # the whole verify. UNKNOWN (rc 2) is INFO, not FAIL.
+    local _hook_entry_st=0
+    path_exists_maybe_root "$LIBVIRT_HOOK_ENTRY" || _hook_entry_st=$?
+    if (( _hook_entry_st == 0 )); then
       if (( ENABLE_COLOR )); then
         say "${C_GREEN}✔ OK${C_RESET}: Libvirt qemu hook entry present: $LIBVIRT_HOOK_ENTRY"
       else
         say "OK: Libvirt qemu hook entry present: $LIBVIRT_HOOK_ENTRY"
+      fi
+    elif (( _hook_entry_st == 2 )); then
+      if (( ENABLE_COLOR )); then
+        say "${C_BLUE}INFO${C_RESET}: Libvirt qemu hook entry cannot be checked as non-root (root-only /etc/libvirt/hooks, no passwordless sudo). Re-run with sudo."
+      else
+        say "INFO: Libvirt qemu hook entry cannot be checked as non-root (root-only /etc/libvirt/hooks, no passwordless sudo). Re-run with sudo."
       fi
     else
       if (( ENABLE_COLOR )); then
@@ -25827,6 +25877,9 @@ verify_setup() {
         say "FAIL: Libvirt qemu hook entry missing: $LIBVIRT_HOOK_ENTRY"
       fi
       ok=0
+      # R53: actionable fix hint — without the entry libvirt never calls the
+      # hook, so a VM start will NOT switch the GPU to vfio-pci.
+      note "Fix: re-run 'sudo $SCRIPT_NAME --install-dynamic-binding' (reinstalls the hook script + qemu entry)."
     fi
   fi
 
@@ -27359,6 +27412,29 @@ reset_vfio_all() {
         "${FISH_COMPLETION_DIR}/${_installed_cmd}.fish" \
         "${BASH_COMPLETION_DIR}/${_installed_cmd}" \
         "${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+    fi
+  fi
+
+  # R53: sweep the timestamped .bak.* backups THIS reset created (registered
+  # in BACKUP_ENTRIES by backup_file). They are redundant after a successful
+  # reset — a fresh backup is written by the next install — and the earlier
+  # _wipe_script_backups call could not have seen them (it runs BEFORE the
+  # grub/BLS edits make their backups), so without this sweep a "clean slate"
+  # reset left exactly one fresh .bak behind (e.g. /etc/default/grub.bak.<ts>).
+  # Same rationale as the /root/vfio-rollback-*.sh sweep above: a pre-reset
+  # backup would UNDO the reset if restored. In the menu context the list also
+  # carries backups from earlier same-session actions — equally stale after a
+  # reset. DRY_RUN-safe (backup_file wrote no .bak files in a dry run).
+  if (( ! DRY_RUN )) && (( ${#BACKUP_ENTRIES[@]} > 0 )); then
+    local _be _bbk _bsweep_n=0
+    for _be in "${BACKUP_ENTRIES[@]}"; do
+      _bbk="${_be##*::}"
+      [[ -n "$_bbk" && -f "$_bbk" ]] || continue
+      run rm -f "$_bbk" 2>/dev/null || true
+      _bsweep_n=$((_bsweep_n + 1))
+    done
+    if (( _bsweep_n > 0 )); then
+      note "Removed $_bsweep_n .bak.* backup file(s) created by this reset (redundant post-reset; fresh ones are written on the next install)."
     fi
   fi
 

@@ -790,8 +790,10 @@ Use `sudo` so that the script can write to `/etc`, `/usr/local`, systemd directo
 The script supports several modes controlled by flags. By default, with **no flag** it launches the **interactive menu** (`--menu`) — pick an action (full configure, switch binding, live-attach, verify, reset, install/uninstall `vfio`, …). The full guided wizard is menu option 0 (Full configure); or run any `--install-*` flag below to do one thing directly.
 
 ```text
-./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+./vfio.sh [--debug] [--dry-run] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--amd-disable-idle-d3] [--no-amd-disable-idle-d3] [--amd-pcie-port-pm-off] [--no-amd-pcie-port-pm-off] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--reset-usb-mitigation] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--menu] [--install-self] [--uninstall-self] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 ```
+
+`--doctor` (R54) is a **one-shot read-only health report**: revision + the structural self-test + the full `--verify` report + live-attach status + USB mitigation status + the kernel/log VFIO health audit, with a final **OK / ATTENTION** verdict. No root required (root-only paths degrade to INFO). Exit code 1 means a key check needs attention — the same one-command sanity pass the maintenance rounds use. Also reachable as menu option 11 (R55) and machine-readable via `--doctor --json` (revision + per-check PASS/FAIL + result; validated JSON).
 
 ### Interactive installer menu
 
@@ -814,7 +816,8 @@ Menu options (0-indexed, as shown in the TUI):
 8. **Install vfio** to /usr/local/bin (+ shell completions).
 9. **Uninstall the self-installed vfio** (+ completions).
 10. **Show VFIO status** — re-opens the per-VM tuning checklist + ReBAR status panel on demand (R48e).
-11. **Exit menu**.
+11. **Doctor** — one-shot read-only health report: self-test + verify + live-attach/USB status + kernel/log audit, with an OK/ATTENTION verdict popup (R55; same as `vfio --doctor`).
+12. **Exit menu**.
 
 The Modify VM hub header shows a **GPU hook checkmark**: `GPU hook: ✔ enabled (libvirt qemu hook installed)` / `✖ not installed (early binding, or hook missing)` so you see at a glance whether the dynamic-binding hook is in place (R48k).
 

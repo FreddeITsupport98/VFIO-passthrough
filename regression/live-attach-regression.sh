@@ -1084,6 +1084,21 @@ assert_contains_text \
   "R48e checklist line 2 has disks-virtio" \
   'disks-virtio $_dk_sym' \
   "$_checklist_fn"
+# R56: net-virtio — an 11th line-2 item: ✔ only when EVERY <interface> uses
+# model type='virtio' (no emulated e1000/e1000e/rtl8139/pcnet left); flipped
+# by the ultimate-perf virtio-net conversion (R50).
+assert_contains_text \
+  "R56 checklist line 2 has net-virtio" \
+  'net-virtio $_nv_sym' \
+  "$_checklist_fn"
+assert_contains_text \
+  "R56 net-virtio counts virtio interface models" \
+  "grep -c \"<model type='virtio'\"" \
+  "$_checklist_fn"
+assert_contains_text \
+  "R56 net-virtio requires every interface to be virtio" \
+  '_n_iface > 0 && _n_iface == _n_vnet' \
+  "$_checklist_fn"
 
 # --- R48k: the flat 23-option menu was compacted into a ~12-option top-level
 # menu with a prominent "Modify VM" entry that opens a sub-menu hub

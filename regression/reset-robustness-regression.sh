@@ -220,6 +220,11 @@ assert_contains_text "P3 reset verifies before complete" '_reset_verify_paths "M
 # R46: reset must sweep the previously-left-behind artifacts too.
 assert_contains_text "P3 reset _rm_paths includes USB_BT_STATE_FILE" '$USB_BT_STATE_FILE' "$_reset_fn"
 assert_contains_text "P3 reset _rm_paths includes GRAPHICS_DAEMON_WANTS_LINK" '$GRAPHICS_DAEMON_WANTS_LINK' "$_reset_fn"
+# R56: reset must sweep the daily doctor timer (monitor + service + timer).
+assert_contains_text "P3 reset _rm_paths includes DOCTOR_MONITOR_SCRIPT" '$DOCTOR_MONITOR_SCRIPT' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes DOCTOR_SERVICE" '$DOCTOR_SERVICE' "$_reset_fn"
+assert_contains_text "P3 reset _rm_paths includes DOCTOR_TIMER" '$DOCTOR_TIMER' "$_reset_fn"
+assert_contains_text "P3 reset disables the vfio-doctor.timer" 'disable --now vfio-doctor.timer' "$_reset_fn"
 assert_contains_text "P3 reset _rm_paths includes SDDM_PLASMA_WAYLAND_CONF" '$SDDM_PLASMA_WAYLAND_CONF' "$_reset_fn"
 assert_contains_text "P3 reset rmdir's the now-empty VFIO_DYNAMIC_DIR" 'rmdir "$VFIO_DYNAMIC_DIR"' "$_reset_fn"
 _vwga_fn="$(sed -n '/^remove_virtio_win_guest_agent()/,/^}/p' "$VFIO_SCRIPT")"

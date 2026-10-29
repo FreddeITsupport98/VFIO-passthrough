@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R50 — bumped on every change; the full history is in changelog.md.
+# Revision: R51 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -23,7 +23,8 @@ SCRIPT_NAME="$(basename "$0")"
 # header comment above and changelog.md) on every change so `--help` shows
 # the exact revision the operator is running.
 # R50: ultimate-perf opt-in emulated-NIC -> virtio-net conversion.
-SCRIPT_REVISION="R50"
+# R51: menu state-leak + abort-survival fixes (see changelog).
+SCRIPT_REVISION="R51"
 
 # --- Configuration ---
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"
@@ -925,7 +926,7 @@ complete -c $cmd -l remove-looking-glass -d 'Remove Looking Glass host-side setu
 complete -c $cmd -l install-looking-glass-client -d 'Install/compile the looking-glass-client binary (dnf COPR / AUR / source compile)'
 complete -c $cmd -l remove-looking-glass-client -d 'Remove the self-compiled looking-glass-client binary (stops running instances first)'
 complete -c $cmd -l menu -d 'Interactive menu — pick what to do without running the whole wizard'
-complete -c $cmd -l install-self -d 'Install this script to /usr/local/sbin + shell completions (auto-load)'
+complete -c $cmd -l install-self -d 'Install this script to /usr/local/bin/vfio + shell completions (auto-load)'
 complete -c $cmd -l uninstall-self -d 'Remove the self-installed vfio.sh + completion files'
 complete -c $cmd -l install-stealth-vm-tuning -d 'Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs'
 complete -c $cmd -l reset-stealth-vm-tuning -d 'Revert stealth/perf VM tuning from backup XML'
@@ -1052,7 +1053,7 @@ _vfio_sh_complete() {
     '--install-looking-glass-client[Install/compile the looking-glass-client binary (dnf COPR / AUR / source compile)]' \\
     '--remove-looking-glass-client[Remove the self-compiled looking-glass-client binary (stops running instances first)]' \\
     '--menu[Interactive menu — pick what to do without running the whole wizard]' \\
-    '--install-self[Install this script to /usr/local/sbin + shell completions (auto-load)]' \\
+    '--install-self[Install this script to /usr/local/bin/vfio + shell completions (auto-load)]' \\
     '--uninstall-self[Remove the self-installed vfio.sh + completion files]' \\
     '--install-stealth-vm-tuning[Re-apply/refresh stealth/perf VM XML tuning on guest-GPU VMs]' \\
     '--reset-stealth-vm-tuning[Revert stealth/perf VM tuning from backup XML]' \\
@@ -15531,9 +15532,12 @@ install_stealth_vm_tuning() {
   local _perf_vnet
   _perf_vnet="$(awk -F= '/^ULTIMATE_PERF_VIRTIO_NET=/{v=$2; gsub(/"/,"",v); print v; exit}' "$CONF_FILE" 2>/dev/null || true)"
   _perf_vnet="$(trim "${_perf_vnet:-}")"
-  if [[ "$_perf_vnet" == "1" ]]; then
+  # R51: also honor an explicitly exported VFIO_STEALTH_SKIP_E1000E=1 (env
+  # override / testing escape hatch, same pattern as VFIO_LA_LEGACY_DIR etc.) —
+  # not just the conf key.
+  if [[ "$_perf_vnet" == "1" || "${VFIO_STEALTH_SKIP_E1000E:-}" == "1" ]]; then
     export VFIO_STEALTH_SKIP_E1000E=1
-    note "virtio-net preserved: ULTIMATE_PERF_VIRTIO_NET=1 in the conf — keeping virtio NICs (not downgrading to e1000e, not stripping vhost)."
+    note "virtio-net preserved: ULTIMATE_PERF_VIRTIO_NET=1 in the conf (or VFIO_STEALTH_SKIP_E1000E=1 in the env) — keeping virtio NICs (not downgrading to e1000e, not stripping vhost)."
   else
     unset VFIO_STEALTH_SKIP_E1000E || true
   fi
@@ -27313,13 +27317,27 @@ reset_vfio_all() {
   fi
 
   say
-  say "Reset complete. Reboot recommended."
-  note "If any devices are currently bound to vfio-pci, a reboot is the cleanest way to restore host drivers."
-  if [[ "$_full" == "full" ]]; then
-    note "Full reset removed the VFIO config + stealth/perf backups + the 'vfio' CLI + completions. Your repo copy of vfio.sh is untouched — re-run ./vfio.sh or --install-self to use vfio again."
+  # R51: honest dry-run completion — "Reset complete" + "removed ..." hints in
+  # a dry run (where NOTHING was removed) read as if the reset had been applied.
+  if (( DRY_RUN )); then
+    say "Dry run complete — NOTHING was removed. Re-run without --dry-run to apply the reset."
   else
-    note "This removed VFIO config only. For a full reset (also the self-installed vfio CLI + completions + all stealth/perf backups), run: sudo $SCRIPT_NAME --reset --full"
-    note "To remove ONLY the self-installed vfio CLI + completions (keep VFIO config), run: sudo $SCRIPT_NAME --uninstall-self"
+    say "Reset complete. Reboot recommended."
+    note "If any devices are currently bound to vfio-pci, a reboot is the cleanest way to restore host drivers."
+  fi
+  if [[ "$_full" == "full" ]]; then
+    if (( DRY_RUN )); then
+      note "DRY-RUN full-reset preview: would also remove the self-installed 'vfio' CLI + completions (repo copy untouched)."
+    else
+      note "Full reset removed the VFIO config + stealth/perf backups + the 'vfio' CLI + completions. Your repo copy of vfio.sh is untouched — re-run ./vfio.sh or --install-self to use vfio again."
+    fi
+  else
+    if (( DRY_RUN )); then
+      note "DRY-RUN scoped-reset preview: would remove the VFIO config only (use --reset --full to also remove the CLI + completions)."
+    else
+      note "This removed VFIO config only. For a full reset (also the self-installed vfio CLI + completions + all stealth/perf backups), run: sudo $SCRIPT_NAME --reset --full"
+      note "To remove ONLY the self-installed vfio CLI + completions (keep VFIO config), run: sudo $SCRIPT_NAME --uninstall-self"
+    fi
   fi
 
   # Snapshot-aware hint for openSUSE/Btrfs users: each snapshot has its own
@@ -29468,42 +29486,95 @@ vfio_menu() {
     case "$_choice" in
       0)
         # Full configure — the existing wizard (mirrors the main() fallthrough).
+        # R51: guarded SUBSHELL (the R49 pattern): a wizard abort (Esc at a picker
+        # -> die "Selection cancelled.", a preflight die, or the preflight /
+        # conf-pickup `exit 0` paths) only ends the subshell and the menu loops
+        # back instead of the whole TUI quitting. The wizard's state (CTX etc.)
+        # is per-run anyway; the menu refreshes everything from disk each loop.
         say
         note "Starting full guided configure..."
-        require_systemd
-        detect_system
-        user_selection
-        apply_configuration
+        local _wiz_rc=0
+        (
+          require_systemd
+          detect_system
+          user_selection
+          apply_configuration
+        ) || _wiz_rc=$?
+        if (( _wiz_rc == 0 )); then
+          _verdict_popup "Full configure" "COMPLETE" "Wizard finished. See the recap + next steps above."
+        else
+          _verdict_popup "Full configure" "WARN" "Wizard cancelled or failed (rc=$_wiz_rc). Returning to the menu."
+        fi
         ;;
       1)
         # Full configure with --recommended defaults (R39).
+        # R51: the SUBSHELL also fixes a REAL STATE LEAK — RECOMMENDED_MODE=1 used
+        # to persist at menu scope after this option ran, so every LATER menu
+        # action's prompts (USB mitigation, Stealth/perf VM tuning, vBIOS,
+        # live-attach, ...) were silently auto-answered from the recommended
+        # table for the rest of the session. It is now contained in the subshell
+        # (plus the same abort-survival as option 0).
         say
         note "Starting full configure with recommended defaults..."
-        RECOMMENDED_MODE=1
-        require_systemd
-        detect_system
-        user_selection
-        apply_configuration
+        local _rec_rc=0
+        (
+          RECOMMENDED_MODE=1
+          require_systemd
+          detect_system
+          user_selection
+          apply_configuration
+        ) || _rec_rc=$?
+        if (( _rec_rc == 0 )); then
+          _verdict_popup "Full configure (recommended)" "COMPLETE" "Wizard finished with recommended defaults. See the recap above."
+        else
+          _verdict_popup "Full configure (recommended)" "WARN" "Wizard cancelled or failed (rc=$_rec_rc). Returning to the menu."
+        fi
         ;;
       2)
         # R48k: Modify VM — one sub-menu with Apply to VM + Revert changes on VM.
+        # R51: guarded subshell — Esc/Cancel at any of the sub-menu pickers
+        # (select_from_list's die "Selection cancelled.") now returns to THIS
+        # main menu instead of exiting the whole TUI. Only the TOP-level menu's
+        # Esc is the documented exit.
         say
         note "Opening the Modify VM sub-menu..."
-        _menu_modify_vm
+        local _mod_rc=0
+        ( _menu_modify_vm ) || _mod_rc=$?
+        if (( _mod_rc != 0 )); then
+          note "Modify VM sub-menu exited (rc=$_mod_rc) — returning to the main menu."
+        fi
         ;;
       3)
         # Switch to dynamic binding.
+        # R51: guarded subshell — a declined prompt / die inside the switcher
+        # returns to the menu instead of quitting the TUI.
         say
         note "Switching to dynamic binding..."
-        require_systemd
-        install_dynamic_binding_from_existing_config
+        local _dyn_rc=0
+        (
+          require_systemd
+          install_dynamic_binding_from_existing_config
+        ) || _dyn_rc=$?
+        if (( _dyn_rc == 0 )); then
+          _verdict_popup "Switch to dynamic binding" "OK" "Switch complete. The status header above now shows the live binding mode."
+        else
+          _verdict_popup "Switch to dynamic binding" "WARN" "Switch cancelled or failed (rc=$_dyn_rc). Returning to the menu."
+        fi
         ;;
       4)
         # Switch to early binding.
         say
         note "Switching to early binding..."
-        require_systemd
-        install_early_binding_from_existing_config
+        local _early_rc=0
+        (
+          require_systemd
+          install_early_binding_from_existing_config
+        ) || _early_rc=$?
+        if (( _early_rc == 0 )); then
+          _verdict_popup "Switch to early binding" "OK" "Switch complete. The status header above now shows the live binding mode."
+        else
+          _verdict_popup "Switch to early binding" "WARN" "Switch cancelled or failed (rc=$_early_rc). Returning to the menu."
+        fi
         ;;
       5)
         # Verify setup (read-only).
@@ -29579,7 +29650,11 @@ vfio_menu() {
           local _reset_rc=0
           ( reset_vfio_all full ) || _reset_rc=$?
           if (( _reset_rc == 0 )); then
-            _verdict_popup "Reset everything" "OK" "Full reset complete (equivalent of: sudo vfio --reset --full). Reboot recommended. Repo copy of vfio.sh untouched."
+            if (( DRY_RUN )); then
+              _verdict_popup "Reset everything" "OK" "Dry-run of the full reset complete — NOTHING was removed. Re-run without --dry-run to apply."
+            else
+              _verdict_popup "Reset everything" "OK" "Full reset complete (equivalent of: sudo vfio --reset --full). Reboot recommended. Repo copy of vfio.sh untouched."
+            fi
           else
             _verdict_popup "Reset everything" "WARN" "Reset cancelled or failed (rc=$_reset_rc). The menu is still alive — see the report above."
           fi
@@ -29590,7 +29665,7 @@ vfio_menu() {
       8)
         # Install vfio.sh to a stable PATH location + shell completions.
         say
-        note "Installing vfio.sh to /usr/local/sbin + shell completions..."
+        note "Installing vfio.sh to /usr/local/bin/vfio + shell completions..."
         install_self
         ;;
       9)

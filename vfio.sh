@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R56 — bumped on every change; the full history is in changelog.md.
+# Revision: R57 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -29,7 +29,37 @@ SCRIPT_NAME="$(basename "$0")"
 # R54: hook-install self-check + --doctor one-shot health mode + honest ReBAR note.
 # R55: Doctor menu option + --doctor --json machine-readable output.
 # R56: net-virtio checklist marker + daily doctor timer (--install-doctor-timer).
-SCRIPT_REVISION="R56"
+# R57: PATH hardening — append /usr/local/sbin:/usr/sbin:/sbin to PATH when
+# missing so user shells without sbin dirs (fish / linuxbrew / minimal DE
+# sessions) resolve modprobe & friends (fixes "Missing required command:
+# modprobe" for the self-installed vfio CLI run as a non-root user).
+SCRIPT_REVISION="R57"
+
+# R57: PATH hardening for non-root / minimal shells. On Debian-family systems
+# modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
+# which are NOT in the default PATH of regular user shells (observed live on
+# SparkyLinux + fish + linuxbrew: PATH = /usr/local/bin:/usr/bin:/bin:... with
+# NO sbin dirs). The self-installed /usr/local/bin/vfio CLI is on PATH for
+# users, so a bare non-root `vfio` (menu/install modes) died at main()'s
+# dependency gate with "ERROR: Missing required command: modprobe" even
+# though modprobe exists at /usr/sbin/modprobe. `sudo ./vfio.sh --install-self`
+# worked because sudo runs with root's PATH (which HAS the sbin dirs); only
+# the non-root invocation died. Append the standard sbin dirs (only when
+# missing AND the dir exists) BEFORE any need_cmd/have_cmd check so both
+# resolution AND every later by-name invocation (`run modprobe ...`,
+# `have_cmd runuser`, ...) work for non-root callers. No-op for root (its
+# PATH already contains these dirs). set -e/-u safe (plain if-guards, no
+# loop variables).
+if [[ ":${PATH}:" != *":/usr/local/sbin:"* && -d /usr/local/sbin ]]; then
+  PATH="${PATH}:/usr/local/sbin"
+fi
+if [[ ":${PATH}:" != *":/usr/sbin:"* && -d /usr/sbin ]]; then
+  PATH="${PATH}:/usr/sbin"
+fi
+if [[ ":${PATH}:" != *":/sbin:"* && -d /sbin ]]; then
+  PATH="${PATH}:/sbin"
+fi
+export PATH
 
 # --- Configuration ---
 CONF_FILE="/etc/vfio-gpu-passthrough.conf"

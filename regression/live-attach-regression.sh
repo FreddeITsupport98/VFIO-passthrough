@@ -1030,8 +1030,8 @@ assert_contains_text \
 # gui_msgbox is now dynamically sized (width from longest line, height from
 # line count) so the long status panel does not truncate at a fixed 18x72 box.
 assert_contains_file \
-  "R48e gui_msgbox sizes dynamically from content" \
-  'whiptail --title "$title" --msgbox "$msg" "$_h" "$_w"' \
+  "R48e/R58 gui_msgbox sizes dynamically from content (TUI backend var)" \
+  '"$TUI_BIN" --title "$title" --msgbox "$msg" "$_h" "$_w"' \
   "$VFIO_SCRIPT"
 _checklist_fn="$(sed -n '/^_vm_checklist_records()/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_checklist_fn" ]]; then

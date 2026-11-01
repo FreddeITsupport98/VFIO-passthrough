@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R57 — bumped on every change; the full history is in changelog.md.
+# Revision: R58 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -33,7 +33,15 @@ SCRIPT_NAME="$(basename "$0")"
 # missing so user shells without sbin dirs (fish / linuxbrew / minimal DE
 # sessions) resolve modprobe & friends (fixes "Missing required command:
 # modprobe" for the self-installed vfio CLI run as a non-root user).
-SCRIPT_REVISION="R57"
+# R58: cross-distro TUI backend — the wizard/menu dialogs now run on whiptail
+# OR dialog (auto-detected; both write the dialog RESULT to stderr, so the
+# shared 3>&1 1>&2 2>&3 fd dance captures either backend unchanged), and the
+# interactive modes AUTO-INSTALL the distro's backend package when none is
+# present (dnf: newt — provides whiptail; apt: whiptail; zypper/pacman/apk/
+# xbps: newt or dialog) with NO prompts; on failure (offline / repo error /
+# no package manager / no sudo) the script prints the exact manual commands
+# and continues in plain-text mode. --no-tui stays the explicit opt-out.
+SCRIPT_REVISION="R58"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -407,13 +415,218 @@ need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Optional TUI support (whiptail/dialog-style). If not available, we fall back
-# to the existing plain-text prompts. This keeps the script usable everywhere
-# while offering a nicer UI when possible.
+# Optional TUI support (whiptail/dialog). If neither backend is available, we
+# fall back to the existing plain-text prompts. This keeps the script usable
+# everywhere while offering a nicer UI when possible.
+# R58: cross-distro backend support — the dialogs now run on whiptail (newt)
+# OR dialog, whichever is installed (whiptail preferred; both write the dialog
+# RESULT to stderr, so the shared `3>&1 1>&2 2>&3` fd dance every TUI call
+# site uses captures either backend's output unchanged — verified live for
+# both binaries). Interactive modes additionally AUTO-INSTALL the distro's
+# backend package when none is present (ensure_tui_backend below) — no
+# prompts; on failure the script prints the exact manual commands and
+# continues in plain-text mode.
+TUI_BIN=""
+TUI_DISABLED_BY_FLAG=0   # 1 = --no-tui passed (explicit opt-out, incl. the auto-install)
 HAS_TUI=0
-if command -v whiptail >/dev/null 2>&1; then
-  HAS_TUI=1
-fi
+tui_backend_detect() {
+  # Set TUI_BIN ("whiptail" | "dialog" | "") + HAS_TUI (0/1). Prefer whiptail
+  # (newt): the backend this script was originally built on; dialog is the
+  # fully compatible fallback for distros without a newt package (openSUSE
+  # Leap, Void, ...).
+  TUI_BIN=""
+  if command -v whiptail >/dev/null 2>&1; then
+    TUI_BIN="whiptail"
+  elif command -v dialog >/dev/null 2>&1; then
+    TUI_BIN="dialog"
+  fi
+  if [[ -n "$TUI_BIN" ]]; then
+    HAS_TUI=1
+  else
+    HAS_TUI=0
+  fi
+}
+tui_backend_detect
+
+# R58: which modes benefit from the TUI backend (and therefore auto-install it
+# when missing). Read-only / machine / non-interactive modes are deliberately
+# EXCLUDED so a --verify / --detect / --doctor / --self-test / completion
+# print / status report NEVER installs packages on the system.
+_mode_needs_tui_backend() {
+  case "${MODE:-install}" in
+    install|menu|reset|install-self|uninstall-self|\
+    install-dynamic-binding|install-early-binding|install-live-attach|\
+    live-attach-on|live-attach-off|live-attach-toggle|\
+    install-stealth-vm-tuning|reset-stealth-vm-tuning|\
+    install-ultimate-perf-vm-tuning|reset-ultimate-perf-vm-tuning|\
+    install-virtio-win-guest-agent|\
+    install-looking-glass|remove-looking-glass|\
+    install-looking-glass-client|remove-looking-glass-client|\
+    install-graphics-daemon|install-usb-bt-mitigation)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# R58: make sure a TUI backend (whiptail OR dialog) exists for the interactive
+# flows, auto-installing the distro package when none is present — NO prompts
+# anywhere. Called from main() only for interactive modes (see
+# _mode_needs_tui_backend) and only when this process is already root (a
+# non-root run is re-exec'd under sudo by require_root in the mode dispatch,
+# and the root instance then runs this same gate).
+#
+# Package candidates per package manager (verified against the distro repos):
+#   apt-get:      whiptail, dialog           (Debian/Ubuntu ship whiptail)
+#   dnf / yum:    newt, dialog               (Fedora/RHEL: newt PROVIDES whiptail)
+#   zypper:       newt, dialog               (openSUSE Tumbleweed: newt; Leap: dialog)
+#   pacman:       whiptail, libnewt, dialog  (Arch renamed the package over time)
+#   apk:          newt, dialog               (Alpine: newt provides cmd:whiptail)
+#   xbps-install: dialog, newt               (Void Linux)
+#
+# Failure handling (never fatal — the wizard/menu stay fully usable): offline,
+# repo error, package unavailable, no package manager, or no root+sudo ->
+# print what was tried + the EXACT manual install commands for the detected
+# distro family, then continue in plain-text mode.
+ensure_tui_backend() {
+  if (( HAS_TUI )); then
+    return 0
+  fi
+  if (( TUI_DISABLED_BY_FLAG )); then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY-RUN: no whiptail/dialog TUI backend found; a real run would auto-install the distro package (dnf: newt / apt: whiptail / pacman: whiptail / zypper: newt)."
+    return 0
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! have_cmd sudo; then
+    note "TUI backend auto-install needs root and sudo is not available in this session."
+    note "Continuing in PLAIN-TEXT mode — every prompt still works."
+    note "Install whiptail or dialog as root and re-run for the full-screen TUI."
+    return 0
+  fi
+
+  local use_sudo=0
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+
+  local _rc=1 _pkg _hints=""
+  say
+  hdr "TUI backend (whiptail/dialog) auto-install"
+  note "No whiptail/dialog TUI backend is installed."
+  note "The wizard and menu work in plain-text mode, but the full-screen TUI is nicer."
+  note "Installing the distro package now (no prompt)..."
+
+  if have_cmd apt-get; then
+    for _pkg in whiptail dialog; do
+      if (( use_sudo )); then
+        if run sudo apt-get -y install "$_pkg"; then _rc=0; break; fi
+      else
+        if run apt-get -y install "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    if (( _rc != 0 )); then
+      # Fresh Debian/Ubuntu images ship EMPTY package lists; refresh once and retry.
+      note "apt-get install failed; refreshing package lists (apt-get update) and retrying..."
+      if (( use_sudo )); then
+        run sudo apt-get update >/dev/null 2>&1 || true
+      else
+        run apt-get update >/dev/null 2>&1 || true
+      fi
+      for _pkg in whiptail dialog; do
+        if (( use_sudo )); then
+          if run sudo apt-get -y install "$_pkg"; then _rc=0; break; fi
+        else
+          if run apt-get -y install "$_pkg"; then _rc=0; break; fi
+        fi
+      done
+    fi
+    _hints="  sudo apt-get install whiptail      # Debian/Ubuntu (or: sudo apt-get install dialog)"
+  elif have_cmd dnf; then
+    for _pkg in newt dialog; do
+      if (( use_sudo )); then
+        if run sudo dnf -y install "$_pkg"; then _rc=0; break; fi
+      else
+        if run dnf -y install "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    _hints="  sudo dnf install newt              # Fedora/RHEL — the newt package PROVIDES whiptail (or: sudo dnf install dialog)"
+  elif have_cmd yum; then
+    for _pkg in newt dialog; do
+      if (( use_sudo )); then
+        if run sudo yum -y install "$_pkg"; then _rc=0; break; fi
+      else
+        if run yum -y install "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    _hints="  sudo yum install newt              # older RHEL/CentOS (or: sudo yum install dialog)"
+  elif have_cmd zypper; then
+    for _pkg in newt dialog; do
+      if (( use_sudo )); then
+        if run sudo zypper --non-interactive in "$_pkg"; then _rc=0; break; fi
+      else
+        if run zypper --non-interactive in "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    _hints="  sudo zypper install newt           # openSUSE Tumbleweed (or: sudo zypper install dialog)"
+  elif have_cmd pacman; then
+    for _pkg in whiptail libnewt dialog; do
+      if (( use_sudo )); then
+        if run sudo pacman --noconfirm -S "$_pkg"; then _rc=0; break; fi
+      else
+        if run pacman --noconfirm -S "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    _hints="  sudo pacman -S whiptail            # Arch (or: sudo pacman -S libnewt / dialog)"
+  elif have_cmd apk; then
+    for _pkg in newt dialog; do
+      if (( use_sudo )); then
+        if run sudo apk add --no-cache "$_pkg"; then _rc=0; break; fi
+      else
+        if run apk add --no-cache "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    _hints="  sudo apk add newt                  # Alpine (or: sudo apk add dialog)"
+  elif have_cmd xbps-install; then
+    for _pkg in dialog newt; do
+      if (( use_sudo )); then
+        if run sudo xbps-install -Sy "$_pkg"; then _rc=0; break; fi
+      else
+        if run xbps-install -Sy "$_pkg"; then _rc=0; break; fi
+      fi
+    done
+    _hints="  sudo xbps-install -Sy dialog       # Void Linux (or: sudo xbps-install -Sy newt)"
+  fi
+
+  # Re-detect: a successful install may have landed whiptail OR dialog.
+  tui_backend_detect
+
+  if (( HAS_TUI )); then
+    say "TUI backend installed and active: $TUI_BIN"
+    return 0
+  fi
+
+  # FAILURE HANDLING — never fatal: continue in plain-text mode.
+  note "Automatic TUI backend install did not succeed (offline, repo error, or package unavailable)."
+  note "Continuing in PLAIN-TEXT mode — every prompt still works (numbered menus, y/n questions)."
+  if [[ -n "$_hints" ]]; then
+    note "To get the full-screen TUI, install it manually with your package manager and re-run:"
+    say "$_hints"
+  else
+    note "No supported package manager (apt-get/dnf/yum/zypper/pacman/apk/xbps-install) was found."
+    note "To get the full-screen TUI, install whiptail or dialog manually, e.g.:"
+    say "  Debian/Ubuntu: sudo apt-get install whiptail"
+    say "  Fedora/RHEL:   sudo dnf install newt          # provides whiptail"
+    say "  openSUSE:      sudo zypper install newt       # or: sudo zypper install dialog"
+    say "  Arch:          sudo pacman -S whiptail        # or: sudo pacman -S dialog"
+    say "  Alpine:        sudo apk add newt              # or: sudo apk add dialog"
+    say "  Void:          sudo xbps-install -Sy dialog"
+  fi
+  return 0
+}
 
 run() {
   # Print commands in debug mode; honor DRY_RUN.
@@ -1725,7 +1938,7 @@ prompt_yn() {
     fi
   fi
 
-  # TUI path: use whiptail if available.
+  # TUI path: use the detected backend (whiptail or dialog) if available.
   # R39b: the 3>&1 1>&2 2>&3 fd dance is MANDATORY here. Without it, when
   # prompt_yn is called inside command substitution (e.g. from
   # add_custom_kernel_params_interactive, which returns its updated cmdline on
@@ -1739,13 +1952,13 @@ prompt_yn() {
   if (( HAS_TUI )); then
     local exit_status
     if [[ "$def" =~ ^[Nn]$ ]]; then
-      whiptail --title "$title" --defaultno --yesno "$q" 10 60 3>&1 1>&2 2>&3
+      "$TUI_BIN" --title "$title" --defaultno --yesno "$q" 10 60 3>&1 1>&2 2>&3
       exit_status=$?
     else
-      whiptail --title "$title" --yesno "$q" 10 60 3>&1 1>&2 2>&3
+      "$TUI_BIN" --title "$title" --yesno "$q" 10 60 3>&1 1>&2 2>&3
       exit_status=$?
     fi
-    # whiptail exit status: 0 = Yes, 1/255 = No/ESC
+    # whiptail/dialog exit status: 0 = Yes/OK, 1 = No/Cancel, 255 = ESC
     return $exit_status
   fi
 
@@ -1797,7 +2010,8 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
 
   --debug           Enable verbose debug logging (and bash xtrace).
   --dry-run         Show actions but do not write files / run system-changing commands.
-  --no-tui          Force plain-text prompts even if whiptail is installed.
+  --no-tui          Force plain-text prompts even if whiptail/dialog is installed
+                   (also skips the automatic TUI backend package install attempt).
   --boot-vga-policy Install-mode override for generated Boot-VGA policy:
                    auto (default behavior, dynamic host-assisted detection) or
                    strict (requires explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1).
@@ -2171,6 +2385,7 @@ parse_args() {
         ;;
       --no-tui)
         HAS_TUI=0
+        TUI_DISABLED_BY_FLAG=1
         ;;
       --boot-vga-policy)
         shift
@@ -2626,7 +2841,7 @@ confirm_phrase() {
       else
         printf -v _box '%s\n\nType exactly: %s' "$prompt" "$phrase"
       fi
-      if ans="$(whiptail --title "Confirm" --inputbox "$_box" 12 70 "" 3>&1 1>&2 2>&3)"; then
+      if ans="$("$TUI_BIN" --title "Confirm" --inputbox "$_box" 12 70 "" 3>&1 1>&2 2>&3)"; then
         if [[ "$ans" == "$phrase" ]]; then return 0; fi
       else
         return 1   # Cancel/Esc = explicit decline, do not loop
@@ -3921,6 +4136,13 @@ self_test() {
     print_kv "/dev/tty" "WARN (menus may be invisible under sudo)"
   fi
 
+  # R58: TUI backend availability (informational — plain-text always works)
+  if (( HAS_TUI )); then
+    print_kv "TUI backend" "$TUI_BIN"
+  else
+    print_kv "TUI backend" "none (plain-text prompts)"
+  fi
+
   # PipeWire: best-effort
   if have_cmd wpctl; then
     if wpctl_cmd status >/dev/null 2>&1; then
@@ -5005,7 +5227,7 @@ gui_msgbox() {
     (( _h > _tl - 2 )) && _h=$(( _tl - 2 ))
     (( _h < 8 )) && _h=8
     (( _h > 48 )) && _h=48
-    whiptail --title "$title" --msgbox "$msg" "$_h" "$_w" 3>&1 1>&2 2>&3 || true
+    "$TUI_BIN" --title "$title" --msgbox "$msg" "$_h" "$_w" 3>&1 1>&2 2>&3 || true
   else
     say
     hdr "$title"
@@ -5068,7 +5290,7 @@ _verdict_popup() {
     *)                sym='•'; color="$C_CYAN" ;;
   esac
   if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
-    whiptail --title "$title" --msgbox "${sym} ${status_word}
+    "$TUI_BIN" --title "$title" --msgbox "${sym} ${status_word}
 
 ${detail}" 12 64 3>&1 1>&2 2>&3 || true
   else
@@ -5257,8 +5479,9 @@ select_from_list() {
   local -a options=("$@")
   local idx
 
-  # TUI path: use whiptail if available. We keep zero-based indices by using
-  # the index as the whiptail TAG and returning it directly.
+  # TUI path: use the detected backend (whiptail or dialog) if available. We
+  # keep zero-based indices by using the index as the TAG and returning it
+  # directly.
   if (( HAS_TUI )); then
     local -a menu_args=()
     local i opt first_line
@@ -5317,7 +5540,7 @@ select_from_list() {
     (( _nh < 12 )) && _nh=12
     (( _nh > 48 )) && _nh=48
     local choice
-    choice=$(whiptail --title "$title" --menu "$prompt" "$_nh" "$_maxw" "$_lh" "${menu_args[@]}" 3>&1 1>&2 2>&3) || die "Selection cancelled."
+    choice=$("$TUI_BIN" --title "$title" --menu "$prompt" "$_nh" "$_maxw" "$_lh" "${menu_args[@]}" 3>&1 1>&2 2>&3) || die "Selection cancelled."
     # choice is already the zero-based index as a string.
     echo "$choice"
     return 0
@@ -28706,7 +28929,7 @@ dynamic is the recommended default for RX 9070 / RDNA4 cards."
     # there is no TUI or no tty.
     local in="/dev/stdin" out="/dev/stderr" ans
     if (( HAS_TUI )) && [[ -r /dev/tty && -w /dev/tty ]]; then
-      ans="$(whiptail --title "Advanced: remove default kernel" --inputbox "Type REMOVE DEFAULT KERNEL to uninstall the default kernel, or press Enter to keep both kernels." 10 70 "" 3>&1 1>&2 2>&3)" || ans=""
+      ans="$("$TUI_BIN" --title "Advanced: remove default kernel" --inputbox "Type REMOVE DEFAULT KERNEL to uninstall the default kernel, or press Enter to keep both kernels." 10 70 "" 3>&1 1>&2 2>&3)" || ans=""
     else
       if [[ -r /dev/tty && -w /dev/tty ]]; then
         in="/dev/tty"; out="/dev/tty"
@@ -29329,6 +29552,14 @@ uninstall_self() {
   say
   note "If vfio was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
   note "The VFIO config ($CONF_FILE) is untouched — use --reset to remove it."
+  # R58: the interactive flows may have AUTO-INSTALLED a TUI backend package
+  # (newt / whiptail / dialog) via the system package manager. That is a
+  # SYSTEM package shared with other tools (debconf on Debian,
+  # NetworkManager-tui on Alpine, ...), so it is deliberately NOT
+  # auto-removed here. Remove it manually if you want it gone:
+  #   dnf remove newt | apt-get remove whiptail | zypper rm newt |
+  #   pacman -R whiptail | apk del newt | xbps-remove dialog
+  note "The whiptail/dialog TUI package (if this script auto-installed it) is a shared system package and is deliberately left in place."
 }
 
 # Config pickup: when the install wizard (or --menu option 0) starts and the
@@ -30441,6 +30672,16 @@ main() {
 
   # Optional but improves UX for PipeWire enumeration under sudo
   have_cmd runuser || true
+
+  # R58: cross-distro TUI backend — for interactive modes, ensure a TUI
+  # backend (whiptail or dialog) exists, auto-installing the distro package
+  # when missing (no prompts; graceful plain-text fallback with exact manual
+  # hints on failure). Only when already root: a non-root run is re-exec'd
+  # under sudo by require_root in the mode dispatch below, and the ROOT
+  # instance then runs this same gate.
+  if _mode_needs_tui_backend && [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    ensure_tui_backend
+  fi
 
   if [[ "$MODE" == "verify" ]]; then
     verify_setup

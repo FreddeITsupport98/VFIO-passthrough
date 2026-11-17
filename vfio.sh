@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R61 — bumped on every change; the full history is in changelog.md.
+# Revision: R62 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -85,7 +85,25 @@ SCRIPT_NAME="$(basename "$0")"
 # libnotify-tools / dnf+yum: libnotify / apt: libnotify-bin / pacman+apk+
 # xbps: libnotify) — BEST-EFFORT (every notify-send call in the applet is
 # try/except); it never blocks or skips the tray.
-SCRIPT_REVISION="R61"
+# R62: universal icon-theme auto-install + themed tray-glyph fallback. The
+# tray applet's icon renders with the desktop's native theme only when the
+# CONFIGURED icon theme actually exists; a missing theme (kf warning "Icon
+# theme ... not found" — observed live with the un-packaged third-party
+# "Snowy" theme, set only in the GTK settings) degrades the tray to a generic
+# glyph. Universal handling: _tray_icon_theme_configured reads the configured
+# theme from the session config (KDE kdeglobals [Icons], then the GTK3/GTK4/2
+# settings — Qt6's QIcon honors the GTK setting too), _tray_icon_theme_present
+# probes the XDG icon path (~/.icons, ~/.local/share/icons, /usr/share/icons),
+# and ensure_icon_theme auto-installs the DISTRO package when the theme has
+# one (verified online 2026-11: breeze -> breeze-icon-theme on zypper/dnf/apt,
+# breeze-icons on pacman/apk/xbps; adwaita/papirus/hicolor -> the same name
+# everywhere; yaru -> yaru-icon-theme on dnf/pacman, yaru-theme-icon on apt,
+# NOT in the official openSUSE repos). Un-packaged third-party store themes
+# (e.g. Snowy) get a clear note instead — and the applet gained a themed
+# fallback chain (breeze -> adwaita -> hicolor before the standard pixmap) so
+# the tray glyph stays themed even then. PURELY BEST-EFFORT: cosmetic, never
+# blocks or skips the tray.
+SCRIPT_REVISION="R62"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -4210,6 +4228,22 @@ self_test() {
     print_kv "notify-send (notifications)" "OK"
   else
     print_kv "notify-send (notifications)" "not installed (tray install auto-installs it)"
+  fi
+
+  # R62: the CONFIGURED icon theme of the invoking user's desktop session
+  # (informational — read-only probe; the tray install auto-installs the
+  # distro package when the theme is missing AND packaged).
+  local _it_home _it_theme
+  _it_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
+  if [[ -n "$_it_home" ]]; then
+    _it_theme="$(_tray_icon_theme_configured "$_it_home" 2>/dev/null || true)"
+    if [[ -n "$_it_theme" ]]; then
+      if _tray_icon_theme_present "$_it_home" "$_it_theme"; then
+        print_kv "Icon theme (tray glyph)" "$_it_theme (installed)"
+      else
+        print_kv "Icon theme (tray glyph)" "$_it_theme (missing — tray install auto-installs it when packaged)"
+      fi
+    fi
   fi
 
   # PipeWire: best-effort
@@ -13457,6 +13491,160 @@ _tray_session_display_env() {
   return 0
 }
 
+# R62: read the DESKTOP user's CONFIGURED icon theme name for $1 (a home dir).
+# Sources, in order: KDE kdeglobals [Icons] Theme=, then the GTK3/GTK4
+# settings.ini / .gtkrc-2.0 gtk-icon-theme-name (Qt6's QIcon theme resolution
+# honors the GTK setting too — observed live: the theme was configured ONLY in
+# the GTK files while kf.iconthemes warned "Icon theme Snowy not found").
+# Prints the theme name (or nothing). Read-only.
+_tray_icon_theme_configured() {
+  local _home="$1" _f _t
+  [[ -n "$_home" && -d "$_home" ]] || return 0
+  _f="$_home/.config/kdeglobals"
+  if [[ -f "$_f" ]]; then
+    _t="$(awk '/^\[Icons\]/{ins=1;next} /^\[/{ins=0} ins && /^Theme=/{sub(/^Theme=/,""); gsub(/[[:space:]]/,""); print; exit}' "$_f" 2>/dev/null || true)"
+    if [[ -n "$_t" ]]; then
+      printf '%s' "$_t"
+      return 0
+    fi
+  fi
+  for _f in "$_home/.config/gtk-3.0/settings.ini" "$_home/.config/gtk-4.0/settings.ini" "$_home/.gtkrc-2.0"; do
+    if [[ -f "$_f" ]]; then
+      _t="$(grep -m1 -E '^[[:space:]]*gtk-icon-theme-name[[:space:]]*=' "$_f" 2>/dev/null | sed -e 's/^[[:space:]]*gtk-icon-theme-name[[:space:]]*=//' -e 's/[[:space:]"]//g' || true)"
+      if [[ -n "$_t" ]]; then
+        printf '%s' "$_t"
+        return 0
+      fi
+    fi
+  done
+  return 0
+}
+
+# R62: is icon theme $2 present for the desktop session at home $1? Probes the
+# XDG icon search path: ~/.icons, ~/.local/share/icons, /usr/share/icons (a
+# theme is a directory — dir/symlink presence is the practical check).
+# Read-only.
+_tray_icon_theme_present() {
+  local _home="$1" _theme="$2" _base
+  [[ -n "$_theme" ]] || return 0
+  for _base in "$_home/.icons" "$_home/.local/share/icons" "/usr/share/icons"; do
+    if [[ -e "$_base/$_theme" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# R62: map icon theme $2 to the distro package for package manager $1. Prints
+# the package name (or nothing when the theme is not packaged there).
+# Verified online (2026-11): breeze -> breeze-icon-theme on zypper/dnf/yum/apt,
+# breeze-icons on pacman/apk/xbps; adwaita -> adwaita-icon-theme everywhere;
+# papirus (all variants incl. ePapirus) -> papirus-icon-theme everywhere; yaru
+# -> yaru-icon-theme on dnf/yum/pacman, yaru-theme-icon on apt, NOT in the
+# official openSUSE repos; hicolor -> hicolor-icon-theme everywhere.
+# Third-party store themes (e.g. Snowy) are deliberately NOT mapped — they
+# have no distro package at all.
+_tray_icon_theme_pkg() {
+  local _pm="$1" _theme="$2"
+  case "${_theme,,}" in
+    breeze)
+      case "$_pm" in
+        zypper|dnf|yum|apt-get) echo "breeze-icon-theme" ;;
+        *) echo "breeze-icons" ;;
+      esac
+      ;;
+    adwaita) echo "adwaita-icon-theme" ;;
+    papirus|papirus-dark|papirus-light|epapirus|epapirus-dark) echo "papirus-icon-theme" ;;
+    yaru)
+      case "$_pm" in
+        apt-get) echo "yaru-theme-icon" ;;
+        dnf|yum|pacman) echo "yaru-icon-theme" ;;
+        *) return 0 ;;
+      esac
+      ;;
+    hicolor) echo "hicolor-icon-theme" ;;
+    *) return 0 ;;
+  esac
+}
+
+# R62: ensure the DESKTOP user's CONFIGURED icon theme is actually installed.
+# UNIVERSAL (any theme, any distro): reads the configured theme from the
+# session config, probes the XDG icon path, and auto-installs the DISTRO
+# package when the theme has one. Third-party store themes with no distro
+# package get a clear actionable note (where to get the theme / how to switch)
+# — the applet's own themed fallback chain covers the glyph meanwhile.
+# PURELY BEST-EFFORT: cosmetic, never blocks or skips the tray. Returns 0 when
+# the theme is present (or nothing configured); 1 when it stays missing.
+ensure_icon_theme() {
+  local _user="$1" _home _theme _pkg _pm
+  _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$_home" && -d "$_home" ]] || return 0
+  _theme="$(_tray_icon_theme_configured "$_home")"
+  [[ -n "$_theme" ]] || return 0
+  if _tray_icon_theme_present "$_home" "$_theme"; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY-RUN: the configured icon theme '$_theme' is missing; a real run would auto-install the distro package when one exists (breeze/adwaita/papirus/yaru/hicolor)."
+    return 1
+  fi
+  if have_cmd apt-get; then _pm=apt-get
+  elif have_cmd dnf; then _pm=dnf
+  elif have_cmd yum; then _pm=yum
+  elif have_cmd zypper; then _pm=zypper
+  elif have_cmd pacman; then _pm=pacman
+  elif have_cmd apk; then _pm=apk
+  elif have_cmd xbps-install; then _pm=xbps-install
+  else _pm=""; fi
+  _pkg="$(_tray_icon_theme_pkg "${_pm:-}" "$_theme")"
+  if [[ -z "$_pkg" ]]; then
+    note "NOTE: the configured icon theme '$_theme' is not installed and has NO distro package (a third-party KDE-Store/GNOME-Look theme)."
+    note "      The tray still works — its icon uses a themed fallback glyph. To get '$_theme' icons, install the theme via"
+    note "      System Settings -> Icons -> Get New Icon Themes, or switch the icon theme to one your distro packages (e.g. breeze)."
+    return 1
+  fi
+  local use_sudo=0
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  elif [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    note "icon-theme auto-install needs root and sudo is not available in this session."
+    return 1
+  fi
+  say
+  hdr "Icon theme auto-install ($_theme)"
+  note "The configured icon theme '$_theme' is not installed (the tray icon falls back to a generic glyph)."
+  note "Installing the distro package now (no prompt)..."
+  case "$_pm" in
+    apt-get)
+      if (( use_sudo )); then run sudo apt-get -y install "$_pkg" || true; else run apt-get -y install "$_pkg" || true; fi
+      ;;
+    dnf)
+      if (( use_sudo )); then run sudo dnf -y install "$_pkg" || true; else run dnf -y install "$_pkg" || true; fi
+      ;;
+    yum)
+      if (( use_sudo )); then run sudo yum -y install "$_pkg" || true; else run yum -y install "$_pkg" || true; fi
+      ;;
+    zypper)
+      if (( use_sudo )); then run sudo zypper --non-interactive in "$_pkg" || true; else run zypper --non-interactive in "$_pkg" || true; fi
+      ;;
+    pacman)
+      if (( use_sudo )); then run sudo pacman --noconfirm -S "$_pkg" || true; else run pacman --noconfirm -S "$_pkg" || true; fi
+      ;;
+    apk)
+      if (( use_sudo )); then run sudo apk add --no-cache "$_pkg" || true; else run apk add --no-cache "$_pkg" || true; fi
+      ;;
+    xbps-install)
+      if (( use_sudo )); then run sudo xbps-install -Sy "$_pkg" || true; else run xbps-install -Sy "$_pkg" || true; fi
+      ;;
+  esac
+  if _tray_icon_theme_present "$_home" "$_theme"; then
+    say "Icon theme '$_theme' installed — the tray icon will render with your native theme."
+    return 0
+  fi
+  note "Automatic '$_theme' install did not make the theme available (offline, repo error, or the package installs it under a different name)."
+  return 1
+}
+
 # R41: Install the system-tray on/off toggle applet for live-attach hotplug.
 # Generates a PySide6 QSystemTrayIcon applet (/usr/local/bin/vfio-hotplug-tray)
 # that reads the world-readable mode file, shows an icon + tooltip reflecting
@@ -13476,6 +13664,10 @@ _tray_session_display_env() {
 # _tray_session_display_env) instead of the stripped sudo env — the fix
 # for the install-time SIGABRT (a display-less launch made Qt fall back to
 # the xcb platform and abort with "could not connect to display").
+# R62: the configured icon theme is a BEST-EFFORT universal auto-install too
+# (see ensure_icon_theme) — any theme, any distro: packaged themes are
+# installed, un-packaged store themes get guidance, and the applet has a
+# themed fallback chain for the glyph.
 install_live_attach_tray() {
   # The tray toggles via pkexec /usr/local/bin/vfio --live-attach-toggle, so it
   # needs the self-installed CLI at SELF_INSTALL_BIN. Without it, the tray would
@@ -13536,6 +13728,19 @@ install_live_attach_tray() {
     else
       note "NOTE: notify-send is not available (non-fatal — the tray works, just without result notifications). Install it manually:"
       say "  openSUSE: sudo zypper install libnotify-tools | Fedora/RHEL: sudo dnf install libnotify | Debian/Ubuntu: sudo apt-get install libnotify-bin | Arch/Alpine/Void: libnotify"
+    fi
+  fi
+  # R62: the desktop user's CONFIGURED icon theme — BEST-EFFORT cosmetic
+  # hardening. When it is missing (observed live: the un-packaged third-party
+  # "Snowy" theme -> kf warning "Icon theme Snowy not found" -> generic tray
+  # glyph), auto-install the DISTRO package when one exists
+  # (breeze/adwaita/papirus/yaru/hicolor), and for un-packaged store themes
+  # print guidance. Never blocks or skips the tray (the applet also has its
+  # own themed fallback chain now).
+  local _icon_user="${SUDO_USER:-}"
+  if [[ -n "$_icon_user" && "$_icon_user" != "root" ]]; then
+    if ! ensure_icon_theme "$_icon_user"; then
+      note "The tray icon will use a themed fallback glyph (cosmetic only; everything else works)."
     fi
   fi
 
@@ -13852,6 +14057,17 @@ def main():
     tray = QtWidgets.QSystemTrayIcon()
     sty = app.style()
     _icon = QtGui.QIcon.fromTheme("video-display")
+    if _icon.isNull():
+        # R62: the configured icon theme may be missing (kf warning "Icon
+        # theme ... not found" — observed with un-packaged store themes).
+        # Retry with a known-good fallback theme before dropping to the
+        # standard pixmap, so the tray glyph stays themed.
+        for _fb in ("breeze", "adwaita", "hicolor"):
+            QtGui.QIcon.setThemeName(_fb)
+            _icon = QtGui.QIcon.fromTheme("video-display")
+            if not _icon.isNull():
+                _log("icon: themed fallback '%s' (configured theme missing)" % _fb)
+                break
     if _icon.isNull():
         _icon = sty.standardIcon(QtWidgets.QStyle.SP_ComputerIcon)
     # Tint the base GPU icon to a solid status color so the on/off/dead state is
@@ -30099,6 +30315,9 @@ uninstall_self() {
   # R61: notify-send (libnotify) follows the same shared-package policy —
   # other desktop tools use it; NOT auto-removed.
   note "The notify-send (libnotify) package (if the tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
+  # R62: an auto-installed icon theme package (breeze / adwaita / papirus /
+  # yaru / hicolor) follows the same shared-package policy — NOT auto-removed.
+  note "An icon theme package (if the tray install auto-installed one) is likewise a shared system package and is deliberately left in place."
 }
 
 # Config pickup: when the install wizard (or --menu option 0) starts and the

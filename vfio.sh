@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R58 — bumped on every change; the full history is in changelog.md.
+# Revision: R59 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -41,7 +41,18 @@ SCRIPT_NAME="$(basename "$0")"
 # xbps: newt or dialog) with NO prompts; on failure (offline / repo error /
 # no package manager / no sudo) the script prints the exact manual commands
 # and continues in plain-text mode. --no-tui stays the explicit opt-out.
-SCRIPT_REVISION="R58"
+# R59: PySide6 tray-toolkit auto-install — when the live-attach tray applet's
+# toolkit (PySide6; Qt6 -> native StatusNotifierItem on KDE Plasma 6) is not
+# importable, the interactive tray install AUTO-INSTALLS the distro package
+# (zypper/dnf/yum: python3-pyside6; apt: python3-pyside6 then the
+# .qtwidgets/.qtnetwork module subpackages + an apt-get update retry; pacman:
+# pyside6; apk: py3-pyside6; xbps: python3-PySide6) with NO prompts, using the
+# IMPORT RE-CHECK as the success criterion (not the package manager's exit
+# code — zypper can resolve the unversioned name to a non-default-python
+# build). On failure (offline / repo error / package unavailable / no package
+# manager / no sudo) it prints the exact manual commands and skips the tray as
+# before — never fatal, the CLI --live-attach-toggle still works.
+SCRIPT_REVISION="R59"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -4141,6 +4152,15 @@ self_test() {
     print_kv "TUI backend" "$TUI_BIN"
   else
     print_kv "TUI backend" "none (plain-text prompts)"
+  fi
+
+  # R59: PySide6 tray toolkit availability (informational — the interactive
+  # tray install auto-installs the distro package when it is missing; this
+  # probe is read-only so --self-test / --doctor never install packages).
+  if pyside6_importable; then
+    print_kv "PySide6 (tray toolkit)" "OK"
+  else
+    print_kv "PySide6 (tray toolkit)" "not importable (tray install auto-installs it)"
   fi
 
   # PipeWire: best-effort
@@ -13007,6 +13027,157 @@ live_attach_status() {
   fi
 }
 
+# R59: is PySide6 importable by the system python3? This is the exact import
+# the generated tray applet performs at startup (QtWidgets + QtGui; QtCore and
+# the optional QtNetwork single-instance guard ship with the same package), so
+# a true answer here == a runnable applet. Read-only; installs nothing.
+pyside6_importable() {
+  python3 -c 'import PySide6.QtWidgets, PySide6.QtGui' >/dev/null 2>&1
+}
+
+# R59: AUTO-INSTALL the PySide6 tray toolkit when it is not importable — the
+# same no-prompt, never-fatal philosophy as the R58 TUI backend auto-install.
+# Called ONLY from install_live_attach_tray (the tray is the single consumer),
+# which itself only runs in the interactive install flows (--install-live-
+# attach / the dynamic-install opt-in / the menu), so the read-only modes
+# (--verify / --detect / --doctor / --live-attach-status / --self-test /
+# completion printers) NEVER install packages.
+#
+# Package names verified against the distro repos (2026-11):
+#   zypper:        python3-pyside6   (openSUSE Tumbleweed/Leap: the unversioned
+#                                    name resolves to the default python's
+#                                    python3XX-pyside6 build; if it resolves
+#                                    to a non-default build the versioned
+#                                    retry below fixes it)
+#   dnf / yum:     python3-pyside6   (Fedora / RHEL / Mageia)
+#   apt-get:       python3-pyside6, then python3-pyside6.qtwidgets +
+#                                    python3-pyside6.qtnetwork (Debian 13+ /
+#                                    Ubuntu 24.10+ split the Qt bindings into
+#                                    per-module subpackages; the tray imports
+#                                    QtWidgets/QtGui/QtCore/QtNetwork)
+#   pacman:        pyside6           (Arch / Manjaro / CachyOS)
+#   apk:           py3-pyside6       (Alpine)
+#   xbps-install:  python3-PySide6   (Void)
+#
+# Returns 0 ONLY when PySide6 is importable afterward — the IMPORT RE-CHECK is
+# the success criterion (a package manager can exit 0 on a partial/meta-only
+# install, and zypper's unversioned name can resolve to a non-default-python
+# build that the system python3 cannot import). Returns 1 on any failure
+# (offline / repo error / package unavailable / no supported package manager /
+# no root+sudo / --dry-run); the caller then falls back to the note + manual
+# hints and the CLI --live-attach-toggle still works.
+ensure_pyside6() {
+  if pyside6_importable; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY-RUN: PySide6 not importable; a real run would auto-install the distro package (zypper/dnf: python3-pyside6 / apt: python3-pyside6.qtwidgets / pacman: pyside6)."
+    return 1
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! have_cmd sudo; then
+    note "PySide6 auto-install needs root and sudo is not available in this session."
+    return 1
+  fi
+  local use_sudo=0 _p=""
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+
+  say
+  hdr "PySide6 tray toolkit auto-install"
+  note "The tray applet needs PySide6 (Qt6 -> native SNI on KDE Plasma 6); it is not importable."
+  note "Installing the distro package now (no prompt)..."
+
+  if have_cmd apt-get; then
+    # Debian 13+/Ubuntu 24.10+ split the Qt bindings into per-module
+    # python3-pyside6.<module> subpackages (the tray imports QtWidgets/QtGui/
+    # QtCore + the optional QtNetwork single-instance guard); older releases
+    # ship no PySide6 at all. Try the plain name, then the module set; a fresh
+    # image with EMPTY package lists gets one apt-get update + retry (the R58
+    # apt pattern).
+    if (( use_sudo )); then
+      run sudo apt-get -y install python3-pyside6 || true
+      if ! pyside6_importable; then
+        run sudo apt-get -y install python3-pyside6.qtwidgets python3-pyside6.qtnetwork || true
+      fi
+      if ! pyside6_importable; then
+        note "apt-get install did not make PySide6 importable; refreshing package lists (apt-get update) and retrying..."
+        run sudo apt-get update >/dev/null 2>&1 || true
+        run sudo apt-get -y install python3-pyside6.qtwidgets python3-pyside6.qtnetwork || true
+      fi
+    else
+      run apt-get -y install python3-pyside6 || true
+      if ! pyside6_importable; then
+        run apt-get -y install python3-pyside6.qtwidgets python3-pyside6.qtnetwork || true
+      fi
+      if ! pyside6_importable; then
+        note "apt-get install did not make PySide6 importable; refreshing package lists (apt-get update) and retrying..."
+        run apt-get update >/dev/null 2>&1 || true
+        run apt-get -y install python3-pyside6.qtwidgets python3-pyside6.qtnetwork || true
+      fi
+    fi
+  elif have_cmd dnf; then
+    if (( use_sudo )); then
+      run sudo dnf -y install python3-pyside6 || true
+    else
+      run dnf -y install python3-pyside6 || true
+    fi
+  elif have_cmd yum; then
+    if (( use_sudo )); then
+      run sudo yum -y install python3-pyside6 || true
+    else
+      run yum -y install python3-pyside6 || true
+    fi
+  elif have_cmd zypper; then
+    if (( use_sudo )); then
+      run sudo zypper --non-interactive in python3-pyside6 || true
+      if ! pyside6_importable; then
+        # openSUSE: the unversioned name can resolve to a NON-default-python
+        # build; retry with the exact versioned name for THIS python3
+        # (python 3.13 -> python313-pyside6).
+        _p="python$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])' 2>/dev/null || true)-pyside6"
+        if [[ -n "$_p" && "$_p" != "python-pyside6" ]]; then
+          run sudo zypper --non-interactive in "$_p" || true
+        fi
+      fi
+    else
+      run zypper --non-interactive in python3-pyside6 || true
+      if ! pyside6_importable; then
+        _p="python$(python3 -c 'import sys; print("%d%d" % sys.version_info[:2])' 2>/dev/null || true)-pyside6"
+        if [[ -n "$_p" && "$_p" != "python-pyside6" ]]; then
+          run zypper --non-interactive in "$_p" || true
+        fi
+      fi
+    fi
+  elif have_cmd pacman; then
+    if (( use_sudo )); then
+      run sudo pacman --noconfirm -S pyside6 || true
+    else
+      run pacman --noconfirm -S pyside6 || true
+    fi
+  elif have_cmd apk; then
+    if (( use_sudo )); then
+      run sudo apk add --no-cache py3-pyside6 || true
+    else
+      run apk add --no-cache py3-pyside6 || true
+    fi
+  elif have_cmd xbps-install; then
+    if (( use_sudo )); then
+      run sudo xbps-install -Sy python3-PySide6 || true
+    else
+      run xbps-install -Sy python3-PySide6 || true
+    fi
+  fi
+
+  # Re-check the import — the REAL success criterion (see the header comment).
+  if pyside6_importable; then
+    say "PySide6 installed and importable — continuing with the tray applet install."
+    return 0
+  fi
+  note "Automatic PySide6 install did not succeed (offline, repo error, package unavailable, or no supported package manager)."
+  return 1
+}
+
 # R41: Install the system-tray on/off toggle applet for live-attach hotplug.
 # Generates a PySide6 QSystemTrayIcon applet (/usr/local/bin/vfio-hotplug-tray)
 # that reads the world-readable mode file, shows an icon + tooltip reflecting
@@ -13026,15 +13197,25 @@ install_live_attach_tray() {
     note "Tray applet: $SELF_INSTALL_BIN not installed; run 'sudo $SCRIPT_NAME --install-self' to enable the system-tray toggle. (CLI --live-attach-toggle still works.)"
     return 0
   fi
-  # PySide6 is the tray toolkit (Qt6 -> native SNI on KDE Plasma 6). If it is
-  # not importable, the generated applet would just notify-and-exit at runtime,
-  # so skip installing it and tell the operator how to get it.
-  if ! python3 -c 'import PySide6.QtWidgets, PySide6.QtGui' >/dev/null 2>&1; then
-    note "Tray applet: PySide6 not available (python3-pyside6); skipping tray install. (CLI --live-attach-toggle still works.)"
-    if have_cmd dnf; then
-      note "  Install it with: sudo dnf install python3-pyside6"
+  # R59: PySide6 is the tray toolkit (Qt6 -> native SNI on KDE Plasma 6). If
+  # it is not importable, AUTO-INSTALL the distro package first (no prompt —
+  # the same philosophy as the R58 TUI backend auto-install; see
+  # ensure_pyside6), then re-check. Only when the auto-install fails (offline
+  # / repo error / package unavailable / no package manager / no root+sudo) do
+  # we fall back to the old skip-with-hints behavior. Never fatal either way:
+  # the CLI --live-attach-toggle works regardless.
+  if ! pyside6_importable; then
+    if ! ensure_pyside6; then
+      note "Tray applet: PySide6 still not available; skipping tray install. (CLI --live-attach-toggle still works.)"
+      note "Install it with your package manager, then re-run --install-live-attach to get the tray:"
+      say "  openSUSE:      sudo zypper install python3-pyside6"
+      say "  Fedora/RHEL:   sudo dnf install python3-pyside6"
+      say "  Debian/Ubuntu: sudo apt-get install python3-pyside6.qtwidgets   (Debian 13+ / Ubuntu 24.10+)"
+      say "  Arch:          sudo pacman -S pyside6"
+      say "  Alpine:        sudo apk add py3-pyside6"
+      say "  Void:          sudo xbps-install -Sy python3-PySide6"
+      return 0
     fi
-    return 0
   fi
   if ! have_cmd zenity; then
     note "Tray applet: zenity not available; skipping tray install (needed for the confirmation dialog)."
@@ -29560,6 +29741,14 @@ uninstall_self() {
   #   dnf remove newt | apt-get remove whiptail | zypper rm newt |
   #   pacman -R whiptail | apk del newt | xbps-remove dialog
   note "The whiptail/dialog TUI package (if this script auto-installed it) is a shared system package and is deliberately left in place."
+  # R59: same policy for the PySide6 tray toolkit the live-attach tray install
+  # may have AUTO-INSTALLED (python3-pyside6 / pyside6) — it is a shared
+  # system Python/Qt package other desktop tooling can import, so it is
+  # deliberately NOT auto-removed. Remove it manually if you want it gone:
+  #   zypper rm python3-pyside6 | dnf remove python3-pyside6 |
+  #   apt-get remove python3-pyside6.qtwidgets | pacman -R pyside6 |
+  #   apk del py3-pyside6 | xbps-remove python3-PySide6
+  note "The PySide6 tray toolkit (if the live-attach tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
 }
 
 # Config pickup: when the install wizard (or --menu option 0) starts and the

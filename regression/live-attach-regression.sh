@@ -2691,8 +2691,8 @@ assert_contains_file \
   'pkill -9 -f "python3 ${LIVE_ATTACH_TRAY}\$"' \
   "$VFIO_SCRIPT"
 assert_contains_file \
-  "R42 tray install relaunches with setsid-detach (survives sudo exit)" \
-  'setsid runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt"' \
+  "R42/R61 tray install relaunches with setsid-detach (survives sudo exit)" \
+  'setsid runuser -u "$_user" -- env "${_env_args[@]}"' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R42 tray install verifies the fresh instance stayed up" \

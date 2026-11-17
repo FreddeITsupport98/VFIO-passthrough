@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R60 — bumped on every change; the full history is in changelog.md.
+# Revision: R61 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -62,7 +62,30 @@ SCRIPT_NAME="$(basename "$0")"
 # auto-installed: it is a core systemd desktop component present wherever a
 # system tray can exist, and a missing pkexec surfaces at toggle time as the
 # tray's own critical notify (actionable, not silent).
-SCRIPT_REVISION="R60"
+# R61: tray launch crash fix + notify-send auto-install. ROOT CAUSE
+# (observed live — coredump metadata + journal): the tray's install-time
+# launch inherited WAYLAND_DISPLAY/DISPLAY from the sudo/root env — which
+# does NOT have them (sudo env_reset strips them) — so the applet started
+# display-less, Qt fell back to the default xcb platform with an EMPTY
+# display, and qFatal'd: "could not connect to display" -> "Could not load
+# the Qt platform plugin xcb" -> SIGABRT (two python3.13 coredumps at
+# tray-install time; a manual in-session launch with wayland-1 runs fine).
+# NOTE: the journal's "From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed"
+# line is Qt's canned plugin-failure advisory, NOT a missing library —
+# libxcb-cursor0 had been installed on the live host since 3 days BEFORE
+# the crash (verified via rpm), so no cursor-lib install is performed.
+# Fixes: (1) new _tray_session_display_env discovers the DESKTOP session's
+# WAYLAND_DISPLAY/DISPLAY from the user's live session process environ
+# (kwin_wayland/plasmashell/gnome-shell/...; picks up non-default sockets
+# like wayland-1), falling back to the standard wayland sockets — the
+# launch now always targets the real session; (2) the applet pre-checks
+# for a display (WAYLAND_DISPLAY/DISPLAY/QT_QPA_PLATFORM) and exits
+# cleanly with an actionable message + log line instead of a Qt abort;
+# (3) ensure_notify_send auto-installs notify-send when missing (zypper:
+# libnotify-tools / dnf+yum: libnotify / apt: libnotify-bin / pacman+apk+
+# xbps: libnotify) — BEST-EFFORT (every notify-send call in the applet is
+# try/except); it never blocks or skips the tray.
+SCRIPT_REVISION="R61"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -4179,6 +4202,14 @@ self_test() {
     print_kv "zenity (tray dialogs)" "OK"
   else
     print_kv "zenity (tray dialogs)" "not installed (tray install auto-installs it)"
+  fi
+
+  # R61: notify-send (informational — the tray install auto-installs it when
+  # missing; read-only probe, no installs here).
+  if have_cmd notify-send; then
+    print_kv "notify-send (notifications)" "OK"
+  else
+    print_kv "notify-send (notifications)" "not installed (tray install auto-installs it)"
   fi
 
   # PipeWire: best-effort
@@ -13297,6 +13328,135 @@ ensure_zenity() {
   return 1
 }
 
+# R61: AUTO-INSTALL notify-send (libnotify) when it is missing — the tray's
+# result-notification channel (toggle results, the dead-GPU alert). Same
+# no-prompt contract; PURELY BEST-EFFORT (every notify-send call in the
+# applet is try/except — a failure never blocks or skips anything). Package
+# names verified online (2026-11): zypper libnotify-tools (openSUSE ships
+# notify-send in libnotify-tools, NOT libnotify) / dnf+yum libnotify /
+# apt-get libnotify-bin / pacman+apk+xbps libnotify. Success criterion: the
+# have_cmd notify-send re-check.
+ensure_notify_send() {
+  if have_cmd notify-send; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY-RUN: notify-send not installed; a real run would auto-install the distro package (openSUSE: libnotify-tools / Fedora/RHEL: libnotify / Debian/Ubuntu: libnotify-bin / Arch/Alpine/Void: libnotify)."
+    return 1
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! have_cmd sudo; then
+    note "notify-send auto-install needs root and sudo is not available in this session."
+    return 1
+  fi
+  local use_sudo=0
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+  say
+  hdr "notify-send (tray notifications) auto-install"
+  note "The tray applet reports toggle results via notify-send; it is not installed."
+  note "Installing the distro package now (no prompt)..."
+  if have_cmd apt-get; then
+    if (( use_sudo )); then
+      run sudo apt-get -y install libnotify-bin || true
+    else
+      run apt-get -y install libnotify-bin || true
+    fi
+    if ! have_cmd notify-send; then
+      note "apt-get install did not make notify-send available; refreshing package lists (apt-get update) and retrying..."
+      if (( use_sudo )); then
+        run sudo apt-get update >/dev/null 2>&1 || true
+        run sudo apt-get -y install libnotify-bin || true
+      else
+        run apt-get update >/dev/null 2>&1 || true
+        run apt-get -y install libnotify-bin || true
+      fi
+    fi
+  elif have_cmd dnf; then
+    if (( use_sudo )); then
+      run sudo dnf -y install libnotify || true
+    else
+      run dnf -y install libnotify || true
+    fi
+  elif have_cmd yum; then
+    if (( use_sudo )); then
+      run sudo yum -y install libnotify || true
+    else
+      run yum -y install libnotify || true
+    fi
+  elif have_cmd zypper; then
+    if (( use_sudo )); then
+      run sudo zypper --non-interactive in libnotify-tools || true
+    else
+      run zypper --non-interactive in libnotify-tools || true
+    fi
+  elif have_cmd pacman; then
+    if (( use_sudo )); then
+      run sudo pacman --noconfirm -S libnotify || true
+    else
+      run pacman --noconfirm -S libnotify || true
+    fi
+  elif have_cmd apk; then
+    if (( use_sudo )); then
+      run sudo apk add --no-cache libnotify || true
+    else
+      run apk add --no-cache libnotify || true
+    fi
+  elif have_cmd xbps-install; then
+    if (( use_sudo )); then
+      run sudo xbps-install -Sy libnotify || true
+    else
+      run xbps-install -Sy libnotify || true
+    fi
+  fi
+  if have_cmd notify-send; then
+    say "notify-send installed and available — tray toggle results will pop as notifications."
+    return 0
+  fi
+  note "Automatic notify-send install did not succeed (non-fatal — the tray works without result notifications)."
+  return 1
+}
+
+# R61: discover the DESKTOP SESSION's display environment for $1 (a
+# username) so a root/sudo context can launch a GUI app inside the user's
+# session. Prints KEY=VAL lines (WAYLAND_DISPLAY / DISPLAY) for `env`.
+# ROOT CAUSE this fixes: the tray's install-time launch used to inherit
+# WAYLAND_DISPLAY/DISPLAY from the sudo/root environment — which does NOT
+# have them (sudo env_reset strips them) — so the applet started
+# display-less, Qt fell back to the xcb platform plugin, and (with
+# libxcb-cursor absent) Qt ABORTED with SIGABRT (two live python3.13
+# coredumps at tray-install time). Sources, in order: (1) the environ of a
+# live session process owned by the user (kwin_wayland / plasmashell /
+# gnome-shell / sway / hyprland / Xorg / ... — picks up non-default sockets
+# like wayland-1; root can read another user's /proc/<pid>/environ, and a
+# user can read its own), then (2) the standard wayland sockets in
+# /run/user/<uid>. Best-effort: prints nothing when no session is found
+# (the caller falls back to the inherited env).
+_tray_session_display_env() {
+  local _user="$1" _proc _pat _env _uid _sock
+  [[ -n "$_user" ]] || return 0
+  for _pat in kwin_wayland plasmashell gnome-shell sway hyprland Xorg wayfire labwc river niri; do
+    while IFS= read -r _proc; do
+      [[ -n "$_proc" ]] || continue
+      _env="$(tr '\0' '\n' <"/proc/$_proc/environ" 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY)=' || true)"
+      if [[ -n "$_env" ]]; then
+        printf '%s\n' "$_env"
+        return 0
+      fi
+    done < <(pgrep -u "$_user" -x "$_pat" 2>/dev/null || true)
+  done
+  _uid="$(id -u "_user" 2>/dev/null || true)"
+  if [[ -n "$_uid" ]]; then
+    for _sock in wayland-0 wayland-1; do
+      if [[ -S "/run/user/$_uid/$_sock" ]]; then
+        echo "WAYLAND_DISPLAY=$_sock"
+        return 0
+      fi
+    done
+  fi
+  return 0
+}
+
 # R41: Install the system-tray on/off toggle applet for live-attach hotplug.
 # Generates a PySide6 QSystemTrayIcon applet (/usr/local/bin/vfio-hotplug-tray)
 # that reads the world-readable mode file, shows an icon + tooltip reflecting
@@ -13311,6 +13471,11 @@ ensure_zenity() {
 # R59/R60: PySide6 and zenity are AUTO-INSTALLED first when missing (see
 # ensure_pyside6 / ensure_zenity) — the skip-with-notes path now only fires
 # when that auto-install itself fails (offline / repo error / no PM / no sudo).
+# R61: notify-send is a BEST-EFFORT auto-install (it never skips the tray),
+# and the launch now targets the user's real desktop session env (see
+# _tray_session_display_env) instead of the stripped sudo env — the fix
+# for the install-time SIGABRT (a display-less launch made Qt fall back to
+# the xcb platform and abort with "could not connect to display").
 install_live_attach_tray() {
   # The tray toggles via pkexec /usr/local/bin/vfio --live-attach-toggle, so it
   # needs the self-installed CLI at SELF_INSTALL_BIN. Without it, the tray would
@@ -13360,6 +13525,17 @@ install_live_attach_tray() {
       say "  Alpine:        sudo apk add zenity"
       say "  Void:          sudo xbps-install -Sy zenity"
       return 0
+    fi
+  fi
+  # R61: notify-send is the tray's result-notification channel (toggle
+  # results, the dead-GPU alert). OPTIONAL — every call in the applet is
+  # try/except — so BEST-EFFORT auto-install; a failure never skips the tray.
+  if ! have_cmd notify-send; then
+    if ensure_notify_send; then
+      say "notify-send installed — tray toggle results will pop as desktop notifications."
+    else
+      note "NOTE: notify-send is not available (non-fatal — the tray works, just without result notifications). Install it manually:"
+      say "  openSUSE: sudo zypper install libnotify-tools | Fedora/RHEL: sudo dnf install libnotify | Debian/Ubuntu: sudo apt-get install libnotify-bin | Arch/Alpine/Void: libnotify"
     fi
   fi
 
@@ -13655,6 +13831,16 @@ def main():
     if not installed():
         notify("VFIO hotplug", "Live-attach is not installed. Run: sudo vfio --install-live-attach")
         sys.exit(0)
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY") or os.environ.get("QT_QPA_PLATFORM")):
+        # R61: a display-less launch (e.g. from a sudo/root context where the
+        # session env is stripped) makes Qt fall back to the xcb platform and
+        # ABORT with qFatal/SIGABRT when its deps are missing (observed live:
+        # two coredumps at tray-install time). Refuse cleanly instead — the
+        # autostart entry starts the tray inside the session on login.
+        _log("no display env (WAYLAND_DISPLAY/DISPLAY/QT_QPA_PLATFORM unset); exiting cleanly instead of a Qt abort")
+        sys.stderr.write("vfio-hotplug-tray: no display (WAYLAND_DISPLAY/DISPLAY not set) — start it from your desktop session.\n"
+                         "The autostart entry does this on Plasma login, or run 'vfio-hotplug-tray' from a terminal in the session.\n")
+        sys.exit(1)
     _srv = ensure_single_instance()
     if _srv is False:
         # Another tray instance is already running; exit quietly (no second icon).
@@ -13831,24 +14017,41 @@ Categories=System;
 DESKEOF
       say "Installed autostart: $_auto_file (starts on next Plasma login)"
       # Best-effort: launch one instance now so the icon appears immediately.
-      # Launching a Wayland GUI app as the desktop user from a root sudo context
-      # needs the user's XDG_RUNTIME_DIR + WAYLAND_DISPLAY; if they aren't in
-      # the inherited env, skip (the autostart covers it on next login).
+      # R61: discover the DESKTOP SESSION's display env for the launch. The old
+      # code inherited WAYLAND_DISPLAY/DISPLAY from the sudo/root env — which
+      # does NOT have them (sudo env_reset strips them) — so the applet started
+      # display-less, Qt fell back to the default xcb platform with an EMPTY
+      # display, and qFatal'd: "could not connect to display" -> SIGABRT
+      # (observed live: two coredumps at tray-install time; the journal's
+      # "xcb-cursor0 is needed" line is Qt's canned advisory, not a missing
+      # lib — libxcb-cursor0 was installed days before the crash). Read the
+      # vars from the user's live session process instead
+      # (_tray_session_display_env); fall back to the inherited env, then
+      # nothing — the applet now exits cleanly with an actionable message
+      # instead of aborting, and the autostart starts it inside the session
+      # on login.
       local _rt="${XDG_RUNTIME_DIR:-/run/user/$(id -u "$_user" 2>/dev/null || echo 0)}"
       if (( ! DRY_RUN )) && [[ -d "$_rt" ]]; then
+        local _disp_env _wd="" _xd=""
+        local -a _env_args=(XDG_RUNTIME_DIR="$_rt")
+        _disp_env="$(_tray_session_display_env "$_user" 2>/dev/null || true)"
+        _wd="$(awk -F= '/^WAYLAND_DISPLAY=/{print $2; exit}' <<<"$_disp_env" 2>/dev/null || true)"
+        _xd="$(awk -F= '/^DISPLAY=/{print $2; exit}' <<<"$_disp_env" 2>/dev/null || true)"
+        if [[ -z "$_wd" ]]; then _wd="${WAYLAND_DISPLAY:-}"; fi
+        if [[ -z "$_xd" ]]; then _xd="${DISPLAY:-}"; fi
+        if [[ -n "$_wd" ]]; then _env_args+=(WAYLAND_DISPLAY="$_wd"); fi
+        if [[ -n "$_xd" ]]; then _env_args+=(DISPLAY="$_xd"); fi
         # setsid-detach so the tray survives this sudo/install process exiting
         # (a bare & child would get SIGHUP when the controlling tty closes).
-        setsid runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" \
-          ${WAYLAND_DISPLAY:+WAYLAND_DISPLAY="$WAYLAND_DISPLAY"} \
-          ${DISPLAY:+DISPLAY="$DISPLAY"} \
+        setsid runuser -u "$_user" -- env "${_env_args[@]}" \
           "$LIVE_ATTACH_TRAY" </dev/null >/dev/null 2>&1 &
         # Verify the fresh instance stayed up (it loads the just-regenerated
         # code; if it died on launch, the autostart covers it on next login).
         sleep 1
         if pgrep -u "$_user" -f "python3 ${LIVE_ATTACH_TRAY}\$" >/dev/null 2>&1; then
-          say "Launched vfio-hotplug-tray for '$_user' (fresh instance running the latest code)."
+          say "Launched vfio-hotplug-tray for '$_user' (fresh instance running the latest code; WAYLAND_DISPLAY=${_wd:-<none>} DISPLAY=${_xd:-<none>})."
         else
-          note "WARN: vfio-hotplug-tray did not stay running for '$_user'; the autostart will start it on next Plasma login."
+          note "WARN: vfio-hotplug-tray did not stay running for '$_user' (launch env: WAYLAND_DISPLAY=${_wd:-<none>} DISPLAY=${_xd:-<none>}); the autostart will start it on next Plasma login. Test from your session: vfio-hotplug-tray"
         fi
       fi
     else
@@ -29893,6 +30096,9 @@ uninstall_self() {
   # R60: zenity follows the same shared-package policy — many desktop scripts
   # use zenity, so it is deliberately NOT auto-removed either.
   note "The zenity package (if the tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
+  # R61: notify-send (libnotify) follows the same shared-package policy —
+  # other desktop tools use it; NOT auto-removed.
+  note "The notify-send (libnotify) package (if the tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
 }
 
 # Config pickup: when the install wizard (or --menu option 0) starts and the

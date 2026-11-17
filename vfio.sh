@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R62 — bumped on every change; the full history is in changelog.md.
+# Revision: R63 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -103,7 +103,21 @@ SCRIPT_NAME="$(basename "$0")"
 # fallback chain (breeze -> adwaita -> hicolor before the standard pixmap) so
 # the tray glyph stays themed even then. PURELY BEST-EFFORT: cosmetic, never
 # blocks or skips the tray.
-SCRIPT_REVISION="R62"
+# R63: native KDE dialogs. The tray applet now uses kdialog on Plasma (native
+# look — zenity renders GTK dialogs that look out of place on KDE) and zenity
+# everywhere else: new python helpers _dialog_cmd/_confirm_args/_info_args
+# pick the tool per call (KDE identity env XDG_CURRENT_DESKTOP /
+# XDG_SESSION_DESKTOP / KDE_FULL_SESSION, honored when forwarded by the
+# launcher; a STRIPPED identity env falls back to "kdialog installed AND
+# plasmashell present" — the KDE signature). kdialog --yesno rc 0/1 mirrors
+# zenity --question exactly, and kdialog --msgbox mirrors zenity --info
+# (official KDE docs). The install-time launch now also forwards the desktop
+# identity keys from the session environ (_tray_session_display_env extended
+# to XDG_CURRENT_DESKTOP / XDG_SESSION_DESKTOP / KDE_FULL_SESSION), and the
+# tray install BEST-EFFORT auto-installs kdialog on KDE when missing
+# ('kdialog' is the package name on every distro — verified online). zenity
+# stays the guaranteed universal fallback (R60); nothing blocks on kdialog.
+SCRIPT_REVISION="R63"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -4243,6 +4257,17 @@ self_test() {
       else
         print_kv "Icon theme (tray glyph)" "$_it_theme (missing — tray install auto-installs it when packaged)"
       fi
+    fi
+  fi
+
+  # R63: native KDE dialog tool (informational — the tray uses kdialog on
+  # Plasma, zenity elsewhere; the tray install auto-installs kdialog on KDE
+  # when missing). Read-only probe, no installs here.
+  if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* || "${XDG_SESSION_DESKTOP:-}" == *KDE* || -n "${KDE_FULL_SESSION:-}" ]]; then
+    if have_cmd kdialog; then
+      print_kv "kdialog (KDE dialogs)" "OK"
+    else
+      print_kv "kdialog (KDE dialogs)" "not installed (tray install auto-installs it on KDE)"
     fi
   fi
 
@@ -13453,7 +13478,9 @@ ensure_notify_send() {
 
 # R61: discover the DESKTOP SESSION's display environment for $1 (a
 # username) so a root/sudo context can launch a GUI app inside the user's
-# session. Prints KEY=VAL lines (WAYLAND_DISPLAY / DISPLAY) for `env`.
+# session. Prints KEY=VAL lines (WAYLAND_DISPLAY / DISPLAY, plus the R63
+# desktop-identity keys XDG_CURRENT_DESKTOP / XDG_SESSION_DESKTOP /
+# KDE_FULL_SESSION) for `env`.
 # ROOT CAUSE this fixes: the tray's install-time launch used to inherit
 # WAYLAND_DISPLAY/DISPLAY from the sudo/root environment — which does NOT
 # have them (sudo env_reset strips them) — so the applet started
@@ -13472,7 +13499,7 @@ _tray_session_display_env() {
   for _pat in kwin_wayland plasmashell gnome-shell sway hyprland Xorg wayfire labwc river niri; do
     while IFS= read -r _proc; do
       [[ -n "$_proc" ]] || continue
-      _env="$(tr '\0' '\n' <"/proc/$_proc/environ" 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY)=' || true)"
+      _env="$(tr '\0' '\n' <"/proc/$_proc/environ" 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY|XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP|KDE_FULL_SESSION)=' || true)"
       if [[ -n "$_env" ]]; then
         printf '%s\n' "$_env"
         return 0
@@ -13645,6 +13672,95 @@ ensure_icon_theme() {
   return 1
 }
 
+# R63: AUTO-INSTALL kdialog (the native KDE dialog tool) when the desktop
+# session is KDE and kdialog is missing — the tray applet prefers kdialog on
+# Plasma (native look) and falls back to zenity elsewhere; zenity is already
+# guaranteed by the R60 gate, so this is PURELY BEST-EFFORT (a failure never
+# blocks or skips the tray — the applet uses zenity then). 'kdialog' is the
+# package name on EVERY supported distro (verified online 2026-11: apt-get /
+# dnf / yum / zypper / pacman / apk / xbps-install all ship a package
+# literally named kdialog). Success criterion: the have_cmd kdialog re-check.
+ensure_kdialog() {
+  if have_cmd kdialog; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY-RUN: kdialog not installed; a real run would auto-install the distro package (kdialog — the same package name on every distro)."
+    return 1
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! have_cmd sudo; then
+    note "kdialog auto-install needs root and sudo is not available in this session."
+    return 1
+  fi
+  local use_sudo=0
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+  say
+  hdr "kdialog (KDE dialogs) auto-install"
+  note "The tray applet uses kdialog for native Plasma dialogs on KDE; it is not installed."
+  note "Installing the distro package now (no prompt)..."
+  if have_cmd apt-get; then
+    if (( use_sudo )); then
+      run sudo apt-get -y install kdialog || true
+    else
+      run apt-get -y install kdialog || true
+    fi
+    if ! have_cmd kdialog; then
+      note "apt-get install did not make kdialog available; refreshing package lists (apt-get update) and retrying..."
+      if (( use_sudo )); then
+        run sudo apt-get update >/dev/null 2>&1 || true
+        run sudo apt-get -y install kdialog || true
+      else
+        run apt-get update >/dev/null 2>&1 || true
+        run apt-get -y install kdialog || true
+      fi
+    fi
+  elif have_cmd dnf; then
+    if (( use_sudo )); then
+      run sudo dnf -y install kdialog || true
+    else
+      run dnf -y install kdialog || true
+    fi
+  elif have_cmd yum; then
+    if (( use_sudo )); then
+      run sudo yum -y install kdialog || true
+    else
+      run yum -y install kdialog || true
+    fi
+  elif have_cmd zypper; then
+    if (( use_sudo )); then
+      run sudo zypper --non-interactive in kdialog || true
+    else
+      run zypper --non-interactive in kdialog || true
+    fi
+  elif have_cmd pacman; then
+    if (( use_sudo )); then
+      run sudo pacman --noconfirm -S kdialog || true
+    else
+      run pacman --noconfirm -S kdialog || true
+    fi
+  elif have_cmd apk; then
+    if (( use_sudo )); then
+      run sudo apk add --no-cache kdialog || true
+    else
+      run apk add --no-cache kdialog || true
+    fi
+  elif have_cmd xbps-install; then
+    if (( use_sudo )); then
+      run sudo xbps-install -Sy kdialog || true
+    else
+      run xbps-install -Sy kdialog || true
+    fi
+  fi
+  if have_cmd kdialog; then
+    say "kdialog installed and available — the tray dialogs will use the native Plasma look on KDE."
+    return 0
+  fi
+  note "Automatic kdialog install did not succeed (non-fatal — the tray falls back to zenity dialogs)."
+  return 1
+}
+
 # R41: Install the system-tray on/off toggle applet for live-attach hotplug.
 # Generates a PySide6 QSystemTrayIcon applet (/usr/local/bin/vfio-hotplug-tray)
 # that reads the world-readable mode file, shows an icon + tooltip reflecting
@@ -13668,6 +13784,8 @@ ensure_icon_theme() {
 # (see ensure_icon_theme) — any theme, any distro: packaged themes are
 # installed, un-packaged store themes get guidance, and the applet has a
 # themed fallback chain for the glyph.
+# R63: on KDE the applet uses kdialog (native Plasma dialogs) with zenity as
+# the universal fallback (see ensure_kdialog + the applet's _dialog_cmd).
 install_live_attach_tray() {
   # The tray toggles via pkexec /usr/local/bin/vfio --live-attach-toggle, so it
   # needs the self-installed CLI at SELF_INSTALL_BIN. Without it, the tray would
@@ -13743,6 +13861,25 @@ install_live_attach_tray() {
       note "The tray icon will use a themed fallback glyph (cosmetic only; everything else works)."
     fi
   fi
+  # R63: native KDE dialogs. When the desktop session is KDE (read from the
+  # user's live session environ — XDG_CURRENT_DESKTOP/XDG_SESSION_DESKTOP
+  # contain KDE, or KDE_FULL_SESSION is set), the tray applet uses kdialog
+  # (native Plasma look) instead of zenity; zenity stays the universal
+  # fallback (guaranteed by the R60 gate). BEST-EFFORT: auto-install kdialog
+  # on KDE when missing; never blocks or skips the tray.
+  if [[ -n "${_icon_user:-}" && "${_icon_user:-}" != "root" ]]; then
+    local _desk_env
+    _desk_env="$(_tray_session_display_env "$_icon_user" 2>/dev/null || true)"
+    if grep -Eq '^(XDG_CURRENT_DESKTOP|XDG_SESSION_DESKTOP)=.*KDE|^KDE_FULL_SESSION=' <<<"$_desk_env" 2>/dev/null; then
+      if ! have_cmd kdialog; then
+        if ensure_kdialog; then
+          say "kdialog installed — the tray dialogs will use the native Plasma look."
+        else
+          note "NOTE: kdialog is not available (non-fatal — the tray falls back to zenity dialogs). Install it manually: the package is 'kdialog' on every distro."
+        fi
+      fi
+    fi
+  fi
 
   # FOOLPROOF: kill any ALREADY-running tray instance BEFORE regenerating the
   # applet file. The old process holds the OLD code in memory; without this the
@@ -13771,7 +13908,7 @@ install_live_attach_tray() {
 # Managed by vfio.sh — system-tray on/off toggle for live-attach GPU hotplug.
 # Do not edit; regenerated on reinstall. Removed by: sudo vfio.sh --reset
 # (or --install-early-binding). Requires PySide6 (Qt6 -> native SNI on KDE).
-import sys, os, subprocess, datetime
+import sys, os, subprocess, datetime, shutil
 
 LOG = "/tmp/vfio-hotplug-tray.log"
 def _log(msg):
@@ -13922,8 +14059,7 @@ def rebar_at_risk():
 
 def show_rebar_warning():
     try:
-        subprocess.run(["zenity", "--info", "--title", "ReBAR warning",
-                        "--text",
+        subprocess.run(_info_args("ReBAR warning",
                         "ReBAR (resizable BAR) is ON for your AMD guest GPU.\n\n"
                         "The amdgpu driver auto-resizes BAR0 to full VRAM on load, "
                         "which breaks the Windows AMD display driver — the display "
@@ -13932,7 +14068,7 @@ def show_rebar_warning():
                         "at 256MB (the BIOS size). The script can do this for you:\n"
                         "  sudo vfio --install-dynamic-binding --amd-rebar\n\n"
                         "NOTE: amdgpu.resizable_bar is NOT a real module param "
-                        "(silently ignored) — use amdgpu.rebar=0."],
+                        "(silently ignored) — use amdgpu.rebar=0."),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
@@ -13944,9 +14080,42 @@ def notify(title, body, urgency="normal"):
     except Exception:
         pass
 
+def _dialog_cmd():
+    # R63: native KDE dialogs on Plasma (kdialog), zenity elsewhere. The KDE
+    # check honors the desktop identity env (forwarded by the install-time
+    # launch too); when the identity env is STRIPPED, fall back to "kdialog
+    # installed AND plasmashell present" — the KDE signature. Both binaries
+    # must exist before kdialog is chosen; zenity is always guaranteed by the
+    # installer (R60), so this never fails.
+    try:
+        kde = ("KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "")
+               or "KDE" in os.environ.get("XDG_SESSION_DESKTOP", "")
+               or bool(os.environ.get("KDE_FULL_SESSION")))
+        no_identity = not (os.environ.get("XDG_CURRENT_DESKTOP")
+                           or os.environ.get("XDG_SESSION_DESKTOP")
+                           or os.environ.get("KDE_FULL_SESSION"))
+        if shutil.which("kdialog"):
+            if kde or (no_identity and shutil.which("plasmashell")):
+                return "kdialog"
+    except Exception:
+        pass
+    return "zenity"
+
+def _confirm_args(title, text):
+    # R63: kdialog --yesno (rc 0 = yes / 1 = no) mirrors zenity --question.
+    if _dialog_cmd() == "kdialog":
+        return ["kdialog", "--title", title, "--yesno", text]
+    return ["zenity", "--question", "--title", title, "--text", text]
+
+def _info_args(title, text):
+    # R63: kdialog --msgbox mirrors zenity --info.
+    if _dialog_cmd() == "kdialog":
+        return ["kdialog", "--title", title, "--msgbox", text]
+    return ["zenity", "--info", "--title", title, "--text", text]
+
 def confirm(title, text):
     try:
-        return subprocess.call(["zenity", "--question", "--title", title, "--text", text]) == 0
+        return subprocess.call(_confirm_args(title, text)) == 0
     except Exception:
         return False
 
@@ -13997,7 +14166,7 @@ def show_status():
     except Exception as e:
         out = "status unavailable: %s" % e
     try:
-        subprocess.run(["zenity", "--info", "--title", "VFIO hotplug status", "--text", out],
+        subprocess.run(_info_args("VFIO hotplug status", out),
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         sys.stderr.write(out + "\n")
@@ -14257,6 +14426,15 @@ DESKEOF
         if [[ -z "$_xd" ]]; then _xd="${DISPLAY:-}"; fi
         if [[ -n "$_wd" ]]; then _env_args+=(WAYLAND_DISPLAY="$_wd"); fi
         if [[ -n "$_xd" ]]; then _env_args+=(DISPLAY="$_xd"); fi
+        # R63: also forward the desktop identity (XDG_CURRENT_DESKTOP /
+        # XDG_SESSION_DESKTOP / KDE_FULL_SESSION) from the session environ so
+        # the applet — and any Qt app launched this way — resolves the desktop
+        # deterministically (e.g. picks the native KDE dialogs).
+        local _ik _iv
+        for _ik in XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP KDE_FULL_SESSION; do
+          _iv="$(grep -m1 -E "^$_ik=" <<<"$_disp_env" 2>/dev/null || true)"
+          if [[ -n "$_iv" ]]; then _env_args+=("$_iv"); fi
+        done
         # setsid-detach so the tray survives this sudo/install process exiting
         # (a bare & child would get SIGHUP when the controlling tty closes).
         setsid runuser -u "$_user" -- env "${_env_args[@]}" \
@@ -30318,6 +30496,9 @@ uninstall_self() {
   # R62: an auto-installed icon theme package (breeze / adwaita / papirus /
   # yaru / hicolor) follows the same shared-package policy — NOT auto-removed.
   note "An icon theme package (if the tray install auto-installed one) is likewise a shared system package and is deliberately left in place."
+  # R63: kdialog follows the same shared-package policy — other KDE scripts
+  # use it; NOT auto-removed.
+  note "The kdialog package (if the tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
 }
 
 # Config pickup: when the install wizard (or --menu option 0) starts and the

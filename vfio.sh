@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R59 — bumped on every change; the full history is in changelog.md.
+# Revision: R60 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -52,7 +52,17 @@ SCRIPT_NAME="$(basename "$0")"
 # build). On failure (offline / repo error / package unavailable / no package
 # manager / no sudo) it prints the exact manual commands and skips the tray as
 # before — never fatal, the CLI --live-attach-toggle still works.
-SCRIPT_REVISION="R59"
+# R60: zenity auto-install — the tray's LAST manual prerequisite. When zenity
+# (the tray's toggle-confirmation / status / ReBAR-warning dialogs) is not
+# installed, the interactive tray install AUTO-INSTALLS the distro package
+# ('zenity' is the package name on EVERY supported distro — verified 2026-11)
+# with NO prompts, using the have_cmd re-check as the success criterion. With
+# R58 (TUI backend) + R59 (PySide6) + R60 (zenity) the tray install is now
+# fully hands-off on a fresh distro. pkexec/polkit is deliberately NOT
+# auto-installed: it is a core systemd desktop component present wherever a
+# system tray can exist, and a missing pkexec surfaces at toggle time as the
+# tray's own critical notify (actionable, not silent).
+SCRIPT_REVISION="R60"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -4161,6 +4171,14 @@ self_test() {
     print_kv "PySide6 (tray toolkit)" "OK"
   else
     print_kv "PySide6 (tray toolkit)" "not importable (tray install auto-installs it)"
+  fi
+
+  # R60: zenity (the tray's confirmation/status dialogs) — informational, the
+  # same read-only contract; the tray install auto-installs it when missing.
+  if have_cmd zenity; then
+    print_kv "zenity (tray dialogs)" "OK"
+  else
+    print_kv "zenity (tray dialogs)" "not installed (tray install auto-installs it)"
   fi
 
   # PipeWire: best-effort
@@ -13178,6 +13196,107 @@ ensure_pyside6() {
   return 1
 }
 
+# R60: AUTO-INSTALL zenity (the tray's toggle-confirmation / status / ReBAR
+# warning dialogs) when it is missing — the R59 PySide6 pattern applied to the
+# tray's LAST manual prerequisite, so a fresh distro gets the full tray
+# install hands-off. Same contract as ensure_pyside6: no prompts; called only
+# from install_live_attach_tray (interactive install flows only — the
+# read-only modes never install packages); sudo-aware for non-root callers;
+# --dry-run / non-root-without-sudo / no-PM / offline failures return 1 with a
+# printed note and the caller falls back to skip-with-hints. 'zenity' is the
+# package name on EVERY supported distro (verified 2026-11: apt-get / dnf /
+# yum / zypper / pacman / apk / xbps-install all ship a package literally
+# named zenity), so there is a single candidate and no versioned retry; the
+# success criterion is the have_cmd re-check (a PM can exit 0 without the
+# binary actually landing on PATH).
+ensure_zenity() {
+  if have_cmd zenity; then
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    note "DRY-RUN: zenity not installed; a real run would auto-install the distro package (zenity — the same package name on every distro)."
+    return 1
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! have_cmd sudo; then
+    note "zenity auto-install needs root and sudo is not available in this session."
+    return 1
+  fi
+  local use_sudo=0
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && have_cmd sudo; then
+    use_sudo=1
+  fi
+
+  say
+  hdr "zenity (tray dialogs) auto-install"
+  note "The tray applet needs zenity (the toggle confirmation + status + ReBAR dialogs); it is not installed."
+  note "Installing the distro package now (no prompt)..."
+
+  if have_cmd apt-get; then
+    if (( use_sudo )); then
+      run sudo apt-get -y install zenity || true
+    else
+      run apt-get -y install zenity || true
+    fi
+    if ! have_cmd zenity; then
+      # Fresh Debian/Ubuntu images ship EMPTY package lists; refresh once and
+      # retry (the R58 apt pattern).
+      note "apt-get install did not make zenity available; refreshing package lists (apt-get update) and retrying..."
+      if (( use_sudo )); then
+        run sudo apt-get update >/dev/null 2>&1 || true
+        run sudo apt-get -y install zenity || true
+      else
+        run apt-get update >/dev/null 2>&1 || true
+        run apt-get -y install zenity || true
+      fi
+    fi
+  elif have_cmd dnf; then
+    if (( use_sudo )); then
+      run sudo dnf -y install zenity || true
+    else
+      run dnf -y install zenity || true
+    fi
+  elif have_cmd yum; then
+    if (( use_sudo )); then
+      run sudo yum -y install zenity || true
+    else
+      run yum -y install zenity || true
+    fi
+  elif have_cmd zypper; then
+    if (( use_sudo )); then
+      run sudo zypper --non-interactive in zenity || true
+    else
+      run zypper --non-interactive in zenity || true
+    fi
+  elif have_cmd pacman; then
+    if (( use_sudo )); then
+      run sudo pacman --noconfirm -S zenity || true
+    else
+      run pacman --noconfirm -S zenity || true
+    fi
+  elif have_cmd apk; then
+    if (( use_sudo )); then
+      run sudo apk add --no-cache zenity || true
+    else
+      run apk add --no-cache zenity || true
+    fi
+  elif have_cmd xbps-install; then
+    if (( use_sudo )); then
+      run sudo xbps-install -Sy zenity || true
+    else
+      run xbps-install -Sy zenity || true
+    fi
+  fi
+
+  # Re-check the command — the REAL success criterion (a PM can exit 0
+  # without the binary actually landing on PATH).
+  if have_cmd zenity; then
+    say "zenity installed and available — continuing with the tray applet install."
+    return 0
+  fi
+  note "Automatic zenity install did not succeed (offline, repo error, package unavailable, or no supported package manager)."
+  return 1
+}
+
 # R41: Install the system-tray on/off toggle applet for live-attach hotplug.
 # Generates a PySide6 QSystemTrayIcon applet (/usr/local/bin/vfio-hotplug-tray)
 # that reads the world-readable mode file, shows an icon + tooltip reflecting
@@ -13189,6 +13308,9 @@ ensure_pyside6() {
 # don't re-prompt) + a per-user autostart desktop file, and best-effort launches
 # one instance now. Best-effort / non-fatal: if PySide6 or the self-installed
 # CLI is absent, the install notes it and returns 0 (CLI toggle still works).
+# R59/R60: PySide6 and zenity are AUTO-INSTALLED first when missing (see
+# ensure_pyside6 / ensure_zenity) — the skip-with-notes path now only fires
+# when that auto-install itself fails (offline / repo error / no PM / no sudo).
 install_live_attach_tray() {
   # The tray toggles via pkexec /usr/local/bin/vfio --live-attach-toggle, so it
   # needs the self-installed CLI at SELF_INSTALL_BIN. Without it, the tray would
@@ -13217,9 +13339,28 @@ install_live_attach_tray() {
       return 0
     fi
   fi
+  # R60: zenity is the tray's dialog tool (the toggle confirmation, the
+  # status popup, and the ReBAR warning). If it is missing, AUTO-INSTALL the
+  # distro package first (no prompt — same as the R59 PySide6 auto-install;
+  # see ensure_zenity), then re-check. Only when the auto-install fails
+  # (offline / repo error / package unavailable / no package manager / no
+  # root+sudo) do we fall back to the old skip-with-hints behavior. Never
+  # fatal: the CLI --live-attach-toggle works regardless. (pkexec/polkit is
+  # deliberately NOT gated here: it is a core systemd desktop component
+  # present wherever a system tray can exist; a missing pkexec surfaces at
+  # toggle time as the tray's own critical notify — actionable, not silent.)
   if ! have_cmd zenity; then
-    note "Tray applet: zenity not available; skipping tray install (needed for the confirmation dialog)."
-    return 0
+    if ! ensure_zenity; then
+      note "Tray applet: zenity still not available; skipping tray install. (CLI --live-attach-toggle still works.)"
+      note "Install it with your package manager ('zenity' is the name on every distro), then re-run --install-live-attach:"
+      say "  openSUSE:      sudo zypper install zenity"
+      say "  Fedora/RHEL:   sudo dnf install zenity"
+      say "  Debian/Ubuntu: sudo apt-get install zenity"
+      say "  Arch:          sudo pacman -S zenity"
+      say "  Alpine:        sudo apk add zenity"
+      say "  Void:          sudo xbps-install -Sy zenity"
+      return 0
+    fi
   fi
 
   # FOOLPROOF: kill any ALREADY-running tray instance BEFORE regenerating the
@@ -29749,6 +29890,9 @@ uninstall_self() {
   #   apt-get remove python3-pyside6.qtwidgets | pacman -R pyside6 |
   #   apk del py3-pyside6 | xbps-remove python3-PySide6
   note "The PySide6 tray toolkit (if the live-attach tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
+  # R60: zenity follows the same shared-package policy — many desktop scripts
+  # use zenity, so it is deliberately NOT auto-removed either.
+  note "The zenity package (if the tray install auto-installed it) is likewise a shared system package and is deliberately left in place."
 }
 
 # Config pickup: when the install wizard (or --menu option 0) starts and the

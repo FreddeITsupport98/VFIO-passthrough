@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R65 — bumped on every change; the full history is in changelog.md.
+# Revision: R66 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -153,7 +153,24 @@ SCRIPT_NAME="$(basename "$0")"
 # failed"), so a successful-probe line can never match. Verified live on the
 # reporting host: the old pipeline matched the 2 cmdline echo lines in the
 # current journal; the fixed pipeline matches nothing on the same journal.
-SCRIPT_REVISION="R65"
+# R66: Looking Glass self-heal parser fix — the R48j self-healing cmake never
+# fired on the real CMake error format (live report: the openSUSE Looking
+# Glass client compile failed with 'The following required packages were not
+# found: xinerama xcursor' and dropped straight to the manual-install error).
+# TWO parser bugs in _lg_extract_missing_modules' awk: (1) the blank line
+# between the '...were not found:' header and the ' - module' list killed the
+# grab state before a single module was read; (2) CMake indents the module
+# lines with THREE spaces, which the old '^ - ' (exactly one) never matched.
+# Rewritten state machine: blanks BEFORE the first module are skipped while
+# waiting; once at least one module is captured, the first non-module line
+# ends the block. Also added the two missing packages to the up-front
+# openSUSE build-dep list (libXinerama-devel, libXcursor-devel — present in
+# the apt list, absent from the zypper list, so the first cmake attempt
+# failed on exactly those two and the broken self-heal was the only defense).
+# The self-heal now actually works: verified end-to-end with a mini cmake
+# project + a fake package manager (attempt 1 fails -> module extracted ->
+# mapped -> auto-install -> attempt 2 succeeds).
+SCRIPT_REVISION="R66"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -19127,6 +19144,7 @@ install_looking_glass_client() {
       run zypper --non-interactive install binutils-devel make cmake \
         fontconfig-devel spice-protocol-devel libX11-devel libnettle-devel \
         wayland-protocols-devel libconfig-devel libXi-devel libXss-devel \
+        libXinerama-devel libXcursor-devel \
         libwayland-egl-devel nettle libglvnd-devel libxkbcommon-devel \
         libXpresent-devel libXrandr-devel libXScrnSaver-devel libdecor-devel \
         dejavu-fonts pipewire-devel libpulse-devel libsamplerate-devel \
@@ -19466,9 +19484,15 @@ _lg_extract_missing_modules() {
   [[ -f "$_log" ]] || return 0
   awk '
     /The following required packages were not found:/{ grab=1; next }
-    grab && /^ - / { sub(/^ - /, ""); sub(/[<>=].*/, ""); print }
-    grab && !/^ - / && !/^$/ { grab=0 }
-    /^$/ { grab=0 }
+    !grab { next }
+    /^[[:space:]]*-[[:space:]]/ {
+      line=$0
+      sub(/^[[:space:]]*-[[:space:]]+/, "", line)
+      sub(/[<>=].*/, "", line)
+      if (line != "") { print line; got=1 }
+      next
+    }
+    got { grab=0 }
   ' "$_log" 2>/dev/null | sort -u | grep -v '^$'
 }
 

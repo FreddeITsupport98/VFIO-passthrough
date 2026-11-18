@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R63 — bumped on every change; the full history is in changelog.md.
+# Revision: R64 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -117,7 +117,26 @@ SCRIPT_NAME="$(basename "$0")"
 # tray install BEST-EFFORT auto-installs kdialog on KDE when missing
 # ('kdialog' is the package name on every distro — verified online). zenity
 # stays the guaranteed universal fallback (R60); nothing blocks on kdialog.
-SCRIPT_REVISION="R63"
+# R64: dead-GPU resilience — a dead guest GPU can no longer block the VM.
+# When the RX 9070 / RDNA4 card drops off the PCI bus entirely (the 'zombie'
+# state qemu reports as 'Unknown PCI header type 127'), the OLD top-level
+# bind-script check died with a bare 'Guest GPU not present in sysfs' and the
+# VM start failed outright. Now: (1) the bind script attempts a bare PCI
+# rescan, then aborts with the DEDICATED exit code 42 via _dead_gpu_abort —
+# one unified, actionable message (what happened: the card dropped off the
+# bus; NOT a config problem; the real fix: save your work and REBOOT the
+# host; the VM still starts) + a desktop notification; (2) the libvirt hook's
+# dead-GPU fallback (VFIO_DEAD_GPU_FALLBACK=1, default) catches rc 42, flips
+# the VM into live-attach mode=on (GPU stripped from the persistent XML,
+# fragment saved) via a FULLY DETACHED worker, and auto-restarts the VM
+# WITHOUT the GPU a few seconds later — the VM boots on the virtual display,
+# and the live-attach helper binds + hot-attaches the GPU automatically the
+# moment it is alive again (after the reboot) thanks to a bounded GPU-alive
+# wait (VFIO_LIVE_ATTACH_GPU_ALIVE_WAIT, default 120s). Loop-guarded (one
+# fallback per domain per 10 minutes; cleared on the next successful bind) so
+# a missing CLI/virsh can never cause an auto-restart loop. Set
+# VFIO_DEAD_GPU_FALLBACK=0 for the old fail-the-start behavior.
+SCRIPT_REVISION="R64"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -6202,6 +6221,35 @@ VFIO_RESTORE_D3COLD_ON_RELEASE="0"
 # hung bind is aborted. Lower it only if your hook deadline is shorter; raise it
 # only if a legitimately slow bind keeps getting aborted (rare).
 VFIO_HOOK_BIND_TIMEOUT="20"
+# R64 dead-GPU fallback (read by the libvirt hook at VM start):
+# - 1 (default): when --bind-now exits 42 (the guest GPU is DEAD — dropped off
+#   the PCI bus, and the rescan + the bind script's own reset/recovery attempts
+#   could not revive it), the hook does NOT fail the VM start outright. Instead
+#   it flips the VM into live-attach mode=on (GPU stripped from the persistent
+#   XML, fragment saved) via a fully-detached worker and auto-restarts the VM
+#   WITHOUT the GPU a few seconds later: the VM boots on the virtual display,
+#   a desktop notification + the libvirt error tell the operator to save their
+#   work and reboot the host, and the live-attach helper binds + hot-attaches
+#   the GPU automatically the moment it is alive again (after the reboot).
+#   Loop-guarded: one fallback per domain per 10 minutes, cleared on the next
+#   successful bind.
+# - 0: the old behavior — the VM start simply fails with the reboot message.
+# WHY this value: 1 keeps a dead GPU from blocking the VM entirely (the VM is
+# still usable on the virtual display / Looking Glass) while making the real
+# fix (host reboot) impossible to miss. Set 0 only if you never want a VM to
+# start without the GPU present.
+VFIO_DEAD_GPU_FALLBACK="1"
+# R64 live-attach GPU-alive wait (seconds, read by the live-attach helper):
+# when the helper starts and the GPU is not yet alive (e.g. the dead-GPU
+# fallback started the VM while the card was off the bus and the operator has
+# not rebooted yet), poll this long for the card to come back and bind +
+# hot-attach the MOMENT it is alive. 0 = the old fail-fast behavior (one bind
+# attempt, notify + exit on a dead card). The VM keeps running WITHOUT the GPU
+# the whole time — this wait never blocks the VM itself.
+# WHY this value: 120s covers a park-keepalive remove+rescan revival and a
+# quick operator reboot+restart without waiting forever. Set 0 to fail fast,
+# or higher for slower recoveries.
+VFIO_LIVE_ATTACH_GPU_ALIVE_WAIT="120"
 # Dynamic-mode host-rebind verify timeout (seconds, read by reprobe_to_host at
 # --release when VFIO_DYNAMIC_REBIND_HOST=1): after kicking
 # /sys/bus/pci/drivers_probe to make amdgpu/snd re-grab the guest GPU, poll
@@ -9896,9 +9944,6 @@ _desktop_notify() {
 
 : "${GUEST_GPU_BDF:?}"
 
-# Basic sanity: ensure sysfs entries exist.
-[[ -d "/sys/bus/pci/devices/$GUEST_GPU_BDF" ]] || die "Guest GPU not present in sysfs: $GUEST_GPU_BDF"
-
 # This script is invoked two ways:
 #   1) by vfio-bind-selected-gpu.service at boot (no args) -> ACTION=boot
 #   2) by the libvirt qemu hook (vfio-libvirt-hook.sh) with --bind-now or --release
@@ -9911,6 +9956,56 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# R64: dead-GPU abort — every "the guest GPU is dead and recovery failed"
+# path in --bind-now routes here so the operator ALWAYS gets the same clear,
+# actionable story, and the libvirt hook ALWAYS gets the SAME dedicated exit
+# code (42) to trigger its GPU-less fallback. The message names the cause (the
+# RX 9070 / RDNA4 'zombie' state), states it is NOT a config problem, gives
+# the REAL fix (save your work + reboot the host), and says the VM still
+# starts (GPU-less fallback). $1 = context; $2 = BDF (default: the GPU).
+_dead_gpu_abort() {
+  local _ctx="$1" _b="${2:-$GUEST_GPU_BDF}"
+  say "ERROR: The guest GPU ($_b) is DEAD — it dropped off the PCI bus ($_ctx; the RX 9070 / RDNA4 'zombie' state qemu reports as 'Unknown PCI header type 127')." >&2
+  say "This is NOT a configuration problem (if you changed hardware recently, verify the BDF with: vfio --verify). The card needs a host reboot to come back on the bus — save your work and reboot the host when convenient." >&2
+  say "The VM start is NOT lost: the libvirt hook's dead-GPU fallback (VFIO_DEAD_GPU_FALLBACK=1, default) restarts the VM WITHOUT the GPU (virtual display), and the GPU hot-attaches automatically once it is alive again — usually right after the reboot." >&2
+  jlog "$_b: DEAD ($_ctx); recovery failed; needs a host reboot; exiting 42 (the hook's dead-GPU fallback trigger)"
+  _desktop_notify "VFIO: guest GPU is dead" "The guest GPU dropped off the bus and needs a host reboot. Save your work and reboot when convenient — the VM will start WITHOUT the GPU meanwhile and the GPU re-attaches automatically after the reboot."
+  exit 42
+}
+
+# R64: dead-GPU gate (replaces the old bare top-level sysfs check, which died
+# with "Guest GPU not present in sysfs" — no recovery attempt, no guidance,
+# and a VM start that failed outright; the exact live report). The RX 9070 /
+# RDNA4 reset bug can drop the guest GPU off the bus ENTIRELY (no sysfs
+# entry). Now: attempt a bare PCI rescan (a remove is impossible — there is
+# no sysfs entry to remove); if the card stays gone, --bind-now exits 42 via
+# _dead_gpu_abort (the hook's fallback trigger), --release tolerates it
+# (records the cooldown, exits 0 — a dead card must not fail the VM-stop
+# flow), and the early-binding boot path keeps the old loud die (a dead card
+# at boot IS a reboot case).
+if [[ ! -d "/sys/bus/pci/devices/$GUEST_GPU_BDF" ]]; then
+  if [[ "$ACTION" == "bind-now" || "$ACTION" == "release" ]]; then
+    jlog "$GUEST_GPU_BDF: not present in sysfs (dropped off the bus); attempting a bare PCI rescan to re-enumerate it"
+    say "WARN: guest GPU $GUEST_GPU_BDF dropped off the PCI bus (RX 9070 / RDNA4 reset bug); attempting a PCI rescan to re-enumerate it..." >&2
+    echo 1 >/sys/bus/pci/rescan 2>/dev/null || true
+    sleep 2
+  fi
+  if [[ -d "/sys/bus/pci/devices/$GUEST_GPU_BDF" ]]; then
+    say "Recovered $GUEST_GPU_BDF after the PCI rescan (back on the bus); continuing."
+    jlog "$GUEST_GPU_BDF: recovered after the bare PCI rescan (was entirely off the bus)"
+  elif [[ "$ACTION" == "bind-now" ]]; then
+    _dead_gpu_abort "no sysfs entry at all; a bare PCI rescan could not re-enumerate it"
+  elif [[ "$ACTION" == "release" ]]; then
+    say "WARN: guest GPU $GUEST_GPU_BDF is gone from sysfs at release time; nothing to unbind or reprobe. The next VM start uses the GPU-less fallback. Save your work and reboot the host to revive the card." >&2
+    jlog "$GUEST_GPU_BDF: gone from sysfs at release; skipping the release body, recording the cooldown timestamp"
+    mkdir -p "$(dirname "$COOLDOWN_TS_FILE")" 2>/dev/null || true
+    date +%s >"$COOLDOWN_TS_FILE" 2>/dev/null || true
+    exit 0
+  else
+    die "Guest GPU not present in sysfs: $GUEST_GPU_BDF (dropped off the bus — reboot the host to revive it)"
+  fi
+fi
 
 binding_mode="${VFIO_BINDING_MODE:-early}"
 binding_mode="${binding_mode^^}"
@@ -10556,9 +10651,7 @@ bind_one() {
         jlog "$dev: recovered after remove+rescan (alive); keeping on vfio-pci"
         return 0
       fi
-      say "ERROR: $dev is bound to vfio-pci but is not alive (config space all 0xff, qemu would report "Unknown PCI header type 127"). A PCI reset and a remove+rescan bus recovery both failed to recover it. The card needs a host reboot to come back. Aborting VM start so the host display stays alive." >&2
-      jlog "$dev: FAILED alive-check (header 127); PCI reset + remove+rescan did not recover; aborting VM start"
-      return 1
+      _dead_gpu_abort "bound to vfio-pci but not alive (config space all 0xff); a PCI reset and a remove+rescan both failed to recover it" "$dev"
     fi
   fi
 
@@ -10647,12 +10740,7 @@ bind_one() {
     if _pci_dev_remove_rescan "$dev"; then
       jlog "$dev: recovered after remove+rescan (alive) post-bind"
     else
-      say "ERROR: $dev bound to vfio-pci but its config space is unreadable (RX 9070 / RDNA4 reset bug: "Unknown PCI header type 127"). qemu would fail to start. A PCI reset and a remove+rescan bus recovery both failed. Aborting VM start. Next steps:" >&2
-      say "  - reboot the host (the card needs a cold reset to come back on the bus)" >&2
-      say "  - then start the VM; avoid rapid stop/start cycles" >&2
-      say "  - if it recurs, enable VFIO_DYNAMIC_PCI_RESET=1 in /etc/vfio-gpu-passthrough.conf" >&2
-      say "  - keep VFIO_DYNAMIC_COOLDOWN_SECONDS (default 10) above 0 to prevent rapid stop/start" >&2
-      return 1
+      _dead_gpu_abort "bound to vfio-pci but config space unreadable after the bind; a PCI reset and a remove+rescan both failed" "$dev"
     fi
   fi
 
@@ -11182,9 +11270,7 @@ case "$ACTION" in
             _elapsed=$(( _now - _last_stop ))
           done
           if ! _pci_dev_alive "$GUEST_GPU_BDF"; then
-            say "ERROR: VM stopped ${_elapsed}s ago and the guest GPU ($GUEST_GPU_BDF) is still not alive after the cooldown window (${_cooldown_seconds}s). Its config space is unreadable (RX 9070 / RDNA4 reset bug: Unknown PCI header type 127). The card needs a host reboot to come back on the bus. Aborting VM start." >&2
-            jlog "$GUEST_GPU_BDF: FAILED cooldown readiness probe -- card still dead after ${_cooldown_seconds}s; needs host reboot"
-            exit 1
+            _dead_gpu_abort "still not alive after the cooldown readiness window (${_cooldown_seconds}s; VM stopped ${_elapsed}s ago, config space unreadable)"
           fi
         fi
       fi
@@ -11606,6 +11692,57 @@ _ensure_hp() {
   fi
 }
 
+# R64: dead-GPU fallback — the bind script exited 42 (the guest GPU is DEAD:
+# off the bus / config space unreadable, and the rescan + reset recoveries all
+# failed). Instead of failing the VM start outright, start the VM WITHOUT the
+# GPU: a FULLY DETACHED worker (runs AFTER this hook exits, so it can never
+# re-enter or rewrite this very script) flips the VM into live-attach mode=on
+# (GPU stripped from the persistent XML, fragment saved — 'vfio
+# --live-attach-on') and auto-restarts it a few seconds later. The VM boots on
+# the virtual display; the live-attach helper binds + hot-attaches the GPU
+# automatically the moment it is alive again (usually after the operator's
+# host reboot; see the helper's GPU-alive wait). The worker is setsid-detached
+# with stdin/stderr OFF the libvirt pipe so this hook exits immediately and
+# qemu never sees the dead card. LOOP-GUARDED: one fallback per domain per 10
+# minutes (stamp cleared on the next successful bind; auto-expires), so a
+# missing CLI/virsh or a still-dead card can never cause an auto-restart
+# loop. Opt out with VFIO_DEAD_GPU_FALLBACK=0 (the old behavior: the start
+# fails with the reboot message).
+_dead_gpu_fallback() {
+  # Loop guard: if a fallback already ran for this domain within the last 10
+  # minutes, abort plainly instead of spawning another restart (the GPU is
+  # still dead — a reboot is required; repeated GPU-less restarts of the same
+  # dead card would loop).
+  local _fs
+  if [[ -f "/var/lib/vfio-dynamic/dead-gpu-fallback.$DOMAIN" ]]; then
+    _fs="$(cat "/var/lib/vfio-dynamic/dead-gpu-fallback.$DOMAIN" 2>/dev/null || echo 0)"
+    if [[ "$_fs" =~ ^[0-9]+$ ]] && (( $(date +%s) - _fs < 600 )); then
+      say "vfio-libvirt-hook: dead-GPU fallback already attempted for '$DOMAIN' within the last 10 minutes; not retrying (loop guard). The guest GPU still needs a host reboot." >&2
+      hook_log "action=dead-gpu-fallback-suppressed domain=$DOMAIN"
+      exit 42
+    fi
+  fi
+  say "vfio-libvirt-hook: guest GPU $GUEST_GPU_BDF is DEAD (dropped off the bus; a host reboot is required to revive it)." >&2
+  say "vfio-libvirt-hook: starting '$DOMAIN' WITHOUT the GPU instead (GPU-less fallback) — the VM boots on the virtual display and the GPU hot-attaches automatically once it is alive again (after your reboot)." >&2
+  say "vfio-libvirt-hook: save your work and reboot the host when convenient; live-attach mode stays ON until you turn it off (tray icon / vfio --live-attach-off)." >&2
+  hook_log "action=dead-gpu-fallback domain=$DOMAIN gpu=$GUEST_GPU_BDF"
+  mkdir -p /var/lib/vfio-dynamic 2>/dev/null || true
+  date +%s >"/var/lib/vfio-dynamic/dead-gpu-fallback.$DOMAIN" 2>/dev/null || true
+  # Fully-detached worker: flip to live-attach mode=on (strips the GPU from
+  # the persistent XML, saves the fragment) and restart the VM GPU-less.
+  # sleep 4 first: this hook must be fully gone (and libvirt must finish
+  # aborting THIS start) before the redefinition + restart happen.
+  setsid bash -c '
+    sleep 4
+    /usr/local/bin/vfio --live-attach-on >>/var/log/vfio-libvirt-hook.log 2>&1 || true
+    sleep 1
+    virsh -c qemu:///system start "$1" >>/var/log/vfio-libvirt-hook.log 2>&1 || true
+  ' _ "$DOMAIN" </dev/null >>/var/log/vfio-libvirt-hook.log 2>&1 &
+  # Abort THIS start cleanly (rc 42: qemu never gets the dead card); the
+  # detached restart brings the VM up GPU-less seconds later.
+  exit 42
+}
+
 case "$PHASE" in
   prepare)
     # VM is about to start. Only bind if this VM has the guest GPU attached.
@@ -11688,9 +11825,15 @@ case "$PHASE" in
         hook_log "action=bind-now gpu=$GUEST_GPU_BDF"
         if _bind_now; then
           hook_log "action=bind-now-done rc=0"
+          rm -f "/var/lib/vfio-dynamic/dead-gpu-fallback.$DOMAIN" 2>/dev/null || true
         else
           _rc=$?
           hook_log "action=bind-now-failed rc=$_rc"
+          # R64: rc 42 = the guest GPU is DEAD (bind script _dead_gpu_abort).
+          # Do NOT fail the VM start outright — start it WITHOUT the GPU.
+          if [[ "$_rc" == "42" && "${VFIO_DEAD_GPU_FALLBACK:-1}" == "1" ]]; then
+            _dead_gpu_fallback
+          fi
           exit "$_rc"
         fi
       else
@@ -11703,9 +11846,16 @@ case "$PHASE" in
       # failure. We still exit non-zero to abort the VM start (see comment above).
       if _bind_now; then
         hook_log "action=bind-now-done rc=0"
+        # R64: a healthy bind clears the dead-GPU fallback loop-guard stamp.
+        rm -f "/var/lib/vfio-dynamic/dead-gpu-fallback.$DOMAIN" 2>/dev/null || true
       else
         _rc=$?
         hook_log "action=bind-now-failed rc=$_rc"
+        # R64: rc 42 = the guest GPU is DEAD (bind script _dead_gpu_abort).
+        # Do NOT fail the VM start outright — start it WITHOUT the GPU.
+        if [[ "$_rc" == "42" && "${VFIO_DEAD_GPU_FALLBACK:-1}" == "1" ]]; then
+          _dead_gpu_fallback
+        fi
         exit "$_rc"
       fi
     else
@@ -12001,6 +12151,52 @@ while :; do
 done
 if (( ! _ready )); then
   jlog "live-attach: guest agent did not respond within ${DELAY}s — proceeding with bind (install the virtio-win guest agent inside Windows for a faster handoff)"
+fi
+
+# R64: wait for the GPU to be ALIVE before binding. The dead-GPU fallback
+# (bind script exit 42 -> the hook's fallback) may have started this VM while
+# the card was entirely off the bus, so this helper can be running with the
+# card DEAD. Poll for it to come back (the park-keepalive monitor's
+# remove+rescan recovery, or the operator's host reboot + VM restart) and
+# bind + hot-attach the MOMENT it is alive — the "auto-enable when the GPU is
+# alive" half of the fallback. Bounded by VFIO_LIVE_ATTACH_GPU_ALIVE_WAIT
+# (default 120s; 0 = the old fail-fast behavior) so the helper never waits
+# forever. The VM keeps running WITHOUT the GPU the whole time — this helper
+# is detached and never blocks the VM itself.
+_gpu_alive() {
+  local _s="/sys/bus/pci/devices/$GUEST_GPU_BDF" _v _c
+  [[ -d "$_s" ]] || return 1
+  _v="$(cat "$_s/vendor" 2>/dev/null || echo "")"
+  [[ -n "$_v" && "$_v" != "0xffff" ]] || return 1
+  _c="$(head -c 4 "$_s/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_c" && "$_c" != "ffffffff" ]] || return 1
+  return 0
+}
+_gpu_alive_wait="${VFIO_LIVE_ATTACH_GPU_ALIVE_WAIT:-120}"
+if [[ ! "$_gpu_alive_wait" =~ ^[0-9]+$ ]]; then
+  _gpu_alive_wait=120
+fi
+if (( _gpu_alive_wait > 0 )) && ! _gpu_alive; then
+  jlog "live-attach: GPU $GUEST_GPU_BDF is not alive yet; polling up to ${_gpu_alive_wait}s (binds + hot-attaches the moment it revives; the VM keeps running WITHOUT the GPU)"
+  _notify_desktop "VFIO hotplug" "The GPU is not on the bus yet. VM '$DOMAIN' is running WITHOUT it; waiting up to ${_gpu_alive_wait}s for the card to revive (a host reboot always revives it)." normal
+  _aw_start="$(date +%s)"
+  while :; do
+    if _gpu_alive; then
+      break
+    fi
+    _aw_now="$(date +%s)"
+    if (( _aw_now - _aw_start >= _gpu_alive_wait )); then
+      break
+    fi
+    sleep 5
+  done
+  if _gpu_alive; then
+    jlog "live-attach: GPU $GUEST_GPU_BDF is alive again; binding + hot-attaching now"
+  else
+    jlog "live-attach: GPU $GUEST_GPU_BDF still dead after ${_gpu_alive_wait}s — skipping this attach (the VM keeps running WITHOUT the GPU; save your work and reboot the host to revive the card)"
+    _notify_desktop "GPU hot-plug skipped" "The guest GPU is still dead after ${_gpu_alive_wait}s. VM '$DOMAIN' keeps running WITHOUT the GPU. Save your work and reboot the host to revive the card." critical
+    exit 1
+  fi
 fi
 
 # Step 0 (RDNA4/Navi 48): lock the GPU in D0, unbind amdgpu, and resize BAR2 to

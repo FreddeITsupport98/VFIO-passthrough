@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R66 — bumped on every change; the full history is in changelog.md.
+# Revision: R67 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -170,7 +170,23 @@ SCRIPT_NAME="$(basename "$0")"
 # The self-heal now actually works: verified end-to-end with a mini cmake
 # project + a fake package manager (attempt 1 fails -> module extracted ->
 # mapped -> auto-install -> attempt 2 succeeds).
-SCRIPT_REVISION="R66"
+# R67: openSUSE egl/gl/glesv2 mapping fix + self-heal verification — the live
+# R66 re-run got past xinerama/xcursor and then failed on 'egl': the mapping
+# pointed at libglvnd-devel, which zypper reported ALREADY INSTALLED ("nothing
+# to do") three times while egl stayed unfound — because openSUSE's
+# libglvnd-devel ships only glx.pc/opengl.pc/libglvnd.pc, NOT egl.pc (verified
+# via rpm -ql). The real providers on SUSE are the Mesa devel packages
+# (Mesa-libEGL-devel / Mesa-libGL-devel / Mesa-libGLESv2-devel — verified in
+# the repos). Fixes: (1) the gl/egl/glesv2 zypper mappings now return CANDIDATE
+# LISTS (libglvnd-devel + the Mesa devel package) since a single wrong primary
+# package that is already installed resolves nothing; (2) Mesa-libEGL-devel +
+# Mesa-libGLESv2-devel added to the up-front zypper build-dep list; (3) the
+# self-heal now VERIFIES after each install round that pkg-config can actually
+# see the module(s) — when the mapped packages are already installed but the
+# module is still invisible it says so precisely and bails EARLY instead of
+# burning all 3 attempts on identical retries; (4) the cosmetic "Retrying
+# cmake configure (attempt 4/3)" note no longer prints past the last attempt.
+SCRIPT_REVISION="R67"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -19148,7 +19164,7 @@ install_looking_glass_client() {
         libwayland-egl-devel nettle libglvnd-devel libxkbcommon-devel \
         libXpresent-devel libXrandr-devel libXScrnSaver-devel libdecor-devel \
         dejavu-fonts pipewire-devel libpulse-devel libsamplerate-devel \
-        Mesa-libGL-devel fuse3-devel || true
+        Mesa-libGL-devel Mesa-libEGL-devel Mesa-libGLESv2-devel fuse3-devel || true
       _lg_compile_from_source && _ok=1 || _ok=0
     fi
   elif have_cmd xbps-install; then
@@ -19423,7 +19439,10 @@ _lg_pkg_to_distro_pkg() {
         dnf) echo "libglvnd-devel" ;;
         pacman) echo "libgl" ;;
         apt-get) echo "libglvnd-dev" ;;
-        zypper) echo "libglvnd-devel" ;;
+        # R67: SUSE's libglvnd-devel ships only glx/opengl/libglvnd .pc — gl.pc
+        # comes from Mesa-libGL-devel. Return BOTH candidates (the caller
+        # installs the list; an already-installed candidate is a harmless no-op).
+        zypper) echo "libglvnd-devel Mesa-libGL-devel" ;;
         xbps-install) echo "libglvnd-devel" ;;
         emerge) echo "media-libs/libglvnd" ;;
       esac ;;
@@ -19432,7 +19451,12 @@ _lg_pkg_to_distro_pkg() {
         dnf) echo "libglvnd-devel" ;;
         pacman) echo "libegl" ;;
         apt-get) echo "libegl1-mesa-dev" ;;
-        zypper) echo "libglvnd-devel" ;;
+        # R67 (live bug): openSUSE's libglvnd-devel does NOT ship egl.pc (only
+        # glx/opengl/libglvnd) — the real provider is Mesa-libEGL-devel
+        # ("Development files for the EGL API"). Return BOTH candidates so the
+        # already-installed-but-wrong primary can no longer wedge the self-heal
+        # into three identical "nothing to do" rounds.
+        zypper) echo "libglvnd-devel Mesa-libEGL-devel" ;;
         xbps-install) echo "libglvnd-devel" ;;
         emerge) echo "media-libs/libglvnd" ;;
       esac ;;
@@ -19441,7 +19465,8 @@ _lg_pkg_to_distro_pkg() {
         dnf) echo "libglvnd-devel" ;;
         pacman) echo "libgles" ;;
         apt-get) echo "libgles2-mesa-dev" ;;
-        zypper) echo "libglvnd-devel" ;;
+        # R67: same as egl — SUSE's glesv2.pc lives in Mesa-libGLESv2-devel.
+        zypper) echo "libglvnd-devel Mesa-libGLESv2-devel" ;;
         xbps-install) echo "libglvnd-devel" ;;
         emerge) echo "media-libs/libglvnd" ;;
       esac ;;
@@ -19536,7 +19561,38 @@ _lg_cmake_with_retry() {
     note "Auto-installing missing build dependency(ies) via ${_lg_pm:-<unknown>}: $_pkgs"
     # shellcheck disable=SC2086 # intentional word-split: _pkgs is a space-joined package list
     _lg_install_pkgs "${_lg_pm:-}" $_pkgs || true
-    note "Retrying cmake configure (attempt $((_attempt + 1))/${_max})..."
+    # R67: VERIFY the install actually resolved the module(s) — installing the
+    # mapped package is useless when it does not ship the module's .pc file
+    # (the live egl case: zypper's libglvnd-devel — the then-mapping — was
+    # ALREADY INSTALLED, shipped only glx/opengl/libglvnd .pc, so zypper said
+    # "nothing to do" three times and every retry failed identically). If a
+    # module is still invisible to pkg-config after its install round, say so
+    # precisely; when NO missing module was resolved at all, bail EARLY with
+    # the zypper se --provides hint instead of burning the remaining attempts
+    # on identical retries.
+    if command -v pkg-config >/dev/null 2>&1; then
+      local _resolved_any=0 _still="" _mod2
+      for _mod2 in $_missing; do
+        if pkg-config --exists "$_mod2" >/dev/null 2>&1; then
+          _resolved_any=1
+        else
+          _still="${_still:+$_still }$_mod2"
+        fi
+      done
+      if [[ -n "$_still" ]]; then
+        note "WARN: pkg-config still cannot find: $_still — the mapped package(s) did not provide their .pc file."
+        if (( ! _resolved_any )); then
+          note "       No missing module was resolved by the auto-install; skipping the remaining retries (they would fail identically)."
+          note "       Hint: find the real provider with your package manager, e.g.: zypper se --provides 'pkgconfig(<module>)'"
+          return 1
+        fi
+      fi
+    fi
+    # R67: only announce a retry when one actually remains (the old note
+    # printed "attempt 4/3" after the LAST failed install).
+    if (( _attempt < _max )); then
+      note "Retrying cmake configure (attempt $((_attempt + 1))/${_max})..."
+    fi
   done
   note "ERROR: cmake configure failed after $_max attempts (auto-install did not resolve it)."
   return 1

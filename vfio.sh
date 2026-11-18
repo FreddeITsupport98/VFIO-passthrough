@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R64 — bumped on every change; the full history is in changelog.md.
+# Revision: R65 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -136,7 +136,24 @@ SCRIPT_NAME="$(basename "$0")"
 # fallback per domain per 10 minutes; cleared on the next successful bind) so
 # a missing CLI/virsh can never cause an auto-restart loop. Set
 # VFIO_DEAD_GPU_FALLBACK=0 for the old fail-the-start behavior.
-SCRIPT_REVISION="R64"
+# R65: health-audit false-positive fix — the log scanner for vfio-pci probe/BAR
+# errors matched the kernel COMMAND-LINE ECHO lines and graded a perfectly
+# healthy boot as HEALTH: FAIL / CRITICAL (live report during the wizard's
+# recommended-defaults run): the cmdline echo contains the literal strings
+# "vfio-pci" (from this script's own vfio-pci.disable_idle_d3=1 param) and
+# "bar" (from this script's own amdgpu.rebar=0 param), so the old pattern
+# 'grep vfio-pci | grep -Ei "(BAR|...|probe|...)"' matched it. Fixes: (1)
+# kernel command-line echo lines are excluded before the signature greps
+# (they are informational, never errors — and panic dumps that echo the
+# cmdline are already handled by the dedicated real-panic signature check);
+# (2) "BAR" now requires a BAR index ("BAR [0-9]" — real messages read
+# "BAR 1: can't reserve ..."), so "amdgpu.rebar=0" can never match even
+# outside echo lines; (3) "probe" now requires a failure word on the same
+# line (probe.*fail | fail.*probe — real messages read "probe of <dev>
+# failed"), so a successful-probe line can never match. Verified live on the
+# reporting host: the old pipeline matched the 2 cmdline echo lines in the
+# current journal; the fixed pipeline matches nothing on the same journal.
+SCRIPT_REVISION="R65"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -3758,9 +3775,19 @@ audit_vfio_health() {
     # Filter for vfio-pci messages that are strongly indicative of BAR or
     # probe failures for this device. We intentionally avoid generic
     # "error" matches here to reduce false positives across distros.
+    # R65: (1) kernel COMMAND-LINE ECHO lines are excluded FIRST — they are
+    # informational, never errors, and they false-positived this scan on this
+    # script's own cmdline params (the echo contains the literal strings
+    # "vfio-pci" (vfio-pci.disable_idle_d3=1) and "bar" (amdgpu.rebar=0),
+    # grading a healthy boot as CRITICAL — live report). (2) "BAR" now
+    # requires a BAR index ("BAR [0-9]": real messages read "BAR 1: can't
+    # reserve ..."), so "amdgpu.rebar=0" can never match. (3) "probe" now
+    # requires a failure word on the same line (real messages read "probe of
+    # <dev> failed"), so successful-probe lines can never match.
     dmesg_out="$(printf '%s\n' "$log_data" \
+      | grep -vi "command line:" \
       | grep -i "vfio-pci" \
-      | grep -Ei "(BAR|cannot reserve|can't reserve|probe|failed to (enable|assign))" \
+      | grep -Ei "(BAR [0-9]|cannot reserve|can't reserve|probe.*fail|fail.*probe|failed to (enable|assign))" \
       | grep -i "$dmesg_filter" || true)"
   else
     dmesg_out=""

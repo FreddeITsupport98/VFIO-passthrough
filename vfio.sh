@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R67 — bumped on every change; the full history is in changelog.md.
+# Revision: R68 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -185,8 +185,24 @@ SCRIPT_NAME="$(basename "$0")"
 # see the module(s) — when the mapped packages are already installed but the
 # module is still invisible it says so precisely and bails EARLY instead of
 # burning all 3 attempts on identical retries; (4) the cosmetic "Retrying
-# cmake configure (attempt 4/3)" note no longer prints past the last attempt.
-SCRIPT_REVISION="R67"
+# cmake configure (attempt 2/3)" note no longer prints past the last attempt.
+# R68: the DISTRO/OBS-PACKAGED looking-glass-client is now a first-class client.
+# The source-compile path kept dying on openSUSE for reasons outside the script's
+# control (the user's Mesa devel packages are PACKMAN rebuilds — rpm --qf Vendor —
+# which omit the GLES3 headers LG's EGL-enabled build needs; the official OSS
+# Mesa-libGLESv2-devel ships them, but force-switching the user's Mesa vendor is
+# NOT the script's call). The user instead installed the prebuilt
+# `looking-glass-client` rpm via opi (an OBS repo) — which lands at
+# /usr/bin/looking-glass-client, a path the script never checked (it only knew
+# the self-compiled /usr/local/bin location). New _lg_client_bin resolves the
+# ACTIVE client across BOTH locations (self-compiled keeps precedence — a
+# re-compile intentionally overrides the packaged one), and every consumer now
+# uses it: _lg_client_available (the smart disclaimer + the shortcut recovery),
+# the per-VM checklist `compiled ✔` marker, the install's already-installed skip
+# check, the R48g compile-first disclaimer, the desktop shortcut Exec=, and the
+# user-facing launch hints — so a packaged client is recognized EVERYWHERE the
+# self-compiled one is and the disclaimer/checklist noise stops.
+SCRIPT_REVISION="R68"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -18831,6 +18847,34 @@ _lg_binary_valid() {
   return 0
 }
 
+# R68: resolve the ACTIVE looking-glass-client binary. The client can now come
+# from TWO sources, and both are first-class:
+#   1. the self-compiled binary at $LG_CLIENT_BIN (/usr/local/bin/...)
+#   2. a DISTRO/OBS PACKAGE (e.g. the openSUSE `looking-glass-client` rpm from
+#      opi / an OBS repo, or a distro package elsewhere) which installs to
+#      /usr/bin/looking-glass-client
+# The self-compiled path keeps precedence (a re-compile intentionally
+# overrides the packaged one). Prints the winning path (for the desktop
+# shortcut Exec= and user-facing messages); returns 1 when NO valid client
+# exists anywhere. Used by _lg_client_available, the checklist `compiled`
+# marker, the smart disclaimer, and the shortcut writer so a packaged client
+# is recognized everywhere the self-compiled one is.
+_lg_client_bin() {
+  local _c
+  for _c in "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}" "/usr/bin/looking-glass-client"; do
+    if _lg_binary_valid "$_c"; then
+      printf '%s\n' "$_c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# R68: is ANY looking-glass-client available (self-compiled OR packaged)?
+_lg_client_available() {
+  _lg_client_bin >/dev/null 2>&1
+}
+
 # R48h: Smart one-line warning printed BEFORE a Looking Glass decision prompt
 # (wizard / install flow / menu) so the user knows the client is NOT compiled
 # yet — at the decision point, before they answer. SILENT (returns 0, prints
@@ -18839,7 +18883,7 @@ _lg_binary_valid() {
 # install_looking_glass disclaimer + the per-VM checklist, so all three always
 # agree on the compiled state. Best-effort: never aborts the caller.
 _lg_client_warn_if_missing() {
-  if _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
+  if _lg_client_available; then
     return 0
   fi
   if (( ENABLE_COLOR )); then
@@ -18859,7 +18903,7 @@ _lg_client_warn_if_missing() {
 # (the recovery write needs root); when root, silently recreates it. Best-effort:
 # never fails the caller.
 _lg_recover_desktop_entry_if_missing() {
-  if ! _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
+  if ! _lg_client_available; then
     return 0
   fi
   if [[ -f "$LG_CLIENT_DESKTOP" ]]; then
@@ -18883,7 +18927,10 @@ _lg_recover_desktop_entry_if_missing() {
 # language the desktop is in. Idempotent (overwrites = shortcut recovery on re-run).
 # DRY_RUN-aware. Best-effort: never fails the caller.
 _lg_install_desktop_entry() {
-  local _apps_dir
+  local _apps_dir _lg_bin
+  # R68: point the shortcut at the ACTIVE client (self-compiled or packaged).
+  _lg_bin="$(_lg_client_bin || true)"
+  [[ -n "$_lg_bin" ]] || _lg_bin="$LG_CLIENT_BIN"
   _apps_dir="$(dirname "$LG_CLIENT_DESKTOP")"
   if (( ! DRY_RUN )); then
     mkdir -p "$_apps_dir" 2>/dev/null || true
@@ -18895,7 +18942,7 @@ _lg_install_desktop_entry() {
 Type=Application
 Name=Looking Glass
 Comment=Low-latency KVM display mirror for VFIO GPU passthrough
-Exec=$LG_CLIENT_BIN
+Exec=$_lg_bin
 Icon=video-display
 Terminal=false
 Categories=System;Utility;Emulator;
@@ -18967,7 +19014,7 @@ EOF
   else
     note "  Desktop folder '$_desktop_dir' not writable; skipping desktop copy (application-menu shortcut still installed)."
   fi
-  note "  Launch Looking Glass from your application menu, your desktop, or run: $LG_CLIENT_BIN"
+  note "  Launch Looking Glass from your application menu, your desktop, or run: $(_lg_client_bin || echo "$LG_CLIENT_BIN")"
   return 0
 }
 
@@ -19030,7 +19077,7 @@ _lg_remove_desktop_entry() {
 # application-menu shortcut so the operator can launch Looking Glass from the
 # desktop menu (GNOME/KDE) instead of typing the binary path.
 install_looking_glass_client() {
-  if _lg_binary_valid "$LG_CLIENT_BIN"; then
+  if _lg_client_available; then
     # R48m: show the shortcut-present checkmark (✔ present / ✖ missing) and
     # recover it if missing, so a re-run on an already-compiled host still
     # restores a deleted desktop shortcut.
@@ -20138,7 +20185,7 @@ install_looking_glass() {
   # banner + the install command when it is NOT compiled. _lg_binary_valid is
   # the same ELF check install_looking_glass_client uses, so the disclaimer and
   # the summary always agree.
-  if _lg_binary_valid "$LG_CLIENT_BIN"; then
+  if _lg_client_available; then
     if (( ENABLE_COLOR )); then
       note "  ${C_GREEN}✔${C_RESET} looking-glass-client already compiled at $LG_CLIENT_BIN — ready to view the VM display."
     else
@@ -31700,7 +31747,7 @@ _vm_checklist_records() {
   local _la_list="${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}"
   # R48h: host-level looking-glass-client compiled check (one for all VMs).
   local _lg_compiled_sym="✖"
-  if _lg_binary_valid "${LG_CLIENT_BIN:-/usr/local/bin/looking-glass-client}"; then
+  if _lg_client_available; then
     _lg_compiled_sym="✔"
   fi
   # R48k: host-level GPU hook (libvirt qemu hook) installed check (one for all

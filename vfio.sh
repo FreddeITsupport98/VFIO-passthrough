@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R75 — bumped on every change; the full history is in changelog.md.
+# Revision: R76 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -432,7 +432,23 @@ SCRIPT_NAME="$(basename "$0")"
 # scan); and the TUI start-lg path (menu option 6) is now harness-covered
 # end-to-end — the R74 coverage gap that let the frozen-infobox report
 # through.
-SCRIPT_REVISION="R75"
+# R76 (live feedback: "this is stupid design — make sure it is enabled via
+# tui" + the R75 debug-log follow-up): (1) option 9 now TOGGLES debug logging
+# LIVE — a Y/N in the dialog (TUI and plain); VM_TUI_DEBUG is checked per
+# event, so the change takes effect immediately: no restart, no env var (the
+# env stays as the auto-on-at-start option). (2) vmtui_dbg got the SAME
+# ownership pre-flight the R75 launch log has: chown-to-SUDO_USER when root
+# (a root run created the file root-owned and a later user run's appends
+# failed SILENTLY), ONE explicit "events are being DROPPED" warning instead
+# of silent drops, and VM_TUI_DEBUG_LOG relocates the log. (3) A REAL hole
+# the report exposed when reasoning the new toggle through: vmtui_confirm's
+# yesno and the typed-name inputbox run INSIDE vmtui_menu_action's output
+# capture — where the normal fd dance paints the dialog into the captured
+# PIPE (invisible on a real whiptail; the harness fake masked it because it
+# paints nothing). All in-action dialogs now paint on the real-terminal
+# fd 9 (the inputbox keeps its RESULT captured via a 2>&1-before->&9
+# redirect order — stderr is whiptail's result channel, stdout is the paint).
+SCRIPT_REVISION="R76"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -743,9 +759,11 @@ VM_TUI_LG_SHM="${VM_TUI_LG_SHM:-}"
 # VM_TUI_DEBUG=1; viewable + clearable from the manager's Debug-log menu
 # entry (option 9), and (best-effort) tailed live in a secondary terminal
 # window when a desktop terminal emulator exists.
-VM_TUI_DEBUG_LOG="/tmp/vm-tui-debug.log"
+VM_TUI_DEBUG_LOG="${VM_TUI_DEBUG_LOG:-/tmp/vm-tui-debug.log}"
 VM_TUI_DEBUG="${VM_TUI_DEBUG:-0}"
 [[ "$VM_TUI_DEBUG" =~ ^[0-9]+$ ]] || VM_TUI_DEBUG=0
+# R76: one-time "events are being dropped" warning latch (see vmtui_dbg).
+VMTUI_DBG_WARNED=0
 # R75: the --help flag-verification timeout. The LIVE false-WARN: 5s cut the
 # client's output short on a host busy booting the Windows VM — the option
 # table prints AFTER the startup logs, so a truncated capture flagged ALL
@@ -31796,9 +31814,25 @@ vmtui_ok() {
 # R75: debug event log (VM_TUI_DEBUG=1). Timestamped, append-only, never
 # fatal; consumed by the manager's Debug-log menu entry (option 9) and by
 # tail -f / the best-effort secondary debug window.
+# R76: the SAME ownership trap the R75 launch log had, closed here too — a
+# root manager run creates the debug log ROOT-OWNED, and a later USER run's
+# appends then failed SILENTLY (2>/dev/null || true), dropping every event
+# with no trace. Now: the ownership is repaired when root with a SUDO_USER
+# (the desktop user who will also run the manager as a user), an unwritable
+# log triggers ONE explicit "events are being DROPPED" warning (never
+# repeated per event), and the log is relocatable via VM_TUI_DEBUG_LOG.
 vmtui_dbg() {
   (( VM_TUI_DEBUG )) || return 0
-  printf '%s %s\n' "$(date -Is)" "$*" >>"$VM_TUI_DEBUG_LOG" 2>/dev/null || true
+  if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    chown "$SUDO_USER" "$VM_TUI_DEBUG_LOG" 2>/dev/null || true
+  fi
+  if ! printf '%s %s\n' "$(date -Is)" "$*" >>"$VM_TUI_DEBUG_LOG" 2>/dev/null; then
+    if (( ! VMTUI_DBG_WARNED )); then
+      VMTUI_DBG_WARNED=1
+      note "NOTE: debug logging is ON but $VM_TUI_DEBUG_LOG is not writable — events are being DROPPED."
+      note "      Fix: sudo chown \$USER $VM_TUI_DEBUG_LOG  — or relocate it with VM_TUI_DEBUG_LOG."
+    fi
+  fi
 }
 
 # R75: the Debug-log menu entry's payload — status (on/off + how to enable),
@@ -31806,11 +31840,31 @@ vmtui_dbg() {
 # vmtui_menu_action path as every other action (msgbox in TUI, streamed in
 # plain mode).
 vmtui_debug_show() {
+  # R76 (live report: "this is stupid design — make sure it is enabled via
+  # tui"): the old flow told the operator to EXIT the manager and re-run
+  # with an env var to enable debug logging — exactly at the moment something
+  # is misbehaving and you are already inside the manager. Option 9 now
+  # TOGGLES debug logging LIVE: a Y/N prompt in both TUI and plain modes, and
+  # since VM_TUI_DEBUG is checked per event the change takes effect
+  # immediately — no restart, no env var. The VM_TUI_DEBUG=1 env remains as
+  # the auto-on-at-start option (e.g. for the first launch after an upgrade).
   if (( ! VM_TUI_DEBUG )); then
-    say "Debug logging is OFF. Enable it and re-run for the full event log:"
-    say "  env VM_TUI_DEBUG=1 vfio --vm-tui"
-    say "The log will be written to $VM_TUI_DEBUG_LOG"
-    return 0
+    if vmtui_confirm "Enable debug logging now? (every manager event + detailed errors -> $VM_TUI_DEBUG_LOG)" Y; then
+      VM_TUI_DEBUG=1
+      vmtui_dbg "debug: enabled from the manager menu (option 9) — events from before this point were not logged"
+      vmtui_ok "Debug logging ENABLED (live — no restart needed)."
+    else
+      say "Debug logging stays OFF. Select option 9 again to enable it at any time — no restart needed."
+      say "(Auto-on at start: env VM_TUI_DEBUG=1 vfio --vm-tui)"
+      return 0
+    fi
+  else
+    if vmtui_confirm "Disable debug logging now?" N; then
+      vmtui_dbg "debug: disabled from the manager menu (option 9)"
+      VM_TUI_DEBUG=0
+      note "Debug logging DISABLED (the log file stays on disk)."
+      return 0
+    fi
   fi
   local _n
   _n="$(wc -l <"$VM_TUI_DEBUG_LOG" 2>/dev/null | tr -d '[:space:]' || true)"
@@ -32235,6 +32289,19 @@ vmtui_confirm() {
   if vmtui_tui_active; then
     local -a _defargs=()
     [[ "$_def" == "Y" ]] || _defargs=("--defaultno")
+    # R76: when this runs INSIDE vmtui_menu_action's output capture (the
+    # debug toggle, destructive confirms), stdout AND stderr are the capture
+    # pipe — the normal fd dance would paint the yesno dialog into the
+    # captured text (invisible on a real whiptail; the harness fake masked
+    # it because it paints nothing). Paint on the real-terminal fd 9 that
+    # menu_action opens around the capture; fall back to the fd dance when
+    # fd 9 is not open (direct/CLI-TUI contexts).
+    if { true >&9; } 2>/dev/null; then
+      if "$TUI_BIN" --title "Confirm" --yesno "$_q" 10 60 "${_defargs[@]}" >&9 2>&9 </dev/null; then
+        return 0
+      fi
+      return 1
+    fi
     if "$TUI_BIN" --title "Confirm" --yesno "$_q" 10 60 "${_defargs[@]}" 3>&1 1>&2 2>&3; then
       return 0
     fi
@@ -32537,7 +32604,18 @@ vmtui_confirm_destructive() {
     return 1
   fi
   if vmtui_tui_active; then
-    _typed="$($TUI_BIN --title "Confirm" --inputbox "Type '$_dom' to confirm the force $_act" 10 60 3>&1 1>&2 2>&3)" || return 1
+    # R76: same fd-9 treatment as vmtui_confirm — inside menu_action's
+    # capture the dance would paint the inputbox into the pipe. On fd 9:
+    # stderr (whiptail's RESULT channel) is redirected to the capture
+    # FIRST (2>&1, while stdout is still the comsub pipe), then stdout (the
+    # paint) moves to the real terminal (>&9).
+    if { true >&9; } 2>/dev/null; then
+      if ! _typed="$($TUI_BIN --title "Confirm" --inputbox "Type '$_dom' to confirm the force $_act" 10 60 2>&1 >&9 </dev/null)"; then
+        return 1
+      fi
+    else
+      _typed="$($TUI_BIN --title "Confirm" --inputbox "Type '$_dom' to confirm the force $_act" 10 60 3>&1 1>&2 2>&3)" || return 1
+    fi
   else
     # Direct stdin read (see vmtui_confirm for the rationale — no /dev/tty;
     # EOF = empty = cancelled, never a hard quit).
@@ -33092,7 +33170,7 @@ vmtui_menu_loop() {
         "6" "Start VM + Looking Glass (Ctrl lock)" \
         "7" "Looking Glass only (VM already running)" \
         "8" "Show VM state" \
-        "9" "Debug log (events + detailed errors)" \
+        "9" "Debug log (toggle + view events + errors)" \
         "0" "Quit" 3>&1 1>&2 2>&3)" || { say "Exiting VM manager."; return 0; }
     else
       say
@@ -33105,7 +33183,7 @@ vmtui_menu_loop() {
       say "  6) Start VM + Looking Glass (Ctrl lock)"
       say "  7) Looking Glass only (VM already running)"
       say "  8) Show VM state"
-      say "  9) Debug log (events + detailed errors)"
+      say "  9) Debug log (toggle + view events + errors)"
       say "  0) Quit"
       # Read STDIN directly (no /dev/tty): stdin is the right source in every
       # mode — interactive (stdin IS the terminal) and automation (stdin IS
@@ -33209,9 +33287,14 @@ Environment:
                         device used by the KVMFR checks (default: the standard
                         /dev/shm/looking-glass, then any KVMFR-magic file)
   VM_TUI_DEBUG         1 = log every manager event with a timestamp + detailed
-                        raw errors to /tmp/vm-tui-debug.log (menu option 9
-                        views it; a secondary terminal window tails it live
-                        when a desktop terminal emulator exists)
+                        raw errors (menu option 9 views it; a secondary
+                        terminal window tails it live when a desktop terminal
+                        emulator exists). Tip: enable it for the first launch
+                        after any upgrade — the full event trail makes any
+                        report instantly diagnosable
+  VM_TUI_DEBUG_LOG     Relocate the debug event log (default
+                        /tmp/vm-tui-debug.log; an unwritable log warns once
+                        and drops events instead of failing)
   VM_TUI_LG_HELP_TIMEOUT
                         Timeout for the --help flag verification (default 15;
                         a timed-out or truncated capture is INCONCLUSIVE —

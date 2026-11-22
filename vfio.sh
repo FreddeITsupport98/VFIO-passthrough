@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R69 — bumped on every change; the full history is in changelog.md.
+# Revision: R70 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -229,7 +229,28 @@ SCRIPT_NAME="$(basename "$0")"
 # persisted in the REAL user's config dir, not root's. Deliberately NOT
 # root-gated: virsh talks to qemu:///system (works for libvirt-group users)
 # and the LG client must run in the user's desktop session.
-SCRIPT_REVISION="R69"
+# R70: two vm-tui quality-of-life upgrades. (1) RECENT-FIRST PICKER: the
+# manager now keeps a most-recently-used list (recent-vms, newest first,
+# capped at VM_TUI_RECENT_MAX, default 5; 0 = off) alongside the single
+# last-vm, and the picker orders the MRU VMs into the LOWEST numbers (position
+# 1 = the newest = the ENTER default) so day-to-day switching between a
+# gaming/work VM is one keystroke; never-used VMs keep their virsh order after
+# them, the plain path marks them "(recent)", and a pre-R70 last-vm seeds the
+# list on first read so an upgrade keeps the remembered VM as recent #1.
+# (2) GUEST-AGENT HANDOFF for start-lg: "running" only means qemu started —
+# Windows is still booting for the next ~30-60s. When the virtio-win guest
+# agent is installed in the guest (the same guest-ping handoff the live-attach
+# helper uses), start-lg now ALSO waits for the agent to answer before
+# launching the Looking Glass client, so the window opens the moment Windows
+# userspace is actually up instead of at a random mid-boot moment. The wait
+# mirrors the helper's proven pattern (timeout-wrapped virsh
+# qemu-agent-command guest-ping, WALL-CLOCK budget — not a loop counter),
+# shares the single VM_TUI_WAIT_TIMEOUT deadline with the running-wait, and
+# degrades gracefully: agent channel missing (virsh "not configured") ->
+# launch immediately + the virtio-win install hint (never burns the budget on
+# a VM that can never answer); agent installed but slow -> bounded by the same
+# deadline, then launch anyway with a WARN; VM_TUI_WAIT_AGENT=0 opts out.
+SCRIPT_REVISION="R70"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -493,6 +514,13 @@ VM_TUI_WAIT_TIMEOUT="${VM_TUI_WAIT_TIMEOUT:-120}"   # bounded wait for 'running'
 VM_TUI_LG_ARGS="${VM_TUI_LG_ARGS:--o input:captureOnFocus=yes -o input:autoCapture=yes -o input:grabKeyboard=yes -o spice:captureOnStart=yes}"
 VM_TUI_FORCE_TUI="${VM_TUI_FORCE_TUI:-0}"  # 1 = skip the isatty guard (serial console / test harness)
 VM_TUI_SKIP_CONFIRM=0                       # 1 = --yes: skip the destroy/reset confirmations
+# R70: most-recently-used VMs remembered for the recent-first picker order.
+VM_TUI_RECENT_MAX="${VM_TUI_RECENT_MAX:-5}"  # newest first, capped; 0 = disable the MRU ordering
+[[ "$VM_TUI_RECENT_MAX" =~ ^[0-9]+$ ]] || VM_TUI_RECENT_MAX=5
+# R70: after 'running', also wait for the Windows guest agent (virtio-win
+# guest-ping) so Looking Glass launches the moment Windows userspace is up.
+VM_TUI_WAIT_AGENT="${VM_TUI_WAIT_AGENT:-1}"  # 1 = enabled (default), 0 = launch right after 'running'
+[[ "$VM_TUI_WAIT_AGENT" =~ ^[0-9]+$ ]] || VM_TUI_WAIT_AGENT=1
 # Args captured after --vm-tui (subcommand + domain); parse_args fills this.
 declare -ag VMTUI_ARGS=()
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
@@ -2235,7 +2263,10 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [com
                    start-lg <dom>, lg <dom>. Runs WITHOUT root (virsh via
                    qemu:///system; the Looking Glass client is re-launched as the
                    sudo-originating desktop user when this runs as root). Also
-                   main-menu option 12. Alias: --vm-manager.
+                   main-menu option 12. Alias: --vm-manager. start-lg waits for
+                   the Windows guest agent (virtio-win) when one is installed so
+                   the client opens the moment Windows is actually up, and the
+                   picker lists your most-recently-used VMs first.
   --tui <backend>  Force the TUI backend (whiptail or dialog) for the interactive
                    flows — the full-screen counterpart of --no-tui. Also skips the
                    terminal-attached check so serial consoles can use dialogs.
@@ -30892,7 +30923,7 @@ uninstall_self() {
   note "  - ${BASH_COMPLETION_DIR}/${_installed_cmd}"
   note "  - ${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
   note "  - the built-in VM manager's (vm-tui) runtime artifacts: $VM_TUI_LOG_FILE"
-  note "    + the remembered last-VM file (R69)"
+  note "    + the remembered VM state (last-vm + recent-vms; R69/R70)"
   note "It does NOT remove the VFIO config (use --reset) or your repo copy."
 
   if ! prompt_yn "Uninstall the self-installed vfio + completions now?" N "Uninstall self"; then
@@ -30912,14 +30943,17 @@ uninstall_self() {
   say "Removed self-installed vfio + completion files."
   # R45: also remove the self-installed CLI's timestamped .bak.* litter.
   _wipe_script_backups "$SELF_INSTALL_BIN"
-  # R69: sweep the built-in VM manager's (vm-tui) user-side artifacts: the LG
-  # client launch log + the remembered last-VM state (resolved to the REAL
-  # user's config dir the same way the manager persists it). Best-effort.
-  local _vmtui_last
+  # R69/R70: sweep the built-in VM manager's (vm-tui) user-side artifacts: the
+  # LG client launch log + the remembered VM state (last-vm + the recent-vms
+  # MRU list, resolved to the REAL user's config dir the same way the manager
+  # persists them). Best-effort; the now-empty config dir is rmdir'd too.
+  local _vmtui_last _vmtui_recent
   _vmtui_last="$(_vmtui_last_vm_file)"
-  if [[ -f "$VM_TUI_LOG_FILE" || -f "$_vmtui_last" ]]; then
-    run rm -f "$VM_TUI_LOG_FILE" "$_vmtui_last" 2>/dev/null || true
-    note "Removed VM manager (vm-tui) runtime artifacts ($VM_TUI_LOG_FILE + remembered last-VM file)."
+  _vmtui_recent="$(_vmtui_recent_vm_file)"
+  if [[ -f "$VM_TUI_LOG_FILE" || -f "$_vmtui_last" || -f "$_vmtui_recent" ]]; then
+    run rm -f "$VM_TUI_LOG_FILE" "$_vmtui_last" "$_vmtui_recent" 2>/dev/null || true
+    run rmdir "$(_vmtui_config_dir)" 2>/dev/null || true
+    note "Removed VM manager (vm-tui) runtime artifacts ($VM_TUI_LOG_FILE + remembered VM state)."
   fi
   say
   note "If vfio was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
@@ -31607,6 +31641,35 @@ vmtui_wait_running() {
   return 1
 }
 
+# R70: wait for the WINDOWS guest to finish booting — the virtio-win guest
+# agent's guest-ping, the same handoff the live-attach helper uses. "running"
+# only means qemu started; the agent answering means Windows userspace is up.
+# Mirrors the helper's proven pattern: a timeout-wrapped virsh
+# qemu-agent-command and a WALL-CLOCK budget (not a loop counter — each virsh
+# call can block up to 5s). Returns: 0 = agent responded; 1 = no response
+# within the budget (agent installed but Windows still booting, or timeout);
+# 2 = NO agent channel in the VM at all (virsh "not configured") — the caller
+# should launch immediately + hint at the virtio-win guest tools instead of
+# burning the budget on a VM that can never answer.
+vmtui_wait_agent() {
+  local _dom="$1" _budget="$2" _out _start _now
+  [[ "$_budget" =~ ^[0-9]+$ ]] || _budget=0
+  _start="$(date +%s)"
+  while :; do
+    _now="$(date +%s)"
+    (( (_now - _start) < _budget )) || return 1
+    _out="$(timeout 5 virsh -c qemu:///system qemu-agent-command "$_dom" '{"execute":"guest-ping"}' 2>&1 || true)"
+    if [[ "$_out" == *'"return"'* ]]; then
+      return 0
+    fi
+    # No agent channel in the VM XML at all — waiting is pointless.
+    if [[ "$_out" == *"not configured"* ]]; then
+      return 2
+    fi
+    sleep 1
+  done
+}
+
 # Confirmation (TUI yes/no or plain y/N). $1 = question, $2 = default (Y/N).
 # Returns 0 = yes, 1 = no. NOTE: VM_TUI_SKIP_CONFIRM (set by --yes) must NOT
 # be reset here — resetting it per call silently defeats --yes for automation.
@@ -31652,12 +31715,52 @@ _vmtui_last_vm_file() {
   printf '%s' "$(_vmtui_config_dir)/last-vm"
 }
 
+# R70: the most-recently-used list file (newest first, capped at
+# VM_TUI_RECENT_MAX) that reorders the VM picker.
+_vmtui_recent_vm_file() {
+  printf '%s' "$(_vmtui_config_dir)/recent-vms"
+}
+
+# R70: read the MRU list (one VM name per line, newest first). Lazily SEEDS
+# from the pre-R70 last-vm file on first read so an upgrade keeps the
+# remembered VM as recent #1. Empty output = no recents yet (fresh install,
+# or VM_TUI_RECENT_MAX=0 wrote an empty list). Read-safe: never fails.
+vmtui_recent_vms() {
+  local _rf _seed
+  _rf="$(_vmtui_recent_vm_file)"
+  if [[ ! -s "$_rf" ]]; then
+    _seed=""
+    if [[ -r "$(_vmtui_last_vm_file)" ]]; then
+      _seed="$(head -1 "$(_vmtui_last_vm_file)" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_seed" ]]; then
+      printf '%s\n' "$_seed" >"$_rf" 2>/dev/null || true
+    fi
+  fi
+  [[ -s "$_rf" ]] || return 0
+  cat "$_rf" 2>/dev/null || true
+}
+
 vmtui_remember_vm() {
-  local _dom="$1" _dir
+  local _dom="$1" _dir _rf _raw _r _new
   [[ -n "$_dom" ]] || return 0
   _dir="$(_vmtui_config_dir)"
   mkdir -p "$_dir" 2>/dev/null || true
   printf '%s\n' "$_dom" >"$(_vmtui_last_vm_file)" 2>/dev/null || true
+  # R70: maintain the MRU list — newest first, deduped, capped — that the
+  # picker uses to put your actually-used VMs in the lowest positions.
+  # Same comsub + here-string discipline as the rest of this block (NO
+  # process substitution; see vmtui_menu_labels for the rationale).
+  _rf="$(_vmtui_recent_vm_file)"
+  _raw="$(vmtui_recent_vms || true)"
+  _new="$_dom"
+  while IFS= read -r _r; do
+    [[ -n "$_r" ]] || continue
+    if [[ "$_r" != "$_dom" ]]; then
+      _new="${_new}"$'\n'"$_r"
+    fi
+  done <<<"$_raw"
+  printf '%s\n' "$_new" | head -n "$VM_TUI_RECENT_MAX" >"$_rf" 2>/dev/null || true
 }
 
 # VM picker (TUI menu with state labels / plain numbered / last-VM default).
@@ -31676,6 +31779,34 @@ vmtui_pick() {
   # stderr (see the plain-path comment below): stdout is the captured name
   # channel.
   (( ${#_labels[@]} > 0 )) || { note "No VMs found (virsh list --all is empty)." >&2; return 1; }
+
+  # R70: RECENT-FIRST ordering. The remembered MRU list (recent-vms, newest
+  # first) reorders _labels so the VMs you actually use take the LOWEST
+  # numbers (position 1 = the newest = the ENTER default); never-used VMs keep
+  # their virsh order after them. VMs that no longer exist are skipped here
+  # (and age out of the file on the next remember). No-op without recents.
+  local _recents="" _r
+  _recents="$(vmtui_recent_vms || true)"
+  if [[ -n "$_recents" ]]; then
+    local -a _ordered=()
+    # Pass 1: recents that still exist, in MRU order.
+    while IFS= read -r _r; do
+      [[ -n "$_r" ]] || continue
+      for _line in "${_labels[@]}"; do
+        if [[ "${_line%%|*}" == "$_r" ]]; then
+          _ordered+=("$_line")
+          break
+        fi
+      done
+    done <<<"$_recents"
+    # Pass 2: everything else, in the original virsh order.
+    for _line in "${_labels[@]}"; do
+      if ! grep -Fixq -- "${_line%%|*}" <<<"$_recents" 2>/dev/null; then
+        _ordered+=("$_line")
+      fi
+    done
+    _labels=("${_ordered[@]}")
+  fi
 
   local _last=""
   [[ -r "$(_vmtui_last_vm_file)" ]] && _last="$(head -1 "$(_vmtui_last_vm_file)" 2>/dev/null || true)"
@@ -31726,6 +31857,13 @@ vmtui_pick() {
         say "  $_i) ${C_BOLD}${_name}${C_RESET}  [${_state}]  ${C_DIM}(last used — ENTER picks this)${C_RESET}" >&2
       else
         say "  $_i) ${_name}  [${_state}]  (last used — ENTER picks this)" >&2
+      fi
+    elif [[ -n "$_recents" ]] && grep -Fixq -- "$_name" <<<"$_recents" 2>/dev/null; then
+      # R70: a recently-used VM that is not the newest — still near the top.
+      if (( ENABLE_COLOR )); then
+        say "  $_i) ${_name}  [${_state}]  ${C_DIM}(recent)${C_RESET}" >&2
+      else
+        say "  $_i) ${_name}  [${_state}]  (recent)" >&2
       fi
     else
       say "  $_i) ${_name}  [${_state}]" >&2
@@ -31843,9 +31981,15 @@ vmtui_lg_launch() {
   return 0
 }
 
-# Start + wait + Looking Glass (the spec's headline action).
+# Start + wait + Looking Glass (the spec's headline action). R70: after qemu
+# reports 'running', ALSO wait for the Windows guest agent (virtio-win
+# guest-ping) so the Looking Glass client opens the moment Windows userspace
+# is actually up — one shared VM_TUI_WAIT_TIMEOUT wall-clock deadline covers
+# both waits. Graceful degradation: no agent channel -> launch + the virtio-win
+# hint; agent slow -> bounded wait, then launch anyway; VM_TUI_WAIT_AGENT=0
+# opts out (launch as soon as qemu reports running, the pre-R70 behavior).
 vmtui_act_start_lg() {
-  local _dom="$1" _s
+  local _dom="$1" _s _t0 _left _arc
   _s="$(vmtui_state "$_dom")"
   vmtui_remember_vm "$_dom"
   if [[ "$_s" == "running" ]]; then
@@ -31861,10 +32005,24 @@ vmtui_act_start_lg() {
   fi
   if (( VM_TUI_WAIT_TIMEOUT > 0 )); then
     note "Waiting for '$_dom' to report running (up to ${VM_TUI_WAIT_TIMEOUT}s)..."
+    _t0="$(date +%s)"
     if ! vmtui_wait_running "$_dom"; then
       note "WARN: '$_dom' did not reach 'running' within ${VM_TUI_WAIT_TIMEOUT}s — launching Looking Glass anyway."
     else
       vmtui_ok "'$_dom' is running."
+      if (( VM_TUI_WAIT_AGENT )); then
+        _left=$(( VM_TUI_WAIT_TIMEOUT - ($(date +%s) - _t0) ))
+        if (( _left > 0 )); then
+          note "Waiting for Windows to boot (virtio-win guest agent handoff, up to ${_left}s)..."
+          _arc=0
+          vmtui_wait_agent "$_dom" "$_left" || _arc=$?
+          case "$_arc" in
+            0) vmtui_ok "Windows is up (guest agent responded) — launching Looking Glass." ;;
+            2) note "No guest agent channel in '$_dom' — launching now. Install the virtio-win guest agent inside Windows (sudo $SCRIPT_NAME --install-virtio-win-guest-agent) so Looking Glass launches the moment Windows is up." ;;
+            *) note "WARN: the guest agent did not respond within ${_left}s — launching Looking Glass anyway (Windows may still be booting)." ;;
+          esac
+        fi
+      fi
     fi
   fi
   vmtui_lg_launch "$_dom"
@@ -31977,7 +32135,13 @@ Environment:
   VM_TUI_LG_BIN         Explicit Looking Glass client path (default: resolve
                         /usr/local/bin then /usr/bin then PATH)
   VM_TUI_WAIT_TIMEOUT   Seconds to wait for 'running' after start (default 120;
-                        0 = no wait)
+                        0 = no wait). With start-lg the SAME deadline also
+                        covers the Windows guest-agent wait (R70).
+  VM_TUI_WAIT_AGENT     1 (default) = after 'running', also wait for the
+                        virtio-win guest agent so Looking Glass launches the
+                        moment Windows is up; 0 = launch right after 'running'
+  VM_TUI_RECENT_MAX     Most-recently-used VMs ordered first in the picker
+                        (default 5; 0 = disable the recent-first ordering)
 EOF
 }
 

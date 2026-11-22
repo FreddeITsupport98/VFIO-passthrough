@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R73 — bumped on every change; the full history is in changelog.md.
+# Revision: R74 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -362,7 +362,28 @@ SCRIPT_NAME="$(basename "$0")"
 # validated against its /tmp/.X11-unix/XN socket — the same stale-env
 # protection WAYLAND_DISPLAY got in R72 (remote/exotic DISPLAY forms cannot be
 # validated from the shell and stay accepted, guarded by the liveness check).
-SCRIPT_REVISION="R73"
+# R74 (live report: "the list vm settings does not show on whiptail" + "do
+# same for rest of tui, in vm manager"): EVERY menu action printed its output
+# to plain stdout, which the fullscreen whiptail dialog covers — in the TUI
+# path NOTHING was visible after picking an action (the VM list, the state
+# line, the Started/Force-stopped feedback, the Looking Glass notes, even the
+# unknown-choice note; the plain-text path was always fine). Fixed for the
+# WHOLE manager menu: new vmtui_menu_action routes every action through —
+# TUI: a transient --infobox ("Running: ... — the VM / Looking Glass may need
+# a moment"; the start-lg waits would otherwise leave a blank screen), then
+# the output is captured (ANSI-stripped so colors never leak into the dialog)
+# and shown in a new dynamically-sized vmtui_msgbox; plain: direct streaming
+# (the bounded waits keep their live progress notes) + the existing ENTER
+# pauses. vmtui_msgbox is gui_msgbox's shape WITHOUT its /dev/tty requirement
+# — this block's TUI calls all rely on the fd dance (serial consoles /
+# VM_TUI_FORCE_TUI are supported cases, and the harness has no controlling
+# tty). Capturing also CONTAINS a die inside an action: the menu survives and
+# SHOWS the error instead of the whole manager quitting (the R49
+# guarded-subshell philosophy, applied to the vm-tui loop in BOTH modes; the
+# CLI subcommands keep die-to-exit). The unknown-choice note routes through
+# the msgbox too, and the state line is now the shared vmtui_act_state (CLI +
+# menu render identically).
+SCRIPT_REVISION="R74"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32751,6 +32772,83 @@ vmtui_act_lg_only() {
 
 # ------------------------------ interactive loop ------------------------------
 
+# R74 (live report: "the list vm settings does not show on whiptail"): every
+# menu action printed its output to plain stdout, which the FULLSCREEN
+# whiptail dialog covers — in the TUI path NOTHING was visible after picking
+# an action (the list, the state line, the Started/Force-stopped feedback,
+# the Looking Glass notes, even the unknown-choice note). New plumbing:
+
+# R74: a dynamically-sized msgbox for the vm-tui block. gui_msgbox's shape,
+# but WITHOUT its /dev/tty requirement — this block's TUI calls all rely on
+# the fd dance instead (serial consoles / harnesses where isatty lies are a
+# SUPPORTED case here via VM_TUI_FORCE_TUI, and the R74 harness itself runs
+# without a controlling tty). Never fails (|| true).
+vmtui_msgbox() {
+  local _title="${1:-VM manager}" _msg="${2:-}"
+  local _tc=80 _tl=24 _ll=0 _line _w _nl _h
+  if [[ -n "${COLUMNS:-}" && "${COLUMNS:-}" =~ ^[0-9]+$ ]]; then _tc="$COLUMNS"; fi
+  if [[ -n "${LINES:-}" && "${LINES:-}" =~ ^[0-9]+$ ]]; then _tl="$LINES"; fi
+  if command -v tput >/dev/null 2>&1; then
+    local _c _l
+    _c="$(tput cols 2>/dev/null || true)"; _l="$(tput lines 2>/dev/null || true)"
+    [[ "$_c" =~ ^[0-9]+$ ]] && _tc="$_c"
+    [[ "$_l" =~ ^[0-9]+$ ]] && _tl="$_l"
+  fi
+  (( _tc < 60 )) && _tc=60
+  (( _tl < 12 )) && _tl=12
+  while IFS= read -r _line; do
+    (( ${#_line} > _ll )) && _ll=${#_line}
+  done <<<"$_msg"
+  _w=$(( _ll + 6 ))
+  (( _w > _tc - 2 )) && _w=$(( _tc - 2 ))
+  (( _w < 60 )) && _w=60
+  (( _w > 130 )) && _w=130
+  _nl="$(printf '%s\n' "$_msg" | wc -l | tr -d '[:space:]')"
+  [[ "$_nl" =~ ^[0-9]+$ ]] || _nl=1
+  (( _nl < 1 )) && _nl=1
+  _h=$(( _nl + 6 ))
+  (( _h > _tl - 2 )) && _h=$(( _tl - 2 ))
+  (( _h < 8 )) && _h=8
+  (( _h > 48 )) && _h=48
+  "$TUI_BIN" --title "$_title" --msgbox "$_msg" "$_h" "$_w" 3>&1 1>&2 2>&3 || true
+}
+
+# R74: run ONE menu action and make its output VISIBLE in both modes.
+# TUI: a transient --infobox shows the action is running (the waits inside
+# start-lg can take a while and the screen would otherwise be blank), the
+# output is captured (ANSI-stripped so colors never leak into the dialog)
+# and shown in a vmtui_msgbox. Plain: DIRECT streaming execution (the
+# bounded waits keep their live progress notes) + the optional ENTER pause.
+# Capturing also CONTAINS a die inside the action — the menu survives and
+# shows the error instead of the whole manager quitting (the R49
+# guarded-subshell philosophy, now applied to the vm-tui loop in BOTH modes;
+# the CLI subcommands keep their die-to-exit behavior).
+# $1 = box title, $2 = pause flag (pause|nopause), $3... = the command.
+vmtui_menu_action() {
+  local _title="$1" _pause="$2"; shift 2
+  local _out=""
+  if vmtui_tui_active; then
+    "$TUI_BIN" --title "$_title" --infobox "Running: $_title ... (the VM / Looking Glass may need a moment)" 6 64 3>&1 1>&2 2>&3 || true
+    _out="$("$@" 2>&1 | _ansi_strip || true)"
+    if [[ -n "$_out" ]]; then
+      vmtui_msgbox "$_title" "$_out"
+    fi
+  else
+    "$@" || true
+    if [[ "$_pause" == "pause" ]]; then
+      # Pause reads STDIN (a piped automation run feeds a blank line; EOF
+      # skips the pause — never fatal).
+      read -r -p "Press ENTER to continue..." _ || true
+    fi
+  fi
+}
+
+# R74: shared by the CLI `state` subcommand and the menu's Show-VM-state, so
+# both render identically.
+vmtui_act_state() {
+  say "'$1' state: $(vmtui_state "$1")"
+}
+
 vmtui_menu_loop() {
   local _choice _dom
   while true; do
@@ -32786,24 +32884,25 @@ vmtui_menu_loop() {
       [[ -n "${_choice:-}" ]] || { say "Exiting VM manager."; return 0; }
     fi
     case "${_choice:-}" in
-      1) vmtui_act_list
-         # Pause reads STDIN (a piped automation run feeds a blank line; EOF
-         # skips the pause — never fatal).
-         if ! vmtui_tui_active; then read -r -p "Press ENTER to continue..." _ || true; fi
+      1) vmtui_menu_action "All VMs" pause vmtui_act_list
          ;;
-      2) if _dom="$(vmtui_pick "Start VM")"; then vmtui_act_start "$_dom"; fi ;;
-      3) if _dom="$(vmtui_pick "Shutdown VM")"; then vmtui_act_shutdown "$_dom"; fi ;;
-      4) if _dom="$(vmtui_pick "Force shutdown")"; then vmtui_act_destroy "$_dom"; fi ;;
-      5) if _dom="$(vmtui_pick "Force reset")"; then vmtui_act_reset "$_dom"; fi ;;
-      6) if _dom="$(vmtui_pick "Start VM + Looking Glass")"; then vmtui_act_start_lg "$_dom"; fi ;;
-      7) if _dom="$(vmtui_pick "Looking Glass only")"; then vmtui_act_lg_only "$_dom"; fi ;;
+      2) if _dom="$(vmtui_pick "Start VM")"; then vmtui_menu_action "Start VM" nopause vmtui_act_start "$_dom"; fi ;;
+      3) if _dom="$(vmtui_pick "Shutdown VM")"; then vmtui_menu_action "Shutdown VM" nopause vmtui_act_shutdown "$_dom"; fi ;;
+      4) if _dom="$(vmtui_pick "Force shutdown")"; then vmtui_menu_action "Force shutdown" nopause vmtui_act_destroy "$_dom"; fi ;;
+      5) if _dom="$(vmtui_pick "Force reset")"; then vmtui_menu_action "Force reset" nopause vmtui_act_reset "$_dom"; fi ;;
+      6) if _dom="$(vmtui_pick "Start VM + Looking Glass")"; then vmtui_menu_action "Start VM + Looking Glass" nopause vmtui_act_start_lg "$_dom"; fi ;;
+      7) if _dom="$(vmtui_pick "Looking Glass only")"; then vmtui_menu_action "Looking Glass only" nopause vmtui_act_lg_only "$_dom"; fi ;;
       8) if _dom="$(vmtui_pick "Show VM state")"; then
-           say "'$_dom' state: $(vmtui_state "$_dom")"
+           vmtui_menu_action "VM state" pause vmtui_act_state "$_dom"
          fi
-         if ! vmtui_tui_active; then read -r -p "Press ENTER to continue..." _ || true; fi
          ;;
       0|"") say "Exiting VM manager."; return 0 ;;
-      *) note "Unknown choice '$_choice'." ;;
+      *) if vmtui_tui_active; then
+           vmtui_msgbox "VM manager" "Unknown choice '$_choice'."
+         else
+           note "Unknown choice '$_choice'."
+         fi
+         ;;
     esac
     if ! vmtui_tui_active; then say; fi
   done
@@ -32936,7 +33035,7 @@ vm_tui_main() {
   case "$_cmd" in
     list)     vmtui_act_list ;;
     state)    [[ -n "${1:-}" ]] || die "state needs a domain: $SCRIPT_NAME --vm-tui state <domain>"
-              say "'$1' state: $(vmtui_state "$1")" ;;
+              vmtui_act_state "$1" ;;
     start)    [[ -n "${1:-}" ]] || die "start needs a domain: $SCRIPT_NAME --vm-tui start <domain>"
               vmtui_act_start "$1" ;;
     shutdown) [[ -n "${1:-}" ]] || die "shutdown needs a domain: $SCRIPT_NAME --vm-tui shutdown <domain>"

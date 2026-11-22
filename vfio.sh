@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R70 — bumped on every change; the full history is in changelog.md.
+# Revision: R71 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -250,7 +250,48 @@ SCRIPT_NAME="$(basename "$0")"
 # launch immediately + the virtio-win install hint (never burns the budget on
 # a VM that can never answer); agent installed but slow -> bounded by the same
 # deadline, then launch anyway with a WARN; VM_TUI_WAIT_AGENT=0 opts out.
-SCRIPT_REVISION="R70"
+# R71: vm-tui reliability round — six identified weak points verified + fixed:
+# (1) LG LAUNCH RELIABILITY (the sudo path, the weakest point per the live
+# review): new _vmtui_lg_session resolves WHO runs the client + their display
+# env and the client is NEVER launched as root (a GUI client under root's
+# stripped env qFatal's "could not connect to display" and SIGABRTs — the
+# exact live R61 tray crash). Target user: VM_TUI_LG_USER (explicit override)
+# > SUDO_USER > the first /run/user/* entry with a live graphical session; the
+# display env comes from the target user's session process environ
+# (_tray_session_display_env — picks up non-default sockets like wayland-1)
+# with a wayland-socket fallback, and the launch mirrors the tray's proven
+# env-array + setsid runuser form. When NO user+display can be resolved the
+# launch is REFUSED with an actionable message instead of crashing blindly —
+# including the non-root SSH-without-a-display case.
+# (2) CTRL-LOCK HONESTY: the capture preset state is reported explicitly —
+# "ACTIVE: captureOnFocus + autoCapture + grabKeyboard + captureOnStart" with
+# a concrete self-verification hint (keyboard goes to the VM immediately;
+# Scroll Lock releases), or an explicit "NOT forced — client defaults" note
+# when VM_TUI_LG_ARGS is empty, so seamless mouse is never silently assumed.
+# (3) DESTRUCTIVE CONFIRMS: destroy/reset now use a TWO-STEP gate — a y/N that
+# shows the VM's LIVE state, then type-the-domain-name (the installer's
+# confirm_phrase safety pattern scaled to the manager; TUI inputbox / plain
+# read, --yes skips both for automation) — so a mis-picked menu entry can no
+# longer destroy the wrong VM with one keypress.
+# (4) TUI/plain CONSISTENCY: every new path (typed-name confirm, session
+# resolution, liveness check) lives in ONE shared helper with TUI + plain
+# branches, exactly like vmtui_confirm/vmtui_pick — no per-path divergence.
+# (5) ERROR FEEDBACK: the client resolution reports WHY it failed (a distinct
+# message for an invalid/stale VM_TUI_LG_BIN override vs not-found), and the
+# launch is VERIFIED to stay alive (VM_TUI_LG_LIVENESS_WAIT, default 2s): an
+# early exit prints the log tail + a diagnosis block (no display for the
+# target user / client crash / the guest's LG host app not up yet -> re-run
+# lg) instead of a one-line "launched" that quietly died.
+# (6) DUAL CLIENT INSTALLS: when BOTH the self-compiled /usr/local/bin and the
+# packaged /usr/bin client exist, the launch SAYS which one wins (self-compiled
+# keeps precedence) and how to force the other (VM_TUI_LG_BIN), and an explicit
+# VM_TUI_LG_BIN override is now ELF-validated (_lg_binary_valid) instead of
+# trusted on a bare -x. Plus the accepted R70 follow-up: the picker shows the
+# per-VM guest-agent state for RUNNING VMs ("agent ✔/✖", one timeout-bounded
+# guest-ping, VM_TUI_SHOW_AGENT=0 hides it) so it is visible which VMs support
+# the instant Looking Glass handoff, and `lg` hints at the virtio-win guest
+# agent when it does not answer.
+SCRIPT_REVISION="R71"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -510,8 +551,11 @@ VM_TUI_LOG_FILE="/tmp/vm-tui.log"          # LG client launch log (append-only)
 VM_TUI_WAIT_TIMEOUT="${VM_TUI_WAIT_TIMEOUT:-120}"   # bounded wait for 'running'; 0 = skip
 # The input-capture ("Ctrl lock") Looking Glass preset — verified against the
 # installed B7-Virt client's option table. Override with VM_TUI_LG_ARGS
-# (space-separated; empty string = client defaults).
-VM_TUI_LG_ARGS="${VM_TUI_LG_ARGS:--o input:captureOnFocus=yes -o input:autoCapture=yes -o input:grabKeyboard=yes -o spice:captureOnStart=yes}"
+# (space-separated; an EXPLICITLY EMPTY value = client defaults — so the
+# default uses `-` (unset only), NOT `:-`: with `:-` an empty VM_TUI_LG_ARGS
+# would silently re-expand to the full preset and defeat the documented
+# override — a real bug the R71 harness caught live).
+VM_TUI_LG_ARGS="${VM_TUI_LG_ARGS--o input:captureOnFocus=yes -o input:autoCapture=yes -o input:grabKeyboard=yes -o spice:captureOnStart=yes}"
 VM_TUI_FORCE_TUI="${VM_TUI_FORCE_TUI:-0}"  # 1 = skip the isatty guard (serial console / test harness)
 VM_TUI_SKIP_CONFIRM=0                       # 1 = --yes: skip the destroy/reset confirmations
 # R70: most-recently-used VMs remembered for the recent-first picker order.
@@ -521,6 +565,12 @@ VM_TUI_RECENT_MAX="${VM_TUI_RECENT_MAX:-5}"  # newest first, capped; 0 = disable
 # guest-ping) so Looking Glass launches the moment Windows userspace is up.
 VM_TUI_WAIT_AGENT="${VM_TUI_WAIT_AGENT:-1}"  # 1 = enabled (default), 0 = launch right after 'running'
 [[ "$VM_TUI_WAIT_AGENT" =~ ^[0-9]+$ ]] || VM_TUI_WAIT_AGENT=1
+# R71: LG launch reliability + feedback knobs.
+VM_TUI_LG_USER=""                        # when run as root: force the desktop user for the LG client (default: SUDO_USER, else the first graphical session)
+VM_TUI_SHOW_AGENT="${VM_TUI_SHOW_AGENT:-1}"    # 1 = show per-VM guest-agent state in the picker (running VMs); 0 = hide
+[[ "$VM_TUI_SHOW_AGENT" =~ ^[0-9]+$ ]] || VM_TUI_SHOW_AGENT=1
+VM_TUI_LG_LIVENESS_WAIT="${VM_TUI_LG_LIVENESS_WAIT:-2}"  # seconds to verify the client stayed alive after launch; 0 = skip
+[[ "$VM_TUI_LG_LIVENESS_WAIT" =~ ^[0-9]+$ ]] || VM_TUI_LG_LIVENESS_WAIT=2
 # Args captured after --vm-tui (subcommand + domain); parse_args fills this.
 declare -ag VMTUI_ARGS=()
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
@@ -2266,7 +2316,11 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [com
                    main-menu option 12. Alias: --vm-manager. start-lg waits for
                    the Windows guest agent (virtio-win) when one is installed so
                    the client opens the moment Windows is actually up, and the
-                   picker lists your most-recently-used VMs first.
+                   picker lists your most-recently-used VMs first (with their
+                   guest-agent state). Launch failures are diagnosed: the client
+                   resolution, display/session detection, and a post-launch
+                   liveness check with the log tail; destroy/reset require
+                   typing the VM name.
   --tui <backend>  Force the TUI backend (whiptail or dialog) for the interactive
                    flows — the full-screen counterpart of --no-tui. Also skips the
                    terminal-attached check so serial consoles can use dialogs.
@@ -31579,49 +31633,83 @@ vmtui_state() {
   printf '%s' "${_s:-unknown}"
 }
 
-# Menu-friendly label lines: "name|state" — the current VM state is visible
-# while picking (the original spec's optional enhancement).
+# Menu-friendly label lines: "name|state|agent" — the current VM state is
+# visible while picking (the original spec's optional enhancement), plus the
+# per-VM guest-agent state for RUNNING VMs (R71: one timeout-bounded
+# guest-ping per running VM, so the picker shows which VMs support the instant
+# Looking Glass handoff; VM_TUI_SHOW_AGENT=0 hides it). Shut-off VMs are never
+# pinged (no latency). The third field is always present (possibly empty) so
+# the split in vmtui_pick is unambiguous.
 vmtui_menu_labels() {
   # NO process substitution here. vmtui_pick is invoked as `$(vmtui_pick ...)`
   # by the menu loop (a command substitution), and nested procsub-inside-
   # comsub proved unreliable in detached contexts (observed live: the picker
   # silently received ZERO labels under setsid; the identical non-nested
   # logic worked). Command substitution + a here-string work everywhere.
-  local _name _state _names
+  local _name _state _ag _names
   _names="$(vmtui_names)"
   while IFS= read -r _name; do
     [[ -n "$_name" ]] || continue
     _state="$(vmtui_state "$_name")"
-    printf '%s\n' "${_name}|${_state}"
+    _ag=""
+    if (( VM_TUI_SHOW_AGENT )) && [[ "$_state" == "running" ]]; then
+      if timeout 2 virsh -c qemu:///system qemu-agent-command "$_name" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+        _ag="agent ✔"
+      else
+        _ag="agent ✖"
+      fi
+    fi
+    printf '%s\n' "${_name}|${_state}|${_ag}"
   done <<<"$_names"
 }
 
 # Looking Glass client resolution (R68 parity via _lg_client_bin). When
-# VM_TUI_LG_BIN is SET it is AUTHORITATIVE: use it when it exists, report
-# missing when it does not — never silently fall through to another location
-# (the operator explicitly named the client; a fallback could pick a binary
-# they deliberately removed). When unset: self-compiled /usr/local/bin
+# VM_TUI_LG_BIN is SET it is AUTHORITATIVE: use it when it is USABLE (exists +
+# non-empty + executable — R71: a stale/missing override now reports as
+# invalid instead of a blind launch attempt; a wrapper script is a legitimate
+# override, so the ELF gate stays on the AUTO-discovery paths only) and report
+# WHY it failed when it is not — never silently fall through to another
+# location (the operator explicitly named the client; a fallback could pick a
+# binary they deliberately removed). When unset: self-compiled /usr/local/bin
 # (precedence) -> distro/OBS /usr/bin -> PATH lookup.
+# R71 form: $1 = the NAME of the variable to receive the resolved path. Called
+# DIRECTLY (never inside a command substitution), so the VMTUI_LG_WHY reason
+# global survives for the caller's feedback — the old print-to-stdout form
+# would have forced the caller into a comsub that swallows side channels.
 vmtui_lg_client() {
+  local _outvar="$1" _c
+  VMTUI_LG_WHY="no looking-glass-client found (searched /usr/local/bin, /usr/bin, PATH)"
   if [[ -n "${VM_TUI_LG_BIN:-}" ]]; then
-    if [[ -x "$VM_TUI_LG_BIN" ]]; then
-      printf '%s\n' "$VM_TUI_LG_BIN"
+    # An EXPLICIT override is checked as exists + non-empty + executable — NOT
+    # the ELF check the auto-discovery uses: a wrapper script (e.g. a launcher
+    # adding env vars) is a legitimate override, while a missing / empty /
+    # non-executable path is the stale-override case that must be reported.
+    if [[ -f "$VM_TUI_LG_BIN" && -s "$VM_TUI_LG_BIN" && -x "$VM_TUI_LG_BIN" ]]; then
+      printf -v "$_outvar" '%s' "$VM_TUI_LG_BIN"
+      VMTUI_LG_WHY=""
       return 0
     fi
+    VMTUI_LG_WHY="VM_TUI_LG_BIN is set but is not a usable client (missing, empty, or not executable): $VM_TUI_LG_BIN"
     return 1
   fi
-  if _lg_client_bin; then
+  _c="$(_lg_client_bin 2>/dev/null || true)"
+  if [[ -n "$_c" ]]; then
+    printf -v "$_outvar" '%s' "$_c"
+    VMTUI_LG_WHY=""
     return 0
   fi
   if have_cmd looking-glass-client; then
-    command -v looking-glass-client
+    # command -v already guarantees an executable; a wrapper script on PATH is
+    # as legitimate as an explicit override, so no ELF gate here either.
+    printf -v "$_outvar" '%s' "$(command -v looking-glass-client)"
+    VMTUI_LG_WHY=""
     return 0
   fi
   return 1
 }
 
 vmtui_lg_notify_missing() {
-  note "Looking Glass client not found — the VM still starts, but there is nothing to look through."
+  note "Looking Glass client not found (${1:-no client resolved}) — the VM still starts, but there is nothing to look through."
   note "  Install it with:  sudo $SCRIPT_NAME --install-looking-glass-client"
   note "  (openSUSE prebuilt: sudo opi looking-glass  ->  looking-glass-client)"
 }
@@ -31812,13 +31900,15 @@ vmtui_pick() {
   [[ -r "$(_vmtui_last_vm_file)" ]] && _last="$(head -1 "$(_vmtui_last_vm_file)" 2>/dev/null || true)"
 
   if vmtui_tui_active; then
-    # Build the menu args: tag = index, item = "name  [state]".
+    # Build the menu args: tag = index, item = "name  [state(+agent)]".
     local -a _menu=()
-    local _i=1 _name _state
+    local _i=1 _name _state _rest _ag
     for _line in "${_labels[@]}"; do
       _name="${_line%%|*}"
-      _state="${_line#*|}"
-      _menu+=("$_i" "${_name}  [${_state}]")
+      _rest="${_line#*|}"
+      _state="${_rest%%|*}"
+      _ag="${_rest#*|}"
+      _menu+=("$_i" "${_name}  [${_state}${_ag:+, ${_ag}}]")
       _i=$((_i + 1))
     done
     local _pick
@@ -31848,25 +31938,27 @@ vmtui_pick() {
   # on BOTH paths. The `read -p` prompt also goes to stderr natively.
   say >&2
   hdr "$_title" >&2
-  local _i=1 _name _state
+  local _i=1 _name _state _rest _ag
   for _line in "${_labels[@]}"; do
     _name="${_line%%|*}"
-    _state="${_line#*|}"
+    _rest="${_line#*|}"
+    _state="${_rest%%|*}"
+    _ag="${_rest#*|}"
     if [[ -n "$_last" && "$_name" == "$_last" ]]; then
       if (( ENABLE_COLOR )); then
-        say "  $_i) ${C_BOLD}${_name}${C_RESET}  [${_state}]  ${C_DIM}(last used — ENTER picks this)${C_RESET}" >&2
+        say "  $_i) ${C_BOLD}${_name}${C_RESET}  [${_state}${_ag:+, ${_ag}}]  ${C_DIM}(last used — ENTER picks this)${C_RESET}" >&2
       else
-        say "  $_i) ${_name}  [${_state}]  (last used — ENTER picks this)" >&2
+        say "  $_i) ${_name}  [${_state}${_ag:+, ${_ag}}]  (last used — ENTER picks this)" >&2
       fi
     elif [[ -n "$_recents" ]] && grep -Fixq -- "$_name" <<<"$_recents" 2>/dev/null; then
       # R70: a recently-used VM that is not the newest — still near the top.
       if (( ENABLE_COLOR )); then
-        say "  $_i) ${_name}  [${_state}]  ${C_DIM}(recent)${C_RESET}" >&2
+        say "  $_i) ${_name}  [${_state}${_ag:+, ${_ag}}]  ${C_DIM}(recent)${C_RESET}" >&2
       else
-        say "  $_i) ${_name}  [${_state}]  (recent)" >&2
+        say "  $_i) ${_name}  [${_state}${_ag:+, ${_ag}}]  (recent)" >&2
       fi
     else
-      say "  $_i) ${_name}  [${_state}]" >&2
+      say "  $_i) ${_name}  [${_state}${_ag:+, ${_ag}}]" >&2
     fi
     _i=$((_i + 1))
   done
@@ -31924,9 +32016,34 @@ vmtui_act_shutdown() {
   fi
 }
 
+# R71: TWO-STEP destructive confirmation (point 3 of the reliability round):
+# (1) a y/N that shows the VM's LIVE state, then (2) type-the-domain-name —
+# the installer's confirm_phrase safety pattern scaled to the manager, so a
+# stray keypress on a mis-picked entry can no longer destroy the wrong VM.
+# Both the TUI (inputbox) and plain (read) paths live HERE, in ONE shared
+# helper (point 4: no per-path divergence). --yes skips both steps for
+# automation (same contract as the single-step confirm it replaces).
+# $1 = domain, $2 = action noun ("shutdown" / "reset"). Returns 0 = confirmed.
+vmtui_confirm_destructive() {
+  local _dom="$1" _act="$2" _state _typed
+  if [[ "${VM_TUI_SKIP_CONFIRM:-0}" == "1" ]]; then return 0; fi
+  _state="$(vmtui_state "$_dom")"
+  if ! vmtui_confirm "FORCE $_act '$_dom' (state: ${_state})? This is the equivalent of pulling the power cable — unsaved data in the guest is lost." N; then
+    return 1
+  fi
+  if vmtui_tui_active; then
+    _typed="$($TUI_BIN --title "Confirm" --inputbox "Type '$_dom' to confirm the force $_act" 10 60 3>&1 1>&2 2>&3)" || return 1
+  else
+    # Direct stdin read (see vmtui_confirm for the rationale — no /dev/tty;
+    # EOF = empty = cancelled, never a hard quit).
+    read -r -p "Type '$_dom' to confirm: " _typed || true
+  fi
+  [[ "${_typed:-}" == "$_dom" ]]
+}
+
 vmtui_act_destroy() {
   local _dom="$1"
-  if ! vmtui_confirm "FORCE shutdown '$_dom'? This is the equivalent of pulling the power cable — unsaved data in the guest is lost." N; then
+  if ! vmtui_confirm_destructive "$_dom" "shutdown"; then
     note "Force shutdown cancelled."
     return 0
   fi
@@ -31940,7 +32057,7 @@ vmtui_act_destroy() {
 
 vmtui_act_reset() {
   local _dom="$1"
-  if ! vmtui_confirm "FORCE reset '$_dom'? This hard-resets the guest without a clean shutdown." N; then
+  if ! vmtui_confirm_destructive "$_dom" "reset"; then
     note "Force reset cancelled."
     return 0
   fi
@@ -31952,31 +32069,176 @@ vmtui_act_reset() {
   fi
 }
 
-# Launch the Looking Glass client detached with the capture preset.
-# $1 = domain (only used in the log + notify text).
-vmtui_lg_launch() {
-  local _dom="$1" _bin
-  if ! _bin="$(vmtui_lg_client)"; then
-    vmtui_lg_notify_missing
+# R71: resolve WHO should run the Looking Glass client and with which display
+# env (reliability point 1 — the weakest link per the live review). NEVER
+# launch the client as root: a GUI client under root's stripped env qFatal's
+# with "could not connect to display" and SIGABRTs (the exact live R61 tray
+# crash). Target user when root: VM_TUI_LG_USER (the explicit override) >
+# SUDO_USER > the first /run/user/* entry with a live graphical session.
+# Display env: the target user's session process environ
+# (_tray_session_display_env — picks up non-default sockets like wayland-1),
+# then a wayland-socket fallback. Sets _vmtui_lg_user / _vmtui_lg_uid /
+# _vmtui_lg_env (array) / _vmtui_lg_wd / _vmtui_lg_xd. Returns 1 with
+# actionable notes when no user+display can be resolved — the caller refuses
+# to launch instead of crashing blindly (reliability point 5).
+_vmtui_lg_session() {
+  # NOTE: _vmtui_lg_env is deliberately a GLOBAL (no `local` here) — the
+  # caller (vmtui_lg_launch) reads it AFTER this function returns; a local
+  # would vanish and set -u would kill the launch with an unbound-variable
+  # error (caught by the harness exactly that way).
+  _vmtui_lg_user=""; _vmtui_lg_uid=""; _vmtui_lg_wd=""; _vmtui_lg_xd=""
+  _vmtui_lg_env=()
+  local _euid _have=0 _rt _s _cand _uid2 _envtext _ik _iv
+  _euid="${EUID:-$(id -u)}"
+  if [[ "$_euid" -ne 0 ]]; then
+    # Normal user run (the primary mode): our own session. A missing display
+    # (SSH without forwarding) is refused with the fix instead of a silent
+    # client crash.
+    _vmtui_lg_user="$(id -un)"
+    _vmtui_lg_uid="$(id -u)"
+    _vmtui_lg_wd="${WAYLAND_DISPLAY:-}"
+    _vmtui_lg_xd="${DISPLAY:-}"
+    if [[ -n "$_vmtui_lg_wd" || -n "$_vmtui_lg_xd" ]]; then
+      _have=1
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR:-}" ]]; then
+      for _s in "$XDG_RUNTIME_DIR"/wayland-*; do
+        [[ -S "$_s" ]] || continue
+        _vmtui_lg_wd="$(basename "$_s")"
+        _vmtui_lg_env+=("WAYLAND_DISPLAY=$_vmtui_lg_wd")
+        _have=1
+        break
+      done
+    fi
+    if (( ! _have )); then
+      note "Looking Glass NOT launched: this session has no display (no WAYLAND_DISPLAY/DISPLAY and no wayland socket in XDG_RUNTIME_DIR)."
+      note "  Run '$SCRIPT_NAME --vm-tui start-lg <domain>' from your desktop session, or over SSH with X/Wayland forwarding."
+      return 1
+    fi
+    return 0
+  fi
+  # --- root: resolve the desktop user (never launch the client as root) ---
+  _vmtui_lg_user="${VM_TUI_LG_USER:-${SUDO_USER:-}}"
+  if [[ -z "$_vmtui_lg_user" || "$_vmtui_lg_user" == "root" ]]; then
+    _vmtui_lg_user=""
+    for _rt in /run/user/*; do
+      [[ -d "$_rt" ]] || continue
+      _uid2="$(basename "$_rt")"
+      [[ "$_uid2" =~ ^[0-9]+$ && "$_uid2" != "0" ]] || continue
+      _cand="$(getent passwd "$_uid2" 2>/dev/null | cut -d: -f1 || true)"
+      [[ -n "$_cand" ]] || continue
+      _envtext="$(_tray_session_display_env "$_cand" 2>/dev/null || true)"
+      if [[ -n "$_envtext" ]]; then
+        _vmtui_lg_user="$_cand"
+        note "Running as root: launching the Looking Glass client as desktop user '$_cand' (set VM_TUI_LG_USER to override)."
+        break
+      fi
+    done
+  fi
+  if [[ -z "$_vmtui_lg_user" ]]; then
+    note "Looking Glass NOT launched: running as root and no desktop session/user could be found (the client must never run as root — it would crash display-less)."
+    note "  Re-run as your normal desktop user, or force one with VM_TUI_LG_USER=<user> (a user with an active graphical session)."
     return 1
   fi
-  printf '%s launch: domain=%s bin=%s args=%s\n' "$(date -Is)" "$_dom" "$_bin" "$VM_TUI_LG_ARGS" >>"$VM_TUI_LOG_FILE" 2>/dev/null || true
-  # R61 parity: when this runs as root (the main-menu path), a GUI client
-  # launched with root's stripped env qFatal's with "could not connect to
-  # display" and SIGABRTs — the exact live tray crash R61 fixed. Re-launch
-  # as the sudo-originating desktop user with their session's display env.
-  if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && have_cmd runuser; then
-    local _env _uid
-    _env="$(_tray_session_display_env "$SUDO_USER" || true)"
-    _uid="$(id -u "$SUDO_USER" 2>/dev/null || true)"
-    # shellcheck disable=SC2086 # intentional word-split: env assignments + the VM_TUI_LG_ARGS flag list
-    runuser -u "$SUDO_USER" -- env ${_env:+$_env }${_uid:+XDG_RUNTIME_DIR=/run/user/$_uid }setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
-  else
-    # shellcheck disable=SC2086 # intentional word-split: VM_TUI_LG_ARGS is a space-joined flag list
-    setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+  _vmtui_lg_uid="$(id -u "$_vmtui_lg_user" 2>/dev/null || true)"
+  if [[ -z "$_vmtui_lg_uid" ]]; then
+    note "Looking Glass NOT launched: cannot resolve the uid for user '$_vmtui_lg_user'."
+    return 1
   fi
-  vmtui_ok "Looking Glass launched for '$_dom' (detached; log: $VM_TUI_LOG_FILE)."
-  note "  Ctrl lock preset: captureOnFocus + autoCapture + grabKeyboard + captureOnStart."
+  _envtext="$(_tray_session_display_env "$_vmtui_lg_user" 2>/dev/null || true)"
+  _vmtui_lg_wd="$(awk -F= '/^WAYLAND_DISPLAY=/{print $2; exit}' <<<"$_envtext" 2>/dev/null || true)"
+  _vmtui_lg_xd="$(awk -F= '/^DISPLAY=/{print $2; exit}' <<<"$_envtext" 2>/dev/null || true)"
+  if [[ -z "$_vmtui_lg_wd" && -z "$_vmtui_lg_xd" ]]; then
+    for _s in /run/user/$_vmtui_lg_uid/wayland-*; do
+      [[ -S "$_s" ]] || continue
+      _vmtui_lg_wd="$(basename "$_s")"
+      break
+    done
+  fi
+  if [[ -z "$_vmtui_lg_wd" && -z "$_vmtui_lg_xd" ]]; then
+    note "Looking Glass NOT launched: no display found for user '$_vmtui_lg_user' (no WAYLAND_DISPLAY/DISPLAY in their session and no wayland socket in /run/user/$_vmtui_lg_uid)."
+    note "  Is that user logged into a graphical session? Set VM_TUI_LG_USER=<user> to pick another."
+    return 1
+  fi
+  # The tray's proven launch env (R61): runtime dir + display keys + the
+  # desktop identity keys (harmless for the LG client; deterministic for its
+  # platform plugins).
+  _vmtui_lg_env=("XDG_RUNTIME_DIR=/run/user/$_vmtui_lg_uid")
+  if [[ -n "$_vmtui_lg_wd" ]]; then _vmtui_lg_env+=("WAYLAND_DISPLAY=$_vmtui_lg_wd"); fi
+  if [[ -n "$_vmtui_lg_xd" ]]; then _vmtui_lg_env+=("DISPLAY=$_vmtui_lg_xd"); fi
+  for _ik in XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP KDE_FULL_SESSION; do
+    _iv="$(grep -m1 -E "^$_ik=" <<<"$_envtext" 2>/dev/null || true)"
+    if [[ -n "$_iv" ]]; then _vmtui_lg_env+=("$_iv"); fi
+  done
+  return 0
+}
+
+# Launch the Looking Glass client detached with the capture preset.
+# $1 = domain (log + notify text). R71 hardening (reliability points 1/2/5/6):
+# the client resolution reports WHY it failed, a dual install says which one
+# wins, the target user + display env are resolved explicitly (never root),
+# the launch is verified to STAY ALIVE with the log tail + a diagnosis block
+# on early exit, and the capture preset state is reported honestly.
+vmtui_lg_launch() {
+  local _dom="$1" _bin="" _pid
+  if ! vmtui_lg_client _bin; then
+    vmtui_lg_notify_missing "$VMTUI_LG_WHY"
+    return 1
+  fi
+  # Point 6: a dual install (self-compiled + packaged) is ambiguous — say
+  # which one wins and how to force the other.
+  if [[ -z "${VM_TUI_LG_BIN:-}" ]] \
+    && _lg_binary_valid /usr/local/bin/looking-glass-client \
+    && _lg_binary_valid /usr/bin/looking-glass-client; then
+    note "NOTE: two Looking Glass clients installed — using the self-compiled /usr/local/bin one (precedence)."
+    note "      Set VM_TUI_LG_BIN to force the packaged /usr/bin one (or vice versa)."
+  fi
+  # Point 1: resolve the target user + display env; refuse (with the fix)
+  # instead of launching a client that would die display-less.
+  if ! _vmtui_lg_session; then
+    return 1
+  fi
+  printf '%s launch: domain=%s user=%s bin=%s env=%s args=%s\n' "$(date -Is)" "$_dom" "$_vmtui_lg_user" "$_bin" "${_vmtui_lg_env[*]}" "$VM_TUI_LG_ARGS" >>"$VM_TUI_LOG_FILE" 2>/dev/null || true
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    # Root: launch as the resolved desktop user — the tray's proven
+    # env-array + setsid runuser form (R61).
+    # shellcheck disable=SC2086 # intentional word-split: VM_TUI_LG_ARGS is a space-joined flag list
+    runuser -u "$_vmtui_lg_user" -- env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+    _pid=$!
+  elif (( ${#_vmtui_lg_env[@]} > 0 )); then
+    # Non-root with a socket-fallback display: add the discovered vars.
+    # shellcheck disable=SC2086
+    env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+    _pid=$!
+  else
+    # Non-root in a normal session: the exact validated R69 launch line.
+    # shellcheck disable=SC2086
+    setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+    _pid=$!
+  fi
+  # Point 5: verify the client STAYED ALIVE instead of printing "launched"
+  # and letting it die quietly.
+  if (( VM_TUI_LG_LIVENESS_WAIT > 0 )); then
+    sleep "$VM_TUI_LG_LIVENESS_WAIT"
+    if ! kill -0 "$_pid" 2>/dev/null; then
+      note "WARN: the Looking Glass client exited within ${VM_TUI_LG_LIVENESS_WAIT}s — it is NOT running."
+      note "  Last log lines ($VM_TUI_LOG_FILE):"
+      tail -n 5 "$VM_TUI_LOG_FILE" 2>/dev/null | sed 's/^/    /' >&2 || true
+      note "  Common causes: no usable display for user '${_vmtui_lg_user}' (WAYLAND_DISPLAY=${_vmtui_lg_wd:-<none>} DISPLAY=${_vmtui_lg_xd:-<none>}),"
+      note "  a client crash (see the log lines above), or the guest's Looking Glass host app is not up yet —"
+      note "  wait for Windows to finish booting and re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+      return 1
+    fi
+    vmtui_ok "Looking Glass client is alive (pid $_pid, user '$_vmtui_lg_user')."
+  fi
+  vmtui_ok "Looking Glass launched for '$_dom' as user '$_vmtui_lg_user' (bin: $_bin; detached; log: $VM_TUI_LOG_FILE)."
+  # Point 2: report the capture preset state HONESTLY — never let the user
+  # assume seamless mouse is on when it is not.
+  if [[ -n "${VM_TUI_LG_ARGS// /}" ]]; then
+    note "  Capture preset ACTIVE: captureOnFocus + autoCapture + grabKeyboard + captureOnStart (the Ctrl lock)."
+    note "  Verify it: your keyboard and mouse go to the VM immediately; press Scroll Lock to release, re-focus the window to capture again."
+  else
+    note "  NOTE: VM_TUI_LG_ARGS is empty — the client uses YOUR config defaults; seamless mouse / Ctrl lock are NOT forced."
+  fi
   note "  Release input with the escape key (default: Scroll Lock). Override flags: VM_TUI_LG_ARGS."
   return 0
 }
@@ -32037,6 +32299,17 @@ vmtui_act_lg_only() {
     return 1
   fi
   vmtui_remember_vm "$_dom"
+  # R71: a quick informational agent ping — when the guest agent never
+  # answers, Windows' Looking Glass host app is probably not up yet either
+  # (non-blocking: the launch proceeds regardless; the note tells the user
+  # what a blank client window means + the virtio-win fix).
+  if (( VM_TUI_SHOW_AGENT )); then
+    if ! timeout 2 virsh -c qemu:///system qemu-agent-command "$_dom" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+      note "NOTE: the guest agent did not answer — Windows' Looking Glass host app may not be up yet."
+      note "      If the client window shows no image, wait a few seconds and re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+      note "      (Install the virtio-win guest agent inside Windows — sudo $SCRIPT_NAME --install-virtio-win-guest-agent — for the instant handoff.)"
+    fi
+  fi
   vmtui_lg_launch "$_dom"
 }
 
@@ -32142,6 +32415,14 @@ Environment:
                         moment Windows is up; 0 = launch right after 'running'
   VM_TUI_RECENT_MAX     Most-recently-used VMs ordered first in the picker
                         (default 5; 0 = disable the recent-first ordering)
+  VM_TUI_SHOW_AGENT     1 (default) = show the per-VM guest-agent state in the
+                        picker for running VMs (agent ✔ / agent ✖); 0 = hide
+  VM_TUI_LG_USER        When run as root: force the desktop user the Looking
+                        Glass client is launched as (default: SUDO_USER, else
+                        the first user with an active graphical session)
+  VM_TUI_LG_LIVENESS_WAIT
+                        Seconds after the launch to verify the client stayed
+                        alive (default 2; 0 = skip the liveness check)
 EOF
 }
 

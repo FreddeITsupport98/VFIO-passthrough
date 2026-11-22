@@ -27,6 +27,7 @@
 - [Install / switch commands](#install--switch-commands)
 - [GPU binding mode (early vs dynamic) — CLI reference](#gpu-binding-mode-early-vs-dynamic)
 - [Unreleased / changelog](#unreleased)
+- [Built-in VM manager (--vm-tui)](#built-in-vm-manager---vm-tui)
 - [Live-attach (hotplug GPU) workflow — the recommended RDNA4 path](#live-attach-hotplug-gpu-workflow--the-recommended-rdna4-path)
 - [System-tray hotplug on/off toggle (R41)](#system-tray-hotplug-onoff-toggle-r41)
 - [virtio-win guest-agent installer (smart handoff)](#virtio-win-guest-agent-installer-smart-handoff)
@@ -69,6 +70,7 @@
 - [Known limitations](#known-limitations)
 - [FAQ](#faq)
 - [Contributing / customizing](#contributing--customizing)
+- [Built-in VM manager (--vm-tui)](#built-in-vm-manager---vm-tui)
 - [Unreleased / changelog](#unreleased)
 
 > **Status:** This script is a highly defensive, feature‑rich VFIO helper that has been hardened for modern Fedora/RHEL/Arch‑style setups, AMD reset quirks, and boot‑VGA framebuffer conflicts. It is designed as a _host configuration wizard_, **not** a VM manager.
@@ -596,9 +598,30 @@ Rapid VM stop/start cycles (stopping the VM and starting it again within a few s
 - **Reducing the chance of the card dying between cycles**: the cooldown (above) automates the "wait a few seconds" advice. As an additional opt-in, `VFIO_DYNAMIC_PCI_RESET="1"` in `/etc/vfio-gpu-passthrough.conf` forces a PCI function-level reset on every bind (costs ~0.5s per VM start; can clear residual amdgpu state that causes the header-127 bind failure).
 - **R64 — a dead GPU no longer blocks the VM (dead-GPU fallback)**: when the card is entirely dead at VM start, the bind script first tries a bare PCI rescan; if that fails it exits with the dedicated code 42 and one unified actionable message (+ desktop notification): the card dropped off the bus, it is NOT a config problem, **save your work and reboot the host when convenient** — and the VM start is NOT lost. The hook then **auto-restarts the VM WITHOUT the GPU** (a detached worker flips it to live-attach mode=on and `virsh start`s it seconds later), so the VM boots on the virtual display, and the live-attach helper **hot-attaches the GPU automatically the moment it is alive again** (after your reboot; bounded 120s wait, `VFIO_LIVE_ATTACH_GPU_ALIVE_WAIT`). Loop-guarded (one fallback per VM per 10 minutes; cleared on the next healthy bind) so it can never auto-restart-loop; opt out with `VFIO_DEAD_GPU_FALLBACK=0` in the conf. A dead card at `--release` no longer fails the VM-stop path either (it records the cooldown and exits 0).
 
+## Built-in VM manager (--vm-tui)
+
+A quick VM manager for day-to-day VM control — no need to remember virsh flags or run the full vfio.sh wizard. It is **built into `vfio.sh`** (R69): launch it with `vfio --vm-tui` (alias: `--vm-manager`), from the interactive **main menu (option 12)**, or with any of its CLI subcommands. It works in THREE modes, with a desktop AND fully headless:
+
+- **Interactive TUI** — whiptail or dialog menus (auto-detected; `--tui <bin>` forces a backend). Main menu: List all VMs (running + shut off, state shown in the pickers), Start, Shutdown (graceful), Force shutdown (destroy, confirmed), Force reset (confirmed), **Start VM + Looking Glass (Ctrl lock)**, Looking Glass only, Show VM state, Quit.
+- **Plain text** — the same numbered menus on stdin/stderr when no TUI backend exists (SSH/headless) or with `--no-tui`.
+- **CLI subcommands** — scriptable, non-interactive: `vfio --vm-tui list | state <dom> | start <dom> | shutdown <dom> | destroy <dom> | reset <dom> | start-lg <dom> | lg <dom>`; `--yes` skips the destructive confirmations for automation.
+
+**Start VM + Looking Glass (Ctrl lock)** starts the VM (no-op if already running; auto-resumes if paused), waits bounded (default 120s, `VM_TUI_WAIT_TIMEOUT`) until virsh reports running, then launches the Looking Glass client DETACHED with the input-capture preset — flags verified against the installed B7 client's option table: `captureOnFocus` + `autoCapture` (seamless mouse) + `grabKeyboard` (the Ctrl lock) + `captureOnStart`. Override the whole set with `VM_TUI_LG_ARGS`. The client resolves via vfio.sh's dual-location resolver (self-compiled `/usr/local/bin` first, then the packaged `/usr/bin` — e.g. the OBS rpm), or set `VM_TUI_LG_BIN` explicitly. A missing client never blocks the VM start.
+
+Run it **without root**: `vfio --vm-tui ...` as your normal user (virsh talks to `qemu:///system` — add yourself to the `libvirt` group if needed) so the Looking Glass client opens in YOUR desktop session; when it runs as root (e.g. from the root main menu) the client is automatically re-launched as the sudo-originating desktop user instead of root (R61 parity — root's stripped display env would crash it).
+
+Safety: destructive actions (destroy/reset) require an explicit confirmation; the last used VM is remembered as the ENTER default (`~/.config/vm-tui/last-vm` — resolved to the real user's home under sudo); every virsh error is surfaced; the LG launch is logged to `/tmp/vm-tui.log`. `--uninstall-self` sweeps those runtime artifacts.
+
+```fish path=null start=null
+vfio --vm-tui                        # interactive (TUI or plain)
+vfio --vm-tui start-lg GAMING       # headless one-shot: start + wait + Looking Glass
+vfio --vm-tui --yes destroy GAMING  # automation (confirmation skipped)
+```
+
 ## Unreleased
 - No pending unreleased README notes.
 - Add upcoming updates below this line as new work lands.
+- **R69**: the **VM manager (vm-tui) is now BUILT IN** to `vfio.sh` — `vfio --vm-tui` (alias `--vm-manager`) or **main-menu option 12** — and the standalone `vm-tui.sh` is retired (single-file deploy). Same three modes (whiptail/dialog TUI, plain numbered menus, and CLI subcommands `list / state / start / shutdown / destroy / reset / start-lg / lg`) plus new `--tui <backend>` and `--yes` flags; it runs WITHOUT root (virsh via `qemu:///system`; from the root main menu the Looking Glass client is re-launched as the sudo-originating desktop user — R61 parity); the LG client resolves via the R68 dual-location resolver; destructive actions stay confirmed; `--uninstall-self` now sweeps the manager's `/tmp/vm-tui.log` + remembered-VM file. See [Built-in VM manager (--vm-tui)](#built-in-vm-manager---vm-tui).
 - **R68**: the **distro/OBS-packaged `looking-glass-client` is now a first-class client** — the resolver checks BOTH locations (the self-compiled `/usr/local/bin/looking-glass-client`, which keeps precedence, AND the packaged `/usr/bin/looking-glass-client` — e.g. the openSUSE OBS rpm installed via `opi`), and every consumer uses it: the per-VM checklist `compiled ✔` marker, the smart disclaimer (silent once ANY client exists), the `--install-looking-glass-client` already-installed skip, and the desktop shortcut `Exec=` (points at the actual active binary). Context: the source-compile path on this host died at `GLES3/gl3.h` because the Packman-rebuilt Mesa devel packages (common on openSUSE multimedia setups) ship only GLES2 headers — the official OSS Mesa-libGLESv2-devel has them; the prebuilt OBS package sidesteps the whole toolchain question.
 - **R67**: fixed the Looking Glass client compile failing on **egl** on openSUSE — the egl mapping pointed at `libglvnd-devel`, which zypper kept reporting as ALREADY INSTALLED ("nothing to do") three times while egl stayed unfound, because openSUSE's libglvnd-devel does not ship `egl.pc` (only glx/opengl/libglvnd — verified via rpm -ql). The real SUSE providers are the Mesa devel packages: `Mesa-libEGL-devel` (egl.pc), `Mesa-libGL-devel` (gl.pc), `Mesa-libGLESv2-devel` (glesv2.pc). The gl/egl/glesv2 zypper mappings now return candidate lists (libglvnd-devel + the Mesa package; an already-installed candidate is a harmless no-op), the two missing Mesa packages are added to the up-front build-dep list, and the self-heal now VERIFIES after each install round that pkg-config can actually see the module — when the mapped packages are already installed but the module is still invisible it says so precisely and bails early with the `zypper se --provides 'pkgconfig(<module>)'` hint instead of burning all 3 retries on identical failures.
 - **R66**: fixed the Looking Glass client compile failing on openSUSE — the zypper build-dep list was missing `libXinerama-devel` + `libXcursor-devel` (added), and the R48j self-healing cmake NEVER actually worked: its missing-module parser could not read the real CMake error block (the blank line between the header and the ` - module` list killed the awk grab state, and CMake's three-space indent never matched the one-space anchor). The parser is rewritten (any indent, version constraints stripped, blanks before the first module tolerated) and verified END-TO-END with a mini cmake project + a fake package manager: attempt 1 fails -> module extracted -> mapped -> auto-install -> attempt 2 configures OK.

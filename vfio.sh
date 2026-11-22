@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R68 — bumped on every change; the full history is in changelog.md.
+# Revision: R69 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -202,7 +202,34 @@ SCRIPT_NAME="$(basename "$0")"
 # check, the R48g compile-first disclaimer, the desktop shortcut Exec=, and the
 # user-facing launch hints — so a packaged client is recognized EVERYWHERE the
 # self-compiled one is and the disclaimer/checklist noise stops.
-SCRIPT_REVISION="R68"
+# R69: the VM manager (vm-tui) is now BUILT IN — the standalone vm-tui.sh V1
+# was merged into this script as the --vm-tui mode (+ --vm-manager alias, and
+# main-menu option 12) so the deploy stays a SINGLE file. It is the light-
+# weight libvirt VM manager + Looking Glass launcher with input capture
+# ("Ctrl lock" preset), working three ways: full-screen TUI (whiptail/dialog
+# via the R58 backend detection + auto-install), plain-text numbered menus
+# (headless / SSH / --no-tui; every read is `|| true` so set -e never kills
+# it, and stdin is read DIRECTLY — no /dev/tty — so piped automation works),
+# and scriptable CLI subcommands (list / state / start / shutdown / destroy /
+# reset / start-lg / lg, with --yes to skip the destructive confirmations).
+# Safety patterns carried over verbatim from the validated standalone: the
+# VM picker renders EVERYTHING to stderr (stdout is the captured name channel
+# for `$(vmtui_pick ...)` callers), labels are captured via command
+# substitution + here-strings only (NEVER nested process substitution — it
+# silently received zero labels in detached contexts), the TUI pick has a
+# 1..N range guard (bash negative array indices silently resolve to the LAST
+# element), and the Looking Glass client launches detached via setsid with
+# the launch logged. R68 parity kept: the client resolves via _lg_client_bin
+# (self-compiled /usr/local/bin first, then the distro/OBS /usr/bin package,
+# then PATH; $VM_TUI_LG_BIN stays AUTHORITATIVE when set). R61 parity added:
+# when the manager runs as root (e.g. from the root main menu), the LG client
+# is re-launched as the sudo-originating desktop user with their session's
+# WAYLAND_DISPLAY/DISPLAY (root's stripped env would SIGABRT the client — the
+# exact tray crash R61 fixed live), and the remembered last-VM state is
+# persisted in the REAL user's config dir, not root's. Deliberately NOT
+# root-gated: virsh talks to qemu:///system (works for libvirt-group users)
+# and the LG client must run in the user's desktop session.
+SCRIPT_REVISION="R69"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -455,6 +482,19 @@ LG_BUILD_LOG="/tmp/looking-glass-client-build.log"
 # instead of having to remember the binary path. Created after a successful
 # compile/install; removed by remove_looking_glass_client.
 LG_CLIENT_DESKTOP="/usr/share/applications/looking-glass-client.desktop"
+# R69: built-in VM manager (--vm-tui / --vm-manager / main-menu option 12).
+# Formerly the standalone vm-tui.sh V1 — see the R69 revision note above for
+# the full rationale. Runtime knobs (env-overridable where noted):
+VM_TUI_LOG_FILE="/tmp/vm-tui.log"          # LG client launch log (append-only)
+VM_TUI_WAIT_TIMEOUT="${VM_TUI_WAIT_TIMEOUT:-120}"   # bounded wait for 'running'; 0 = skip
+# The input-capture ("Ctrl lock") Looking Glass preset — verified against the
+# installed B7-Virt client's option table. Override with VM_TUI_LG_ARGS
+# (space-separated; empty string = client defaults).
+VM_TUI_LG_ARGS="${VM_TUI_LG_ARGS:--o input:captureOnFocus=yes -o input:autoCapture=yes -o input:grabKeyboard=yes -o spice:captureOnStart=yes}"
+VM_TUI_FORCE_TUI="${VM_TUI_FORCE_TUI:-0}"  # 1 = skip the isatty guard (serial console / test harness)
+VM_TUI_SKIP_CONFIRM=0                       # 1 = --yes: skip the destroy/reset confirmations
+# Args captured after --vm-tui (subcommand + domain); parse_args fills this.
+declare -ag VMTUI_ARGS=()
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
 # PATH for both root and users; the generated boot-time helpers stay in
 # /usr/local/sbin) and drops the
@@ -473,7 +513,7 @@ RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completion
 RECOMMENDED_MODE=0   # 1=--recommended: auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (R39)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | reset-systemd-boot-entries | usb-mitigation-status | doctor | install-doctor-timer | remove-doctor-timer | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | install-self | uninstall-self | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | reset-systemd-boot-entries | usb-mitigation-status | doctor | install-doctor-timer | remove-doctor-timer | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | vm-tui | install-self | uninstall-self | completion printers
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -623,7 +663,7 @@ _mode_needs_tui_backend() {
     install-virtio-win-guest-agent|\
     install-looking-glass|remove-looking-glass|\
     install-looking-glass-client|remove-looking-glass-client|\
-    install-graphics-daemon|install-usb-bt-mitigation)
+    install-graphics-daemon|install-usb-bt-mitigation|vm-tui)
       return 0
       ;;
     *)
@@ -1307,11 +1347,15 @@ print_fish_completion() {
 # fish completion for $cmd (generated by $SCRIPT_NAME)
 complete -c $cmd -f
 # On bare-space TAB (current token has no leading dash) list every flag; once a dash is typed the per-flag -l lines below take over (with descriptions + argument completions).
-complete -c $cmd -n "string match -vq -- '-*' (commandline -ct)" -a "--help --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --recommended --reset-usb-mitigation --reset-systemd-boot-entries --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
+complete -c $cmd -n "string match -vq -- '-*' (commandline -ct)" -a "--help --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --recommended --reset-usb-mitigation --reset-systemd-boot-entries --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
 complete -c $cmd -s h -l help -d 'Show help'
 complete -c $cmd -l debug -d 'Enable verbose debug logging'
 complete -c $cmd -l dry-run -d 'Show actions without changing the system'
 complete -c $cmd -l no-tui -d 'Force plain-text prompts'
+complete -c $cmd -l vm-tui -d 'Built-in VM manager: start/stop/reset VMs + Looking Glass launch (list|state|start|shutdown|destroy|reset|start-lg|lg)'
+complete -c $cmd -l vm-manager -d 'Alias of --vm-tui (built-in VM manager)'
+complete -c $cmd -l tui -r -a 'whiptail dialog' -d 'Force the TUI backend (whiptail or dialog) for the interactive flows'
+complete -c $cmd -l yes -d 'With --vm-tui: skip the destroy/reset confirmations (automation)'
 complete -c $cmd -l boot-vga-policy -r -a 'auto strict' -d 'Install-mode Boot-VGA policy override'
 complete -c $cmd -l graphics-protocol -r -a 'auto x11 wayland' -d 'Install-mode graphics protocol override'
 complete -c $cmd -l graphics-daemon-interval -r -d 'Set graphics daemon polling interval in seconds (1-3600)'
@@ -1405,8 +1449,12 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-systemd-boot-entries --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-systemd-boot-entries --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
 
+  if [[ "\$prev" == "--tui" ]]; then
+    COMPREPLY=(\$(compgen -W "whiptail dialog" -- "\$cur"))
+    return 0
+  fi
   if [[ "\$prev" == "--boot-vga-policy" ]]; then
     COMPREPLY=(\$(compgen -W "auto strict" -- "\$cur"))
     return 0
@@ -1442,7 +1490,11 @@ _vfio_sh_complete() {
     '--debug[Enable verbose debug logging]' \\
     '--dry-run[Show actions without changing the system]' \\
     '--no-tui[Force plain-text prompts]' \\
-    '--boot-vga-policy=[Install-mode Boot-VGA policy override]:policy:(auto strict)' \\
+    '--vm-tui[Built-in VM manager: start/stop/reset VMs + Looking Glass launch (list|state|start|shutdown|destroy|reset|start-lg|lg)]' \\
+    '--vm-manager[Alias of --vm-tui (built-in VM manager)]' \\
+    '--tui=[Force the TUI backend for the interactive flows]:backend:(whiptail dialog)' \\
+    '--yes[With --vm-tui: skip the destroy/reset confirmations (automation)]' \\
+    '--boot-vga-policy=[Install-mode Boot-VGA policy override]:policy:(auto strict)' \\\
     '--graphics-protocol=[Install-mode graphics protocol override]:protocol:(auto x11 wayland)' \\
     '--graphics-daemon-interval=[Set graphics daemon polling interval in seconds (1-3600)]:seconds:(5 10 15 30 60)' \\
     '--no-graphics-daemon[Do not install graphics protocol daemon service]' \\
@@ -2162,7 +2214,7 @@ prompt_yn() {
 usage() {
   say "Revision: $SCRIPT_REVISION"
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-virtio-net] [--no-ultimate-perf-virtio-net] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--install-doctor-timer] [--remove-doctor-timer] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [command] [domain]] [--tui whiptail|dialog] [--yes] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-virtio-net] [--no-ultimate-perf-virtio-net] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--install-doctor-timer] [--remove-doctor-timer] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -2173,6 +2225,22 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--boot-vga-policy auto|str
   --dry-run         Show actions but do not write files / run system-changing commands.
   --no-tui          Force plain-text prompts even if whiptail/dialog is installed
                    (also skips the automatic TUI backend package install attempt).
+  --vm-tui [command [domain]]
+                   Launch the BUILT-IN VM manager (vm-tui): start/shutdown/force-
+                   stop/reset libvirt VMs and start a VM with the Looking Glass
+                   client (input-capture "Ctrl lock" preset). With no command:
+                   interactive menu (whiptail/dialog, or plain numbered menus on a
+                   headless/SSH box). One-shot subcommands: list, state <dom>,
+                   start <dom>, shutdown <dom>, destroy <dom>, reset <dom>,
+                   start-lg <dom>, lg <dom>. Runs WITHOUT root (virsh via
+                   qemu:///system; the Looking Glass client is re-launched as the
+                   sudo-originating desktop user when this runs as root). Also
+                   main-menu option 12. Alias: --vm-manager.
+  --tui <backend>  Force the TUI backend (whiptail or dialog) for the interactive
+                   flows — the full-screen counterpart of --no-tui. Also skips the
+                   terminal-attached check so serial consoles can use dialogs.
+  --yes            With --vm-tui: skip the destroy/reset confirmations (automation;
+                   equivalent to piping the answer, but explicit).
   --boot-vga-policy Install-mode override for generated Boot-VGA policy:
                    auto (default behavior, dynamic host-assisted detection) or
                    strict (requires explicit VFIO_ALLOW_BOOT_VGA_IF_HOST_GPU=1).
@@ -2731,6 +2799,30 @@ parse_args() {
         ;;
       --remove-looking-glass-client)
         MODE="remove-looking-glass-client"
+        ;;
+      --vm-tui|--vm-manager)
+        # R69: built-in VM manager. Everything AFTER this flag is the vm-tui
+        # subcommand + its own leading options (re-parsed in vm_tui_main), so
+        # capture the rest verbatim and stop global parsing here.
+        MODE="vm-tui"
+        shift
+        VMTUI_ARGS=("$@")
+        break
+        ;;
+      --tui)
+        # R69: force the TUI backend for the interactive flows (--vm-tui's
+        # plain counterpart of --no-tui). Also skips the isatty guard so a
+        # serial console / detached session can still use full-screen dialogs.
+        shift
+        (( $# > 0 )) || die "--tui requires a TUI backend: whiptail or dialog"
+        have_cmd "$1" || die "--tui backend not found: $1 (install whiptail or dialog first)"
+        TUI_BIN="$1"
+        HAS_TUI=1
+        VM_TUI_FORCE_TUI=1
+        ;;
+      --yes)
+        # R69: with --vm-tui, skip the destroy/reset confirmations (automation).
+        VM_TUI_SKIP_CONFIRM=1
         ;;
       --menu)
         MODE="menu"
@@ -30799,6 +30891,8 @@ uninstall_self() {
   note "  - ${FISH_COMPLETION_DIR}/${_installed_cmd}.fish"
   note "  - ${BASH_COMPLETION_DIR}/${_installed_cmd}"
   note "  - ${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+  note "  - the built-in VM manager's (vm-tui) runtime artifacts: $VM_TUI_LOG_FILE"
+  note "    + the remembered last-VM file (R69)"
   note "It does NOT remove the VFIO config (use --reset) or your repo copy."
 
   if ! prompt_yn "Uninstall the self-installed vfio + completions now?" N "Uninstall self"; then
@@ -30818,6 +30912,15 @@ uninstall_self() {
   say "Removed self-installed vfio + completion files."
   # R45: also remove the self-installed CLI's timestamped .bak.* litter.
   _wipe_script_backups "$SELF_INSTALL_BIN"
+  # R69: sweep the built-in VM manager's (vm-tui) user-side artifacts: the LG
+  # client launch log + the remembered last-VM state (resolved to the REAL
+  # user's config dir the same way the manager persists it). Best-effort.
+  local _vmtui_last
+  _vmtui_last="$(_vmtui_last_vm_file)"
+  if [[ -f "$VM_TUI_LOG_FILE" || -f "$_vmtui_last" ]]; then
+    run rm -f "$VM_TUI_LOG_FILE" "$_vmtui_last" 2>/dev/null || true
+    note "Removed VM manager (vm-tui) runtime artifacts ($VM_TUI_LOG_FILE + remembered last-VM file)."
+  fi
   say
   note "If vfio was on PATH, run 'hash -r' (bash) / 'rehash' (zsh) so the shell forgets it."
   note "The VFIO config ($CONF_FILE) is untouched — use --reset to remove it."
@@ -31401,6 +31504,558 @@ _menu_modify_vm() {
   done
 }
 
+# ============================== R69: VM manager (vm-tui) ==============================
+# The baked-in libvirt VM manager + Looking Glass launcher (--vm-tui / menu
+# option 12). Ported from the validated standalone vm-tui.sh V1; reuses this
+# script's helpers (say/die/note/hdr/have_cmd, the R58 TUI backend detection,
+# the R68 _lg_client_bin resolution) instead of duplicating them. Everything
+# is prefixed vmtui_ so nothing collides with the installer's vm_* helpers.
+
+# Green check-line output (color-aware, like the standalone's ok_msg).
+vmtui_ok() {
+  if (( ENABLE_COLOR )); then
+    say "${C_GREEN}${C_BOLD}✔${C_RESET} $1"
+  else
+    say "✔ $1"
+  fi
+}
+
+# TUI usable? True when a backend exists (R58 detection: HAS_TUI covers both
+# an installed backend AND the --no-tui opt-out) AND we have a terminal to
+# draw on. VM_TUI_FORCE_TUI=1 (env, or the --tui flag) skips the -t checks —
+# serial consoles / test harnesses where isatty lies or is absent.
+vmtui_tui_active() {
+  (( HAS_TUI )) && [[ -n "$TUI_BIN" ]] \
+    && { [[ "${VM_TUI_FORCE_TUI:-0}" == "1" ]] || [[ -t 0 && -t 2 ]]; }
+}
+
+vmtui_need_virsh() {
+  have_cmd virsh || die "virsh not found. Install libvirt-client (openSUSE: sudo zypper install libvirt-client) and make sure libvirtd/virtqemud is running."
+}
+
+# All VM names, one per line (may be empty).
+vmtui_names() {
+  virsh -c qemu:///system list --all --name 2>/dev/null | grep -v '^$' || true
+}
+
+# State of $1 (lowercased; 'shut off', 'running', 'paused', ... or 'unknown').
+vmtui_state() {
+  local _s
+  _s="$(LC_ALL=C virsh -c qemu:///system domstate "$1" 2>/dev/null || true)"
+  printf '%s' "${_s:-unknown}"
+}
+
+# Menu-friendly label lines: "name|state" — the current VM state is visible
+# while picking (the original spec's optional enhancement).
+vmtui_menu_labels() {
+  # NO process substitution here. vmtui_pick is invoked as `$(vmtui_pick ...)`
+  # by the menu loop (a command substitution), and nested procsub-inside-
+  # comsub proved unreliable in detached contexts (observed live: the picker
+  # silently received ZERO labels under setsid; the identical non-nested
+  # logic worked). Command substitution + a here-string work everywhere.
+  local _name _state _names
+  _names="$(vmtui_names)"
+  while IFS= read -r _name; do
+    [[ -n "$_name" ]] || continue
+    _state="$(vmtui_state "$_name")"
+    printf '%s\n' "${_name}|${_state}"
+  done <<<"$_names"
+}
+
+# Looking Glass client resolution (R68 parity via _lg_client_bin). When
+# VM_TUI_LG_BIN is SET it is AUTHORITATIVE: use it when it exists, report
+# missing when it does not — never silently fall through to another location
+# (the operator explicitly named the client; a fallback could pick a binary
+# they deliberately removed). When unset: self-compiled /usr/local/bin
+# (precedence) -> distro/OBS /usr/bin -> PATH lookup.
+vmtui_lg_client() {
+  if [[ -n "${VM_TUI_LG_BIN:-}" ]]; then
+    if [[ -x "$VM_TUI_LG_BIN" ]]; then
+      printf '%s\n' "$VM_TUI_LG_BIN"
+      return 0
+    fi
+    return 1
+  fi
+  if _lg_client_bin; then
+    return 0
+  fi
+  if have_cmd looking-glass-client; then
+    command -v looking-glass-client
+    return 0
+  fi
+  return 1
+}
+
+vmtui_lg_notify_missing() {
+  note "Looking Glass client not found — the VM still starts, but there is nothing to look through."
+  note "  Install it with:  sudo $SCRIPT_NAME --install-looking-glass-client"
+  note "  (openSUSE prebuilt: sudo opi looking-glass  ->  looking-glass-client)"
+}
+
+# Bounded wait for "running": polls domstate every 1s up to $VM_TUI_WAIT_TIMEOUT.
+# Returns 0 once running, 1 on timeout. Prints nothing (the caller reports).
+vmtui_wait_running() {
+  local _dom="$1" _i=0 _to="$VM_TUI_WAIT_TIMEOUT" _s
+  [[ "$_to" =~ ^[0-9]+$ ]] || _to=120
+  (( _to > 0 )) || return 0
+  while (( _i < _to )); do
+    _s="$(vmtui_state "$_dom")"
+    [[ "$_s" == "running" ]] && return 0
+    sleep 1
+    _i=$((_i + 1))
+  done
+  return 1
+}
+
+# Confirmation (TUI yes/no or plain y/N). $1 = question, $2 = default (Y/N).
+# Returns 0 = yes, 1 = no. NOTE: VM_TUI_SKIP_CONFIRM (set by --yes) must NOT
+# be reset here — resetting it per call silently defeats --yes for automation.
+vmtui_confirm() {
+  local _q="$1" _def="${2:-N}"
+  if [[ "${VM_TUI_SKIP_CONFIRM:-0}" == "1" ]]; then return 0; fi
+  if vmtui_tui_active; then
+    local -a _defargs=()
+    [[ "$_def" == "Y" ]] || _defargs=("--defaultno")
+    if "$TUI_BIN" --title "Confirm" --yesno "$_q" 10 60 "${_defargs[@]}" 3>&1 1>&2 2>&3; then
+      return 0
+    fi
+    return 1
+  fi
+  local _ans _prompt="$_q"
+  if [[ "$_def" == "Y" ]]; then _prompt="$_prompt [Y/n]"; else _prompt="$_prompt [y/N]"; fi
+  # Read STDIN directly (no /dev/tty): stdin is the right source in every
+  # mode — interactive (stdin IS the terminal) and headless automation (stdin
+  # IS the answer stream: printf 'y\n' | vfio --vm-tui destroy GAMING).
+  # EOF falls back to the default answer.
+  read -r -p "$_prompt " _ans || true
+  _ans="${_ans:-$_def}"
+  [[ "${_ans,,}" == "y" || "${_ans,,}" == "yes" ]]
+}
+
+# Config dir for the remembered last-VM. Under sudo, resolves the REAL
+# user's home (root's ~/.config would lose the memory between the root menu
+# and user-session CLI runs) unless XDG_CONFIG_HOME pins it explicitly.
+_vmtui_config_dir() {
+  local _base="${XDG_CONFIG_HOME:-}"
+  if [[ -z "$_base" ]]; then
+    _base="$HOME/.config"
+    if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+      local _h
+      _h="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+      [[ -n "$_h" && -d "$_h" ]] && _base="$_h/.config"
+    fi
+  fi
+  printf '%s' "$_base/vm-tui"
+}
+
+_vmtui_last_vm_file() {
+  printf '%s' "$(_vmtui_config_dir)/last-vm"
+}
+
+vmtui_remember_vm() {
+  local _dom="$1" _dir
+  [[ -n "$_dom" ]] || return 0
+  _dir="$(_vmtui_config_dir)"
+  mkdir -p "$_dir" 2>/dev/null || true
+  printf '%s\n' "$_dom" >"$(_vmtui_last_vm_file)" 2>/dev/null || true
+}
+
+# VM picker (TUI menu with state labels / plain numbered / last-VM default).
+# Prints the picked domain name to STDOUT; returns 1 when cancelled/empty.
+vmtui_pick() {
+  local _title="${1:-Select VM}"
+  local -a _labels=()
+  local _line _raw
+  # Same hardening as vmtui_menu_labels: capture via command substitution
+  # and read from a here-string — never `< <(...)` inside this function,
+  # because every menu caller wraps vmtui_pick in `$( ... )`.
+  _raw="$(vmtui_menu_labels || true)"
+  while IFS= read -r _line; do
+    [[ -n "$_line" ]] && _labels+=("$_line")
+  done <<<"$_raw"
+  # stderr (see the plain-path comment below): stdout is the captured name
+  # channel.
+  (( ${#_labels[@]} > 0 )) || { note "No VMs found (virsh list --all is empty)." >&2; return 1; }
+
+  local _last=""
+  [[ -r "$(_vmtui_last_vm_file)" ]] && _last="$(head -1 "$(_vmtui_last_vm_file)" 2>/dev/null || true)"
+
+  if vmtui_tui_active; then
+    # Build the menu args: tag = index, item = "name  [state]".
+    local -a _menu=()
+    local _i=1 _name _state
+    for _line in "${_labels[@]}"; do
+      _name="${_line%%|*}"
+      _state="${_line#*|}"
+      _menu+=("$_i" "${_name}  [${_state}]")
+      _i=$((_i + 1))
+    done
+    local _pick
+    _pick="$("$TUI_BIN" --title "$_title" --menu "Choose a VM (state shown in brackets)" \
+      20 70 10 "${_menu[@]}" 3>&1 1>&2 2>&3)" || return 1
+    [[ -n "$_pick" ]] || return 1
+    # Range guard: a tag outside 1..N (e.g. a stray 0) must be REJECTED —
+    # bash negative indices silently resolve to the LAST array element, so
+    # without this a bad pick would quietly launch the wrong VM.
+    if [[ "$_pick" =~ ^[0-9]+$ ]] && (( _pick >= 1 && _pick <= ${#_labels[@]} )); then
+      _line="${_labels[$((_pick - 1))]}"
+      printf '%s\n' "${_line%%|*}"
+      return 0
+    fi
+    note "Invalid menu pick '$_pick'." >&2
+    return 1
+  fi
+
+  # Plain text: numbered list, ENTER = last used VM (when it still exists).
+  # EVERYTHING here renders to STDERR: the caller captures STDOUT for the
+  # picked domain name (`_dom="$(vmtui_pick ...)"` — every menu caller wraps
+  # vmtui_pick in a command substitution), so a stdout render would pollute
+  # the returned name with the whole menu (the standalone's draft bug: _dom
+  # became the rendered list, and virsh start got a multi-line "domain").
+  # The TUI path is already stderr-clean for the same reason (whiptail's fd
+  # dance writes the dialog to stderr); only the final name goes to stdout —
+  # on BOTH paths. The `read -p` prompt also goes to stderr natively.
+  say >&2
+  hdr "$_title" >&2
+  local _i=1 _name _state
+  for _line in "${_labels[@]}"; do
+    _name="${_line%%|*}"
+    _state="${_line#*|}"
+    if [[ -n "$_last" && "$_name" == "$_last" ]]; then
+      if (( ENABLE_COLOR )); then
+        say "  $_i) ${C_BOLD}${_name}${C_RESET}  [${_state}]  ${C_DIM}(last used — ENTER picks this)${C_RESET}" >&2
+      else
+        say "  $_i) ${_name}  [${_state}]  (last used — ENTER picks this)" >&2
+      fi
+    else
+      say "  $_i) ${_name}  [${_state}]" >&2
+    fi
+    _i=$((_i + 1))
+  done
+  local _ans
+  # Read STDIN directly (see vmtui_confirm for the rationale — no /dev/tty).
+  read -r -p "Pick a VM number${_last:+ (ENTER = $_last)}: " _ans || true
+  [[ -n "$_ans" ]] || _ans="$_last"
+  [[ -n "$_ans" ]] || return 1
+  if [[ "$_ans" =~ ^[0-9]+$ ]] && (( _ans >= 1 && _ans <= ${#_labels[@]} )); then
+    _line="${_labels[$((_ans - 1))]}"
+    printf '%s\n' "${_line%%|*}"
+    return 0
+  fi
+  # Also accept a VM name typed directly.
+  for _line in "${_labels[@]}"; do
+    if [[ "${_line%%|*}" == "$_ans" ]]; then
+      printf '%s\n' "$_ans"
+      return 0
+    fi
+  done
+  note "No VM matches '$_ans'." >&2
+  return 1
+}
+
+# ---------------------------------- actions ----------------------------------
+
+vmtui_act_list() {
+  hdr "All VMs"
+  virsh -c qemu:///system list --all || true
+}
+
+vmtui_act_start() {
+  local _dom="$1"
+  local _s
+  _s="$(vmtui_state "$_dom")"
+  if [[ "$_s" == "running" ]]; then
+    vmtui_ok "'$_dom' is already running."
+    return 0
+  fi
+  if virsh -c qemu:///system start "$_dom"; then
+    vmtui_ok "Started '$_dom'."
+    vmtui_remember_vm "$_dom"
+  else
+    die "virsh start '$_dom' failed (see the error above)."
+  fi
+}
+
+vmtui_act_shutdown() {
+  local _dom="$1"
+  if virsh -c qemu:///system shutdown "$_dom"; then
+    vmtui_ok "Graceful shutdown sent to '$_dom' (the guest OS decides when to stop)."
+    vmtui_remember_vm "$_dom"
+  else
+    die "virsh shutdown '$_dom' failed (is the guest agent installed?)."
+  fi
+}
+
+vmtui_act_destroy() {
+  local _dom="$1"
+  if ! vmtui_confirm "FORCE shutdown '$_dom'? This is the equivalent of pulling the power cable — unsaved data in the guest is lost." N; then
+    note "Force shutdown cancelled."
+    return 0
+  fi
+  if virsh -c qemu:///system destroy "$_dom"; then
+    vmtui_ok "Force-stopped '$_dom'."
+    vmtui_remember_vm "$_dom"
+  else
+    die "virsh destroy '$_dom' failed."
+  fi
+}
+
+vmtui_act_reset() {
+  local _dom="$1"
+  if ! vmtui_confirm "FORCE reset '$_dom'? This hard-resets the guest without a clean shutdown." N; then
+    note "Force reset cancelled."
+    return 0
+  fi
+  if virsh -c qemu:///system reset "$_dom"; then
+    vmtui_ok "Force-reset '$_dom'."
+    vmtui_remember_vm "$_dom"
+  else
+    die "virsh reset '$_dom' failed."
+  fi
+}
+
+# Launch the Looking Glass client detached with the capture preset.
+# $1 = domain (only used in the log + notify text).
+vmtui_lg_launch() {
+  local _dom="$1" _bin
+  if ! _bin="$(vmtui_lg_client)"; then
+    vmtui_lg_notify_missing
+    return 1
+  fi
+  printf '%s launch: domain=%s bin=%s args=%s\n' "$(date -Is)" "$_dom" "$_bin" "$VM_TUI_LG_ARGS" >>"$VM_TUI_LOG_FILE" 2>/dev/null || true
+  # R61 parity: when this runs as root (the main-menu path), a GUI client
+  # launched with root's stripped env qFatal's with "could not connect to
+  # display" and SIGABRTs — the exact live tray crash R61 fixed. Re-launch
+  # as the sudo-originating desktop user with their session's display env.
+  if [[ "${EUID:-$(id -u)}" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]] && have_cmd runuser; then
+    local _env _uid
+    _env="$(_tray_session_display_env "$SUDO_USER" || true)"
+    _uid="$(id -u "$SUDO_USER" 2>/dev/null || true)"
+    # shellcheck disable=SC2086 # intentional word-split: env assignments + the VM_TUI_LG_ARGS flag list
+    runuser -u "$SUDO_USER" -- env ${_env:+$_env }${_uid:+XDG_RUNTIME_DIR=/run/user/$_uid }setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+  else
+    # shellcheck disable=SC2086 # intentional word-split: VM_TUI_LG_ARGS is a space-joined flag list
+    setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+  fi
+  vmtui_ok "Looking Glass launched for '$_dom' (detached; log: $VM_TUI_LOG_FILE)."
+  note "  Ctrl lock preset: captureOnFocus + autoCapture + grabKeyboard + captureOnStart."
+  note "  Release input with the escape key (default: Scroll Lock). Override flags: VM_TUI_LG_ARGS."
+  return 0
+}
+
+# Start + wait + Looking Glass (the spec's headline action).
+vmtui_act_start_lg() {
+  local _dom="$1" _s
+  _s="$(vmtui_state "$_dom")"
+  vmtui_remember_vm "$_dom"
+  if [[ "$_s" == "running" ]]; then
+    note "'$_dom' is already running — skipping the start."
+  elif [[ "$_s" == "paused" ]]; then
+    note "'$_dom' is PAUSED — resuming it."
+    virsh -c qemu:///system resume "$_dom" 2>/dev/null || true
+  else
+    if ! virsh -c qemu:///system start "$_dom"; then
+      die "virsh start '$_dom' failed (see the error above)."
+    fi
+    vmtui_ok "Started '$_dom'."
+  fi
+  if (( VM_TUI_WAIT_TIMEOUT > 0 )); then
+    note "Waiting for '$_dom' to report running (up to ${VM_TUI_WAIT_TIMEOUT}s)..."
+    if ! vmtui_wait_running "$_dom"; then
+      note "WARN: '$_dom' did not reach 'running' within ${VM_TUI_WAIT_TIMEOUT}s — launching Looking Glass anyway."
+    else
+      vmtui_ok "'$_dom' is running."
+    fi
+  fi
+  vmtui_lg_launch "$_dom"
+}
+
+# Looking Glass only (the VM must already be running).
+vmtui_act_lg_only() {
+  local _dom="$1" _s
+  _s="$(vmtui_state "$_dom")"
+  if [[ "$_s" != "running" ]]; then
+    note "'$_dom' is not running (state: $_s). Use 'Start VM + Looking Glass' instead."
+    return 1
+  fi
+  vmtui_remember_vm "$_dom"
+  vmtui_lg_launch "$_dom"
+}
+
+# ------------------------------ interactive loop ------------------------------
+
+vmtui_menu_loop() {
+  local _choice _dom
+  while true; do
+    if vmtui_tui_active; then
+      _choice="$("$TUI_BIN" --title "VM Manager ($SCRIPT_REVISION)" --menu \
+        "Select action" 20 70 10 \
+        "1" "List all VMs (running + shut off)" \
+        "2" "Start VM" \
+        "3" "Shutdown VM (graceful)" \
+        "4" "Force shutdown (destroy)" \
+        "5" "Force reset (reset)" \
+        "6" "Start VM + Looking Glass (Ctrl lock)" \
+        "7" "Looking Glass only (VM already running)" \
+        "8" "Show VM state" \
+        "0" "Quit" 3>&1 1>&2 2>&3)" || { say "Exiting VM manager."; return 0; }
+    else
+      say
+      hdr "VM Manager ($SCRIPT_REVISION) — plain-text mode"
+      say "  1) List all VMs (running + shut off)"
+      say "  2) Start VM"
+      say "  3) Shutdown VM (graceful)"
+      say "  4) Force shutdown (destroy)"
+      say "  5) Force reset (reset)"
+      say "  6) Start VM + Looking Glass (Ctrl lock)"
+      say "  7) Looking Glass only (VM already running)"
+      say "  8) Show VM state"
+      say "  0) Quit"
+      # Read STDIN directly (no /dev/tty): stdin is the right source in every
+      # mode — interactive (stdin IS the terminal) and automation (stdin IS
+      # the answer stream). EOF -> empty -> graceful exit (NEVER a hard quit
+      # on a failed tty read).
+      read -r -p "Choice: " _choice || true
+      [[ -n "${_choice:-}" ]] || { say "Exiting VM manager."; return 0; }
+    fi
+    case "${_choice:-}" in
+      1) vmtui_act_list
+         # Pause reads STDIN (a piped automation run feeds a blank line; EOF
+         # skips the pause — never fatal).
+         if ! vmtui_tui_active; then read -r -p "Press ENTER to continue..." _ || true; fi
+         ;;
+      2) if _dom="$(vmtui_pick "Start VM")"; then vmtui_act_start "$_dom"; fi ;;
+      3) if _dom="$(vmtui_pick "Shutdown VM")"; then vmtui_act_shutdown "$_dom"; fi ;;
+      4) if _dom="$(vmtui_pick "Force shutdown")"; then vmtui_act_destroy "$_dom"; fi ;;
+      5) if _dom="$(vmtui_pick "Force reset")"; then vmtui_act_reset "$_dom"; fi ;;
+      6) if _dom="$(vmtui_pick "Start VM + Looking Glass")"; then vmtui_act_start_lg "$_dom"; fi ;;
+      7) if _dom="$(vmtui_pick "Looking Glass only")"; then vmtui_act_lg_only "$_dom"; fi ;;
+      8) if _dom="$(vmtui_pick "Show VM state")"; then
+           say "'$_dom' state: $(vmtui_state "$_dom")"
+         fi
+         if ! vmtui_tui_active; then read -r -p "Press ENTER to continue..." _ || true; fi
+         ;;
+      0|"") say "Exiting VM manager."; return 0 ;;
+      *) note "Unknown choice '$_choice'." ;;
+    esac
+    if ! vmtui_tui_active; then say; fi
+  done
+}
+
+# ------------------------------- CLI entry point -------------------------------
+
+vmtui_usage() {
+  cat <<EOF
+$SCRIPT_NAME --vm-tui — built-in libvirt VM manager + Looking Glass launch ($SCRIPT_REVISION)
+
+Usage:
+  $SCRIPT_NAME --vm-tui                    Interactive menu (whiptail/dialog, or
+                                            plain text when no TUI backend or
+                                            terminal is available)
+  $SCRIPT_NAME --vm-tui list               List all VMs (running + shut off)
+  $SCRIPT_NAME --vm-tui state <domain>     Show a VM's state
+  $SCRIPT_NAME --vm-tui start <domain>     Start a VM (no-op when already running)
+  $SCRIPT_NAME --vm-tui shutdown <domain>  Graceful shutdown (ACPI)
+  $SCRIPT_NAME --vm-tui destroy <domain>   Force shutdown (confirmed; --yes skips)
+  $SCRIPT_NAME --vm-tui reset <domain>     Force reset (confirmed; --yes skips)
+  $SCRIPT_NAME --vm-tui start-lg <domain>  Start + wait + Looking Glass (Ctrl lock)
+  $SCRIPT_NAME --vm-tui lg <domain>        Looking Glass only (VM must be running)
+
+Options (before or after --vm-tui):
+  --no-tui        Force plain-text interactive mode (headless / SSH)
+  --tui <bin>     Force the TUI backend (whiptail or dialog)
+  --yes           Skip the destroy/reset confirmations (automation)
+
+Runs WITHOUT root: virsh talks to qemu:///system (add your user to the libvirt
+group if needed), and the Looking Glass client must run in YOUR desktop
+session. From the root main menu (option 12) the client is automatically
+re-launched as the sudo-originating desktop user instead of root.
+
+Environment:
+  VM_TUI_LG_ARGS        Looking Glass client flags (default: the input-capture
+                        Ctrl-lock preset; empty string = client defaults)
+  VM_TUI_LG_BIN         Explicit Looking Glass client path (default: resolve
+                        /usr/local/bin then /usr/bin then PATH)
+  VM_TUI_WAIT_TIMEOUT   Seconds to wait for 'running' after start (default 120;
+                        0 = no wait)
+EOF
+}
+
+# Main entry for MODE=vm-tui. Receives the args captured after --vm-tui
+# (parse_args) OR after a leading-options re-parse, so BOTH
+# `vfio --no-tui --vm-tui destroy VM` and `vfio --vm-tui --no-tui destroy VM`
+# work identically.
+vm_tui_main() {
+  local _cmd
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-tui)
+        HAS_TUI=0
+        TUI_DISABLED_BY_FLAG=1
+        shift
+        ;;
+      --tui)
+        [[ -n "${2:-}" ]] || die "--tui needs an argument (whiptail or dialog)"
+        have_cmd "$2" || die "--tui backend not found: $2 (install whiptail or dialog first)"
+        TUI_BIN="$2"
+        HAS_TUI=1
+        VM_TUI_FORCE_TUI=1
+        shift 2
+        ;;
+      --yes)
+        VM_TUI_SKIP_CONFIRM=1
+        shift
+        ;;
+      -h|--help)
+        vmtui_usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "Unknown option: $1 (see: $SCRIPT_NAME --vm-tui --help)"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [[ $# -eq 0 ]]; then
+    vmtui_need_virsh
+    vmtui_menu_loop
+    return $?
+  fi
+
+  _cmd="$1"
+  shift || true
+  if [[ "$_cmd" == "help" || "$_cmd" == "--help" ]]; then
+    vmtui_usage
+    return 0
+  fi
+  vmtui_need_virsh
+  case "$_cmd" in
+    list)     vmtui_act_list ;;
+    state)    [[ -n "${1:-}" ]] || die "state needs a domain: $SCRIPT_NAME --vm-tui state <domain>"
+              say "'$1' state: $(vmtui_state "$1")" ;;
+    start)    [[ -n "${1:-}" ]] || die "start needs a domain: $SCRIPT_NAME --vm-tui start <domain>"
+              vmtui_act_start "$1" ;;
+    shutdown) [[ -n "${1:-}" ]] || die "shutdown needs a domain: $SCRIPT_NAME --vm-tui shutdown <domain>"
+              vmtui_act_shutdown "$1" ;;
+    destroy)  [[ -n "${1:-}" ]] || die "destroy needs a domain: $SCRIPT_NAME --vm-tui destroy <domain>"
+              vmtui_act_destroy "$1" ;;
+    reset)    [[ -n "${1:-}" ]] || die "reset needs a domain: $SCRIPT_NAME --vm-tui reset <domain>"
+              vmtui_act_reset "$1" ;;
+    start-lg) [[ -n "${1:-}" ]] || die "start-lg needs a domain: $SCRIPT_NAME --vm-tui start-lg <domain>"
+              vmtui_act_start_lg "$1" ;;
+    lg)       [[ -n "${1:-}" ]] || die "lg needs a domain: $SCRIPT_NAME --vm-tui lg <domain>"
+              vmtui_act_lg_only "$1" ;;
+    *)        die "Unknown command: $_cmd (see: $SCRIPT_NAME --vm-tui --help)" ;;
+  esac
+}
+
 vfio_menu() {
   local _menu_opts _choice _conf_present _bmode _last_status=""
 
@@ -31430,6 +32085,7 @@ vfio_menu() {
       "Uninstall the self-installed vfio (+ completions)"
       "Show VFIO status (per-VM tuning checklist + ReBAR)"
       "Doctor (one-shot health report: self-test + verify + status + kernel audit)"
+      "VM manager (start / stop / reset VMs + Looking Glass launch — vm-tui)"
       "Exit menu"
     )
     say
@@ -31683,6 +32339,23 @@ vfio_menu() {
         fi
         ;;
       12)
+        # R69: VM manager (vm-tui) — the baked-in VM manager + Looking Glass
+        # launcher, same as `vfio --vm-tui`. Guarded subshell: a die inside the
+        # manager (missing virsh, a failed virsh call) only ends the subshell
+        # and the menu loops back (R49 pattern). NOTE: the manager itself is
+        # intentionally usable WITHOUT root (`vfio --vm-tui` as your normal
+        # user); from this root menu the Looking Glass client is automatically
+        # re-launched as the sudo-originating desktop user (R61 parity).
+        say
+        note "Opening the VM manager (same as: vfio --vm-tui)..."
+        note "Tip: for day-to-day use, run 'vfio --vm-tui' as your normal user (no sudo) so Looking Glass opens in your session."
+        local _vmtui_rc=0
+        ( vmtui_menu_loop ) || _vmtui_rc=$?
+        if (( _vmtui_rc != 0 )); then
+          note "VM manager exited (rc=$_vmtui_rc) — returning to the main menu."
+        fi
+        ;;
+      13)
         # Exit.
         say
         say "Exiting vfio.sh menu."
@@ -31955,7 +32628,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" && "$MODE" != "reset-systemd-boot-entries" && "$MODE" != "live-attach-status" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" && "$MODE" != "reset-systemd-boot-entries" && "$MODE" != "live-attach-status" && "$MODE" != "vm-tui" ]]; then
     need_cmd modprobe
   fi
 
@@ -32322,6 +32995,16 @@ main() {
     require_writable_root_or_die
     remove_looking_glass_client
     exit 0
+  fi
+
+  if [[ "$MODE" == "vm-tui" ]]; then
+    # R69: built-in VM manager. Deliberately NOT root-gated: virsh talks to
+    # qemu:///system (works for libvirt-group users without root), and the
+    # Looking Glass client MUST run in the user's desktop session — when this
+    # path IS root (sudo), vmtui_lg_launch re-launches the client as the
+    # sudo-originating desktop user (R61 parity) instead of root.
+    vm_tui_main "${VMTUI_ARGS[@]}"
+    exit $?
   fi
 
   if [[ "$MODE" == "menu" ]]; then

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R74 — bumped on every change; the full history is in changelog.md.
+# Revision: R75 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -383,7 +383,56 @@ SCRIPT_NAME="$(basename "$0")"
 # CLI subcommands keep die-to-exit). The unknown-choice note routes through
 # the msgbox too, and the state line is now the shared vmtui_act_state (CLI +
 # menu render identically).
-SCRIPT_REVISION="R74"
+# R75 (live reports: the false "does not list option key(s)" WARN + "it does
+# not start looking glass" + the frozen "Running..." infobox; plus the two
+# accepted R74 suggestions and the requested debug window):
+# (1) THE FALSE FLAG WARN, root-caused empirically: the R73 flag verification
+# captured the client's --help under `timeout 5` — but the option TABLE prints
+# AFTER the startup logs, and on a host BUSY BOOTING THE WINDOWS VM the client
+# exceeded 5s, so the truncated capture flagged ALL FOUR preset keys as
+# unknown (an idle-host test found them all, which is why it slipped through).
+# Fixed with an evidence-based gate: the timeout is VM_TUI_LG_HELP_TIMEOUT
+# (default 15) and its EXIT CODE is inspected (rc 124 = timed out) — a timed
+# out, empty, or TABLE-LESS capture (the "| Long |" marker is required) now
+# means INCONCLUSIVE: an explicit skip note, never a WARN on evidence we do
+# not have. Verified against the real client (all four keys found when the
+# capture completes) + two new harness scenarios (slow-help, truncated-help).
+# (2) "IT DOES NOT START LOOKING GLASS", root-caused on the live host:
+# /tmp/vm-tui.log was created ROOT-OWNED by an earlier manager run under
+# sudo — the manager-as-root writes the launch log line as root, then the
+# R71 user-re-launch appends to a root-owned 0644 file → DENIED — and a
+# failed >> redirect ABORTS the command, so the CLIENT NEVER STARTED (it read
+# as "LG does not start" with zero errors in the manager's own output). The
+# launch now repairs the ownership when root (chown to the target user), the
+# log is relocatable via VM_TUI_LOG, and an still-unwritable log degrades to
+# launching WITHOUT logging (with the exact chown fix printed) — never
+# silently kills the client again.
+# (3) THE FROZEN INFOBOX: the bounded waits (agent + KVMFR, legitimately ~1-2
+# minutes on a real Windows boot) painted nothing — one static "Running..."
+# box, which read as broken. New vmtui_progress paints a small LIVE infobox
+# per wait note on the REAL terminal — fd 9, opened by vmtui_menu_action
+# around its output capture, because stdout AND stderr inside the capture are
+# the pipe and the normal fd dance would be swallowed as captured text (plain
+# mode keeps streaming notes).
+# (4) The accepted R74 suggestions: a VERDICT header on every action's dialog
+# ("✔ <action>: COMPLETE" / "⚠ <action>: ATTENTION — see the details"), and a
+# "screen ✔" picker marker for running VMs whose guest LG host app has
+# initialized the IVSHMEM (KVMFR) — the display is live right now (best-effort
+# per the global shm resolution; pin with VM_TUI_LG_SHM).
+# (5) The requested DEBUG WINDOW: VM_TUI_DEBUG=1 logs every manager event with
+# a timestamp + detailed context (the --help capture length/rc — exactly what
+# diagnosed the false WARN — session resolution, launch, liveness, connection)
+# to /tmp/vm-tui-debug.log; menu option 9 ("Debug log") views the tail + how
+# to enable/clear it; and a best-effort SECONDARY TERMINAL WINDOW (konsole /
+# gnome-terminal / xterm, whichever exists) tails the log live while the
+# manager runs. Never fatal, headless-safe.
+# (6) Weaknesses: wait_running is now WALL-CLOCK bounded (the last counter
+# loop in the block — a slow libvirt could exceed the budget); one more
+# $-slip ("_out" in the R74 menu action, always-true — caught by this round's
+# scan); and the TUI start-lg path (menu option 6) is now harness-covered
+# end-to-end — the R74 coverage gap that let the frozen-infobox report
+# through.
+SCRIPT_REVISION="R75"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -639,7 +688,14 @@ LG_CLIENT_DESKTOP="/usr/share/applications/looking-glass-client.desktop"
 # R69: built-in VM manager (--vm-tui / --vm-manager / main-menu option 12).
 # Formerly the standalone vm-tui.sh V1 — see the R69 revision note above for
 # the full rationale. Runtime knobs (env-overridable where noted):
-VM_TUI_LOG_FILE="/tmp/vm-tui.log"          # LG client launch log (append-only)
+# LG client launch log (append-only). VM_TUI_LOG relocates it (tests,
+# tmpfs-restricted hosts). R75 LIVE BUG this fixed: a root-owned
+# /tmp/vm-tui.log (created by an earlier manager run under sudo) made the
+# >> redirect fail for the USER-launched client — and a failed redirect means
+# the child NEVER STARTS (bash aborts the command), which read as "Looking
+# Glass does not start". The launch now repairs the ownership when root and
+# degrades to launching WITHOUT the log (never silently kills the client).
+VM_TUI_LOG_FILE="${VM_TUI_LOG:-/tmp/vm-tui.log}"
 VM_TUI_WAIT_TIMEOUT="${VM_TUI_WAIT_TIMEOUT:-120}"   # bounded wait for 'running'; 0 = skip
 # The input-capture ("Ctrl lock") Looking Glass preset — verified against the
 # installed B7-Virt client's option table. Override with VM_TUI_LG_ARGS
@@ -681,6 +737,22 @@ VM_TUI_WAIT_CONNECT="${VM_TUI_WAIT_CONNECT:-0}"
 # readiness checks (default: resolve the standard node, then any /dev/shm
 # file that begins with the KVMFR magic). Informational hint, never fatal.
 VM_TUI_LG_SHM="${VM_TUI_LG_SHM:-}"
+# R75: the debug event log — every manager event with a timestamp, detailed
+# raw errors, and the full verification context (e.g. the --help capture
+# length + exit code, so a flag WARN is instantly diagnosable). Enabled with
+# VM_TUI_DEBUG=1; viewable + clearable from the manager's Debug-log menu
+# entry (option 9), and (best-effort) tailed live in a secondary terminal
+# window when a desktop terminal emulator exists.
+VM_TUI_DEBUG_LOG="/tmp/vm-tui-debug.log"
+VM_TUI_DEBUG="${VM_TUI_DEBUG:-0}"
+[[ "$VM_TUI_DEBUG" =~ ^[0-9]+$ ]] || VM_TUI_DEBUG=0
+# R75: the --help flag-verification timeout. The LIVE false-WARN: 5s cut the
+# client's output short on a host busy booting the Windows VM — the option
+# table prints AFTER the startup logs, so a truncated capture flagged ALL
+# FOUR preset keys as unknown. 15s + rc-124 detection + a table-marker
+# sanity gate below make truncation mean INCONCLUSIVE (skip), never a WARN.
+VM_TUI_LG_HELP_TIMEOUT="${VM_TUI_LG_HELP_TIMEOUT:-15}"
+[[ "$VM_TUI_LG_HELP_TIMEOUT" =~ ^[0-9]+$ ]] || VM_TUI_LG_HELP_TIMEOUT=15
 # R72: internal flag — suppresses _vmtui_lg_session's notes for silent probes
 # (the root-menu pre-warn); never user-facing.
 VMTUI_LG_QUIET=0
@@ -31721,6 +31793,83 @@ vmtui_ok() {
   fi
 }
 
+# R75: debug event log (VM_TUI_DEBUG=1). Timestamped, append-only, never
+# fatal; consumed by the manager's Debug-log menu entry (option 9) and by
+# tail -f / the best-effort secondary debug window.
+vmtui_dbg() {
+  (( VM_TUI_DEBUG )) || return 0
+  printf '%s %s\n' "$(date -Is)" "$*" >>"$VM_TUI_DEBUG_LOG" 2>/dev/null || true
+}
+
+# R75: the Debug-log menu entry's payload — status (on/off + how to enable),
+# the line count, and the last 40 lines. Rendered via the same
+# vmtui_menu_action path as every other action (msgbox in TUI, streamed in
+# plain mode).
+vmtui_debug_show() {
+  if (( ! VM_TUI_DEBUG )); then
+    say "Debug logging is OFF. Enable it and re-run for the full event log:"
+    say "  env VM_TUI_DEBUG=1 vfio --vm-tui"
+    say "The log will be written to $VM_TUI_DEBUG_LOG"
+    return 0
+  fi
+  local _n
+  _n="$(wc -l <"$VM_TUI_DEBUG_LOG" 2>/dev/null | tr -d '[:space:]' || true)"
+  say "Debug log: $VM_TUI_DEBUG_LOG (${_n:-0} lines) — last 40:"
+  tail -n 40 "$VM_TUI_DEBUG_LOG" 2>/dev/null || true
+  say "Live-follow in another terminal: tail -f $VM_TUI_DEBUG_LOG"
+  say "Clear it with: rm $VM_TUI_DEBUG_LOG"
+}
+
+# R75: the secondary debug WINDOW — when debug is enabled and a desktop
+# terminal emulator exists, open a DETACHED window tailing the debug log
+# live, so every event + detailed error is visible while the manager runs.
+# Best-effort by design: headless / no emulator -> the tail command note.
+# Never fatal, never blocks the manager.
+vmtui_debug_window() {
+  (( VM_TUI_DEBUG )) || return 0
+  local _t
+  for _t in konsole gnome-terminal xterm; do
+    command -v "$_t" >/dev/null 2>&1 || continue
+    case "$_t" in
+      konsole)
+        setsid konsole --hold -e "tail -f $VM_TUI_DEBUG_LOG" </dev/null >/dev/null 2>&1 &
+        ;;
+      gnome-terminal)
+        setsid gnome-terminal -- bash -c "tail -f $VM_TUI_DEBUG_LOG" </dev/null >/dev/null 2>&1 &
+        ;;
+      xterm)
+        setsid xterm -hold -e "tail -f $VM_TUI_DEBUG_LOG" </dev/null >/dev/null 2>&1 &
+        ;;
+    esac
+    note "Debug window open: tailing $VM_TUI_DEBUG_LOG live (close it any time)."
+    return 0
+  done
+  note "Debug log (no terminal emulator found): tail -f $VM_TUI_DEBUG_LOG in another terminal"
+  return 0
+}
+
+# R75: LIVE progress for the TUI path. The bounded waits (agent / KVMFR) can
+# legitimately run for minutes on a real Windows boot; before this they were
+# invisible behind one static "Running..." infobox (the live report: the
+# operator watched a frozen box for ~2 minutes and read it as broken — the
+# box only appeared when everything had already finished). The wait notes
+# route through here: TUI -> a small infobox painted on the REAL terminal
+# (fd 9 — opened by vmtui_menu_action around its output capture, because
+# stdout AND stderr inside the capture are the PIPE and the normal fd dance
+# would be swallowed as captured text; falls back to the fd dance when fd 9
+# is not open); plain -> the ordinary streamed note.
+vmtui_progress() {
+  if vmtui_tui_active; then
+    if { true >&9; } 2>/dev/null; then
+      "$TUI_BIN" --title "VM manager" --infobox "$*" 6 70 >&9 2>&9 </dev/null || true
+    else
+      "$TUI_BIN" --title "VM manager" --infobox "$*" 6 70 3>&1 1>&2 2>&3 || true
+    fi
+  else
+    note "$*"
+  fi
+}
+
 # TUI usable? True when a backend exists (R58 detection: HAS_TUI covers both
 # an installed backend AND the --no-tui opt-out) AND we have a terminal to
 # draw on. VM_TUI_FORCE_TUI=1 (env, or the --tui flag) skips the -t checks —
@@ -31770,6 +31919,16 @@ vmtui_menu_labels() {
         _ag="agent ✔"
       else
         _ag="agent ✖"
+      fi
+      # R75 (the accepted suggestion): "screen ✔" — the guest's Looking Glass
+      # host app has initialized the IVSHMEM (KVMFR), so that VM's display is
+      # LIVE right now. Best-effort: the shm device is resolved globally
+      # (VM_TUI_LG_SHM > the standard node > any KVMFR-magic file), so on a
+      # multi-VM host with custom shmem names the marker reflects the resolved
+      # device, not necessarily THIS VM's — pin it with VM_TUI_LG_SHM if that
+      # matters on your host.
+      if vmtui_lg_hoststate; then
+        _ag="${_ag}, screen ✔"
       fi
     fi
     printf '%s\n' "${_name}|${_state}|${_ag}"
@@ -31837,12 +31996,31 @@ vmtui_lg_notify_missing() {
 # unusable --help skips the check (the liveness + connection checks still
 # guard the launch); a WARN names the unknown keys.
 vmtui_lg_verify_flags() {
-  local _bin="$1" _helptext _a _key _bad=""
+  local _bin="$1" _helptext _a _key _bad="" _hrc=0
   [[ -n "${VM_TUI_LG_ARGS// /}" ]] || return 0
-  # R73 hardening: timeout-wrapped (a client that hangs on --help would stall
-  # the launch) and the rc ignored as before.
-  _helptext="$(timeout 5 "$_bin" --help 2>&1 || true)"
-  [[ -n "$_helptext" ]] || return 0
+  # R73: timeout-wrapped (a client that hangs on --help would stall the
+  # launch); R75: the timeout is now VM_TUI_LG_HELP_TIMEOUT (default 15s) and
+  # its EXIT CODE is inspected — the LIVE false-WARN was a 5s timeout cutting
+  # the output short on a host busy booting the Windows VM (the option table
+  # prints AFTER the startup logs), flagging ALL FOUR preset keys as unknown.
+  _helptext="$(timeout "$VM_TUI_LG_HELP_TIMEOUT" "$_bin" --help 2>&1)" || _hrc=$?
+  vmtui_dbg "verify-flags: bin=$_bin help_len=${#_helptext} help_rc=$_hrc"
+  # A TIMEOUT (rc 124) or an EMPTY capture is INCONCLUSIVE — say so and skip;
+  # never WARN on evidence we do not have.
+  if [[ "$_hrc" == "124" || -z "$_helptext" ]]; then
+    note "NOTE: could not verify the capture-preset flags (the client's --help did not complete within ${VM_TUI_LG_HELP_TIMEOUT}s) — skipping the check."
+    vmtui_dbg "verify-flags: inconclusive (timeout/empty) — skipped"
+    return 0
+  fi
+  # R75: a TRUNCATED capture is also inconclusive. The client prints its
+  # option list as a "| Long | Short | Value | Description |" table; if that
+  # marker is absent the capture is not the option table at all — skip
+  # instead of WARNing on a half-printed help.
+  if ! grep -q -- '| Long' <<<"$_helptext" 2>/dev/null; then
+    note "NOTE: could not verify the capture-preset flags (the client's option table was not in the --help output — truncated?) — skipping the check."
+    vmtui_dbg "verify-flags: inconclusive (no option-table marker) — skipped"
+    return 0
+  fi
   # shellcheck disable=SC2086 # intentional word-split: the documented space-joined flag list
   for _a in $VM_TUI_LG_ARGS; do
     [[ "$_a" == "-o" ]] && continue
@@ -31860,6 +32038,9 @@ vmtui_lg_verify_flags() {
   if [[ -n "$_bad" ]]; then
     note "WARN: this Looking Glass client does not list option key(s): $_bad"
     note "      (version mismatch — seamless mouse / Ctrl lock may not behave as expected; the launch continues)."
+    vmtui_dbg "verify-flags: UNKNOWN KEYS: $_bad"
+  else
+    vmtui_dbg "verify-flags: all preset keys present in the client's option table"
   fi
   return 0
 }
@@ -31994,16 +32175,26 @@ vmtui_lg_connected() {
 # Bounded wait for "running": polls domstate every 1s up to $VM_TUI_WAIT_TIMEOUT.
 # Returns 0 once running, 1 on timeout. Prints nothing (the caller reports).
 vmtui_wait_running() {
-  local _dom="$1" _i=0 _to="$VM_TUI_WAIT_TIMEOUT" _s
+  # R75: WALL-CLOCK bounded (the R70 lesson applied to the last counter-based
+  # wait in the block): each iteration costs a virsh round-trip + 1s, so a
+  # loop counter could exceed the intended budget on a slow libvirt.
+  local _dom="$1" _to="$VM_TUI_WAIT_TIMEOUT" _s _start _now
   [[ "$_to" =~ ^[0-9]+$ ]] || _to=120
   (( _to > 0 )) || return 0
-  while (( _i < _to )); do
+  _start="$(date +%s)"
+  while :; do
     _s="$(vmtui_state "$_dom")"
-    [[ "$_s" == "running" ]] && return 0
+    if [[ "$_s" == "running" ]]; then
+      vmtui_dbg "wait-running: '$_dom' is running"
+      return 0
+    fi
+    _now="$(date +%s)"
+    if (( (_now - _start) >= _to )); then
+      vmtui_dbg "wait-running: '$_dom' still '$_s' after ${_to}s (timeout)"
+      return 1
+    fi
     sleep 1
-    _i=$((_i + 1))
   done
-  return 1
 }
 
 # R70: wait for the WINDOWS guest to finish booting — the virtio-win guest
@@ -32551,24 +32742,41 @@ vmtui_lg_launch() {
   # with the guest host app) — never while a client is alive, so there is no
   # double-window risk. VM_TUI_LG_RETRIES (default 1; 0 = off).
   local _retries="$VM_TUI_LG_RETRIES" _died
+  # R75 (the LIVE "does not start Looking Glass" root cause): a root-owned
+  # log file makes the user-launched client's >> redirect fail — and a failed
+  # redirect ABORTS the command, so the client never started. Repair the
+  # ownership when root (the manager-as-root path created the file as root in
+  # the first place); if the log still is not writable (e.g. root-owned and
+  # we are the user), launch WITHOUT logging instead of killing the client.
+  local _lg_out="$VM_TUI_LOG_FILE"
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    chown "$_vmtui_lg_user" "$VM_TUI_LOG_FILE" 2>/dev/null || true
+  fi
+  touch "$VM_TUI_LOG_FILE" 2>/dev/null || true
+  if ! test -w "$VM_TUI_LOG_FILE" 2>/dev/null; then
+    note "NOTE: $VM_TUI_LOG_FILE is not writable by user '$_vmtui_lg_user' — launching WITHOUT the log (fix it: sudo chown \$USER $VM_TUI_LOG_FILE, or relocate it with VM_TUI_LOG)."
+    vmtui_dbg "launch: log not writable — falling back to /dev/null"
+    _lg_out="/dev/null"
+  fi
+  vmtui_dbg "launch: domain=$_dom user=$_vmtui_lg_user bin=$_bin log=$_lg_out"
   while :; do
-    printf '%s launch: domain=%s user=%s bin=%s env=%s args=%s\n' "$(date -Is)" "$_dom" "$_vmtui_lg_user" "$_bin" "${_vmtui_lg_env[*]}" "$VM_TUI_LG_ARGS" >>"$VM_TUI_LOG_FILE" 2>/dev/null || true
+    printf '%s launch: domain=%s user=%s bin=%s env=%s args=%s\n' "$(date -Is)" "$_dom" "$_vmtui_lg_user" "$_bin" "${_vmtui_lg_env[*]}" "$VM_TUI_LG_ARGS" >>"$_lg_out" 2>/dev/null || true
     _died=0
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
       # Root: launch as the resolved desktop user — the tray's proven
       # env-array + setsid runuser form (R61).
       # shellcheck disable=SC2086 # intentional word-split: VM_TUI_LG_ARGS is a space-joined flag list
-      runuser -u "$_vmtui_lg_user" -- env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+      runuser -u "$_vmtui_lg_user" -- env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$_lg_out" 2>&1 &
       _pid=$!
     elif (( ${#_vmtui_lg_env[@]} > 0 )); then
       # Non-root with a socket-fallback display: add the discovered vars.
       # shellcheck disable=SC2086
-      env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+      env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$_lg_out" 2>&1 &
       _pid=$!
     else
       # Non-root in a normal session: the exact validated R69 launch line.
       # shellcheck disable=SC2086
-      setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$VM_TUI_LOG_FILE" 2>&1 &
+      setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$_lg_out" 2>&1 &
       _pid=$!
     fi
     # Point 5: verify the client STAYED ALIVE instead of printing "launched"
@@ -32584,7 +32792,7 @@ vmtui_lg_launch() {
     fi
     if (( _retries > 0 )); then
       _retries=$((_retries - 1))
-      note "The Looking Glass client exited within ${VM_TUI_LG_LIVENESS_WAIT}s — retrying in 3s (VM_TUI_LG_RETRIES)..."
+      vmtui_progress "The Looking Glass client exited within ${VM_TUI_LG_LIVENESS_WAIT}s — retrying in 3s (VM_TUI_LG_RETRIES)..."
       sleep 3
       continue
     fi
@@ -32635,7 +32843,7 @@ vmtui_lg_launch() {
   # ready) and exit non-zero when not achieved, so start-lg is automation-safe
   # (rc 0 = the display pipeline is actually up). Default 0 = report-only.
   if (( VM_TUI_WAIT_CONNECT > 0 )); then
-    note "Waiting for a fully-connected Looking Glass (client attached + guest host app ready, up to ${VM_TUI_WAIT_CONNECT}s)..."
+    vmtui_progress "Waiting for a fully-connected Looking Glass (client attached + guest host app ready, up to ${VM_TUI_WAIT_CONNECT}s)..."
     local _wc0 _wcok=0
     _wc0="$(date +%s)"
     while :; do
@@ -32691,7 +32899,7 @@ vmtui_act_start_lg() {
     vmtui_ok "Started '$_dom'."
   fi
   if (( VM_TUI_WAIT_TIMEOUT > 0 )); then
-    note "Waiting for '$_dom' to report running (up to ${VM_TUI_WAIT_TIMEOUT}s)..."
+    vmtui_progress "Waiting for '$_dom' to report running (up to ${VM_TUI_WAIT_TIMEOUT}s)..."
     _t0="$(date +%s)"
     if ! vmtui_wait_running "$_dom"; then
       note "WARN: '$_dom' did not reach 'running' within ${VM_TUI_WAIT_TIMEOUT}s — launching Looking Glass anyway."
@@ -32700,7 +32908,7 @@ vmtui_act_start_lg() {
       if (( VM_TUI_WAIT_AGENT )); then
         _left=$(( VM_TUI_WAIT_TIMEOUT - ($(date +%s) - _t0) ))
         if (( _left > 0 )); then
-          note "Waiting for Windows to boot (virtio-win guest agent handoff, up to ${_left}s)..."
+          vmtui_progress "Waiting for Windows to boot (virtio-win guest agent handoff, up to ${_left}s)..."
           _arc=0
           vmtui_wait_agent "$_dom" "$_left" || _arc=$?
           case "$_arc" in
@@ -32731,7 +32939,7 @@ vmtui_act_start_lg() {
             local _shml
             _shml=$(( VM_TUI_WAIT_TIMEOUT - ($(date +%s) - _t0) ))
             if (( _shml > 0 )); then
-              note "Waiting for the Windows Looking Glass host app to initialize the shared memory (up to ${_shml}s)..."
+              vmtui_progress "Waiting for the Windows Looking Glass host app to initialize the shared memory (up to ${_shml}s)..."
               if vmtui_lg_wait_shm "$_shml"; then
                 vmtui_ok "The guest Looking Glass host app is ready (shared memory initialized)."
               else
@@ -32826,12 +33034,32 @@ vmtui_msgbox() {
 # $1 = box title, $2 = pause flag (pause|nopause), $3... = the command.
 vmtui_menu_action() {
   local _title="$1" _pause="$2"; shift 2
-  local _out=""
+  local _out="" _verdict=""
+  vmtui_dbg "action: start '$_title' (cmd: $*)"
   if vmtui_tui_active; then
     "$TUI_BIN" --title "$_title" --infobox "Running: $_title ... (the VM / Looking Glass may need a moment)" 6 64 3>&1 1>&2 2>&3 || true
+    # R75: keep a handle to the REAL terminal (stderr) around the capture —
+    # inside the command substitution below, stdout AND stderr are the PIPE,
+    # so progress dialogs painted via the normal fd dance would be swallowed
+    # as captured text. fd 9 is inherited by the substitution; vmtui_progress
+    # paints on it (closed again right after).
+    exec 9>&2
     _out="$("$@" 2>&1 | _ansi_strip || true)"
+    exec 9>&-
+    # R75: a VERDICT header (the accepted R74 follow-up) — scannable at a
+    # glance in the dialog instead of reading the whole output: anything
+    # error/warning-shaped -> ATTENTION, else COMPLETE.
+    if printf '%s' "$_out" | grep -qE 'ERROR:|WARN:|NOT launched|retry exhausted|did not reach|cancelled'; then
+      _verdict="⚠ $_title: ATTENTION — see the details below."
+    else
+      _verdict="✔ $_title: COMPLETE"
+    fi
     if [[ -n "$_out" ]]; then
-      vmtui_msgbox "$_title" "$_out"
+      vmtui_msgbox "$_title" "${_verdict}
+
+$_out"
+    else
+      vmtui_msgbox "$_title" "$_verdict"
     fi
   else
     "$@" || true
@@ -32841,6 +33069,7 @@ vmtui_menu_action() {
       read -r -p "Press ENTER to continue..." _ || true
     fi
   fi
+  vmtui_dbg "action: end '$_title' verdict=${_verdict:-n/a}"
 }
 
 # R74: shared by the CLI `state` subcommand and the menu's Show-VM-state, so
@@ -32863,6 +33092,7 @@ vmtui_menu_loop() {
         "6" "Start VM + Looking Glass (Ctrl lock)" \
         "7" "Looking Glass only (VM already running)" \
         "8" "Show VM state" \
+        "9" "Debug log (events + detailed errors)" \
         "0" "Quit" 3>&1 1>&2 2>&3)" || { say "Exiting VM manager."; return 0; }
     else
       say
@@ -32875,6 +33105,7 @@ vmtui_menu_loop() {
       say "  6) Start VM + Looking Glass (Ctrl lock)"
       say "  7) Looking Glass only (VM already running)"
       say "  8) Show VM state"
+      say "  9) Debug log (events + detailed errors)"
       say "  0) Quit"
       # Read STDIN directly (no /dev/tty): stdin is the right source in every
       # mode — interactive (stdin IS the terminal) and automation (stdin IS
@@ -32883,6 +33114,7 @@ vmtui_menu_loop() {
       read -r -p "Choice: " _choice || true
       [[ -n "${_choice:-}" ]] || { say "Exiting VM manager."; return 0; }
     fi
+    vmtui_dbg "menu: choice '${_choice:-}'"
     case "${_choice:-}" in
       1) vmtui_menu_action "All VMs" pause vmtui_act_list
          ;;
@@ -32895,6 +33127,8 @@ vmtui_menu_loop() {
       8) if _dom="$(vmtui_pick "Show VM state")"; then
            vmtui_menu_action "VM state" pause vmtui_act_state "$_dom"
          fi
+         ;;
+      9) vmtui_menu_action "Debug log" pause vmtui_debug_show
          ;;
       0|"") say "Exiting VM manager."; return 0 ;;
       *) if vmtui_tui_active; then
@@ -32974,6 +33208,14 @@ Environment:
   VM_TUI_LG_SHM        Explicit path of the VM's Looking Glass shared-memory
                         device used by the KVMFR checks (default: the standard
                         /dev/shm/looking-glass, then any KVMFR-magic file)
+  VM_TUI_DEBUG         1 = log every manager event with a timestamp + detailed
+                        raw errors to /tmp/vm-tui-debug.log (menu option 9
+                        views it; a secondary terminal window tails it live
+                        when a desktop terminal emulator exists)
+  VM_TUI_LG_HELP_TIMEOUT
+                        Timeout for the --help flag verification (default 15;
+                        a timed-out or truncated capture is INCONCLUSIVE —
+                        skipped, never a WARN)
 EOF
 }
 
@@ -33021,6 +33263,10 @@ vm_tui_main() {
 
   if [[ $# -eq 0 ]]; then
     vmtui_need_virsh
+    vmtui_dbg "manager: interactive start (TUI=$TUI_BIN HAS_TUI=$HAS_TUI debug=$VM_TUI_DEBUG)"
+    # R75: the secondary debug window (best-effort) — a detached terminal
+    # tailing the debug log live while the manager runs.
+    vmtui_debug_window
     vmtui_menu_loop
     return $?
   fi

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R72 — bumped on every change; the full history is in changelog.md.
+# Revision: R73 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -333,7 +333,36 @@ SCRIPT_NAME="$(basename "$0")"
 # R71 follow-up: the ROOT main-menu entry pre-warns when no desktop session is
 # detectable (a quiet probe of the same resolver — one code path, no drift), so
 # the operator knows BEFORE picking a VM that the LG launch will refuse.
-SCRIPT_REVISION="R72"
+# R73: the definitive Looking Glass readiness signal + a scriptable wait. The
+# IVSHMEM device qemu creates (/dev/shm/looking-glass — VERIFIED live on this
+# host: the file exists as a 0-BYTE qemu-created file while the VM is down, and
+# the "KVMFR" magic is present in the client binary) stays EMPTY until the
+# WINDOWS-SIDE host app initializes its KVMFR header — so reading 5 bytes
+# distinguishes "the host app is running" from "Windows is still booting"
+# WITHOUT polling the client. New: (1) vmtui_lg_shm_file resolves the device
+# (VM_TUI_LG_SHM override > the standard node > any /dev/shm file that begins
+# with the KVMFR magic — custom shmem names); (2) vmtui_lg_hoststate (0 ready /
+# 1 not-yet-initialized / 2 none found); (3) a PRE-LAUNCH bounded wait for the
+# magic in start-lg (VM_TUI_WAIT_SHM, default 1, shares the VM_TUI_WAIT_TIMEOUT
+# deadline) — strictly better than the guest-agent proxy (agent up does NOT
+# mean the host app is up; it starts later in the boot); a VM with NO shm at
+# all skips the wait with the --install-looking-glass hint instead of burning
+# the budget; (4) the post-launch report is now the attach x host-state MATRIX
+# (attached+ready / attached+black-window-expected / not-attached+ready /
+# not-attached+not-ready — each with its exact meaning and recovery); (5)
+# VM_TUI_WAIT_CONNECT (default 0 = off): a scriptable fully-connected wait —
+# poll up to N seconds for (client attached AND KVMFR ready) and EXIT NON-ZERO
+# if not achieved, so `vfio --vm-tui start-lg GAMING` becomes automation-safe.
+# Weaknesses found in the R72 self-review and fixed: the connection pid now
+# uses pgrep -n (the NEWEST client instance — head -1 could pick an older
+# still-running one, exactly the multi-instance limitation the R72 harness
+# tripped over); the --help flag verification is timeout-wrapped (a hung
+# client would stall the launch) and handles the attached -okey=value form
+# (previously a false "unknown key" WARN); and a LOCAL X11 DISPLAY (:N) is now
+# validated against its /tmp/.X11-unix/XN socket — the same stale-env
+# protection WAYLAND_DISPLAY got in R72 (remote/exotic DISPLAY forms cannot be
+# validated from the shell and stay accepted, guarded by the liveness check).
+SCRIPT_REVISION="R73"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -617,6 +646,20 @@ VM_TUI_LG_LIVENESS_WAIT="${VM_TUI_LG_LIVENESS_WAIT:-2}"  # seconds to verify the
 # case — never retried while alive, so no double windows). 0 = disable.
 VM_TUI_LG_RETRIES="${VM_TUI_LG_RETRIES:-1}"
 [[ "$VM_TUI_LG_RETRIES" =~ ^[0-9]+$ ]] || VM_TUI_LG_RETRIES=1
+# R73: the definitive LG readiness — wait for the Windows host app to write
+# its KVMFR magic into the IVSHMEM before launching the client (default 1;
+# 0 = launch right after the guest-agent phase).
+VM_TUI_WAIT_SHM="${VM_TUI_WAIT_SHM:-1}"
+[[ "$VM_TUI_WAIT_SHM" =~ ^[0-9]+$ ]] || VM_TUI_WAIT_SHM=1
+# R73: scriptable fully-connected wait — after the launch, poll up to N
+# seconds for (client attached AND KVMFR ready); exit non-zero when not
+# achieved. Default 0 = off (report-only).
+VM_TUI_WAIT_CONNECT="${VM_TUI_WAIT_CONNECT:-0}"
+[[ "$VM_TUI_WAIT_CONNECT" =~ ^[0-9]+$ ]] || VM_TUI_WAIT_CONNECT=0
+# R73: explicit override for the LG shared-memory device used by the KVMFR
+# readiness checks (default: resolve the standard node, then any /dev/shm
+# file that begins with the KVMFR magic). Informational hint, never fatal.
+VM_TUI_LG_SHM="${VM_TUI_LG_SHM:-}"
 # R72: internal flag — suppresses _vmtui_lg_session's notes for silent probes
 # (the root-menu pre-warn); never user-facing.
 VMTUI_LG_QUIET=0
@@ -984,11 +1027,11 @@ _link() {
     return 0
   fi
   local _abs
-  _abs="$(readlink -f "_path" 2>/dev/null || echo "$_path")"
+  _abs="$(readlink -f "$_path" 2>/dev/null || echo "$_path")"
   # The \\ in the printf below is intentional: it emits the OSC 8 hyperlink
   # ST (String Terminator) byte. It is NOT a mis-escaped single quote.
   # shellcheck disable=SC1003
-  printf '\033]8;;file://%s\033\\%s\033]8;;\033\\' "_abs" "_text"
+  printf '\033]8;;file://%s\033\\%s\033]8;;\033\\' "$_abs" "$_text"
 }
 # Like _link but prints with a trailing newline (for use with `say`-style lines).
 _saylink() {
@@ -31775,12 +31818,17 @@ vmtui_lg_notify_missing() {
 vmtui_lg_verify_flags() {
   local _bin="$1" _helptext _a _key _bad=""
   [[ -n "${VM_TUI_LG_ARGS// /}" ]] || return 0
-  _helptext="$("$_bin" --help 2>&1 || true)"
+  # R73 hardening: timeout-wrapped (a client that hangs on --help would stall
+  # the launch) and the rc ignored as before.
+  _helptext="$(timeout 5 "$_bin" --help 2>&1 || true)"
   [[ -n "$_helptext" ]] || return 0
   # shellcheck disable=SC2086 # intentional word-split: the documented space-joined flag list
   for _a in $VM_TUI_LG_ARGS; do
     [[ "$_a" == "-o" ]] && continue
-    _key="${_a%%=*}"
+    # R73: also handle the attached form -okey=value (previously a false
+    # "unknown key" WARN).
+    _key="${_a#-o}"
+    _key="${_key%%=*}"
     # Only namespaced LG options (input:*/spice:*/win:* ...) can be checked
     # this way; bare flags are left to the client's own arg parser.
     [[ "$_key" == *:* ]] || continue
@@ -31813,6 +31861,91 @@ vmtui_lg_wayland_ok() {
     fi
   fi
   return 1
+}
+
+# R73: a LOCAL X11 DISPLAY (:N[.M]) is validated against its /tmp/.X11-unix
+# socket — the same stale-env protection WAYLAND_DISPLAY got in R72 (the R72
+# self-review found this hole). Remote forms (host:N) and exotic transports
+# cannot be validated from the shell and are accepted as-is (the liveness +
+# connection checks guard them).
+vmtui_lg_x_ok() {
+  local _xd="$1" _n
+  case "$_xd" in
+    :[0-9]*)
+      _n="${_xd#:}"
+      _n="${_n%%.*}"
+      if [[ -S "/tmp/.X11-unix/X$_n" ]]; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# R73: resolve the VM's Looking Glass shared-memory device: VM_TUI_LG_SHM (an
+# explicit override, if it exists) > the standard $LG_SHMEM_NODE > any /dev/shm
+# file that begins with the KVMFR magic (custom shmem names). Prints the path
+# (empty when none exists). Informational only — never gates the launch.
+vmtui_lg_shm_file() {
+  local _f _c
+  if [[ -n "${VM_TUI_LG_SHM:-}" && -f "$VM_TUI_LG_SHM" ]]; then
+    printf '%s\n' "$VM_TUI_LG_SHM"
+    return 0
+  fi
+  if [[ -f "$LG_SHMEM_NODE" ]]; then
+    printf '%s\n' "$LG_SHMEM_NODE"
+    return 0
+  fi
+  for _f in /dev/shm/*; do
+    [[ -f "$_f" ]] || continue
+    _c="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
+    if [[ "$_c" == "4b564d4652" ]]; then
+      printf '%s\n' "$_f"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# R73: the DEFINITIVE Looking Glass readiness, read from the IVSHMEM itself.
+# qemu creates the shared-memory file, but it stays EMPTY (0-byte / zeroed)
+# until the WINDOWS-SIDE host app initializes its KVMFR header — VERIFIED live
+# on this host (a 0-byte qemu-created /dev/shm/looking-glass while the VM is
+# down) and against the client binary (the "KVMFR" magic is embedded in it).
+# Returns: 0 = the host app initialized it (ready); 1 = the file exists but is
+# not initialized yet (Windows still booting — the client would show black);
+# 2 = no Looking Glass shm found at all (LG not set up on this VM?).
+vmtui_lg_hoststate() {
+  local _f _hex
+  _f="$(vmtui_lg_shm_file)"
+  [[ -n "$_f" ]] || return 2
+  _hex="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
+  if [[ "$_hex" == "4b564d4652" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# R73: bounded WALL-CLOCK wait for the KVMFR magic (the Windows host app
+# initializing the IVSHMEM). Re-resolves the file on every poll — the device
+# can appear moments after qemu reports 'running'. Sleeps 2s between polls.
+vmtui_lg_wait_shm() {
+  local _budget="$1" _start _now _hs
+  [[ "$_budget" =~ ^[0-9]+$ ]] || _budget=0
+  _start="$(date +%s)"
+  while :; do
+    _now="$(date +%s)"
+    (( (_now - _start) < _budget )) || return 1
+    _hs=0
+    vmtui_lg_hoststate || _hs=$?
+    if [[ "$_hs" == "0" ]]; then
+      return 0
+    fi
+    sleep 2
+  done
 }
 
 # R72 (point 2): did the client actually ATTACH to the VM's shared memory?
@@ -32267,6 +32400,12 @@ _vmtui_lg_session() {
       (( VMTUI_LG_QUIET )) || note "NOTE: WAYLAND_DISPLAY='$_vmtui_lg_wd' has no live socket (stale env) — scanning XDG_RUNTIME_DIR for one..."
       _vmtui_lg_wd=""
     fi
+    # R73: a LOCAL X11 DISPLAY gets the same stale-env protection (its
+    # /tmp/.X11-unix/XN socket must exist; remote/exotic forms are accepted).
+    if [[ -n "$_vmtui_lg_xd" ]] && ! vmtui_lg_x_ok "$_vmtui_lg_xd"; then
+      (( VMTUI_LG_QUIET )) || note "NOTE: DISPLAY='$_vmtui_lg_xd' has no local X socket (stale env) — ignoring it..."
+      _vmtui_lg_xd=""
+    fi
     if [[ -n "$_vmtui_lg_wd" || -n "$_vmtui_lg_xd" ]]; then
       _have=1
     elif [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR:-}" ]]; then
@@ -32439,20 +32578,61 @@ vmtui_lg_launch() {
   if (( VM_TUI_LG_LIVENESS_WAIT > 0 )); then
     vmtui_ok "Looking Glass client is alive (pid $_pid, user '$_vmtui_lg_user')."
   fi
-  # R72 (point 2): confirm the client actually ATTACHED to the VM's shared
-  # memory (the IVSHMEM lives in /dev/shm/) — a running-but-unattached client
-  # just sits idle, and "launched" alone would hide that. Best-effort.
-  local _cpid=""
+  # R72 (point 2) + R73: the attach x host-state MATRIX — a running client
+  # that never attached just sits idle (R72), and an attached client whose
+  # guest host app has not initialized the IVSHMEM shows a black window that
+  # WILL resolve (R73). Each combination gets its exact meaning + recovery.
+  # R73: pgrep -n picks the NEWEST client instance (head -1 could pick an
+  # older still-running one — the multi-instance limitation the R72 harness
+  # tripped over live).
+  local _cpid="" _att _hst
   if have_cmd pgrep; then
-    _cpid="$(pgrep -u "$_vmtui_lg_user" -f "$_bin" 2>/dev/null | head -1 || true)"
+    _cpid="$(pgrep -n -u "$_vmtui_lg_user" -f "$_bin" 2>/dev/null || true)"
   fi
   [[ -n "$_cpid" ]] || _cpid="$_pid"
-  if vmtui_lg_connected "$_cpid"; then
-    vmtui_ok "Looking Glass CONNECTED to the VM's shared memory (client pid $_cpid)."
+  _att=0
+  vmtui_lg_connected "$_cpid" || _att=1
+  _hst=0
+  vmtui_lg_hoststate || _hst=$?
+  if (( ! _att )); then
+    if [[ "$_hst" == "0" ]]; then
+      vmtui_ok "Looking Glass CONNECTED to the VM's shared memory (client pid $_cpid) — and the guest host app is ready (KVMFR)."
+    else
+      note "The client attached to the VM's shared memory (pid $_cpid), but the guest's Looking Glass host app has NOT initialized it yet —"
+      note "      a black window is EXPECTED until Windows starts the host app; it will come up on its own (no re-launch needed)."
+    fi
   else
-    note "NOTE: could not confirm the client attached to the VM's shared memory yet."
-    note "      If the window stays black, Windows' Looking Glass host app is not running —"
-    note "      wait a few seconds and re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+    if [[ "$_hst" == "0" ]]; then
+      note "could not confirm the client attached to the VM's shared memory yet (client pid $_cpid) — but the guest host app IS ready;"
+      note "      if no window appeared, wait a few seconds and re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+    else
+      note "could not confirm the client attached to the VM's shared memory yet, and the guest host app has not initialized it either."
+      note "      If the window stays black or missing: Windows is still booting — wait a few seconds and re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+    fi
+  fi
+  # R73: scriptable fully-connected wait — poll for (attached AND KVMFR
+  # ready) and exit non-zero when not achieved, so start-lg is automation-safe
+  # (rc 0 = the display pipeline is actually up). Default 0 = report-only.
+  if (( VM_TUI_WAIT_CONNECT > 0 )); then
+    note "Waiting for a fully-connected Looking Glass (client attached + guest host app ready, up to ${VM_TUI_WAIT_CONNECT}s)..."
+    local _wc0 _wcok=0
+    _wc0="$(date +%s)"
+    while :; do
+      if vmtui_lg_connected "$_cpid" && vmtui_lg_hoststate; then
+        _wcok=1
+        break
+      fi
+      if (( ($(date +%s) - _wc0) >= VM_TUI_WAIT_CONNECT )); then
+        break
+      fi
+      sleep 2
+    done
+    if (( _wcok )); then
+      vmtui_ok "Looking Glass is fully CONNECTED (client attached + guest host app ready)."
+    else
+      note "WARN: Looking Glass did not reach fully-connected within ${VM_TUI_WAIT_CONNECT}s (VM_TUI_WAIT_CONNECT) — see the state above."
+      return 1
+    fi
   fi
   vmtui_ok "Looking Glass launched for '$_dom' as user '$_vmtui_lg_user' (bin: $_bin; detached; log: $VM_TUI_LOG_FILE)."
   # Point 2: report the capture preset state HONESTLY — never let the user
@@ -32511,6 +32691,34 @@ vmtui_act_start_lg() {
           # R72 (point 1): the running-wait consumed the whole budget — say so
           # instead of silently skipping the agent handoff.
           note "No wait budget left for the guest-agent handoff — launching now. If the window is black, Windows is still booting; re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+        fi
+        # R73: the DEFINITIVE LG readiness — the Windows host app writing its
+        # KVMFR magic into the IVSHMEM (strictly better than the guest-agent
+        # proxy: the agent being up does NOT mean the host app is up — it
+        # starts later in the boot). Bounded by the remaining deadline; a VM
+        # with NO shm at all skips the wait with the install hint instead of
+        # burning the budget. VM_TUI_WAIT_SHM=0 opts out.
+        if (( VM_TUI_WAIT_SHM )); then
+          local _hs=0
+          vmtui_lg_hoststate || _hs=$?
+          if [[ "$_hs" == "0" ]]; then
+            vmtui_ok "The guest Looking Glass host app is ready (shared memory initialized)."
+          elif [[ "$_hs" == "2" ]]; then
+            note "No Looking Glass shared memory found for '$_dom' — skipping the host-app wait."
+            note "  Is Looking Glass set up on this VM? sudo $SCRIPT_NAME --install-looking-glass"
+          else
+            local _shml
+            _shml=$(( VM_TUI_WAIT_TIMEOUT - ($(date +%s) - _t0) ))
+            if (( _shml > 0 )); then
+              note "Waiting for the Windows Looking Glass host app to initialize the shared memory (up to ${_shml}s)..."
+              if vmtui_lg_wait_shm "$_shml"; then
+                vmtui_ok "The guest Looking Glass host app is ready (shared memory initialized)."
+              else
+                note "WARN: the host app did not initialize the shared memory within ${_shml}s — launching anyway."
+                note "      Expect a BLACK window until Windows starts the Looking Glass host app; it will come up on its own (re-run lg only if no window appears at all)."
+              fi
+            fi
+          fi
         fi
       fi
     fi
@@ -32656,6 +32864,17 @@ Environment:
                         windows). The launch also verifies the client attached
                         to the VM's shared memory and pre-validates the
                         capture-preset flags against the client's own --help.
+  VM_TUI_WAIT_SHM      1 (default) = before launching, also wait for the
+                        Windows host app to write its KVMFR magic into the
+                        VM's shared memory (the DEFINITIVE readiness — more
+                        precise than the guest agent); 0 = skip that wait
+  VM_TUI_WAIT_CONNECT  0 (default) = report-only after the launch. N > 0 =
+                        poll up to N seconds for (client attached AND host
+                        app ready) and EXIT NON-ZERO when not achieved —
+                        makes start-lg automation-safe (rc 0 = display up)
+  VM_TUI_LG_SHM        Explicit path of the VM's Looking Glass shared-memory
+                        device used by the KVMFR checks (default: the standard
+                        /dev/shm/looking-glass, then any KVMFR-magic file)
 EOF
 }
 

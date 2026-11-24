@@ -188,6 +188,33 @@ assert_contains_text \
   "R23 helper guest-ping loop computes elapsed from wall clock" \
   '_elapsed=$((_now - _start))' \
   "$helper_block"
+# --- R77: EVENT-DRIVEN readiness (push, not poll) ---
+# The helper now FIRST subscribes to libvirt's agent-lifecycle event, which
+# fires the INSTANT the guest agent connects — no 3s poll granularity, no
+# repeated 5s virsh calls. LC_ALL=C pins the event text to English so the
+# connect marker is greppable regardless of the host locale (this host's
+# virsh speaks Swedish). The R23 guest-ping poll loop above is kept VERBATIM
+# as the fallback, so every locked assertion above still holds.
+assert_contains_text \
+  "R77 helper subscribes to the agent-lifecycle event (push, not poll)" \
+  'virsh -c qemu:///system event --domain "$DOMAIN" --event agent-lifecycle --timeout "$DELAY"' \
+  "$helper_block"
+assert_contains_text \
+  "R77 helper pins the event text to English (locale-proof connect marker)" \
+  'LC_ALL=C virsh -c qemu:///system event' \
+  "$helper_block"
+assert_contains_text \
+  "R77 helper binds at the exact connect moment (event-driven)" \
+  'agent-lifecycle CONNECTED event after ${_elapsed}s' \
+  "$helper_block"
+assert_contains_text \
+  "R77 helper falls back to the R23 guest-ping poll (fallback chain intact)" \
+  'falling back to guest-ping polling for up to ${_left}s' \
+  "$helper_block"
+assert_contains_text \
+  "R77 helper polls with the REMAINING wall-clock budget" \
+  '_left=$(( 10#$DELAY - ($(date +%s) - _start) ))' \
+  "$helper_block"
 # Anti-hang: the helper MUST wrap virsh attach-device in `timeout` (tunable via
 # VFIO_DYNAMIC_LIVE_ATTACH_TIMEOUT, default 60) so a hung attach (guest PCI
 # address conflict, vfio reset hang) can NEVER block libvirt's VM lock
@@ -812,7 +839,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 MODE comment lists install-virtio-win-guest-agent" \
-  'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | install-self | uninstall-self | completion printers' \
+  'install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | vm-tui | install-self | uninstall-self | completion printers' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R27 usage help documents --install-virtio-win-guest-agent" \
@@ -856,7 +883,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R33 MODE comment lists menu" \
-  'menu | install-self | uninstall-self | completion printers' \
+  'menu | vm-tui | install-self | uninstall-self | completion printers' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R33 main dispatch wires menu" \
@@ -1433,8 +1460,8 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 _r48h_warn_fn="$(sed -n '/^_lg_client_warn_if_missing()/,/^}/p' "$VFIO_SCRIPT")"
 assert_contains_text \
-  "R48h _lg_client_warn_if_missing checks _lg_binary_valid" \
-  '_lg_binary_valid "${LG_CLIENT_BIN' \
+  "R48h _lg_client_warn_if_missing checks the active-client resolver (R68: _lg_client_available wraps _lg_binary_valid)" \
+  '_lg_client_available' \
   "$_r48h_warn_fn"
 assert_contains_text \
   "R48h _lg_client_warn_if_missing is silent when compiled (early return 0)" \
@@ -1453,8 +1480,8 @@ assert_contains_text \
   'compiled $_lg_compiled_sym' \
   "$_checklist_fn"
 assert_contains_text \
-  "R48h checklist computes the compiled marker via _lg_binary_valid" \
-  '_lg_binary_valid "${LG_CLIENT_BIN' \
+  "R48h checklist computes the compiled marker via the R68 active-client resolver" \
+  '_lg_client_available' \
   "$_checklist_fn"
 # The smart helper is wired before BOTH wizard/install-flow LG prompts.
 _lg_warn_count="$(grep -cF '_lg_client_warn_if_missing' "$VFIO_SCRIPT" 2>/dev/null || echo 0)"
@@ -1694,7 +1721,7 @@ assert_contains_file \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R34 MODE comment lists install-self | uninstall-self" \
-  'menu | install-self | uninstall-self | completion printers' \
+  'menu | vm-tui | install-self | uninstall-self | completion printers' \
   "$VFIO_SCRIPT"
 assert_contains_file \
   "R34 main dispatch wires install-self" \

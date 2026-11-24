@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R76 — bumped on every change; the full history is in changelog.md.
+# Revision: R77 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -448,7 +448,28 @@ SCRIPT_NAME="$(basename "$0")"
 # paints nothing). All in-action dialogs now paint on the real-terminal
 # fd 9 (the inputbox keeps its RESULT captured via a 2>&1-before->&9
 # redirect order — stderr is whiptail's result channel, stdout is the paint).
-SCRIPT_REVISION="R76"
+# R77: EVENT-DRIVEN live-attach readiness ("add polish" — the user asked for
+# something that REPLACES the guest-ping polling): the generated live-attach
+# helper now FIRST subscribes to libvirt's agent-lifecycle event, which fires
+# the INSTANT the virtio-win guest agent connects to its virtio-serial channel
+# — push instead of pull: no 3s poll granularity, no repeated 5s virsh calls,
+# and the bind+hot-attach fires at the exact connect moment (often a few
+# seconds earlier than the first successful poll). LC_ALL=C pins the event text
+# to English so the connect marker is greppable regardless of the host locale
+# (this host's virsh speaks Swedish); one event = the agent just connected (the
+# channel starts disconnected at VM start, a disconnect event can only follow a
+# connect). The R23 guest-ping poll loop is kept VERBATIM as the fallback
+# (event subscription unavailable / unsupported --event agent-lifecycle /
+# times out -> poll with the REMAINING wall-clock budget -> full fixed delay),
+# so every locked regression string survives and no scenario regresses. NOTE:
+# the event replaces the POLLING, not the agent — the virtio-win guest agent
+# must still be installed inside Windows (virtio-win-guest-tools.exe) for
+# either signal to fire; without it the fallback fixed delay still applies.
+# Truly instant attach at VM power-on remains deliberately unsupported: that is
+# cold-attach, the PCIe-reset path that kills the RX 9070 / RDNA4 — the wait IS
+# the protection on this card. Redeploy the updated helper with
+# sudo $SCRIPT_NAME --install-live-attach.
+SCRIPT_REVISION="R77"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -12579,32 +12600,53 @@ GPU_XML="$(_strip_guest_addr "$_GPU_SRC" "$_GPU_ROM" "$_keep_addr")"
 AUDIO_XML="$(_strip_guest_addr "$_AUDIO_SRC" "" "$_keep_addr")"
 
 # Wait for Windows userspace to be ready before binding + hot-attaching the GPU.
-# Smart path: poll the qemu guest agent (guest-ping) — when it responds, Windows
-# userspace is up and the AMD driver has loaded, so bind + attach IMMEDIATELY
-# instead of waiting the full fixed delay (often ~15s vs the full 30s). Fallback:
-# if the agent never responds within DELAY seconds (agent not installed in
-# Windows yet, or no channel), bind + attach after the full delay — same
-# behavior as before. install_live_attach auto-injects the guest-agent channel,
-# but the virtio-win guest agent must still be installed inside Windows (via the
-# virtio-win guest-tools ISO) for guest-ping to respond.
+# R77: EVENT-DRIVEN smart path — subscribe to libvirt's agent-lifecycle event,
+# which fires the INSTANT the qemu guest agent connects to its virtio-serial
+# channel (push, not poll: no 3s poll granularity, no repeated 5s virsh calls;
+# the bind+attach fires at the exact connect moment). LC_ALL=C pins the event
+# text to English so the connect marker is greppable regardless of the host
+# locale; one event = the agent just connected (the channel starts disconnected
+# at VM start, a disconnect event can only follow a connect). The event needs
+# the virtio-win guest agent installed inside Windows exactly like the poll
+# does — it replaces the POLLING, not the agent.
+# Fallback chain: event subscription unavailable / unsupported
+# (--event agent-lifecycle) / times out without a connect -> the R23 guest-ping
+# poll loop (unchanged, wall-clock bounded) -> the full fixed delay.
+# install_live_attach auto-injects the guest-agent channel, but the virtio-win
+# guest agent must still be installed inside Windows (virtio-win-guest-tools.exe
+# from the guest-tools ISO) for either signal to fire.
 # IMPORTANT: use WALL-CLOCK elapsed time (date +%s), not a loop counter — each
-# iteration takes up to 8s (5s virsh timeout + 3s sleep), so a counter that
+# poll iteration takes up to 8s (5s virsh timeout + 3s sleep), so a counter that
 # increments by 3 made a 30s ceiling take ~80s real time (observed in the journal:
 # 22:02:34 -> 22:03:54). Wall-clock makes DELAY mean what it says.
-jlog "live-attach: waiting for Windows readiness (guest-ping, up to ${DELAY}s) for domain '$DOMAIN'"
+jlog "live-attach: waiting for Windows readiness (agent-lifecycle event, up to ${DELAY}s) for domain '$DOMAIN'"
 _ready=0
 _start="$(date +%s)"
-while :; do
-  _now="$(date +%s)"
-  _elapsed=$((_now - _start))
-  (( _elapsed < 10#$DELAY )) || break
-  if timeout 5 virsh -c qemu:///system qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
-    _ready=1
-    jlog "live-attach: guest agent responded after ${_elapsed}s — Windows is up, binding GPU"
-    break
+_ev_rc=0
+_ev_out="$(LC_ALL=C virsh -c qemu:///system event --domain "$DOMAIN" --event agent-lifecycle --timeout "$DELAY" 2>/dev/null)" || _ev_rc=$?
+if (( _ev_rc == 0 )) && grep -qi 'connect' <<<"$_ev_out"; then
+  _elapsed=$(( $(date +%s) - _start ))
+  _ready=1
+  jlog "live-attach: agent-lifecycle CONNECTED event after ${_elapsed}s — Windows is up, binding GPU (event-driven, no polling)"
+else
+  # No connect event (unsupported / timed out / error) — fall back to the R23
+  # guest-ping poll loop with the REMAINING wall-clock budget.
+  _left=$(( 10#$DELAY - ($(date +%s) - _start) ))
+  if (( _left > 0 )); then
+    jlog "live-attach: no agent-lifecycle connect event (${_ev_rc:+rc=$_ev_rc }falling back to guest-ping polling for up to ${_left}s)"
+    while :; do
+      _now="$(date +%s)"
+      _elapsed=$((_now - _start))
+      (( _elapsed < 10#$DELAY )) || break
+      if timeout 5 virsh -c qemu:///system qemu-agent-command "$DOMAIN" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+        _ready=1
+        jlog "live-attach: guest agent responded after ${_elapsed}s — Windows is up, binding GPU"
+        break
+      fi
+      sleep 3
+    done
   fi
-  sleep 3
-done
+fi
 if (( ! _ready )); then
   jlog "live-attach: guest agent did not respond within ${DELAY}s — proceeding with bind (install the virtio-win guest agent inside Windows for a faster handoff)"
 fi

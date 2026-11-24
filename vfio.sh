@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R77 — bumped on every change; the full history is in changelog.md.
+# Revision: R78 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -469,7 +469,22 @@ SCRIPT_NAME="$(basename "$0")"
 # cold-attach, the PCIe-reset path that kills the RX 9070 / RDNA4 — the wait IS
 # the protection on this card. Redeploy the updated helper with
 # sudo $SCRIPT_NAME --install-live-attach.
-SCRIPT_REVISION="R77"
+# R78 (the accepted R77 follow-up, "as last"): R77 parity for the vm-tui
+# Looking Glass handoff — vmtui_wait_agent (the start-lg / lg agent wait) is
+# now EVENT-DRIVEN too, with a deliberate twist the helper did not need: ONE
+# quick probe guest-ping runs FIRST, because it alone preserves the R70
+# semantics — instant rc 0 when the agent is already up (the common
+# already-running VM case) and the instant rc 2 "not configured" fast-path
+# when the VM has NO agent channel (an event-first approach would silently
+# eat the whole budget on a channel-less VM, since no agent-lifecycle event
+# can ever fire without a channel — a real regression risk caught in design).
+# While the agent is booting (channel present, ping says not-yet-connected):
+# subscribe to the agent-lifecycle event (push — the exact connect moment,
+# no 1s poll granularity, LC_ALL=C locale-proof connect marker) for the
+# REMAINING wall-clock budget; if the subscription cannot deliver (old
+# libvirt / timeout), the R70 guest-ping poll loop runs VERBATIM as the
+# fallback. Same return contract: 0 = agent up, 2 = no channel, 1 = timeout.
+SCRIPT_REVISION="R78"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32304,9 +32319,45 @@ vmtui_wait_running() {
 # should launch immediately + hint at the virtio-win guest tools instead of
 # burning the budget on a VM that can never answer.
 vmtui_wait_agent() {
-  local _dom="$1" _budget="$2" _out _start _now
+  # R78: EVENT-DRIVEN (R77 parity for the Looking Glass handoff). ONE quick
+  # probe ping runs FIRST — it alone preserves the R70 semantics: instant 0
+  # when the agent is already up (the common already-running case), and the
+  # instant 2 "not configured" fast-path when the VM has NO agent channel
+  # (an event-first approach would silently eat the whole budget on a
+  # channel-less VM, because no agent-lifecycle event can ever fire without
+  # a channel). While the agent is booting (channel present, ping says
+  # not-yet-connected), subscribe to the agent-lifecycle event (push: the
+  # exact connect moment, no 1s poll granularity; LC_ALL=C pins the event
+  # text to English so the connect marker is greppable regardless of the
+  # host locale) for the REMAINING budget; if the subscription cannot
+  # deliver a connect (old libvirt / timeout), the R70 poll loop runs
+  # VERBATIM as the fallback. Same contract: 0 = agent up, 2 = no channel,
+  # 1 = timeout.
+  local _dom="$1" _budget="$2" _out _start _now _left _ev _ev_rc
   [[ "$_budget" =~ ^[0-9]+$ ]] || _budget=0
+  (( _budget > 0 )) || return 1
   _start="$(date +%s)"
+  # Quick probe: answers instantly when the agent is up; detects a missing
+  # channel fast (the ONLY path that can recognize "not configured").
+  _out="$(timeout 5 virsh -c qemu:///system qemu-agent-command "$_dom" '{"execute":"guest-ping"}' 2>&1 || true)"
+  if [[ "$_out" == *'"return"'* ]]; then
+    return 0
+  fi
+  # No agent channel in the VM XML at all — waiting (and subscribing) is
+  # pointless.
+  if [[ "$_out" == *"not configured"* ]]; then
+    return 2
+  fi
+  # R78: event subscription (push) with the remaining wall-clock budget.
+  _left=$(( _budget - ($(date +%s) - _start) ))
+  if (( _left > 0 )); then
+    _ev_rc=0
+    _ev="$(LC_ALL=C virsh -c qemu:///system event --domain "$_dom" --event agent-lifecycle --timeout "$_left" 2>/dev/null)" || _ev_rc=$?
+    if (( _ev_rc == 0 )) && grep -qi 'connect' <<<"$_ev"; then
+      return 0
+    fi
+  fi
+  # R70 poll-loop fallback (unchanged semantics; wall-clock bounded).
   while :; do
     _now="$(date +%s)"
     (( (_now - _start) < _budget )) || return 1
@@ -32314,7 +32365,6 @@ vmtui_wait_agent() {
     if [[ "$_out" == *'"return"'* ]]; then
       return 0
     fi
-    # No agent channel in the VM XML at all — waiting is pointless.
     if [[ "$_out" == *"not configured"* ]]; then
       return 2
     fi

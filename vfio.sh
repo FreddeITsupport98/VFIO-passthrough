@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R81 — bumped on every change; the full history is in changelog.md.
+# Revision: R82 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -520,7 +520,32 @@ SCRIPT_NAME="$(basename "$0")"
 # glass". The latch is one-shot per VM session (reset when the VM stops, so
 # each boot of an unconfigured VM explains itself once — not per poll), and a
 # late-starting host app still wins (the warning never prevents the launch).
-SCRIPT_REVISION="R81"
+# R82 (the live report: "i asked about make it launch separate windows to
+# display logs. debug logg is not working too"): the debug window — the
+# SEPARATE TERMINAL showing logs, the original ask — is now actually usable:
+# (1) it tails BOTH logs (the debug event log AND the LG client launch log,
+# tail -F with per-file ==> headers), so one window shows everything the
+# manager + client produce; (2) ROOT-SAFE SPAWN — the old code spawned the
+# terminal as the current process user, so from the ROOT main-menu path it
+# ran as root with no display and NEVER appeared (the exact R61 tray-crash
+# class — the live "debug log is not working"); it now spawns via setsid
+# runuser as the desktop user with XDG_RUNTIME_DIR so the window opens on the
+# real desktop; (3) a pgrep dedup guard prevents stacking windows on repeated
+# toggles; (4) ENABLING debug mid-session (option 9) now opens the window
+# IMMEDIATELY — before, the window only ever spawned at manager START with
+# the env var, so the mid-session toggle logged fine but showed nothing;
+# (5) the launch-log writability check now runs AS THE TARGET USER when the
+# manager is root (a root-perspective `test -w` is almost always true while
+# the re-launched desktop user may still fail — the child's >> redirect then
+# aborted the client: the live "Atkomst nekas" dead-client run); and (6) the
+# early-exit diagnosis no longer tails STALE readable content from an
+# unwritable (disabled) log — it says the log is disabled + the chown fix
+# (observed live: quoting days-old purespice_disconnect lines as if current).
+# NOTE for the live host: the failing run predated the R75 fixes being
+# DEPLOYED (its error line numbers match a pre-R75 /usr/local/bin/vfio) —
+# redeploy with: sudo ./vfio.sh --install-self (the deployed copy is R81,
+# refresh it to R82 after this change).
+SCRIPT_REVISION="R82"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32333,6 +32358,11 @@ vmtui_debug_show() {
       VM_TUI_DEBUG=1
       vmtui_dbg "debug: enabled from the manager menu (option 9) — events from before this point were not logged"
       vmtui_ok "Debug logging ENABLED (live — no restart needed)."
+      # R82 (the live report: "debug log is not working"): enabling debug
+      # mid-session NOW opens the separate log window immediately — before,
+      # the window only ever spawned at manager START with the env var, so a
+      # mid-session toggle looked broken (logging worked, nothing showed).
+      vmtui_debug_window
     else
       say "Debug logging stays OFF. Select option 9 again to enable it at any time — no restart needed."
       say "(Auto-on at start: env VM_TUI_DEBUG=1 vfio --vm-tui)"
@@ -32355,30 +32385,66 @@ vmtui_debug_show() {
 }
 
 # R75: the secondary debug WINDOW — when debug is enabled and a desktop
-# terminal emulator exists, open a DETACHED window tailing the debug log
-# live, so every event + detailed error is visible while the manager runs.
-# Best-effort by design: headless / no emulator -> the tail command note.
-# Never fatal, never blocks the manager.
+# terminal emulator exists, open a DETACHED window tailing the logs LIVE so
+# every event + detailed error is visible while the manager runs.
+# R82 (the live report: "debug log is not working" + "i asked about make it
+# launch separate windows to display logs"): three real fixes —
+#   (1) the window now tails BOTH logs: the debug event log AND the LG
+#       client launch log ($VM_TUI_LOG_FILE — the one whose tail the
+#       early-exit diagnosis quotes), with tail -F so files created later
+#       are picked up and the ==> headers name which log each line is from;
+#   (2) ROOT-SAFE SPAWN: when the manager runs as root (the root main-menu
+#       path — how the reporting user runs it), the old code spawned the
+#       terminal AS ROOT, which has no WAYLAND_DISPLAY/DISPLAY — the exact
+#       R61 tray-crash class: the window never appeared. The spawn now
+#       resolves the desktop user + their session env (the same quiet
+#       _vmtui_lg_session resolver) and launches via setsid runuser as that
+#       user, so the window opens on the REAL desktop;
+#   (3) DEDUP: a pgrep guard refuses a second window when one is already
+#       tailing (repeated toggles no longer stack windows).
+# Best-effort by design: headless / no emulator / no desktop session -> the
+# tail command note. Never fatal, never blocks the manager.
 vmtui_debug_window() {
   (( VM_TUI_DEBUG )) || return 0
-  local _t
+  # Dedup: never stack a second window on an existing tail.
+  if command -v pgrep >/dev/null 2>&1 \
+    && pgrep -f "tail -F $VM_TUI_DEBUG_LOG" >/dev/null 2>&1; then
+    note "Debug window already open (tailing $VM_TUI_DEBUG_LOG + $VM_TUI_LOG_FILE)."
+    return 0
+  fi
+  local _t _cmd
   for _t in konsole gnome-terminal xterm; do
     command -v "$_t" >/dev/null 2>&1 || continue
     case "$_t" in
-      konsole)
-        setsid konsole --hold -e "tail -f $VM_TUI_DEBUG_LOG" </dev/null >/dev/null 2>&1 &
-        ;;
-      gnome-terminal)
-        setsid gnome-terminal -- bash -c "tail -f $VM_TUI_DEBUG_LOG" </dev/null >/dev/null 2>&1 &
-        ;;
-      xterm)
-        setsid xterm -hold -e "tail -f $VM_TUI_DEBUG_LOG" </dev/null >/dev/null 2>&1 &
-        ;;
+      konsole)        _cmd="konsole --hold -e tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE" ;;
+      gnome-terminal) _cmd="gnome-terminal -- bash -c 'tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE'" ;;
+      xterm)          _cmd="xterm -hold -e tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE" ;;
     esac
-    note "Debug window open: tailing $VM_TUI_DEBUG_LOG live (close it any time)."
+    # shellcheck disable=SC2086 # intentional word-split: _cmd is a word list
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+      # Root (the root main-menu path): resolve the desktop user + their
+      # session env quietly, then spawn the window AS THAT USER — a
+      # root-spawned GUI terminal has no display and never appears (R61).
+      local _win_user="${SUDO_USER:-}"
+      if [[ -z "$_win_user" || "$_win_user" == "root" ]] || ! command -v runuser >/dev/null 2>&1; then
+        note "Debug window: running as root without a usable desktop user — open it yourself:"
+        note "  tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
+        return 0
+      fi
+      local _uid _rt
+      _uid="$(id -u "$_win_user" 2>/dev/null || true)"
+      _rt="/run/user/${_uid}"
+      # shellcheck disable=SC2086 # intentional word-split: env assignments + _cmd
+      setsid runuser -u "$_win_user" -- env XDG_RUNTIME_DIR="$_rt" $_cmd </dev/null >/dev/null 2>&1 &
+    else
+      # Normal user session: spawn directly (the display is ours).
+      # shellcheck disable=SC2086 # intentional word-split: _cmd is a word list
+      setsid $_cmd </dev/null >/dev/null 2>&1 &
+    fi
+    note "Debug window open: tailing $VM_TUI_DEBUG_LOG + $VM_TUI_LOG_FILE live (close it any time)."
     return 0
   done
-  note "Debug log (no terminal emulator found): tail -f $VM_TUI_DEBUG_LOG in another terminal"
+  note "Debug log (no terminal emulator found): tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE in another terminal"
   return 0
 }
 
@@ -33346,10 +33412,35 @@ vmtui_lg_launch() {
     chown "$_vmtui_lg_user" "$VM_TUI_LOG_FILE" 2>/dev/null || true
   fi
   touch "$VM_TUI_LOG_FILE" 2>/dev/null || true
-  if ! test -w "$VM_TUI_LOG_FILE" 2>/dev/null; then
+  # R82: the writability check must reflect the user the CLIENT will run as.
+  # When the manager is root, a plain `test -w` checks AS ROOT — which is
+  # almost always TRUE (root writes anything) even when the re-launched
+  # desktop user still cannot (a silently-failed chown, an immutable file).
+  # The client's `>>$log` redirect would then fail AS THE CHILD and the
+  # client would never start — the exact live bug. Check as the TARGET user
+  # (runuser) whenever the launch will be re-user'd.
+  local _log_writable=0
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
+    if runuser -u "$_vmtui_lg_user" -- test -w "$VM_TUI_LOG_FILE" 2>/dev/null; then
+      _log_writable=1
+    fi
+  else
+    if test -w "$VM_TUI_LOG_FILE" 2>/dev/null; then
+      _log_writable=1
+    fi
+  fi
+  if (( ! _log_writable )); then
     note "NOTE: $VM_TUI_LOG_FILE is not writable by user '$_vmtui_lg_user' — launching WITHOUT the log (fix it: sudo chown \$USER $VM_TUI_LOG_FILE, or relocate it with VM_TUI_LOG)."
     vmtui_dbg "launch: log not writable — falling back to /dev/null"
     _lg_out="/dev/null"
+    # R82: latch for the early-exit diagnosis — tailing the (readable but
+    # stale) unwritable log there showed OLD-session client output and
+    # actively misled the diagnosis (observed live: a "purespice_disconnect"
+    # tail from days earlier). The diagnosis now says the log is disabled
+    # instead of quoting stale lines.
+    VMTUI_LG_LOG_FALLBACK=1
+  else
+    VMTUI_LG_LOG_FALLBACK=0
   fi
   vmtui_dbg "launch: domain=$_dom user=$_vmtui_lg_user bin=$_bin log=$_lg_out"
   while :; do
@@ -33390,8 +33481,17 @@ vmtui_lg_launch() {
       continue
     fi
     note "WARN: the Looking Glass client exited within ${VM_TUI_LG_LIVENESS_WAIT}s (retry exhausted) — it is NOT running."
-    note "  Last log lines ($VM_TUI_LOG_FILE):"
-    tail -n 5 "$VM_TUI_LOG_FILE" 2>/dev/null | sed 's/^/    /' >&2 || true
+    if [[ "${VMTUI_LG_LOG_FALLBACK:-0}" == "1" ]]; then
+      # R82: the launch log is DISABLED (unwritable — see the NOTE above);
+      # its readable content is STALE output from an EARLIER session, so
+      # quoting it here would mislead. Say so + the fix instead.
+      note "  The launch log is DISABLED for this session (not writable — see the NOTE above),"
+      note "  so there are no fresh client lines to show. Fix the log, then re-run:"
+      note "    sudo chown \$USER $VM_TUI_LOG_FILE   (or relocate it with VM_TUI_LOG)"
+    else
+      note "  Last log lines ($VM_TUI_LOG_FILE):"
+      tail -n 5 "$VM_TUI_LOG_FILE" 2>/dev/null | sed 's/^/    /' >&2 || true
+    fi
     note "  Common causes: no usable display for user '${_vmtui_lg_user}' (WAYLAND_DISPLAY=${_vmtui_lg_wd:-<none>} DISPLAY=${_vmtui_lg_xd:-<none>}),"
     note "  a client crash (see the log lines above), or the guest's Looking Glass host app is not up yet —"
     note "  wait for Windows to finish booting and re-run: $SCRIPT_NAME --vm-tui lg $_dom"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R92 — bumped on every change; the full history is in changelog.md.
+# Revision: R93 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -678,7 +678,20 @@ SCRIPT_NAME="$(basename "$0")"
 # tail + viewer header now show 200 lines, and the live-follow hint prints
 # "tail -n 200 -f ..." (the same backlog the manager window opens with),
 # so every debug surface shows the same history.
-SCRIPT_REVISION="R92"
+# R93 (the live "ok look now" verification — the Windows host app was
+# installed and started, the client connected to the REAL stream): every
+# host-app readiness check now accepts BOTH IVSHMEM magics — the legacy
+# KVMFR header ("4b564d4652", the pre-B6 format the R73 check was built
+# on) AND the B7 host app's LGMP session header ("4c474d50" + version
+# byte; verified live: the B7-Virt OBS host writes 4c 47 4d 50 06 ...).
+# The R73 single-magic check reported a RUNNING host app as "not
+# initialized": the auto-start watcher never fired, the manager's
+# host-app wait always timed out ("black window" warnings), and the
+# picker never showed the screen marker. New shared helpers:
+# vmtui_lg_magic_ok (vm-tui block) + a standalone twin inside the
+# generated watcher — REGENERATE the deployed watcher after
+# --install-self: sudo vfio --install-lg-autostart (or menu option 13).
+SCRIPT_REVISION="R93"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -20521,8 +20534,9 @@ set -euo pipefail
 # Loop design (one iteration = one VM session):
 #  1. WAIT: poll every VFIO_LG_AUTOSTART_POLL seconds (default 3) until the
 #     VM is 'running' AND the Windows LG host app has initialized the IVSHMEM
-#     — the KVMFR magic (4b564d4652) in the first 5 bytes of the shared-memory
-#     device. This is the R73 DEFINITIVE readiness signal: 'running' alone
+#     — the host-app magic in the first bytes of the shared-memory device
+#     (R93: BOTH the legacy KVMFR header AND the B7 LGMP session header).
+#     This is the R73 DEFINITIVE readiness signal: 'running' alone
 #     only means qemu started; the magic means the guest's display pipeline
 #     is actually up, so the client opens onto a live image instead of a
 #     black window. The shm device resolves: $VM_TUI_LG_SHM > the standard
@@ -20588,8 +20602,15 @@ lg_bin() {
   return 1
 }
 
+# R93: BOTH host-app magics — the legacy KVMFR header ("4b564d4652") and
+# the B7 host app's LGMP session header ("4c474d50" + version byte;
+# verified live on this host). $1 = the first-5-bytes hex string.
+magic_ok() {
+  [[ "$1" == "4b564d4652" || "${1:0:8}" == "4c474d50" ]]
+}
+
 # Resolve the VM's shared-memory device: override > standard node > any
-# /dev/shm file that begins with the KVMFR magic (custom shmem names).
+# /dev/shm file that begins with the host-app magic (custom shmem names).
 shm_file() {
   local _f _hex
   if [[ -n "${VM_TUI_LG_SHM:-}" && -f "${VM_TUI_LG_SHM:-}" ]]; then
@@ -20603,7 +20624,7 @@ shm_file() {
   for _f in /dev/shm/*; do
     [[ -f "$_f" ]] || continue
     _hex="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
-    if [[ "$_hex" == "4b564d4652" ]]; then
+    if magic_ok "$_hex"; then
       printf '%s\n' "$_f"
       return 0
     fi
@@ -20611,13 +20632,14 @@ shm_file() {
   return 0
 }
 
-# Is the Windows LG host app up? (KVMFR magic present in the resolved device.)
+# Is the Windows LG host app up? (host-app magic — KVMFR or LGMP — present
+# in the resolved device.)
 host_app_ready() {
   local _f _hex
   _f="$(shm_file)"
   [[ -n "$_f" ]] || return 1
   _hex="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
-  [[ "$_hex" == "4b564d4652" ]]
+  magic_ok "$_hex"
 }
 
 # Is the VM running?
@@ -20675,7 +20697,7 @@ while :; do
   # Ready: clear the latch for the next session.
   _no_lg_since=0
   _no_lg_warned=0
-  log "domain '$DOMAIN' is running and the guest host app is ready (KVMFR)"
+  log "domain '$DOMAIN' is running and the guest host app is ready (host-app magic present)"
 
   # --- 2. LAUNCH (once) ---
   if lg_running; then
@@ -32994,10 +33016,23 @@ vmtui_lg_x_ok() {
   esac
 }
 
+# R93: BOTH host-app magics are accepted — the legacy KVMFR header
+# ("4b564d4652", the pre-B6 format the R73 check was built on) AND the B7
+# host app's LGMP session header ("4c474d50" + version byte; verified
+# LIVE on this host: the freshly-installed B7-Virt host app writes
+# "4c 47 4d 50 06 ..." into the IVSHMEM). The R73 single-magic check
+# reported a RUNNING host app as "not initialized" — the auto-start
+# watcher never fired, the manager's host-app wait always timed out, and
+# the picker never showed the screen marker. $1 = the first-5-bytes hex.
+vmtui_lg_magic_ok() {
+  [[ "$1" == "4b564d4652" || "${1:0:8}" == "4c474d50" ]]
+}
+
 # R73: resolve the VM's Looking Glass shared-memory device: VM_TUI_LG_SHM (an
 # explicit override, if it exists) > the standard $LG_SHMEM_NODE > any /dev/shm
-# file that begins with the KVMFR magic (custom shmem names). Prints the path
-# (empty when none exists). Informational only — never gates the launch.
+# file that begins with the host-app magic — KVMFR or LGMP (custom shmem
+# names). Prints the path (empty when none exists). Informational only —
+# never gates the launch.
 vmtui_lg_shm_file() {
   local _f _c
   if [[ -n "${VM_TUI_LG_SHM:-}" && -f "$VM_TUI_LG_SHM" ]]; then
@@ -33011,7 +33046,7 @@ vmtui_lg_shm_file() {
   for _f in /dev/shm/*; do
     [[ -f "$_f" ]] || continue
     _c="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
-    if [[ "$_c" == "4b564d4652" ]]; then
+    if vmtui_lg_magic_ok "$_c"; then
       printf '%s\n' "$_f"
       return 0
     fi
@@ -33021,9 +33056,10 @@ vmtui_lg_shm_file() {
 
 # R73: the DEFINITIVE Looking Glass readiness, read from the IVSHMEM itself.
 # qemu creates the shared-memory file, but it stays EMPTY (0-byte / zeroed)
-# until the WINDOWS-SIDE host app initializes its KVMFR header — VERIFIED live
-# on this host (a 0-byte qemu-created /dev/shm/looking-glass while the VM is
-# down) and against the client binary (the "KVMFR" magic is embedded in it).
+# until the WINDOWS-SIDE host app initializes its session header — VERIFIED
+# live on this host (a 0-byte qemu-created /dev/shm/looking-glass while the
+# VM is down). R93: BOTH header formats count as ready — the legacy KVMFR
+# magic and the B7 LGMP session magic (see vmtui_lg_magic_ok).
 # Returns: 0 = the host app initialized it (ready); 1 = the file exists but is
 # not initialized yet (Windows still booting — the client would show black);
 # 2 = no Looking Glass shm found at all (LG not set up on this VM?).
@@ -33032,7 +33068,7 @@ vmtui_lg_hoststate() {
   _f="$(vmtui_lg_shm_file)"
   [[ -n "$_f" ]] || return 2
   _hex="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
-  if [[ "$_hex" == "4b564d4652" ]]; then
+  if vmtui_lg_magic_ok "$_hex"; then
     return 0
   fi
   return 1

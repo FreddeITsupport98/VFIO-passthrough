@@ -1626,6 +1626,37 @@ else
 fi
 rm -rf "$_r48g_root"
 
+# --- R94: the LG setup ensures the SPICE USB redirector + the Windows-host-app final step ---
+_lg_fn_r94="$(sed -n '/^install_looking_glass()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R94 LG setup defines the USB-redirector patcher" \
+  '_lg_ensure_usb_redir_to_vm()' \
+  "$VFIO_SCRIPT"
+assert_contains_text \
+  "R94 the patcher adds the spicevmc redirector element" \
+  "devices.append(ET.Element('redirdev', {'bus': 'usb', 'type': 'spicevmc'}))" \
+  "$(sed -n '/^_lg_ensure_usb_redir_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R94 install_looking_glass calls the patcher per VM" \
+  '_lg_ensure_usb_redir_to_vm "$_tmp"' \
+  "$_lg_fn_r94"
+assert_contains_text \
+  "R94 _lg_apply_to_vm calls the patcher too (the live-attach auto-LG path)" \
+  '_lg_ensure_usb_redir_to_vm "$_file"' \
+  "$(sed -n '/^_lg_apply_to_vm()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R94 the setup lists the redirector in its description" \
+  'SPICE USB redirector per VM' \
+  "$_lg_fn_r94"
+assert_contains_text \
+  "R94 the FINAL STEP tells the user to install the Windows host app" \
+  'looking-glass-host-setup.exe' \
+  "$_lg_fn_r94"
+assert_contains_text \
+  "R94 the final step names the USB-audio sound setting" \
+  'Looking Glass USB Audio' \
+  "$_lg_fn_r94"
+
 _vm_summary_fn="$(sed -n '/^_menu_vm_status_summary()/,/^}/p' "$VFIO_SCRIPT")"
 if [[ -n "$_vm_summary_fn" ]]; then
   printf 'PASS: R48e _menu_vm_status_summary body extracted\n'

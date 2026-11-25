@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R93 — bumped on every change; the full history is in changelog.md.
+# Revision: R94 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -691,7 +691,24 @@ SCRIPT_NAME="$(basename "$0")"
 # vmtui_lg_magic_ok (vm-tui block) + a standalone twin inside the
 # generated watcher — REGENERATE the deployed watcher after
 # --install-self: sudo vfio --install-lg-autostart (or menu option 13).
-SCRIPT_REVISION="R93"
+# R94 (the user request: the Modify-VM "Set up Looking Glass" path should
+# make the whole chain seamless): (1) the LG setup now ENSURES the SPICE
+# USB redirection device in every guest-GPU VM — a <redirdev bus='usb'
+# type='spicevmc'/> (the new idempotent python patcher
+# _lg_ensure_usb_redir_to_vm, exit 3 when one already exists; wired into
+# install_looking_glass's per-VM pass AND _lg_apply_to_vm so the
+# live-attach auto-LG path gets it too). The B7 USB-audio path needs it:
+# the client's spice:usbAudio creates a virtual USB sound device in the
+# guest THROUGH an unused redirector — Windows then shows "Looking Glass
+# USB Audio" speakers (Sound settings), lower-latency audio independent
+# of the emulated sound card. (2) The setup now ENDS with the final step
+# spelled out: install the Looking Glass HOST application inside Windows
+# (looking-glass-host-setup.exe matching the client version) — without it
+# the shared memory never initializes and every window stays black
+# (verified live); plus the USB-audio sound-settings pick and the
+# auto-start tip. The _install_looking_glass_defaults (hotplug auto-LG)
+# ending gained the same host-app one-liner.
+SCRIPT_REVISION="R94"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -21086,6 +21103,36 @@ sys.exit(0)
 PYEOF
 }
 
+# R94: ensure the VM has a SPICE USB redirection device (<redirdev
+# bus='usb' type='spicevmc'/>). The Looking Glass B7 USB-audio path uses an
+# (unused) spicevmc USB redirector: the client's spice:usbAudio creates a
+# virtual USB sound device in the guest through it, giving Looking Glass
+# its own low-latency audio channel independent of the VM's emulated
+# sound card (Windows shows "Looking Glass USB Audio" speakers). A VM
+# created in virt-manager usually already has several redirectors; a
+# stripped/manual XML may have none. Idempotent: exit 3 when a redirdev
+# already exists, exit 0 when one was added. $1 = path to a temp file
+# holding the VM dumpxml.
+_lg_ensure_usb_redir_to_vm() {
+  local _xml_file="$1"
+  python3 - "$_xml_file" <<'PYEOF'
+import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+tree = ET.parse(path); root = tree.getroot()
+devices = root.find('devices')
+if devices is None:
+    sys.exit(1)
+# Any existing redirdev satisfies the requirement (spicevmc is the only
+# common redirector type; virt-manager VMs typically carry several, and
+# the LG client claims one for its virtual USB audio device).
+if devices.find('redirdev') is not None:
+    sys.exit(3)
+devices.append(ET.Element('redirdev', {'bus': 'usb', 'type': 'spicevmc'}))
+tree.write(path)
+sys.exit(0)
+PYEOF
+}
+
 # Generate/merge ~/.looking-glass-client.ini for $SUDO_USER: shmFile + spice
 # enable/audio + wayland fractionalScale (when the session is Wayland).
 _lg_generate_user_config() {
@@ -21167,6 +21214,14 @@ _lg_apply_to_vm() {
   if (( _vd != 0 && _vd != 3 )); then
     note "WARN: Looking Glass video/spice patch failed (python exit $_vd) for $_file; continuing."
   fi
+  # R94: also ensure the SPICE USB redirection device (the B7 USB-audio
+  # path) — this covers install_live_attach's auto-LG and any future
+  # caller. Idempotent; best-effort.
+  local _ur=0
+  _lg_ensure_usb_redir_to_vm "$_file" || _ur=$?
+  if (( _ur != 0 && _ur != 3 )); then
+    note "WARN: USB-redirector patch failed (python exit $_ur) for $_file; continuing."
+  fi
   return 0
 }
 
@@ -21192,6 +21247,9 @@ _install_looking_glass_defaults() {
     say "✔ Looking Glass host-side setup complete"
   fi
   note "Reboot the VM (full shutdown, not restart) so the <shmem> device appears, then run: looking-glass-client"
+  # R94: without the Windows-side host application the display stays black —
+  # say it here too (this is the hotplug auto-LG path).
+  note "Then install the Looking Glass HOST app inside Windows (looking-glass-host-setup.exe) — without it the display stays black."
 }
 
 # Install Looking Glass host-side setup for each shut-off guest-GPU VM.
@@ -21216,6 +21274,7 @@ install_looking_glass() {
   note "  - a <shmem name='looking-glass'> ivshmem-plain device attached to each shut-off guest-GPU VM"
   note "  - <video> model: DEFAULT 'none' for cold-attach (GPU present at boot = the only display via LG; no competing virtual card). Kept as a boot display (virtio-gpu) ONLY for live-attach mode=on (GPU absent at boot — video=none would leave Windows headless and the hot-attached GPU's display would silently fail -> black screen)"
   note "  - spice <graphics> set to the Looking Glass input block (<listen type='address'/> port=-1, image compression=off — local 127.0.0.1 port for LG's PureSpice input)"
+  note "  - a <redirdev bus='usb' type='spicevmc'/> SPICE USB redirector per VM, idempotently (R94 — the B7 USB-audio path: the client's spice:usbAudio creates a virtual USB sound device in the guest through an unused redirector; Windows then shows 'Looking Glass USB Audio' speakers)"
   note "  - ~/.looking-glass-client.ini for $SUDO_USER (shmFile + spice + wayland)"
   note "  - optional ReBAR 64-bit MMIO on the VM (helps the GPU map large BARs)"
   note "vBIOS is NOT touched here (use --vbios / the wizard for vBIOS injection)."
@@ -21345,6 +21404,17 @@ install_looking_glass() {
     if (( _vd_status != 0 && _vd_status != 3 )); then
       note "WARN: video/spice patching failed for '$_dom' (python exit $_vd_status); continuing."
     fi
+    # R94: ensure the SPICE USB redirection device (the B7 USB-audio path).
+    # Idempotent: exit 3 = redirector(s) already present.
+    local _ur_status=0
+    _lg_ensure_usb_redir_to_vm "$_tmp" || _ur_status=$?
+    if (( _ur_status == 0 )); then
+      say "  ✔ Added the SPICE USB redirection device (Looking Glass USB audio) to '$_dom'."
+    elif (( _ur_status == 3 )); then
+      say "  VM '$_dom' already has SPICE USB redirector(s); keeping them (idempotent)."
+    else
+      note "WARN: USB-redirector patching failed for '$_dom' (python exit $_ur_status); continuing."
+    fi
     if ! virt-xml-validate "$_tmp" 2>/dev/null; then
       note "WARN: virt-xml-validate failed for '$_dom'; skipping redefine."
       rm -f "$_tmp"
@@ -21379,6 +21449,19 @@ install_looking_glass() {
       say "✔ Looking Glass host-side setup complete"
     fi
     note "Reboot the VM (full shutdown, not restart) so the <shmem> device appears, then run: looking-glass-client"
+    # R94: the FINAL step is guest-side — without the Windows host
+    # application the shared memory never initializes and every client
+    # window stays black (verified live). Spell the whole chain out so the
+    # setup ends with everything needed for it to just work.
+    say
+    note "FINAL STEP (inside Windows, the guest) — install the Looking Glass HOST application:"
+    note "  download looking-glass-host-setup.exe (match your client version, B7) from"
+    note "  https://looking-glass.io/ and run it in the VM; it installs the host service +"
+    note "  the IVSHMEM driver, and from then on the shared memory initializes at every boot"
+    note "  and the client connects automatically."
+    note "  USB audio: pick the 'Looking Glass USB Audio' speakers in Windows Sound settings"
+    note "  (the SPICE USB redirector this setup added enables them)."
+    note "  Seamless auto-start on every VM boot: sudo $SCRIPT_NAME --install-lg-autostart."
   fi
 }
 

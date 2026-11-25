@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R84 — bumped on every change; the full history is in changelog.md.
+# Revision: R85 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -585,7 +585,15 @@ SCRIPT_NAME="$(basename "$0")"
 # single-tag command line and would never match the all-tags spawn (repeated
 # toggles would stack windows) — the guard now pgrep-matches the printer's
 # exact output. All fixed before validation ran.
-SCRIPT_REVISION="R84"
+# R85 (the accepted R84 follow-up, "ok do it"): the hotplug journal window
+# now opens WITH BACKLOG — the follow command is "journalctl -n 200 -f -t
+# <tag>...", so the last 200 matching lines print BEFORE the live follow
+# starts (before, a freshly opened window sat EMPTY until the next event —
+# useless right after a failure just happened). The -n 200 lives in the
+# _vmtui_journal_follow_cmd printer, so the spawned command (all three
+# terminal variants), the dedup pattern (the printer's exact output), and
+# both manual fallback notes all get it from the one place.
+SCRIPT_REVISION="R85"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32462,8 +32470,11 @@ vmtui_debug_show() {
 # gets the identical stream from the single VFIO_JOURNAL_TAGS source of truth
 # — and the hotplug dedup guard reuses this IDENTICAL output as its pgrep
 # pattern, so the guard always matches what is actually spawned.
+# R85: -n 200 gives the window BACKLOG — the last 200 matching lines print
+# before the live follow starts, so a window opened right after a failure
+# shows the failure itself instead of waiting for the next event.
 _vmtui_journal_follow_cmd() {
-  local _tag _out=(journalctl -f)
+  local _tag _out=(journalctl -n 200 -f)
   # shellcheck disable=SC2086 # intentional word-split: the tag list is space-separated by design
   for _tag in $VFIO_JOURNAL_TAGS; do
     _out+=(-t "$_tag")

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R80 — bumped on every change; the full history is in changelog.md.
+# Revision: R81 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -513,7 +513,14 @@ SCRIPT_NAME="$(basename "$0")"
 # option count or the Exit index, the R55/R69 precedent), and the vm-tui
 # manager's manual LG launch now carries the one-line tip pointing at the
 # automatic sibling.
-SCRIPT_REVISION="R80"
+# R81 (the accepted R80 follow-up): the watcher now EXPLAINS a VM that never
+# fires — one notification after VFIO_LG_AUTOSTART_NO_LG_WAIT seconds (default
+# 60; 0 = off) of the watched VM running WITHOUT the LG shared memory: "the
+# auto-launch will not fire for it. Set it up: sudo vfio --install-looking-
+# glass". The latch is one-shot per VM session (reset when the VM stops, so
+# each boot of an unconfigured VM explains itself once — not per poll), and a
+# late-starting host app still wins (the warning never prevents the launch).
+SCRIPT_REVISION="R81"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -2799,6 +2806,9 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [com
                    input-capture Ctrl-lock preset and pops a notification that the
                    mouse + keyboard are hooked to the VM (Scroll Lock releases
                    them). Re-arms after every VM stop — no icon-clicking ever.
+                   A VM running WITHOUT Looking Glass configured gets a one-time
+                   hint after VFIO_LG_AUTOSTART_NO_LG_WAIT seconds (default 60;
+                   0 = off) instead of silently never firing.
                    Configure: VM_TUI_LG_ARGS / VM_TUI_LG_BIN / VM_TUI_LG_SHM /
                    VFIO_LG_AUTOSTART_POLL.
   --remove-lg-autostart
@@ -20349,6 +20359,13 @@ set -euo pipefail
 #     is actually up, so the client opens onto a live image instead of a
 #     black window. The shm device resolves: $VM_TUI_LG_SHM > the standard
 #     /dev/shm/looking-glass > any /dev/shm file that begins with the magic.
+#     R81: a VM that is running WITHOUT the shared memory (Looking Glass not
+#     configured host-side) gets ONE notification after
+#     VFIO_LG_AUTOSTART_NO_LG_WAIT seconds (default 60; 0 = off) explaining
+#     exactly that + the fix (--install-looking-glass) — instead of silently
+#     never firing. The latch resets when the VM stops, so each boot of an
+#     unconfigured VM explains itself once; a late-starting host app still
+#     wins (the warning never prevents the launch).
 #  2. LAUNCH (once per session): if a client is already running (the user
 #     clicked the icon first, or a previous session's client survived), skip
 #     — never a second window. The client launches detached (setsid) with the
@@ -20371,6 +20388,10 @@ DOMAIN="${1:-}"
 [[ -n "$DOMAIN" ]] || { echo "vfio-lg-autostart: missing <domain> argument" >&2; exit 1; }
 POLL="${VFIO_LG_AUTOSTART_POLL:-3}"
 [[ "$POLL" =~ ^[0-9]+$ ]] || POLL=3
+# R81: how long the VM may run WITHOUT the LG shared memory before the
+# one-time "no Looking Glass configured" warning fires (0 = disable it).
+NO_LG_WAIT="${VFIO_LG_AUTOSTART_NO_LG_WAIT:-60}"
+[[ "$NO_LG_WAIT" =~ ^[0-9]+$ ]] || NO_LG_WAIT=60
 LOG_FILE="${VM_TUI_LOG:-/tmp/vm-tui.log}"
 # The input-capture ("Ctrl lock") preset — identical to the vm-tui manager's
 # default (verified against the installed B7 client's option table).
@@ -20448,14 +20469,44 @@ notify() { # best-effort — a missing notify-send never breaks the watcher
 
 log "watcher started for domain '$DOMAIN' (poll=${POLL}s, user $(id -un))"
 
+# R81: the one-shot no-LG warning latch + its running-without-LG timestamp.
+# Reset whenever the VM is NOT running, so every VM session gets at most one
+# warning (a still-unconfigured VM explains itself on every boot, not every
+# poll); the magic appearing late (LG host app starts at login) still wins —
+# the warning never prevents the launch, it only explains its absence.
+_no_lg_since=0
+_no_lg_warned=0
+
 while :; do
   # --- 1. WAIT for the definitive readiness (running + KVMFR) ---
   while :; do
-    if vm_running && host_app_ready; then
-      break
+    if vm_running; then
+      if host_app_ready; then
+        break
+      fi
+      # R81: running WITHOUT the LG shared memory — after NO_LG_WAIT seconds,
+      # warn ONCE that this VM has no Looking Glass configured (the
+      # auto-launch will not fire for it) with the exact fix.
+      if (( NO_LG_WAIT > 0 )); then
+        if (( _no_lg_since == 0 )); then
+          _no_lg_since="$(date +%s)"
+        elif (( ! _no_lg_warned )) && (( ($(date +%s) - _no_lg_since) >= NO_LG_WAIT )); then
+          _no_lg_warned=1
+          log "domain '$DOMAIN' has run ${NO_LG_WAIT}s+ without the LG shared memory — warning once (no Looking Glass configured?)"
+          notify "Looking Glass auto-start" "VM '$DOMAIN' is running but no Looking Glass shared memory was found — the auto-launch will not fire for it. Set it up: sudo vfio --install-looking-glass"
+        fi
+      fi
+    else
+      # VM not running: reset the session latch (the next boot warns again
+      # if still unconfigured).
+      _no_lg_since=0
+      _no_lg_warned=0
     fi
     sleep "$POLL"
   done
+  # Ready: clear the latch for the next session.
+  _no_lg_since=0
+  _no_lg_warned=0
   log "domain '$DOMAIN' is running and the guest host app is ready (KVMFR)"
 
   # --- 2. LAUNCH (once) ---
@@ -20527,7 +20578,9 @@ DESKEOF
   note "It launches Looking Glass automatically when '$_dom' is booted AND the Windows host"
   note "app is up (the shared-memory readiness signal), with input capture ON, and notifies"
   note "you that the mouse+keyboard are hooked (Scroll Lock releases). Configure with"
-  note "VM_TUI_LG_ARGS / VM_TUI_LG_BIN / VM_TUI_LG_SHM / VFIO_LG_AUTOSTART_POLL."
+  note "VM_TUI_LG_ARGS / VM_TUI_LG_BIN / VM_TUI_LG_SHM / VFIO_LG_AUTOSTART_POLL; a VM"
+  note "running WITHOUT Looking Glass gets a one-time hint after"
+  note "VFIO_LG_AUTOSTART_NO_LG_WAIT seconds (default 60; 0 = off)."
   note "Remove any time with: sudo $SCRIPT_NAME --remove-lg-autostart"
   return 0
 }

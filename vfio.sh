@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R88 — bumped on every change; the full history is in changelog.md.
+# Revision: R89 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -645,7 +645,22 @@ SCRIPT_NAME="$(basename "$0")"
 # atomic write makes the overwrite harmless. One regression lock updated in
 # lockstep with the intentional change (the R55/R61/R77 precedent): the R34
 # "cp -a" install assert now expects the atomic write_file_atomic form.
-SCRIPT_REVISION="R88"
+# R89 (the accepted R88 follow-up, "ok do it as last" — the last change of
+# this arc): the agent-wait timeout WARN is now SELF-DIAGNOSING. The open
+# mystery from the R87 session: the manager's 120s agent wait timed out
+# even though the live-attach helper caught the agent-lifecycle CONNECT at
+# 11s, and a manual ping minutes later said "not connected" (Windows may
+# drop the agent after the GPU hot-attach). New vmtui_agent_wait_diagnose
+# runs ONE final guest-ping (LC_ALL=C, so the error text is locale-stable
+# — the R77 lesson; this host's virsh speaks Swedish) and prints an exact
+# verdict: the agent JUST answered (the wait missed it by a moment —
+# reported as "Windows is up", not a WARN) / the channel exists but
+# Windows has NOT connected it (still booting, or the agent service
+# dropped) / NO channel (the earlier probes saw one) / no answer in 8s.
+# The verdict is appended to the WARN ("Final check: ...") and mirrored
+# into the agent-wait dbg event, so the debug log pins the outcome without
+# a re-run.
+SCRIPT_REVISION="R89"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -33127,6 +33142,33 @@ vmtui_wait_agent() {
   done
 }
 
+# R89: the agent-wait timeout SELF-DIAGNOSIS — one final guest-ping whose
+# exact outcome (LC_ALL=C, so the error text is locale-stable — the R77
+# lesson; this host's virsh speaks Swedish) distinguishes "Windows is
+# still booting" from "the agent dropped / was never connected". Prints
+# ONE verdict line; rc 0 = the agent JUST answered (the wait missed it by
+# a moment — the caller reports Windows up instead of a WARN), rc 1 =
+# still not answering. The caller mirrors the verdict into the dbg event,
+# so the debug log pins the outcome without a re-run.
+vmtui_agent_wait_diagnose() {
+  local _dom="$1" _out
+  _out="$(LC_ALL=C timeout 8 virsh -c qemu:///system qemu-agent-command "$_dom" '{"execute":"guest-ping"}' 2>&1 || true)"
+  if [[ "$_out" == *'"return"'* ]]; then
+    printf '%s\n' "the guest agent JUST answered — Windows is up (the wait missed it by a moment)"
+    return 0
+  fi
+  if [[ "$_out" == *"not configured"* ]]; then
+    printf '%s\n' "NO agent channel in the VM (the earlier probes saw one — the channel may have been removed)"
+    return 1
+  fi
+  if [[ "$_out" == *"not connected"* || "$_out" == *"not responding"* ]]; then
+    printf '%s\n' "the channel exists but Windows has NOT connected the agent (still booting, or the agent service stopped/dropped)"
+    return 1
+  fi
+  printf '%s\n' "no answer within 8s (agent not connected / still booting)"
+  return 1
+}
+
 # Confirmation (TUI yes/no or plain y/N). $1 = question, $2 = default (Y/N).
 # Returns 0 = yes, 1 = no. NOTE: VM_TUI_SKIP_CONFIRM (set by --yes) must NOT
 # be reset here — resetting it per call silently defeats --yes for automation.
@@ -33942,7 +33984,27 @@ vmtui_act_start_lg() {
           case "$_arc" in
             0) vmtui_ok "Windows is up (guest agent responded) — launching Looking Glass." ;;
             2) note "No guest agent channel in '$_dom' — launching now. Install the virtio-win guest agent inside Windows (sudo $SCRIPT_NAME --install-virtio-win-guest-agent) so Looking Glass launches the moment Windows is up." ;;
-            *) note "WARN: the guest agent did not respond within ${_left}s — launching Looking Glass anyway. Windows may still be booting: expect a BLACK window until the guest's Looking Glass host app starts; if it stays black, re-run: $SCRIPT_NAME --vm-tui lg $_dom" ;;
+            *)
+              # R89: the timeout WARN now SELF-DIAGNOSES — one final
+              # guest-ping (vmtui_agent_wait_diagnose; LC_ALL=C so the
+              # error text is locale-stable) whose exact outcome
+              # distinguishes "Windows still booting" from "the agent
+              # dropped" (the live R87-session mystery: the manager timed
+              # out at 120s while the live-attach helper had caught the
+              # agent-lifecycle CONNECT at 11s, and a manual ping minutes
+              # later said "not connected" — Windows may drop the agent
+              # after the GPU hot-attach). When the final ping ANSWERS, the
+              # wait missed it by a moment: report Windows UP, not a WARN.
+              local _awd_rc=0 _awd
+              _awd="$(vmtui_agent_wait_diagnose "$_dom")" || _awd_rc=$?
+              vmtui_dbg "agent-wait: timeout self-diagnosis: $_awd"
+              if (( _awd_rc == 0 )); then
+                vmtui_ok "Windows is up (the guest agent answered right after the wait) — launching Looking Glass."
+              else
+                note "WARN: the guest agent did not respond within ${_left}s — launching Looking Glass anyway. Windows may still be booting: expect a BLACK window until the guest's Looking Glass host app starts; if it stays black, re-run: $SCRIPT_NAME --vm-tui lg $_dom"
+                note "      Final check: $_awd."
+              fi
+              ;;
           esac
         else
           # R72 (point 1): the running-wait consumed the whole budget — say so

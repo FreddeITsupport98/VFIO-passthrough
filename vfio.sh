@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R79 — bumped on every change; the full history is in changelog.md.
+# Revision: R80 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -502,11 +502,18 @@ SCRIPT_NAME="$(basename "$0")"
 # spinning, the R68 dual-location resolver + VM_TUI_LG_ARGS/VM_TUI_LG_BIN/
 # VM_TUI_LG_SHM/VFIO_LG_AUTOSTART_POLL are honored, everything logs to
 # /tmp/vm-tui.log. The watcher runs IN THE USER SESSION (autostart entry for
-# the SUDO_USER desktop user; the R61 session-env discovery is used when the
-# sudo install starts it immediately) — never as root, so the client and the
+# the sudo-originating desktop user; the install-time immediate start uses
+# the R61 session-env discovery) — never as root, so the client and the
 # notification land on the real desktop. --remove-lg-autostart,
 # --uninstall-self and --reset all sweep it.
-SCRIPT_REVISION="R79"
+# R80 (the immediate follow-up, "did you add that to tui?"): the auto-start
+# is now in the TUI too — main-menu option 13 "Looking Glass auto-start"
+# (context-aware: install when absent, reinstall-vs-remove when present; the
+# Exit entry moved 13 -> 14, verified additive — no regression locks the
+# option count or the Exit index, the R55/R69 precedent), and the vm-tui
+# manager's manual LG launch now carries the one-line tip pointing at the
+# automatic sibling.
+SCRIPT_REVISION="R80"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -33406,6 +33413,10 @@ vmtui_lg_launch() {
     note "  NOTE: VM_TUI_LG_ARGS is empty — the client uses YOUR config defaults; seamless mouse / Ctrl lock are NOT forced."
   fi
   note "  Release input with the escape key (default: Scroll Lock). Override flags: VM_TUI_LG_ARGS."
+  # R80 (the "did you add that to tui?" follow-up): one tip line pointing at
+  # the R79 auto-start — so the manual-launch flow advertises its automatic
+  # sibling exactly where a repeat user feels the click-fatigue.
+  note "  Tip: make this automatic on every VM boot: sudo $SCRIPT_NAME --install-lg-autostart (or main-menu option 13)."
   return 0
 }
 
@@ -33866,6 +33877,7 @@ vfio_menu() {
       "Show VFIO status (per-VM tuning checklist + ReBAR)"
       "Doctor (one-shot health report: self-test + verify + status + kernel audit)"
       "VM manager (start / stop / reset VMs + Looking Glass launch — vm-tui)"
+      "Looking Glass auto-start (auto-launch when VM is booted + Ctrl lock + notification)"
       "Exit menu"
     )
     say
@@ -34152,6 +34164,41 @@ vfio_menu() {
         fi
         ;;
       13)
+        # R80 (the follow-up to the R79 question "did you add that to tui?"):
+        # the Looking Glass AUTO-START installer, in the TUI (same as the CLI
+        # --install-lg-autostart). Context-aware single entry: when the watcher
+        # is already installed it ASKS reinstall-vs-remove (both paths from one
+        # menu option); otherwise it installs. Guarded subshell + verdict popup
+        # (the R49/R55 pattern); install_lg_autostart is idempotent (overwrites
+        # the watcher + the autostart entry) and remove_lg_autostart sweeps
+        # every user's entry, so a failure just returns to the menu.
+        say
+        if [[ -x "$LG_AUTOSTART_WATCHER" ]]; then
+          note "Looking Glass auto-start is ALREADY installed ($LG_AUTOSTART_WATCHER)."
+          if prompt_yn "Reinstall (refresh) the auto-start watcher? Answer No to REMOVE it instead." Y "LG auto-start"; then
+            say
+            note "Reinstalling the Looking Glass auto-start watcher..."
+            local _lga_rc=0
+            ( install_lg_autostart ) || _lga_rc=$?
+          else
+            say
+            note "Removing the Looking Glass auto-start watcher + autostart entries..."
+            local _lga_rc=0
+            ( remove_lg_autostart ) || _lga_rc=$?
+          fi
+        else
+          say
+          note "Installing the Looking Glass auto-start watcher (same as: sudo vfio --install-lg-autostart)..."
+          local _lga_rc=0
+          ( install_lg_autostart ) || _lga_rc=$?
+        fi
+        if (( _lga_rc == 0 )); then
+          _verdict_popup "Looking Glass auto-start" "OK" "Done. Every VM boot now auto-launches Looking Glass with input captured (Scroll Lock releases) — see the notes above."
+        else
+          _verdict_popup "Looking Glass auto-start" "WARN" "Cancelled or failed (rc=$_lga_rc) — see the notes above. The menu is still alive."
+        fi
+        ;;
+      14)
         # Exit.
         say
         say "Exiting vfio.sh menu."

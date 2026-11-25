@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R86 — bumped on every change; the full history is in changelog.md.
+# Revision: R87 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -604,7 +604,31 @@ SCRIPT_NAME="$(basename "$0")"
 # (start / shutdown / start-lg / lg), and the fast/local actions (All
 # VMs, Force shutdown, Force reset, VM state, Debug log) show a plain
 # "Running: ..." with no claim.
-SCRIPT_REVISION="R86"
+# R87 (the LIVE "start vm and hotplug succeeded but looking glass failed"
+# report, root-caused LIVE on the host with a python open-flag
+# discrimination): the R75 log-ownership fix was itself arming a NEW
+# client-killer on modern systemd distros. fs.protected_regular=2 (the
+# systemd default) denies any >> open — bash appends always carry O_CREAT —
+# on a FOREIGN-OWNED file in sticky world-writable /tmp, EVEN FOR ROOT:
+# after the R75 chown the launch log is fb-owned, so the ROOT manager's own
+# parent-side >>$log redirect was EACCES-denied ("Atkomst nekas" at the
+# exact launch lines), the failed redirect ABORTED the launch before exec,
+# and the client died twice ("retry exhausted") on a file BOTH gates (the
+# root test -w and the R82 runuser'd test -w) called writable — access(2)
+# does not model the O_CREAT open. Fixes: (1) the ROOT launch's log
+# redirect moved to the TARGET-USER side of the runuser (a bash -c child
+# writes the header + execs the client with its own >> — the open is done
+# by the user the gates validated), with an IN-CHILD re-probe + /dev/null
+# fallback so a log problem can NEVER kill the client; (2) the non-root
+# gate now probes the REAL open instead of test -w; (3) the root gate adds
+# a runuser'd real-open probe; (4) the chown moved AFTER the touch (a
+# MISSING log was created root-owned by root's touch after a no-op chown —
+# no logging on fresh boots). Open observation for the next run: the
+# agent-lifecycle CONNECT the live-attach helper caught at 11s did NOT
+# reach the manager's own agent wait (it timed out at 120s and the agent
+# was not connected at diagnosis time) — the R84 agent-wait dbg event will
+# pin it with debug logging on.
+SCRIPT_REVISION="R87"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -33606,10 +33630,14 @@ vmtui_lg_launch() {
   # the first place); if the log still is not writable (e.g. root-owned and
   # we are the user), launch WITHOUT logging instead of killing the client.
   local _lg_out="$VM_TUI_LOG_FILE"
+  # R87: the touch runs FIRST now — on a MISSING log the old order (chown,
+  # then touch) had root's touch CREATE the file root-owned (the chown
+  # before it had nothing to chown yet), and the fb-side gate then correctly
+  # refused it: no logging on fresh boots. Touch, then chown.
+  touch "$VM_TUI_LOG_FILE" 2>/dev/null || true
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     chown "$_vmtui_lg_user" "$VM_TUI_LOG_FILE" 2>/dev/null || true
   fi
-  touch "$VM_TUI_LOG_FILE" 2>/dev/null || true
   # R82: the writability check must reflect the user the CLIENT will run as.
   # When the manager is root, a plain `test -w` checks AS ROOT — which is
   # almost always TRUE (root writes anything) even when the re-launched
@@ -33617,13 +33645,27 @@ vmtui_lg_launch() {
   # The client's `>>$log` redirect would then fail AS THE CHILD and the
   # client would never start — the exact live bug. Check as the TARGET user
   # (runuser) whenever the launch will be re-user'd.
+  # R87 (the live report that broke through BOTH gates, root-caused live):
+  # fs.protected_regular=2 (the systemd default) denies any >> open — bash
+  # appends always carry O_CREAT — on a FOREIGN-OWNED file in sticky
+  # world-writable /tmp, EVEN FOR ROOT: after the chown above the log is
+  # fb-owned, so the ROOT manager's own parent-side >>$log redirect was
+  # EACCES-denied, the failed redirect ABORTED the launch before exec, and
+  # the client died twice ("retry exhausted") on a file BOTH gates called
+  # writable — access(2)/test -w does not model the O_CREAT open. So every
+  # gate now probes the REAL open as the user who will actually do it.
   local _log_writable=0
   if [[ "${EUID:-$(id -u)}" -eq 0 ]] && command -v runuser >/dev/null 2>&1; then
-    if runuser -u "$_vmtui_lg_user" -- test -w "$VM_TUI_LOG_FILE" 2>/dev/null; then
+    if runuser -u "$_vmtui_lg_user" -- test -w "$VM_TUI_LOG_FILE" 2>/dev/null \
+      && runuser -u "$_vmtui_lg_user" -- bash -c 'exec >>"$1"' _ "$_lg_out" 2>/dev/null; then
       _log_writable=1
     fi
   else
-    if test -w "$VM_TUI_LOG_FILE" 2>/dev/null; then
+    # R87: the REAL-open probe (a subshell exec — set -e safe): the
+    # permission bits can pass test -w while the O_CREAT append is denied
+    # by the sticky-/tmp policy, and a failed >> on the launch line below
+    # would kill the client exactly like the live report.
+    if ( exec >>"$_lg_out" ) 2>/dev/null; then
       _log_writable=1
     fi
   fi
@@ -33642,13 +33684,38 @@ vmtui_lg_launch() {
   fi
   vmtui_dbg "launch: domain=$_dom user=$_vmtui_lg_user bin=$_bin log=$_lg_out"
   while :; do
-    printf '%s launch: domain=%s user=%s bin=%s env=%s args=%s\n' "$(date -Is)" "$_dom" "$_vmtui_lg_user" "$_bin" "${_vmtui_lg_env[*]}" "$VM_TUI_LG_ARGS" >>"$_lg_out" 2>/dev/null || true
+    # R87: the header line is written by whoever OWNS the log-open — the
+    # root path writes it inside the target-user child below (the parent's
+    # own O_CREAT append is exactly what fs.protected_regular denies); the
+    # non-root paths keep the parent-side write (the gate above probed the
+    # real open for exactly this form).
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      printf '%s launch: domain=%s user=%s bin=%s env=%s args=%s\n' "$(date -Is)" "$_dom" "$_vmtui_lg_user" "$_bin" "${_vmtui_lg_env[*]}" "$VM_TUI_LG_ARGS" >>"$_lg_out" 2>/dev/null || true
+    fi
     _died=0
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
       # Root: launch as the resolved desktop user — the tray's proven
       # env-array + setsid runuser form (R61).
-      # shellcheck disable=SC2086 # intentional word-split: VM_TUI_LG_ARGS is a space-joined flag list
-      runuser -u "$_vmtui_lg_user" -- env "${_vmtui_lg_env[@]}" setsid "$_bin" $VM_TUI_LG_ARGS </dev/null >>"$_lg_out" 2>&1 &
+      # R87: the log redirect now happens on the TARGET-USER side of the
+      # runuser (the bash -c child writes the header + execs the client
+      # with its own >>): the parent-side >>$log (O_CREAT on the
+      # now-fb-owned file in sticky /tmp under fs.protected_regular=2) was
+      # EACCES-denied even as root and the failed redirect killed the
+      # client (the live "retry exhausted" report). The child re-probes its
+      # own open and falls back to /dev/null internally, so a log problem
+      # can NEVER kill the client; `exec setsid` keeps the process chain
+      # (runuser waits on it), so the liveness pid semantics are unchanged.
+      runuser -u "$_vmtui_lg_user" -- env "${_vmtui_lg_env[@]}" \
+        VMTUI_LAUNCH_DOM="$_dom" VMTUI_LAUNCH_BIN="$_bin" \
+        VMTUI_LAUNCH_ARGS="$VM_TUI_LG_ARGS" \
+        VMTUI_LAUNCH_ENVS="${_vmtui_lg_env[*]}" \
+        VMTUI_LAUNCH_LOG="$_lg_out" \
+        bash -c 'if ( exec >>"$VMTUI_LAUNCH_LOG" ) 2>/dev/null; then
+  printf "%s launch: domain=%s user=%s bin=%s env=%s args=%s\n" "$(date -Is)" "$VMTUI_LAUNCH_DOM" "$(id -un)" "$VMTUI_LAUNCH_BIN" "$VMTUI_LAUNCH_ENVS" "$VMTUI_LAUNCH_ARGS" >>"$VMTUI_LAUNCH_LOG"
+  exec setsid "$VMTUI_LAUNCH_BIN" $VMTUI_LAUNCH_ARGS </dev/null >>"$VMTUI_LAUNCH_LOG" 2>&1
+else
+  exec setsid "$VMTUI_LAUNCH_BIN" $VMTUI_LAUNCH_ARGS </dev/null >/dev/null 2>&1
+fi' &
       _pid=$!
     elif (( ${#_vmtui_lg_env[@]} > 0 )); then
       # Non-root with a socket-fallback display: add the discovered vars.

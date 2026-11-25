@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R90 — bumped on every change; the full history is in changelog.md.
+# Revision: R92 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -667,7 +667,18 @@ SCRIPT_NAME="$(basename "$0")"
 # a failure shows the failure itself instead of tail's default last 10
 # lines. The manager dedup pattern is updated in lockstep (it must match
 # the new command line exactly — the R84 hotplug lesson).
-SCRIPT_REVISION="R90"
+# R91 (the accepted R90 follow-up, "ok do it"): the debug windows now SAY
+# what they carry — both window titles name the backlog ("VFIO manager
+# logs (last 200 + live)" / "VFIO journal (all tags — last 200 + live)"),
+# and option 9's sub-choice labels + the plain-mode prompt say each window
+# opens with the last 200 lines then follows live, so a short log reads as
+# a short log, not an empty-by-design window.
+# R92 (the accepted R91 follow-up, "ok do it"): the option-9 debug-log
+# viewer is aligned with the windows' 200-line standard — the "last 40:"
+# tail + viewer header now show 200 lines, and the live-follow hint prints
+# "tail -n 200 -f ..." (the same backlog the manager window opens with),
+# so every debug surface shows the same history.
+SCRIPT_REVISION="R92"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32509,9 +32520,9 @@ vmtui_dbg() {
 }
 
 # R75: the Debug-log menu entry's payload — status (on/off + how to enable),
-# the line count, and the last 40 lines. Rendered via the same
-# vmtui_menu_action path as every other action (msgbox in TUI, streamed in
-# plain mode).
+# the line count, and the last 200 lines (R92: aligned with the windows'
+# backlog standard). Rendered via the same vmtui_menu_action path as every
+# other action (msgbox in TUI, streamed in plain mode).
 vmtui_debug_show() {
   # R76 (live report: "this is stupid design — make sure it is enabled via
   # tui"): the old flow told the operator to EXIT the manager and re-run
@@ -32536,12 +32547,12 @@ vmtui_debug_show() {
       local _wsrc=""
       if vmtui_tui_active; then
         _wsrc="$($TUI_BIN --title "Debug windows" --menu "Which log windows to open?" 14 70 4 \
-          "1" "Manager logs (debug events + Looking Glass client)" \
-          "2" "GPU hotplug journal (all component tags)" \
+          "1" "Manager logs (debug events + Looking Glass client — last 200 lines + live)" \
+          "2" "GPU hotplug journal (all component tags — last 200 lines + live)" \
           "3" "Both (two windows)" \
           "0" "None (logging only, no windows)" 3>&1 1>&2 2>&3)" || true
       else
-        read -r -p "Open log windows — 1 manager, 2 hotplug journal, 3 both, 0 none [3]: " _wsrc || true
+        read -r -p "Open log windows (each shows the last 200 lines, then live) — 1 manager, 2 hotplug journal, 3 both, 0 none [3]: " _wsrc || true
         _wsrc="${_wsrc:-3}"
       fi
       case "${_wsrc:-1}" in
@@ -32565,9 +32576,9 @@ vmtui_debug_show() {
   fi
   local _n
   _n="$(wc -l <"$VM_TUI_DEBUG_LOG" 2>/dev/null | tr -d '[:space:]' || true)"
-  say "Debug log: $VM_TUI_DEBUG_LOG (${_n:-0} lines) — last 40:"
-  tail -n 40 "$VM_TUI_DEBUG_LOG" 2>/dev/null || true
-  say "Live-follow in another terminal: tail -f $VM_TUI_DEBUG_LOG"
+  say "Debug log: $VM_TUI_DEBUG_LOG (${_n:-0} lines) — last 200:"
+  tail -n 200 "$VM_TUI_DEBUG_LOG" 2>/dev/null || true
+  say "Live-follow in another terminal: tail -n 200 -f $VM_TUI_DEBUG_LOG"
   say "Clear it with: rm $VM_TUI_DEBUG_LOG"
 }
 
@@ -32645,7 +32656,7 @@ vmtui_debug_window() {
       # The printer's EXACT output is the pattern: pgrep matches precisely
       # what the window spawns, whatever the tag list becomes.
       _tail_pat="$(_vmtui_journal_follow_cmd)"
-      _win_title="VFIO journal (all tags)"
+      _win_title="VFIO journal (all tags — last 200 + live)"
       command -v journalctl >/dev/null 2>&1 || { note "No journalctl found — cannot tail the hotplug journal."; return 0; }
       ;;
     *)
@@ -32654,7 +32665,7 @@ vmtui_debug_window() {
       # spawns (the R84 lesson — a stale pattern never fires and repeated
       # toggles stack windows).
       _tail_pat="tail -n 200 -F $VM_TUI_DEBUG_LOG"
-      _win_title="VFIO manager logs"
+      _win_title="VFIO manager logs (last 200 + live)"
       ;;
   esac
   # Dedup: never stack a second window on an existing tail of THIS source.

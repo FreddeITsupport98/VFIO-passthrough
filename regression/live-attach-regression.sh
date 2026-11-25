@@ -1756,9 +1756,13 @@ assert_contains_file \
   "'--install-self[" \
   "$VFIO_SCRIPT"
 _self_fn="$(sed -n '/^install_self()/,/^}/p' "$VFIO_SCRIPT")"
+# R88 lockstep (the R55/R61/R77 precedent): the intentional atomic-install
+# change replaced the in-place `cp -a` (same-inode rewrite — a running
+# session reads a shifting file mid-run) with write_file_atomic (temp file
+# + rename = a new inode).
 assert_contains_text \
-  "R34 install_self copies to SELF_INSTALL_BIN" \
-  'cp -a "$src" "$SELF_INSTALL_BIN"' \
+  "R34/R88 install_self installs to SELF_INSTALL_BIN ATOMICALLY (temp + rename — a running session keeps its own code)" \
+  'write_file_atomic "$SELF_INSTALL_BIN" 0755 "root:root" <"$src"' \
   "$_self_fn"
 assert_contains_text \
   "R34 install_self chmods 0755" \

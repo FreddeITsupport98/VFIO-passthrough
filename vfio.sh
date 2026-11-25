@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R87 — bumped on every change; the full history is in changelog.md.
+# Revision: R88 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -628,7 +628,24 @@ SCRIPT_NAME="$(basename "$0")"
 # reach the manager's own agent wait (it timed out at 120s and the agent
 # was not connected at diagnosis time) — the R84 agent-wait dbg event will
 # pin it with debug logging on.
-SCRIPT_REVISION="R87"
+# R88 (the accepted R87 follow-up suggestion, "ok do it"): --install-self is
+# now drift-proof and session-safe. (1) DRIFT VISIBILITY: every install reads
+# the previously deployed SCRIPT_REVISION and says what it updates FROM and
+# TO ("Deployed revision updated: R86 -> R88"), plus the deployed revision
+# in the dry-run note and the same-file refresh note — a stale deployed copy
+# can no longer be missed. (2) ATOMIC INSTALL: the old `cp -a` rewrote the
+# SAME inode in place — a bash process executing the deployed copy (an open
+# VM-manager session) reads a shifting file mid-run; the install now goes
+# through write_file_atomic (temp file + rename = a NEW inode), so a running
+# session keeps its own stable code. (3) RUNNING-INSTANCE GUARD: an anchored
+# pgrep ("$SELF_INSTALL_BIN" followed by space-or-end-of-line, $$ excluded —
+# the vfio-lg-autostart watcher / vfio-hotplug-tray merely CONTAIN the
+# prefix and never match) warns loudly when a vfio process is still running
+# from the deployed copy + says to restart it; warn-not-refuse, because the
+# atomic write makes the overwrite harmless. One regression lock updated in
+# lockstep with the intentional change (the R55/R61/R77 precedent): the R34
+# "cp -a" install assert now expects the atomic write_file_atomic form.
+SCRIPT_REVISION="R88"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -31683,30 +31700,66 @@ install_self() {
   note "Target: $(_link "$SELF_INSTALL_BIN")"
 
   if (( DRY_RUN )); then
-    note "DRY-RUN: would copy $src -> $SELF_INSTALL_BIN (0755) and install 3 completion files (command name: $(basename "$SELF_INSTALL_BIN"))"
+    note "DRY-RUN: would copy $src -> $SELF_INSTALL_BIN (0755, revision $SCRIPT_REVISION) and install 3 completion files (command name: $(basename "$SELF_INSTALL_BIN"))"
     return 0
   fi
 
   # Same-file guard: running the already-installed copy re-installs idempotently
   # (refresh completions only) instead of cp-erroring "same file".
   if [[ "$src" -ef "$SELF_INSTALL_BIN" ]]; then
-    note "Source is already the installed copy; refreshing completions only."
+    note "Source is already the installed copy (revision $SCRIPT_REVISION); refreshing completions only."
   else
     run mkdir -p "$(dirname "$SELF_INSTALL_BIN")"
+    # R88: the deployed revision BEFORE the update — DRIFT VISIBILITY. The
+    # live reports that traced to a STALE deployed copy (a pre-R75 binary
+    # producing phantom bugs) can no longer be missed: every install says
+    # exactly what it updated FROM and TO.
+    local _old_rev=""
     if [[ -f "$SELF_INSTALL_BIN" ]]; then
+      _old_rev="$(grep -m1 'SCRIPT_REVISION=' "$SELF_INSTALL_BIN" 2>/dev/null | cut -d'"' -f2 || true)"
       backup_file "$SELF_INSTALL_BIN"
     fi
-    run cp -a "$src" "$SELF_INSTALL_BIN"
-    run chmod 0755 "$SELF_INSTALL_BIN"
-    # R48l: pkexec (used by the live-attach tray applet to run `vfio
+    # R88: the running-instance guard. The old in-place copy rewrote the
+    # SAME inode — a bash process executing the deployed copy (an open
+    # VM-manager session) reads a shifting file mid-run. The write below is
+    # now ATOMIC (temp file + rename = a NEW inode), so running instances
+    # keep their own stable code and are merely STALE until restarted:
+    # warn loudly + say what to do instead of refusing. The pgrep pattern
+    # is ANCHORED ("$SELF_INSTALL_BIN" followed by a space or end-of-line,
+    # $$ excluded so running the deployed copy itself to refresh does not
+    # trigger it) — the vfio-lg-autostart watcher and vfio-hotplug-tray
+    # merely CONTAIN the path as a prefix and never match.
+    local _ipids=""
+    if command -v pgrep >/dev/null 2>&1; then
+      _ipids="$(pgrep -f "$SELF_INSTALL_BIN( |\$)" 2>/dev/null | grep -vx "$$" || true)"
+      _ipids="${_ipids//$'\n'/ }"
+    fi
+    if [[ -n "$_ipids" ]]; then
+      note "NOTE: vfio process(es) still running from the deployed copy (pid: $_ipids)."
+      note "      This update is ATOMIC, so the running session is safe — but it keeps the OLD"
+      note "      code until restarted. Exit and re-open it to pick up $SCRIPT_REVISION."
+    fi
+    # R88: the ATOMIC install — temp file + rename swaps in a NEW inode, so
+    # a running session's interpreter keeps reading its own stable copy;
+    # mode 0755 + owner root:root are set by the install itself.
+    write_file_atomic "$SELF_INSTALL_BIN" 0755 "root:root" <"$src"
+    # R48l (kept, belt-and-suspenders over the atomic install's -m/-o):
+    # pkexec (used by the live-attach tray applet to run `vfio
     # --live-attach-toggle` without a terminal) REFUSES to execute a binary
-    # that is not owned by root. `cp -a` preserves the source file's ownership,
-    # so when the operator runs `sudo ./vfio.sh --install-self` the installed
-    # CLI would inherit the user's `fb:fb` ownership and the tray toggle would
-    # fail with rc=127 ("Not authorized" / command not found). Force the
-    # installed CLI to root:root so pkexec accepts it.
+    # that is not owned by root — the ownership is enforced twice rather
+    # than zero times.
+    run chmod 0755 "$SELF_INSTALL_BIN"
     run chown root:root "$SELF_INSTALL_BIN" 2>/dev/null || true
-    say "Installed: $(_link "$SELF_INSTALL_BIN")"
+    say "Installed: $(_link "$SELF_INSTALL_BIN") — revision $SCRIPT_REVISION"
+    if [[ -n "$_old_rev" ]]; then
+      if [[ "$_old_rev" != "$SCRIPT_REVISION" ]]; then
+        say "Deployed revision updated: $_old_rev -> $SCRIPT_REVISION."
+      else
+        say "Deployed revision: $SCRIPT_REVISION (already up to date — completions refreshed)."
+      fi
+    else
+      say "Deployed revision: $SCRIPT_REVISION (fresh install)."
+    fi
   fi
 
   # Install the 3 shell completions into the vendor auto-load directories so

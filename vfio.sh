@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R89 — bumped on every change; the full history is in changelog.md.
+# Revision: R90 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -660,7 +660,14 @@ SCRIPT_NAME="$(basename "$0")"
 # The verdict is appended to the WARN ("Final check: ...") and mirrored
 # into the agent-wait dbg event, so the debug log pins the outcome without
 # a re-run.
-SCRIPT_REVISION="R89"
+# R90 (the accepted R89 follow-up, "ok doit"): the MANAGER debug window now
+# opens with the same 200-line BACKLOG as the journal window (R85) — all
+# three terminal variants and both manual fallback notes run/print
+# "tail -n 200 -F <debug log> <launch log>", so a window opened right after
+# a failure shows the failure itself instead of tail's default last 10
+# lines. The manager dedup pattern is updated in lockstep (it must match
+# the new command line exactly — the R84 hotplug lesson).
+SCRIPT_REVISION="R90"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32607,8 +32614,10 @@ _vmtui_journal_follow_cmd() {
 # tail command note. Never fatal, never blocks the manager.
 vmtui_debug_window() {
   # R83: $1 (optional) selects the SOURCE whose tail window to open:
-  #   "manager" (default) -> tail -F BOTH /tmp logs (debug events + LG
-  #                          client launch log — one window, per-file headers)
+  #   "manager" (default) -> tail -n 200 -F BOTH /tmp logs (debug events +
+  #                          LG client launch log — one window, per-file
+  #                          headers; R90: 200 lines of backlog, the same
+  #                          as the journal window)
   #   "hotplug"            -> journalctl -f -t <tag> for EVERY VFIO_JOURNAL_TAGS
   #                          tag (R84: the whole hotplug chain — bind/hook,
   #                          live-attach helper, reboot-FLR + park-keepalive
@@ -32641,7 +32650,10 @@ vmtui_debug_window() {
       ;;
     *)
       _src="manager"
-      _tail_pat="tail -F $VM_TUI_DEBUG_LOG"
+      # R90: the pattern matches the BACKLOG form the window actually
+      # spawns (the R84 lesson — a stale pattern never fires and repeated
+      # toggles stack windows).
+      _tail_pat="tail -n 200 -F $VM_TUI_DEBUG_LOG"
       _win_title="VFIO manager logs"
       ;;
   esac
@@ -32666,7 +32678,8 @@ vmtui_debug_window() {
           # shellcheck disable=SC2207 # intentional word-split: the printer emits one flag word per element
           _cmd+=($(_vmtui_journal_follow_cmd))
         else
-          _cmd+=(tail -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
+          # R90: 200 lines of backlog — the same as the journal window.
+          _cmd+=(tail -n 200 -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
         fi
         ;;
       gnome-terminal)
@@ -32675,7 +32688,8 @@ vmtui_debug_window() {
           # shellcheck disable=SC2207 # intentional word-split: the printer emits one flag word per element
           _cmd+=($(_vmtui_journal_follow_cmd))
         else
-          _cmd+=(bash -c "tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE")
+          # R90: 200 lines of backlog — the same as the journal window.
+          _cmd+=(bash -c "tail -n 200 -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE")
         fi
         ;;
       xterm)
@@ -32684,7 +32698,8 @@ vmtui_debug_window() {
           # shellcheck disable=SC2207 # intentional word-split: the printer emits one flag word per element
           _cmd+=($(_vmtui_journal_follow_cmd))
         else
-          _cmd+=(tail -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
+          # R90: 200 lines of backlog — the same as the journal window.
+          _cmd+=(tail -n 200 -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
         fi
         ;;
     esac
@@ -32701,7 +32716,7 @@ vmtui_debug_window() {
       if [[ "$_src" == "hotplug" ]]; then
         note "  $(_vmtui_journal_follow_cmd)"
       else
-        note "  tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
+        note "  tail -n 200 -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
       fi
         return 0
       fi
@@ -32724,7 +32739,7 @@ vmtui_debug_window() {
   if [[ "$_src" == "hotplug" ]]; then
     note "Journal stream (no terminal emulator found): $(_vmtui_journal_follow_cmd) in another terminal"
   else
-    note "Debug log (no terminal emulator found): tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE in another terminal"
+    note "Debug log (no terminal emulator found): tail -n 200 -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE in another terminal"
   fi
   return 0
 }

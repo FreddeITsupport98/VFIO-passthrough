@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R78 — bumped on every change; the full history is in changelog.md.
+# Revision: R79 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -484,7 +484,29 @@ SCRIPT_NAME="$(basename "$0")"
 # REMAINING wall-clock budget; if the subscription cannot deliver (old
 # libvirt / timeout), the R70 guest-ping poll loop runs VERBATIM as the
 # fallback. Same return contract: 0 = agent up, 2 = no channel, 1 = timeout.
-SCRIPT_REVISION="R78"
+# R79: Looking Glass AUTO-START (the user request: "automatic enabled looking
+# glass start when vm has booted so i dont have to click on looking glass
+# icon ... also auto hook scroll lock and give message to user that vm has
+# hooked mouse and keyboard now to vm ready to use press ctrl lock to unhook
+# from vm to use host linux"). New --install-lg-autostart installs a per-user
+# watcher + XDG autostart entry; the watcher waits for the DEFINITIVE
+# readiness (the VM running AND the Windows LG host app's KVMFR magic in the
+# IVSHMEM — not merely "virsh says running", so the client never opens onto a
+# black window), then launches the client DETACHED with the input-capture
+# Ctrl-lock preset (the mouse+keyboard are HOOKED at launch) and pops a
+# desktop notification with the exact requested message: the VM is ready,
+# input is hooked, Scroll Lock releases. It then waits for the session to end
+# (magic gone) and RE-ARMS — every VM boot in the session auto-starts Looking
+# Glass. Guardrails: no second window while a client is already running
+# (pgrep), a missing client notifies with the install command instead of
+# spinning, the R68 dual-location resolver + VM_TUI_LG_ARGS/VM_TUI_LG_BIN/
+# VM_TUI_LG_SHM/VFIO_LG_AUTOSTART_POLL are honored, everything logs to
+# /tmp/vm-tui.log. The watcher runs IN THE USER SESSION (autostart entry for
+# the SUDO_USER desktop user; the R61 session-env discovery is used when the
+# sudo install starts it immediately) — never as root, so the client and the
+# notification land on the real desktop. --remove-lg-autostart,
+# --uninstall-self and --reset all sweep it.
+SCRIPT_REVISION="R79"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -812,6 +834,18 @@ VM_TUI_LG_HELP_TIMEOUT="${VM_TUI_LG_HELP_TIMEOUT:-15}"
 VMTUI_LG_QUIET=0
 # Args captured after --vm-tui (subcommand + domain); parse_args fills this.
 declare -ag VMTUI_ARGS=()
+# R79: Looking Glass AUTO-START — a per-user watcher (autostarted at login)
+# that launches the Looking Glass client automatically the moment the guest
+# VM is booted AND its Windows LG host app has initialized the IVSHMEM (the
+# R73 KVMFR magic — the definitive "booted + display pipeline up" signal),
+# with the input-capture (Ctrl lock) preset, and notifies the user that the
+# mouse + keyboard are hooked (Scroll Lock releases). Installed by
+# --install-lg-autostart; removed by --remove-lg-autostart, --uninstall-self
+# and --reset. The watcher itself runs IN THE USER SESSION (no root): virsh
+# is read-only here and the LG client must open on the user's desktop.
+LG_AUTOSTART_WATCHER="/usr/local/bin/vfio-lg-autostart"
+# Per-user XDG autostart entry (same pattern as the tray's) — the actual path
+# is resolved per-desktop-user at install time (SUDO_USER).
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
 # PATH for both root and users; the generated boot-time helpers stay in
 # /usr/local/sbin) and drops the
@@ -830,7 +864,7 @@ RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completion
 RECOMMENDED_MODE=0   # 1=--recommended: auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (R39)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | reset-systemd-boot-entries | usb-mitigation-status | doctor | install-doctor-timer | remove-doctor-timer | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | vm-tui | install-self | uninstall-self | completion printers
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | reset-systemd-boot-entries | usb-mitigation-status | doctor | install-doctor-timer | remove-doctor-timer | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | vm-tui | install-self | uninstall-self | completion printers | install-lg-autostart | remove-lg-autostart
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -1664,7 +1698,7 @@ print_fish_completion() {
 # fish completion for $cmd (generated by $SCRIPT_NAME)
 complete -c $cmd -f
 # On bare-space TAB (current token has no leading dash) list every flag; once a dash is typed the per-flag -l lines below take over (with descriptions + argument completions).
-complete -c $cmd -n "string match -vq -- '-*' (commandline -ct)" -a "--help --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --recommended --reset-usb-mitigation --reset-systemd-boot-entries --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
+complete -c $cmd -n "string match -vq -- '-*' (commandline -ct)" -a "--help --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --install-lg-autostart --remove-lg-autostart --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --recommended --reset-usb-mitigation --reset-systemd-boot-entries --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
 complete -c $cmd -s h -l help -d 'Show help'
 complete -c $cmd -l debug -d 'Enable verbose debug logging'
 complete -c $cmd -l dry-run -d 'Show actions without changing the system'
@@ -1706,6 +1740,8 @@ complete -c $cmd -l install-looking-glass -d 'Set up Looking Glass host side: sh
 complete -c $cmd -l remove-looking-glass -d 'Remove Looking Glass host-side setup (detach shmem + shared-memory node + security rules + user config)'
 complete -c $cmd -l install-looking-glass-client -d 'Install/compile the looking-glass-client binary (dnf COPR / AUR / source compile)'
 complete -c $cmd -l remove-looking-glass-client -d 'Remove the self-compiled looking-glass-client binary (stops running instances first)'
+complete -c $cmd -l install-lg-autostart -d 'Per-user watcher: auto-launch Looking Glass when the VM is booted + host app ready (Ctrl lock + notification)'
+complete -c $cmd -l remove-lg-autostart -d 'Remove the Looking Glass auto-start watcher + autostart entry'
 complete -c $cmd -l menu -d 'Interactive menu — pick what to do without running the whole wizard'
 complete -c $cmd -l install-self -d 'Install this script to /usr/local/bin/vfio + shell completions (auto-load)'
 complete -c $cmd -l uninstall-self -d 'Remove the self-installed vfio.sh + completion files'
@@ -1766,7 +1802,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-systemd-boot-entries --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --install-lg-autostart --remove-lg-autostart --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-systemd-boot-entries --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--tui" ]]; then
     COMPREPLY=(\$(compgen -W "whiptail dialog" -- "\$cur"))
@@ -1811,6 +1847,8 @@ _vfio_sh_complete() {
     '--vm-manager[Alias of --vm-tui (built-in VM manager)]' \\
     '--tui=[Force the TUI backend for the interactive flows]:backend:(whiptail dialog)' \\
     '--yes[With --vm-tui: skip the destroy/reset confirmations (automation)]' \\
+    '--install-lg-autostart[Per-user watcher: auto-launch Looking Glass when the VM is booted + host app ready (Ctrl lock + notification)]' \\
+    '--remove-lg-autostart[Remove the Looking Glass auto-start watcher + autostart entry]' \\
     '--boot-vga-policy=[Install-mode Boot-VGA policy override]:policy:(auto strict)' \\\
     '--graphics-protocol=[Install-mode graphics protocol override]:protocol:(auto x11 wayland)' \\
     '--graphics-daemon-interval=[Set graphics daemon polling interval in seconds (1-3600)]:seconds:(5 10 15 30 60)' \\
@@ -2531,7 +2569,7 @@ prompt_yn() {
 usage() {
   say "Revision: $SCRIPT_REVISION"
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [command] [domain]] [--tui whiptail|dialog] [--yes] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-virtio-net] [--no-ultimate-perf-virtio-net] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--install-doctor-timer] [--remove-doctor-timer] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [command] [domain]] [--tui whiptail|dialog] [--yes] [--install-lg-autostart] [--remove-lg-autostart] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-virtio-net] [--no-ultimate-perf-virtio-net] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--install-doctor-timer] [--remove-doctor-timer] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -2746,6 +2784,18 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [com
                   removes /usr/local/bin/looking-glass-client ONLY if it is NOT owned by a distro
                   package (rpm -qf / dpkg -S check) — a package-managed binary must be removed via
                   your package manager, not by this script.
+  --install-lg-autostart
+                   Install the per-user Looking Glass AUTO-START watcher: at login it
+                   waits until the guest VM is booted AND the Windows Looking Glass
+                   host app is up (the shared-memory readiness signal — not merely
+                   "running"), then launches the client automatically with the
+                   input-capture Ctrl-lock preset and pops a notification that the
+                   mouse + keyboard are hooked to the VM (Scroll Lock releases
+                   them). Re-arms after every VM stop — no icon-clicking ever.
+                   Configure: VM_TUI_LG_ARGS / VM_TUI_LG_BIN / VM_TUI_LG_SHM /
+                   VFIO_LG_AUTOSTART_POLL.
+  --remove-lg-autostart
+                   Remove the Looking Glass auto-start watcher + its autostart entry.
   --menu
                   Interactive menu — pick what to do without running the whole wizard or
                   remembering individual flags. This is also the default when you run vfio
@@ -3123,6 +3173,12 @@ parse_args() {
         ;;
       --remove-looking-glass-client)
         MODE="remove-looking-glass-client"
+        ;;
+      --install-lg-autostart)
+        MODE="install-lg-autostart"
+        ;;
+      --remove-lg-autostart)
+        MODE="remove-lg-autostart"
         ;;
       --vm-tui|--vm-manager)
         # R69: built-in VM manager. Everything AFTER this flag is the vm-tui
@@ -16061,6 +16117,9 @@ remove_live_attach() {
   fi
   # R41: remove the system-tray applet + polkit policy + autostart.
   remove_live_attach_tray
+  # R79: --reset also removes the Looking Glass auto-start watcher + its
+  # autostart entries (best-effort, never fatal — same pattern as the tray).
+  remove_lg_autostart
   # Flip the conf key back to 0.
   if readable_file "$CONF_FILE" && grep -Eq '^VFIO_DYNAMIC_LIVE_ATTACH="1"' "$CONF_FILE" 2>/dev/null; then
     rewrite_conf_key "VFIO_DYNAMIC_LIVE_ATTACH" "0"
@@ -20209,6 +20268,305 @@ remove_looking_glass_client() {
   fi
   # R48m: also remove the .desktop application-menu shortcut we installed.
   _lg_remove_desktop_entry
+}
+
+# R79: install the Looking Glass AUTO-START watcher + its per-user autostart
+# entry. The watcher is a small user-session daemon (see the heredoc below for
+# the full design notes): it waits until the target VM is running AND the
+# Windows LG host app has initialized the IVSHMEM (the KVMFR magic — the
+# definitive readiness signal, NOT merely "virsh says running"), then
+# launches the client detached with the Ctrl-lock preset and pops a desktop
+# notification telling the operator the input is hooked and how to release it
+# (Scroll Lock). It then waits for the VM to stop and re-arms — so every VM
+# boot gets an automatic Looking Glass launch for the whole session, without
+# the user ever clicking the Looking Glass icon.
+install_lg_autostart() {
+  # NOTE: require_root re-execs `sudo -E "$0" "$@"`, so the MODE FLAG must be
+  # passed explicitly (this function is called with no args from the dispatch;
+  # a bare `require_root "$@"` would re-exec with NO flag -> the menu -> an
+  # ask-loop. SC2120 caught exactly this).
+  require_root --install-lg-autostart
+  require_writable_root_or_die
+
+  hdr "Looking Glass auto-start (per-user watcher)"
+
+  # Target VM: prefer the explicitly-detected guest-GPU VM (the first from the
+  # shared enumerator); fall back to the live-attach list's first entry; die
+  # with guidance if neither exists (there is nothing to watch).
+  local _dom="" _xml
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || true
+    break
+  done < <(_list_guest_gpu_vms)
+  if [[ -z "$_dom" ]] && [[ -f "${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}" ]]; then
+    _dom="$(head -n1 "${LIVE_ATTACH_VM_LIST:-/var/lib/vfio-dynamic/live-attach-vms}" 2>/dev/null || true)"
+  fi
+  [[ -n "$_dom" ]] || die "No guest-GPU VM detected (and no live-attach VM list). Run the full installer or --install-dynamic-binding first — the watcher needs a VM to watch."
+
+  # Resolve the desktop user (the autostart + notification target): SUDO_USER
+  # by default; the session-scan fallback keeps a pure-root install honest.
+  local _user="${SUDO_USER:-}"
+  if [[ -z "$_user" || "$_user" == "root" ]]; then
+    _user=""
+    local _rt _uid _cand
+    for _rt in /run/user/*; do
+      [[ -d "$_rt" ]] || continue
+      _uid="$(basename "$_rt")"
+      [[ "$_uid" =~ ^[0-9]+$ && "$_uid" != "0" ]] || continue
+      _cand="$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1 || true)"
+      if [[ -n "$_cand" ]]; then
+        _user="$_cand"
+        break
+      fi
+    done
+  fi
+  [[ -n "$_user" ]] || die "No desktop user found (SUDO_USER unset and no active graphical session). The watcher + its notification must run in your desktop session. Re-run via sudo from your user terminal."
+
+  # The watcher: a standalone script (NEVER sources vfio.sh — it runs as the
+  # user at login). Every design decision is documented inline.
+  write_file_atomic "$LG_AUTOSTART_WATCHER" 0755 "root:root" <<'WATCHEREOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Managed by vfio.sh (R79) — Looking Glass auto-start watcher.
+# Runs IN THE USER SESSION (autostarted at login; NEVER as root — the client
+# must open on the user's desktop). Usage: vfio-lg-autostart <domain>
+# Removed by: --remove-lg-autostart / --uninstall-self / --reset.
+#
+# Loop design (one iteration = one VM session):
+#  1. WAIT: poll every VFIO_LG_AUTOSTART_POLL seconds (default 3) until the
+#     VM is 'running' AND the Windows LG host app has initialized the IVSHMEM
+#     — the KVMFR magic (4b564d4652) in the first 5 bytes of the shared-memory
+#     device. This is the R73 DEFINITIVE readiness signal: 'running' alone
+#     only means qemu started; the magic means the guest's display pipeline
+#     is actually up, so the client opens onto a live image instead of a
+#     black window. The shm device resolves: $VM_TUI_LG_SHM > the standard
+#     /dev/shm/looking-glass > any /dev/shm file that begins with the magic.
+#  2. LAUNCH (once per session): if a client is already running (the user
+#     clicked the icon first, or a previous session's client survived), skip
+#     — never a second window. The client launches detached (setsid) with the
+#     Ctrl-lock preset (input capture ON: captureOnFocus + autoCapture +
+#     grabKeyboard + captureOnStart — the mouse+keyboard are HOOKED at
+#     launch), honoring VM_TUI_LG_BIN / VM_TUI_LG_ARGS, logging to
+#     /tmp/vm-tui.log. Desktop notification (notify-send, best-effort):
+#     "VM '<dom>' is ready — Looking Glass started. Mouse and keyboard are
+#     now HOOKED to the VM (input capture is ON). Press Scroll Lock to
+#     release them and use the host Linux desktop."
+#  3. RE-ARM: after launching, wait until the KVMFR magic is GONE (the VM
+#     stopped / the host app shut down), then loop back to step 1 — so the
+#     next VM boot auto-starts Looking Glass again. A single desktop session
+#     covers any number of VM boots.
+# All waits are sleep-poll loops with short intervals — this is a login-time
+# user daemon, so a few wakeups per minute are negligible (same cost class
+# as the tray applet's 2s timer).
+
+DOMAIN="${1:-}"
+[[ -n "$DOMAIN" ]] || { echo "vfio-lg-autostart: missing <domain> argument" >&2; exit 1; }
+POLL="${VFIO_LG_AUTOSTART_POLL:-3}"
+[[ "$POLL" =~ ^[0-9]+$ ]] || POLL=3
+LOG_FILE="${VM_TUI_LOG:-/tmp/vm-tui.log}"
+# The input-capture ("Ctrl lock") preset — identical to the vm-tui manager's
+# default (verified against the installed B7 client's option table).
+LG_ARGS="${VM_TUI_LG_ARGS:--o input:captureOnFocus=yes -o input:autoCapture=yes -o input:grabKeyboard=yes -o spice:captureOnStart=yes}"
+
+log() { printf '%s autostart: %s\n' "$(date -Is)" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+
+# Resolve the LG client binary: explicit override > self-compiled > packaged
+# > PATH (the R68 dual-location resolution, replicated standalone).
+lg_bin() {
+  local _c
+  if [[ -n "${VM_TUI_LG_BIN:-}" && -x "${VM_TUI_LG_BIN:-}" ]]; then
+    printf '%s\n' "$VM_TUI_LG_BIN"
+    return 0
+  fi
+  for _c in /usr/local/bin/looking-glass-client /usr/bin/looking-glass-client; do
+    if [[ -x "$_c" ]]; then
+      printf '%s\n' "$_c"
+      return 0
+    fi
+  done
+  if command -v looking-glass-client >/dev/null 2>&1; then
+    command -v looking-glass-client
+    return 0
+  fi
+  return 1
+}
+
+# Resolve the VM's shared-memory device: override > standard node > any
+# /dev/shm file that begins with the KVMFR magic (custom shmem names).
+shm_file() {
+  local _f _hex
+  if [[ -n "${VM_TUI_LG_SHM:-}" && -f "${VM_TUI_LG_SHM:-}" ]]; then
+    printf '%s\n' "$VM_TUI_LG_SHM"
+    return 0
+  fi
+  if [[ -f /dev/shm/looking-glass ]]; then
+    printf '%s\n' "/dev/shm/looking-glass"
+    return 0
+  fi
+  for _f in /dev/shm/*; do
+    [[ -f "$_f" ]] || continue
+    _hex="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
+    if [[ "$_hex" == "4b564d4652" ]]; then
+      printf '%s\n' "$_f"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Is the Windows LG host app up? (KVMFR magic present in the resolved device.)
+host_app_ready() {
+  local _f _hex
+  _f="$(shm_file)"
+  [[ -n "$_f" ]] || return 1
+  _hex="$(od -An -tx1 -N5 "$_f" 2>/dev/null | tr -d ' \n')"
+  [[ "$_hex" == "4b564d4652" ]]
+}
+
+# Is the VM running?
+vm_running() {
+  LC_ALL=C virsh -c qemu:///system domstate "$DOMAIN" 2>/dev/null | head -n1 | grep -qx 'running'
+}
+
+# Is a Looking Glass client already running? (never launch a second window)
+lg_running() {
+  pgrep -u "$(id -un)" -f 'looking-glass-client' >/dev/null 2>&1
+}
+
+notify() { # best-effort — a missing notify-send never breaks the watcher
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -u normal -t 10000 "$1" "$2" >/dev/null 2>&1 || true
+}
+
+log "watcher started for domain '$DOMAIN' (poll=${POLL}s, user $(id -un))"
+
+while :; do
+  # --- 1. WAIT for the definitive readiness (running + KVMFR) ---
+  while :; do
+    if vm_running && host_app_ready; then
+      break
+    fi
+    sleep "$POLL"
+  done
+  log "domain '$DOMAIN' is running and the guest host app is ready (KVMFR)"
+
+  # --- 2. LAUNCH (once) ---
+  if lg_running; then
+    log "client already running — skipping the auto-launch (no second window)"
+    notify "Looking Glass" "The VM is ready, but a Looking Glass window is already open — not launching a second one."
+  elif ! _bin="$(lg_bin)"; then
+    log "no looking-glass-client found — auto-start disabled until one is installed"
+    notify "Looking Glass auto-start" "The VM is ready, but no looking-glass-client is installed. Install it: sudo vfio --install-looking-glass-client"
+    # Do not spin: wait for the readiness to pass (VM stop) before retrying.
+    while host_app_ready; do sleep "$POLL"; done
+  else
+    printf '%s launch: domain=%s user=%s bin=%s args=%s (autostart)\n' "$(date -Is)" "$DOMAIN" "$(id -un)" "$_bin" "$LG_ARGS" >>"$LOG_FILE" 2>/dev/null || true
+    # shellcheck disable=SC2086 # intentional word-split: LG_ARGS is a space-joined flag list
+    setsid "$_bin" $LG_ARGS </dev/null >>"$LOG_FILE" 2>&1 &
+    log "client launched detached with the Ctrl-lock preset"
+    notify "Looking Glass auto-started" "VM '$DOMAIN' is ready — mouse and keyboard are now HOOKED to the VM (input capture is ON). Press Scroll Lock to release them and use the host Linux desktop."
+  fi
+
+  # --- 3. RE-ARM: wait for the session to end (magic gone) ---
+  while :; do
+    if ! host_app_ready; then
+      break
+    fi
+    sleep "$POLL"
+  done
+  log "guest host app went away (VM stopped) — re-arming for the next boot"
+done
+WATCHEREOF
+  say "  ✔ Installed the watcher: $(_link "$LG_AUTOSTART_WATCHER") (target VM: $_dom)"
+
+  # Per-user XDG autostart entry (the tray's proven pattern): starts the
+  # watcher at desktop login, in the user session — never as root.
+  local _home _auto_dir _auto_file
+  _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$_home" && -d "$_home" ]] || die "Could not resolve the home directory for user '$_user'."
+  _auto_dir="$_home/.config/autostart"
+  _auto_file="$_auto_dir/vfio-lg-autostart.desktop"
+  if (( ! DRY_RUN )); then
+    mkdir -p "$_auto_dir" 2>/dev/null || true
+  fi
+  write_file_atomic "$_auto_file" 0644 "$_user:$(id -gn "$_user" 2>/dev/null || echo "$_user")" <<DESKEOF
+[Desktop Entry]
+Type=Application
+Name=VFIO Looking Glass Auto-Start
+Comment=Auto-launch Looking Glass when the guest VM is booted (Ctrl lock + notification)
+Exec=$LG_AUTOSTART_WATCHER $_dom
+Icon=video-display
+Terminal=false
+NoDisplay=false
+X-KDE-autostart-after=panel
+Categories=System;
+DESKEOF
+  say "  ✔ Installed autostart entry: $_auto_file (starts at login as $_user)"
+
+  # Best-effort: start the watcher NOW (so it works without re-logging-in),
+  # detached in the user session (the R61 display-env discovery so a sudo
+  # install does not launch it display-less).
+  if (( ! DRY_RUN )); then
+    local _env _uid _rt
+    _env="$(_tray_session_display_env "$_user" 2>/dev/null || true)"
+    _uid="$(id -u "$_user" 2>/dev/null || true)"
+    _rt="/run/user/${_uid}"
+    # shellcheck disable=SC2086 # intentional word-split: env assignments
+    setsid runuser -u "$_user" -- env ${_env:+$_env }XDG_RUNTIME_DIR="$_rt" "$LG_AUTOSTART_WATCHER" "$_dom" </dev/null >>/dev/null 2>&1 &
+    say "  ✔ Watcher started now for this session (it also starts at every login)."
+  fi
+
+  note "It launches Looking Glass automatically when '$_dom' is booted AND the Windows host"
+  note "app is up (the shared-memory readiness signal), with input capture ON, and notifies"
+  note "you that the mouse+keyboard are hooked (Scroll Lock releases). Configure with"
+  note "VM_TUI_LG_ARGS / VM_TUI_LG_BIN / VM_TUI_LG_SHM / VFIO_LG_AUTOSTART_POLL."
+  note "Remove any time with: sudo $SCRIPT_NAME --remove-lg-autostart"
+  return 0
+}
+
+# R79: remove the Looking Glass auto-start watcher + every per-user autostart
+# entry (SUDO_USER + all /home users, the tray's removal pattern). Best-effort
+# / never fatal. Called by --remove-lg-autostart, --uninstall-self and --reset.
+remove_lg_autostart() {
+  require_root --remove-lg-autostart
+  require_writable_root_or_die
+  local _removed=0 _user _home _auto_file _d _u
+  # Stop any running watcher instances (best-effort; end-anchored pattern so
+  # this pkill never matches itself or unrelated processes).
+  if have_cmd pkill; then
+    pkill -f "${LG_AUTOSTART_WATCHER} \\$" 2>/dev/null || true
+  fi
+  if [[ -f "$LG_AUTOSTART_WATCHER" ]]; then
+    run rm -f "$LG_AUTOSTART_WATCHER" 2>/dev/null || true
+    _removed=1
+  fi
+  _user="${SUDO_USER:-}"
+  if [[ -n "$_user" && "$_user" != "root" ]]; then
+    _home="$(getent passwd "$_user" 2>/dev/null | cut -d: -f6 || true)"
+    if [[ -n "$_home" ]]; then
+      _auto_file="$_home/.config/autostart/vfio-lg-autostart.desktop"
+      if [[ -f "$_auto_file" ]]; then
+        run rm -f "$_auto_file" 2>/dev/null || true
+        _removed=1
+      fi
+    fi
+  fi
+  for _d in /home/*; do
+    [[ -d "$_d" ]] || continue
+    _u="$(basename "$_d")"
+    _auto_file="$_d/.config/autostart/vfio-lg-autostart.desktop"
+    if [[ -f "$_auto_file" ]]; then
+      run rm -f "$_auto_file" 2>/dev/null || true
+      _removed=1
+    fi
+  done
+  if (( _removed )); then
+    note "Removed the Looking Glass auto-start watcher + autostart entries."
+  else
+    note "No Looking Glass auto-start artifacts found; nothing to remove."
+  fi
+  return 0
 }
 
 # R40b/R42: Set the VM's <video> model to 'none' (no virtual video card — the
@@ -31236,6 +31594,7 @@ uninstall_self() {
   note "  - ${FISH_COMPLETION_DIR}/${_installed_cmd}.fish"
   note "  - ${BASH_COMPLETION_DIR}/${_installed_cmd}"
   note "  - ${ZSH_COMPLETION_DIR}/_${_installed_cmd}"
+  note "  - the Looking Glass auto-start watcher + its autostart entries (R79)"
   note "  - the built-in VM manager's (vm-tui) runtime artifacts: $VM_TUI_LOG_FILE"
   note "    + the remembered VM state (last-vm + recent-vms; R69/R70)"
   note "It does NOT remove the VFIO config (use --reset) or your repo copy."
@@ -31257,6 +31616,10 @@ uninstall_self() {
   say "Removed self-installed vfio + completion files."
   # R45: also remove the self-installed CLI's timestamped .bak.* litter.
   _wipe_script_backups "$SELF_INSTALL_BIN"
+  # R79: sweep the Looking Glass auto-start watcher + its autostart entries
+  # (the shared remove_lg_autostart does the watcher + every user's desktop
+  # entry; best-effort, never fatal).
+  remove_lg_autostart
   # R69/R70: sweep the built-in VM manager's (vm-tui) user-side artifacts: the
   # LG client launch log + the remembered VM state (last-vm + the recent-vms
   # MRU list, resolved to the REAL user's config dir the same way the manager
@@ -34427,6 +34790,20 @@ main() {
     require_root "$@"
     require_writable_root_or_die
     remove_looking_glass_client
+    exit 0
+  fi
+
+  if [[ "$MODE" == "install-lg-autostart" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    install_lg_autostart
+    exit 0
+  fi
+
+  if [[ "$MODE" == "remove-lg-autostart" ]]; then
+    require_root "$@"
+    require_writable_root_or_die
+    remove_lg_autostart
     exit 0
   fi
 

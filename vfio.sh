@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R85 — bumped on every change; the full history is in changelog.md.
+# Revision: R86 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -593,7 +593,18 @@ SCRIPT_NAME="$(basename "$0")"
 # _vmtui_journal_follow_cmd printer, so the spawned command (all three
 # terminal variants), the dedup pattern (the printer's exact output), and
 # both manual fallback notes all get it from the one place.
-SCRIPT_REVISION="R85"
+# R86 (the live follow-up to the R84/R85 window round, asked while using
+# it: "does need to start vm to window to open?"): the transient
+# "Running: <action> ..." infobox no longer claims VM involvement for
+# EVERY action. The old FIXED clause "(the VM / Looking Glass may need a
+# moment)" — R74 boilerplate — made picking Debug log look like a VM had
+# to be started (it does not: the debug windows open at the enable flip,
+# no VM involved). The hint is now a PER-ACTION argument (3rd arg to
+# vmtui_menu_action): the VM/LG actions pass their own SPECIFIC text
+# (start / shutdown / start-lg / lg), and the fast/local actions (All
+# VMs, Force shutdown, Force reset, VM state, Debug log) show a plain
+# "Running: ..." with no claim.
+SCRIPT_REVISION="R86"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -33929,13 +33940,26 @@ vmtui_msgbox() {
 # shows the error instead of the whole manager quitting (the R49
 # guarded-subshell philosophy, now applied to the vm-tui loop in BOTH modes;
 # the CLI subcommands keep their die-to-exit behavior).
-# $1 = box title, $2 = pause flag (pause|nopause), $3... = the command.
+# $1 = box title, $2 = pause flag (pause|nopause), $3 = the transient
+# infobox hint (REQUIRED at every call site, may be EMPTY — R86: the old
+# FIXED "(the VM / Looking Glass may need a moment)" clause claimed VM
+# involvement for EVERY action, which misled on Debug log / All VMs / VM
+# state — the live report read Debug log's box as "does a VM need to
+# start for the window to open?". Actions that actually wait on the VM or
+# the Looking Glass client pass their own SPECIFIC hint; fast/local
+# actions pass "" and the box makes no claim), $4... = the command.
 vmtui_menu_action() {
-  local _title="$1" _pause="$2"; shift 2
+  local _title="$1" _pause="$2" _hint="$3"; shift 3
   local _out="" _verdict=""
   vmtui_dbg "action: start '$_title' (cmd: $*)"
   if vmtui_tui_active; then
-    "$TUI_BIN" --title "$_title" --infobox "Running: $_title ... (the VM / Looking Glass may need a moment)" 6 64 3>&1 1>&2 2>&3 || true
+    # R86: per-action infobox text — the hint (when any) appends in
+    # parentheses; an empty hint makes no VM/LG claim at all.
+    local _ib="Running: $_title ..."
+    if [[ -n "$_hint" ]]; then
+      _ib="Running: $_title ... ($_hint)"
+    fi
+    "$TUI_BIN" --title "$_title" --infobox "$_ib" 6 64 3>&1 1>&2 2>&3 || true
     # R75: keep a handle to the REAL terminal (stderr) around the capture —
     # inside the command substitution below, stdout AND stderr are the PIPE,
     # so progress dialogs painted via the normal fd dance would be swallowed
@@ -34014,19 +34038,19 @@ vmtui_menu_loop() {
     fi
     vmtui_dbg "menu: choice '${_choice:-}'"
     case "${_choice:-}" in
-      1) vmtui_menu_action "All VMs" pause vmtui_act_list
+      1) vmtui_menu_action "All VMs" pause "" vmtui_act_list
          ;;
-      2) if _dom="$(vmtui_pick "Start VM")"; then vmtui_menu_action "Start VM" nopause vmtui_act_start "$_dom"; fi ;;
-      3) if _dom="$(vmtui_pick "Shutdown VM")"; then vmtui_menu_action "Shutdown VM" nopause vmtui_act_shutdown "$_dom"; fi ;;
-      4) if _dom="$(vmtui_pick "Force shutdown")"; then vmtui_menu_action "Force shutdown" nopause vmtui_act_destroy "$_dom"; fi ;;
-      5) if _dom="$(vmtui_pick "Force reset")"; then vmtui_menu_action "Force reset" nopause vmtui_act_reset "$_dom"; fi ;;
-      6) if _dom="$(vmtui_pick "Start VM + Looking Glass")"; then vmtui_menu_action "Start VM + Looking Glass" nopause vmtui_act_start_lg "$_dom"; fi ;;
-      7) if _dom="$(vmtui_pick "Looking Glass only")"; then vmtui_menu_action "Looking Glass only" nopause vmtui_act_lg_only "$_dom"; fi ;;
+      2) if _dom="$(vmtui_pick "Start VM")"; then vmtui_menu_action "Start VM" nopause "starting the VM may take a moment" vmtui_act_start "$_dom"; fi ;;
+      3) if _dom="$(vmtui_pick "Shutdown VM")"; then vmtui_menu_action "Shutdown VM" nopause "the graceful shutdown waits for the guest OS to stop" vmtui_act_shutdown "$_dom"; fi ;;
+      4) if _dom="$(vmtui_pick "Force shutdown")"; then vmtui_menu_action "Force shutdown" nopause "" vmtui_act_destroy "$_dom"; fi ;;
+      5) if _dom="$(vmtui_pick "Force reset")"; then vmtui_menu_action "Force reset" nopause "" vmtui_act_reset "$_dom"; fi ;;
+      6) if _dom="$(vmtui_pick "Start VM + Looking Glass")"; then vmtui_menu_action "Start VM + Looking Glass" nopause "the VM + Windows boot waits can take a few minutes" vmtui_act_start_lg "$_dom"; fi ;;
+      7) if _dom="$(vmtui_pick "Looking Glass only")"; then vmtui_menu_action "Looking Glass only" nopause "the launch + liveness check takes a few seconds" vmtui_act_lg_only "$_dom"; fi ;;
       8) if _dom="$(vmtui_pick "Show VM state")"; then
-           vmtui_menu_action "VM state" pause vmtui_act_state "$_dom"
+           vmtui_menu_action "VM state" pause "" vmtui_act_state "$_dom"
          fi
          ;;
-      9) vmtui_menu_action "Debug log" pause vmtui_debug_show
+      9) vmtui_menu_action "Debug log" pause "" vmtui_debug_show
          ;;
       0|"") say "Exiting VM manager."; return 0 ;;
       *) if vmtui_tui_active; then

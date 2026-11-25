@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R83 — bumped on every change; the full history is in changelog.md.
+# Revision: R84 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -559,7 +559,33 @@ SCRIPT_NAME="$(basename "$0")"
 # the window shows journalctl's own honest permission notice (root reads the
 # full journal; from the root menu the window is spawned as the desktop user
 # by design — the note explains the limitation).
-SCRIPT_REVISION="R83"
+# R84 (the accepted free-rein follow-up, "rework log so it captures all
+# events — do what you want"): ALL-EVENTS LOGGING. (1) The hotplug debug
+# window now follows EVERY journal tag the script's generated components
+# log under — the new VFIO_JOURNAL_TAGS constant (vfio-dynamic bind/hook
+# + vfio-live-attach helper + vfio-reboot-flr + vfio-park-keepalive
+# monitors) is the single source of truth, and _vmtui_journal_follow_cmd
+# builds the journalctl -f -t <tag>... command from it, so ONE window shows
+# the ENTIRE hotplug chain (previously only vfio-live-attach was followed).
+# (2) The debug event log now captures every remaining manager decision
+# point: the session resolution (target user + display env + the refusal),
+# the agent-wait outcome, the KVMFR host-app state, the post-launch
+# connection check, the liveness check (alive / died / retry), the last-VM
+# remember, and the MRU prune — coverage went from menu/action/verify/launch
+# to every branch a failure can hide in — and the generated live-attach
+# helper's failure notifications now name BOTH relevant journal tags (its
+# own vfio-live-attach + the bind script's vfio-dynamic). (3) Bugs caught
+# during the round
+# (the recurring class, all caught by the pre-validation re-read): (a) the
+# first draft appended the helper function NAME literally to the spawn array
+# (_cmd+=(fn) appends a WORD, not the command — must be $()); (b) the printer
+# emitted only the FLAGS, not the journalctl word itself — konsole --hold -e
+# would have run "-f" AS the command, so the printer now emits the FULL
+# journalctl command; (c) the hotplug dedup pattern still described the OLD
+# single-tag command line and would never match the all-tags spawn (repeated
+# toggles would stack windows) — the guard now pgrep-matches the printer's
+# exact output. All fixed before validation ran.
+SCRIPT_REVISION="R84"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -897,6 +923,16 @@ declare -ag VMTUI_ARGS=()
 # and --reset. The watcher itself runs IN THE USER SESSION (no root): virsh
 # is read-only here and the LG client must open on the user's desktop.
 LG_AUTOSTART_WATCHER="/usr/local/bin/vfio-lg-autostart"
+# R84: EVERY journal tag this script's generated components log under — the
+# single source of truth for the debug window's hotplug stream (one window,
+# the entire hotplug chain: bind script + hook runtime [vfio-dynamic], the
+# live-attach helper [vfio-live-attach], the reboot-FLR monitor
+# [vfio-reboot-flr], and the park-keepalive monitor [vfio-park-keepalive]).
+# Update BOTH the tag list AND the generated script's logger -t when a new
+# component is added (grep "logger -t" to find them all; the generated
+# helper's failure-notify hints name the failure-relevant tags too — grep
+# "Check: journalctl").
+VFIO_JOURNAL_TAGS="vfio-dynamic vfio-live-attach vfio-reboot-flr vfio-park-keepalive"
 # Per-user XDG autostart entry (same pattern as the tray's) — the actual path
 # is resolved per-desktop-user at install time (SUDO_USER).
 # Self-install: --install-self copies this script to /usr/local/bin/vfio (on
@@ -12895,7 +12931,7 @@ if (( _bind_rc != 0 )); then
   printf '%s\n' "$_bind_out" | while IFS= read -r _line; do
     [[ -n "$_line" ]] && jlog "live-attach: bind: $_line"
   done
-  _notify_desktop "GPU hot-plug failed" "Failed to bind the GPU to vfio-pci for VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach" critical
+  _notify_desktop "GPU hot-plug failed" "Failed to bind the GPU to vfio-pci for VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach -t vfio-dynamic" critical
   exit 1
 fi
 jlog "live-attach: GPU bound to vfio-pci, proceeding to hot-attach"
@@ -13017,7 +13053,7 @@ if [[ -s "$GPU_XML" ]]; then
     else
       jlog "live-attach: FAILED to attach GPU to '$DOMAIN' (rc=$_rc)"
     fi
-    _notify_desktop "GPU hot-plug failed" "Failed to hot-attach the GPU to VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach" critical
+    _notify_desktop "GPU hot-plug failed" "Failed to hot-attach the GPU to VM '$DOMAIN' (rc=$_rc). Check: journalctl -t vfio-live-attach -t vfio-dynamic" critical
     exit 1
   fi
 fi
@@ -32383,7 +32419,7 @@ vmtui_debug_show() {
       if vmtui_tui_active; then
         _wsrc="$($TUI_BIN --title "Debug windows" --menu "Which log windows to open?" 14 70 4 \
           "1" "Manager logs (debug events + Looking Glass client)" \
-          "2" "GPU hotplug journal (vfio-live-attach)" \
+          "2" "GPU hotplug journal (all component tags)" \
           "3" "Both (two windows)" \
           "0" "None (logging only, no windows)" 3>&1 1>&2 2>&3)" || true
       else
@@ -32417,6 +32453,24 @@ vmtui_debug_show() {
   say "Clear it with: rm $VM_TUI_DEBUG_LOG"
 }
 
+# R84: the journal-follow command for the hotplug debug window — prints the
+# FULL journalctl command (the journalctl word + -f + "-t <tag>" per
+# VFIO_JOURNAL_TAGS tag), meant to be called inside an array append:
+# _cmd+=($(_vmtui_journal_follow_cmd)). A printer emitting only the FLAGS
+# (the first draft) would make konsole --hold -e run "-f" AS the command.
+# Kept as a printer so every terminal variant (konsole/gnome-terminal/xterm)
+# gets the identical stream from the single VFIO_JOURNAL_TAGS source of truth
+# — and the hotplug dedup guard reuses this IDENTICAL output as its pgrep
+# pattern, so the guard always matches what is actually spawned.
+_vmtui_journal_follow_cmd() {
+  local _tag _out=(journalctl -f)
+  # shellcheck disable=SC2086 # intentional word-split: the tag list is space-separated by design
+  for _tag in $VFIO_JOURNAL_TAGS; do
+    _out+=(-t "$_tag")
+  done
+  printf '%s\n' "${_out[*]}"
+}
+
 # R75: the secondary debug WINDOW — when debug is enabled and a desktop
 # terminal emulator exists, open a DETACHED window tailing the logs LIVE so
 # every event + detailed error is visible while the manager runs.
@@ -32441,9 +32495,10 @@ vmtui_debug_window() {
   # R83: $1 (optional) selects the SOURCE whose tail window to open:
   #   "manager" (default) -> tail -F BOTH /tmp logs (debug events + LG
   #                          client launch log — one window, per-file headers)
-  #   "hotplug"            -> journalctl -t vfio-live-attach -f (the GPU
-  #                          hotplug helper's journal — the third stream the
-  #                          R82 follow-up asked for; needs journalctl, may
+  #   "hotplug"            -> journalctl -f -t <tag> for EVERY VFIO_JOURNAL_TAGS
+  #                          tag (R84: the whole hotplug chain — bind/hook,
+  #                          live-attach helper, reboot-FLR + park-keepalive
+  #                          monitors — in ONE stream; needs journalctl, may
   #                          need root for the system journal — the window is
   #                          spawned AS THE MANAGER USER via a terminal that
   #                          runs journalctl directly; if the journal is
@@ -32456,8 +32511,18 @@ vmtui_debug_window() {
   local _tail_pat _win_title
   case "$_src" in
     hotplug)
-      _tail_pat="journalctl -t vfio-live-attach"
-      _win_title="VFIO hotplug journal"
+      # R84: ALL the script's journal tags in ONE stream — the complete
+      # hotplug chain (bind/hook, live-attach helper, reboot-FLR +
+      # park-keepalive monitors), built from the VFIO_JOURNAL_TAGS constant
+      # so a new component's tag lands here automatically.
+      # R84 dedup fix: the pattern must match the ALL-TAGS command line —
+      # the old literal "journalctl -t vfio-live-attach" no longer appears
+      # in it (the -f and the other -t pairs sit between the two), so the
+      # guard would never fire and repeated toggles would stack windows.
+      # The printer's EXACT output is the pattern: pgrep matches precisely
+      # what the window spawns, whatever the tag list becomes.
+      _tail_pat="$(_vmtui_journal_follow_cmd)"
+      _win_title="VFIO journal (all tags)"
       command -v journalctl >/dev/null 2>&1 || { note "No journalctl found — cannot tail the hotplug journal."; return 0; }
       ;;
     *)
@@ -32484,7 +32549,8 @@ vmtui_debug_window() {
       konsole)
         _cmd=(konsole --hold -e)
         if [[ "$_src" == "hotplug" ]]; then
-          _cmd+=(journalctl -t vfio-live-attach -f)
+          # shellcheck disable=SC2207 # intentional word-split: the printer emits one flag word per element
+          _cmd+=($(_vmtui_journal_follow_cmd))
         else
           _cmd+=(tail -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
         fi
@@ -32492,7 +32558,8 @@ vmtui_debug_window() {
       gnome-terminal)
         _cmd=(gnome-terminal --title "$_win_title" --)
         if [[ "$_src" == "hotplug" ]]; then
-          _cmd+=(journalctl -t vfio-live-attach -f)
+          # shellcheck disable=SC2207 # intentional word-split: the printer emits one flag word per element
+          _cmd+=($(_vmtui_journal_follow_cmd))
         else
           _cmd+=(bash -c "tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE")
         fi
@@ -32500,7 +32567,8 @@ vmtui_debug_window() {
       xterm)
         _cmd=(xterm -hold -T "$_win_title" -e)
         if [[ "$_src" == "hotplug" ]]; then
-          _cmd+=(journalctl -t vfio-live-attach -f)
+          # shellcheck disable=SC2207 # intentional word-split: the printer emits one flag word per element
+          _cmd+=($(_vmtui_journal_follow_cmd))
         else
           _cmd+=(tail -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
         fi
@@ -32516,11 +32584,11 @@ vmtui_debug_window() {
       local _win_user="${SUDO_USER:-}"
       if [[ -z "$_win_user" || "$_win_user" == "root" ]] || ! command -v runuser >/dev/null 2>&1; then
         note "Debug window: running as root without a usable desktop user — open it yourself:"
-        if [[ "$_src" == "hotplug" ]]; then
-          note "  journalctl -t vfio-live-attach -f"
-        else
-          note "  tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
-        fi
+      if [[ "$_src" == "hotplug" ]]; then
+        note "  $(_vmtui_journal_follow_cmd)"
+      else
+        note "  tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
+      fi
         return 0
       fi
       local _uid _rt
@@ -32532,14 +32600,15 @@ vmtui_debug_window() {
       setsid "${_cmd[@]}" </dev/null >/dev/null 2>&1 &
     fi
     if [[ "$_src" == "hotplug" ]]; then
-      note "Debug window open: following the GPU hotplug journal (journalctl -t vfio-live-attach -f)."
+      note "Debug window open: following ALL the script's journal tags live ($VFIO_JOURNAL_TAGS)."
+      note "  (bind/hook + live-attach helper + reboot-FLR + park-keepalive — one stream)."
     else
       note "Debug window open: tailing $VM_TUI_DEBUG_LOG + $VM_TUI_LOG_FILE live (close it any time)."
     fi
     return 0
   done
   if [[ "$_src" == "hotplug" ]]; then
-    note "Hotplug journal (no terminal emulator found): journalctl -t vfio-live-attach -f in another terminal"
+    note "Journal stream (no terminal emulator found): $(_vmtui_journal_follow_cmd) in another terminal"
   else
     note "Debug log (no terminal emulator found): tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE in another terminal"
   fi
@@ -33063,6 +33132,10 @@ vmtui_remember_vm() {
     fi
   done <<<"$_raw"
   printf '%s\n' "$_new" | head -n "$VM_TUI_RECENT_MAX" >"$_rf" 2>/dev/null || true
+  # R84: the MRU write is a decision point too (a picker that "forgot" a VM
+  # is debugged from here). File-only output — safe inside the callers'
+  # $( ) captures (stdout stays the picked-name channel).
+  vmtui_dbg "mru: remembered '$_dom' (recent-first, cap $VM_TUI_RECENT_MAX)"
 }
 
 # VM picker (TUI menu with state labels / plain numbered / last-VM default).
@@ -33132,6 +33205,7 @@ vmtui_pick() {
     if (( _pruned_any )); then
       printf '%s\n' "$_pruned" | head -n "$VM_TUI_RECENT_MAX" >"$(_vmtui_recent_vm_file)" 2>/dev/null || true
       note "Pruned removed/renamed VM(s) from the recent list." >&2
+      vmtui_dbg "mru: pruned stale entries (a remembered VM no longer exists in the virsh list)"
     fi
   fi
 
@@ -33491,9 +33565,13 @@ vmtui_lg_launch() {
   vmtui_lg_verify_flags "$_bin"
   # Point 1: resolve the target user + display env; refuse (with the fix)
   # instead of launching a client that would die display-less.
+  # R84: the session resolution is now a dbg event pair (the refusal + the
+  # resolved env) — the first thing a "the client did nothing" report needs.
   if ! _vmtui_lg_session; then
+    vmtui_dbg "session: REFUSED (no usable user+display — the notes above carry the fix)"
     return 1
   fi
+  vmtui_dbg "session: user=$_vmtui_lg_user uid=$_vmtui_lg_uid wd=${_vmtui_lg_wd:-<none>} xd=${_vmtui_lg_xd:-<none>}"
   # R72 (point 5): launch + liveness with ONE bounded retry. The retry fires
   # ONLY when the client DIED early (the common transient first-launch race
   # with the guest host app) — never while a client is alive, so there is no
@@ -33562,18 +33640,25 @@ vmtui_lg_launch() {
       _pid=$!
     fi
     # Point 5: verify the client STAYED ALIVE instead of printing "launched"
-    # and letting it die quietly.
+    # and letting it die quietly. R84: each liveness verdict is a dbg event —
+    # the died / alive / retrying distinction is exactly what a live report
+    # of "the client window never appears" needs.
     if (( VM_TUI_LG_LIVENESS_WAIT > 0 )); then
       sleep "$VM_TUI_LG_LIVENESS_WAIT"
       if ! kill -0 "$_pid" 2>/dev/null; then
         _died=1
+        vmtui_dbg "liveness: pid $_pid did NOT survive ${VM_TUI_LG_LIVENESS_WAIT}s"
       fi
     fi
     if (( ! _died )); then
+      if (( VM_TUI_LG_LIVENESS_WAIT > 0 )); then
+        vmtui_dbg "liveness: pid $_pid alive after ${VM_TUI_LG_LIVENESS_WAIT}s"
+      fi
       break
     fi
     if (( _retries > 0 )); then
       _retries=$((_retries - 1))
+      vmtui_dbg "liveness: pid $_pid exited early — retrying ($_retries left)"
       vmtui_progress "The Looking Glass client exited within ${VM_TUI_LG_LIVENESS_WAIT}s — retrying in 3s (VM_TUI_LG_RETRIES)..."
       sleep 3
       continue
@@ -33614,6 +33699,11 @@ vmtui_lg_launch() {
   vmtui_lg_connected "$_cpid" || _att=1
   _hst=0
   vmtui_lg_hoststate || _hst=$?
+  # R84: the post-launch verdict pair as dbg events — the attach x host-state
+  # matrix below reads from THESE two values, so the debug log shows which
+  # cell of the matrix a live run actually landed in.
+  vmtui_dbg "connection: pid=$_cpid attached=$_att (0=attached)"
+  vmtui_dbg "post-launch host-app: state=$_hst (0=ready 1=not-initialized 2=no-shm)"
   if (( ! _att )); then
     if [[ "$_hst" == "0" ]]; then
       vmtui_ok "Looking Glass CONNECTED to the VM's shared memory (client pid $_cpid) — and the guest host app is ready (KVMFR)."
@@ -33706,6 +33796,7 @@ vmtui_act_start_lg() {
           vmtui_progress "Waiting for Windows to boot (virtio-win guest agent handoff, up to ${_left}s)..."
           _arc=0
           vmtui_wait_agent "$_dom" "$_left" || _arc=$?
+          vmtui_dbg "agent-wait: rc=$_arc (0=up 1=timeout 2=no channel)"
           case "$_arc" in
             0) vmtui_ok "Windows is up (guest agent responded) — launching Looking Glass." ;;
             2) note "No guest agent channel in '$_dom' — launching now. Install the virtio-win guest agent inside Windows (sudo $SCRIPT_NAME --install-virtio-win-guest-agent) so Looking Glass launches the moment Windows is up." ;;
@@ -33725,6 +33816,7 @@ vmtui_act_start_lg() {
         if (( VM_TUI_WAIT_SHM )); then
           local _hs=0
           vmtui_lg_hoststate || _hs=$?
+          vmtui_dbg "host-app: state=$_hs (0=ready 1=not-initialized 2=no-shm)"
           if [[ "$_hs" == "0" ]]; then
             vmtui_ok "The guest Looking Glass host app is ready (shared memory initialized)."
           elif [[ "$_hs" == "2" ]]; then

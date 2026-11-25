@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R82 — bumped on every change; the full history is in changelog.md.
+# Revision: R83 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -545,7 +545,21 @@ SCRIPT_NAME="$(basename "$0")"
 # DEPLOYED (its error line numbers match a pre-R75 /usr/local/bin/vfio) —
 # redeploy with: sudo ./vfio.sh --install-self (the deployed copy is R81,
 # refresh it to R82 after this change).
-SCRIPT_REVISION="R82"
+# R83 (the accepted R82 follow-up, "ok do it"): the debug windows are now
+# PER-SOURCE and operator-chosen. vmtui_debug_window takes a source argument
+# — "manager" (default; tail -F BOTH /tmp logs in one window) and "hotplug"
+# (journalctl -t vfio-live-attach -f, the GPU hotplug helper's journal — the
+# third stream; the R82 window only had the two /tmp logs). Each source gets
+# its OWN window with a per-source dedup guard, so both can sit side by side.
+# Option 9's ENABLE flow now asks WHICH windows to open (a TUI menu / plain
+# read: 1 manager logs, 2 hotplug journal, 3 both, 0 none — default 3), and
+# the manager-start auto-open (VM_TUI_DEBUG=1) keeps opening the manager
+# window. The hotplug journal window runs journalctl AS THE SPAWNED USER: a
+# normal user's view of the system journal may be restricted, in which case
+# the window shows journalctl's own honest permission notice (root reads the
+# full journal; from the root menu the window is spawned as the desktop user
+# by design — the note explains the limitation).
+SCRIPT_REVISION="R83"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32362,7 +32376,26 @@ vmtui_debug_show() {
       # mid-session NOW opens the separate log window immediately — before,
       # the window only ever spawned at manager START with the env var, so a
       # mid-session toggle looked broken (logging worked, nothing showed).
-      vmtui_debug_window
+      # R83: WHICH window(s) to open is now the operator's choice — the
+      # manager logs (both /tmp files) and/or the GPU-hotplug journal, each
+      # in its own terminal (option 3 = both side by side).
+      local _wsrc=""
+      if vmtui_tui_active; then
+        _wsrc="$($TUI_BIN --title "Debug windows" --menu "Which log windows to open?" 14 70 4 \
+          "1" "Manager logs (debug events + Looking Glass client)" \
+          "2" "GPU hotplug journal (vfio-live-attach)" \
+          "3" "Both (two windows)" \
+          "0" "None (logging only, no windows)" 3>&1 1>&2 2>&3)" || true
+      else
+        read -r -p "Open log windows — 1 manager, 2 hotplug journal, 3 both, 0 none [3]: " _wsrc || true
+        _wsrc="${_wsrc:-3}"
+      fi
+      case "${_wsrc:-1}" in
+        1) vmtui_debug_window manager ;;
+        2) vmtui_debug_window hotplug ;;
+        3) vmtui_debug_window manager; vmtui_debug_window hotplug ;;
+        *) : ;;
+      esac
     else
       say "Debug logging stays OFF. Select option 9 again to enable it at any time — no restart needed."
       say "(Auto-on at start: env VM_TUI_DEBUG=1 vfio --vm-tui)"
@@ -32405,46 +32438,111 @@ vmtui_debug_show() {
 # Best-effort by design: headless / no emulator / no desktop session -> the
 # tail command note. Never fatal, never blocks the manager.
 vmtui_debug_window() {
+  # R83: $1 (optional) selects the SOURCE whose tail window to open:
+  #   "manager" (default) -> tail -F BOTH /tmp logs (debug events + LG
+  #                          client launch log — one window, per-file headers)
+  #   "hotplug"            -> journalctl -t vfio-live-attach -f (the GPU
+  #                          hotplug helper's journal — the third stream the
+  #                          R82 follow-up asked for; needs journalctl, may
+  #                          need root for the system journal — the window is
+  #                          spawned AS THE MANAGER USER via a terminal that
+  #                          runs journalctl directly; if the journal is
+  #                          root-only the window shows journalctl's own
+  #                          permission error, which is the honest result)
+  # Each source gets its OWN window (dedup per source), so option 9's sub-
+  # choice can open either or both side by side.
+  local _src="${1:-manager}"
   (( VM_TUI_DEBUG )) || return 0
-  # Dedup: never stack a second window on an existing tail.
+  local _tail_pat _win_title
+  case "$_src" in
+    hotplug)
+      _tail_pat="journalctl -t vfio-live-attach"
+      _win_title="VFIO hotplug journal"
+      command -v journalctl >/dev/null 2>&1 || { note "No journalctl found — cannot tail the hotplug journal."; return 0; }
+      ;;
+    *)
+      _src="manager"
+      _tail_pat="tail -F $VM_TUI_DEBUG_LOG"
+      _win_title="VFIO manager logs"
+      ;;
+  esac
+  # Dedup: never stack a second window on an existing tail of THIS source.
   if command -v pgrep >/dev/null 2>&1 \
-    && pgrep -f "tail -F $VM_TUI_DEBUG_LOG" >/dev/null 2>&1; then
-    note "Debug window already open (tailing $VM_TUI_DEBUG_LOG + $VM_TUI_LOG_FILE)."
+    && pgrep -f "$_tail_pat" >/dev/null 2>&1; then
+    note "Debug window '$_win_title' already open."
     return 0
   fi
-  local _t _cmd
+  # R83 (shellcheck SC2089/2090 fix): the command is built as an ARRAY — a
+  # string with embedded quotes would pass them literally to the spawned
+  # terminal (konsole --hold -e "tail -F a b" must be THREE words after -e,
+  # and gnome-terminal/xterm titles with spaces must stay ONE argument).
+  local _t
+  local -a _cmd=()
   for _t in konsole gnome-terminal xterm; do
     command -v "$_t" >/dev/null 2>&1 || continue
     case "$_t" in
-      konsole)        _cmd="konsole --hold -e tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE" ;;
-      gnome-terminal) _cmd="gnome-terminal -- bash -c 'tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE'" ;;
-      xterm)          _cmd="xterm -hold -e tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE" ;;
+      konsole)
+        _cmd=(konsole --hold -e)
+        if [[ "$_src" == "hotplug" ]]; then
+          _cmd+=(journalctl -t vfio-live-attach -f)
+        else
+          _cmd+=(tail -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
+        fi
+        ;;
+      gnome-terminal)
+        _cmd=(gnome-terminal --title "$_win_title" --)
+        if [[ "$_src" == "hotplug" ]]; then
+          _cmd+=(journalctl -t vfio-live-attach -f)
+        else
+          _cmd+=(bash -c "tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE")
+        fi
+        ;;
+      xterm)
+        _cmd=(xterm -hold -T "$_win_title" -e)
+        if [[ "$_src" == "hotplug" ]]; then
+          _cmd+=(journalctl -t vfio-live-attach -f)
+        else
+          _cmd+=(tail -F "$VM_TUI_DEBUG_LOG" "$VM_TUI_LOG_FILE")
+        fi
+        ;;
     esac
-    # shellcheck disable=SC2086 # intentional word-split: _cmd is a word list
     if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-      # Root (the root main-menu path): resolve the desktop user + their
-      # session env quietly, then spawn the window AS THAT USER — a
-      # root-spawned GUI terminal has no display and never appears (R61).
+      # Root (the root main-menu path): spawn the window AS THE DESKTOP USER
+      # — a root-spawned GUI terminal has no display and never appears (R61).
+      # For the hotplug journal this ALSO means journalctl runs as that user
+      # (a normal user's journal view of a system-unit tag may be restricted —
+      # the window then shows journalctl's own honest permission notice; root
+      # can read the full journal, so the root-menu path passes the note).
       local _win_user="${SUDO_USER:-}"
       if [[ -z "$_win_user" || "$_win_user" == "root" ]] || ! command -v runuser >/dev/null 2>&1; then
         note "Debug window: running as root without a usable desktop user — open it yourself:"
-        note "  tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
+        if [[ "$_src" == "hotplug" ]]; then
+          note "  journalctl -t vfio-live-attach -f"
+        else
+          note "  tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE"
+        fi
         return 0
       fi
       local _uid _rt
       _uid="$(id -u "$_win_user" 2>/dev/null || true)"
       _rt="/run/user/${_uid}"
-      # shellcheck disable=SC2086 # intentional word-split: env assignments + _cmd
-      setsid runuser -u "$_win_user" -- env XDG_RUNTIME_DIR="$_rt" $_cmd </dev/null >/dev/null 2>&1 &
+      setsid runuser -u "$_win_user" -- env XDG_RUNTIME_DIR="$_rt" "${_cmd[@]}" </dev/null >/dev/null 2>&1 &
     else
       # Normal user session: spawn directly (the display is ours).
-      # shellcheck disable=SC2086 # intentional word-split: _cmd is a word list
-      setsid $_cmd </dev/null >/dev/null 2>&1 &
+      setsid "${_cmd[@]}" </dev/null >/dev/null 2>&1 &
     fi
-    note "Debug window open: tailing $VM_TUI_DEBUG_LOG + $VM_TUI_LOG_FILE live (close it any time)."
+    if [[ "$_src" == "hotplug" ]]; then
+      note "Debug window open: following the GPU hotplug journal (journalctl -t vfio-live-attach -f)."
+    else
+      note "Debug window open: tailing $VM_TUI_DEBUG_LOG + $VM_TUI_LOG_FILE live (close it any time)."
+    fi
     return 0
   done
-  note "Debug log (no terminal emulator found): tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE in another terminal"
+  if [[ "$_src" == "hotplug" ]]; then
+    note "Hotplug journal (no terminal emulator found): journalctl -t vfio-live-attach -f in another terminal"
+  else
+    note "Debug log (no terminal emulator found): tail -F $VM_TUI_DEBUG_LOG $VM_TUI_LOG_FILE in another terminal"
+  fi
   return 0
 }
 

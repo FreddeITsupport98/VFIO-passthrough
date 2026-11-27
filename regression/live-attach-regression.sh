@@ -153,6 +153,23 @@ assert_contains_text \
   "R23 hook logs the live-attach launch" \
   'action=live-attach-launch domain=$DOMAIN delay=${_la_delay}s' \
   "$hook_block"
+# --- R95: zombie forensics in the hook (stop reason + session length) ---
+assert_contains_text \
+  "R95 the hook defines the stop-forensics logger" \
+  '_log_vm_stop_forensics()' \
+  "$hook_block"
+assert_contains_text \
+  "R95 the prepare phase stamps the per-domain session start" \
+  'vm-start.$DOMAIN.ts' \
+  "$hook_block"
+assert_contains_text \
+  "R95 the stop log names the reason + session" \
+  "action=vm-stopped domain=$_dom reason=" \
+  "$hook_block"
+assert_contains_text \
+  "R95 the stopped phase calls the forensics logger (gated to real stops)" \
+  '_log_vm_stop_forensics "$DOMAIN"' \
+  "$hook_block"
 
 # --- Static wiring: generated live-attach helper script ---
 helper_block="$(sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT")"

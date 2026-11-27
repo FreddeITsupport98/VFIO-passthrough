@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R94 — bumped on every change; the full history is in changelog.md.
+# Revision: R95 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -708,7 +708,23 @@ SCRIPT_NAME="$(basename "$0")"
 # (verified live); plus the USB-audio sound-settings pick and the
 # auto-start tip. The _install_looking_glass_defaults (hotplug auto-LG)
 # ending gained the same host-app one-liner.
-SCRIPT_REVISION="R94"
+# R95 (the accepted root-cause-dive follow-up, "ok do it"): zombie
+# forensics in the generated libvirt hook. The RX 9070 (Navi 48)
+# release-time zombie wedges during the Windows guest driver's power-down
+# path (the AMD "reset gap": PCIe-level resets cannot reach the SMU/PSP
+# firmware state, so remove+rescan and even SBR restore the LINK but not
+# the endpoint — only a host reboot re-runs the power-rail/SMU handshake).
+# The hook now stamps every VM-session start (per-domain
+# ${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.<domain>.ts at
+# prepare) and logs action=vm-stopped reason='<libvirt stop reason>'
+# session=<n>s at every ACTUAL stop (new _log_vm_stop_forensics; gated to
+# the 'stopped' phase so migration/managed-save 'release' events never log
+# false stops). After a few cycles, "which shutdown mode (graceful shutdown
+# vs destroyed) and which session lengths wedge the card" becomes hard
+# journal data instead of guesswork — compare the reason/session of stops
+# that zombied vs stops that didn't (journalctl -t vfio-dynamic | grep
+# vm-stopped).
+SCRIPT_REVISION="R95"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -12439,6 +12455,29 @@ _release() {
   fi
 }
 
+# R95: zombie forensics — log HOW the VM stopped (libvirt's stop reason:
+# shutdown = the guest powered off gracefully, destroyed = force-stop,
+# crashed) + the session length, at every VM stop. The RX 9070 (Navi 48)
+# release-time zombie wedges during the Windows guest driver's power-down
+# path; comparing the reason/session of stops that zombied vs stops that
+# didn't turns "which shutdown mode wedges the card?" into hard journal
+# data. $1 = domain. Best-effort: an unreadable reason logs as 'unknown';
+# a missing start-stamp logs session=unknown. Never fails the caller.
+_log_vm_stop_forensics() {
+  local _dom="$1" _reason _ts
+  _reason="$(LC_ALL=C virsh -c qemu:///system domstate --reason "$_dom" 2>/dev/null | head -n1 | tr -d '\n' || true)"
+  _ts=""
+  if [[ -r "${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.$_dom.ts" ]]; then
+    _ts="$(cat "${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.$_dom.ts" 2>/dev/null || true)"
+  fi
+  if [[ "$_ts" =~ ^[0-9]+$ ]]; then
+    hook_log "action=vm-stopped domain=$_dom reason='${_reason:-unknown}' session=$(( $(date +%s) - _ts ))s"
+  else
+    hook_log "action=vm-stopped domain=$_dom reason='${_reason:-unknown}' session=unknown"
+  fi
+  return 0
+}
+
 # Dynamic hugepages re-reserve at VM start: ensure the host pool covers THIS VM's
 # current <memory> (recomputed from the XML on stdin) so a RAM change without a
 # reboot is honored at the moment qemu mmaps the backing store. No-op for non-
@@ -12518,6 +12557,12 @@ case "$PHASE" in
     # extract_hostdev_bdfs) need it. Consuming stdin twice would leave the GPU
     # detection with an empty pipe and silently skip the bind.
     DOMAIN_XML="$(cat 2>/dev/null || true)"
+    #
+    # R95: stamp THIS VM-session's start (per-domain) so
+    # _log_vm_stop_forensics can log the session length at stop — a
+    # parallel VM start can never corrupt another domain's stamp.
+    mkdir -p "${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}" 2>/dev/null || true
+    printf '%s\n' "$(date +%s)" >"${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.$DOMAIN.ts" 2>/dev/null || true
     #
     # Dynamic hugepages re-reserve BEFORE the GPU bind: ensure the host pool
     # covers this VM's current <memory> (recomputed from DOMAIN_XML) so a RAM
@@ -12627,6 +12672,12 @@ case "$PHASE" in
     fi
     ;;
   stopped|release)
+    # R95: zombie forensics — log the stop reason + session length at every
+    # ACTUAL stop (the 'release' phase also fires at migration / managed-save
+    # ends, where the VM did NOT stop — gated so those never log false stops).
+    if [[ "$PHASE" == "stopped" ]]; then
+      _log_vm_stop_forensics "$DOMAIN"
+    fi
     # VM stopped. If the guest GPU is currently on vfio-pci (we bound it), release
     # it back to the host driver per VFIO_DYNAMIC_REBIND_HOST. No-op otherwise.
     if guest_gpu_on_vfio; then

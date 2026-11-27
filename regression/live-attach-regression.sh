@@ -170,6 +170,36 @@ assert_contains_text \
   "R95 the stopped phase calls the forensics logger (gated to real stops)" \
   '_log_vm_stop_forensics "$DOMAIN"' \
   "$hook_block"
+# --- R96: the mode-preserving dead-GPU fallback ---
+assert_contains_text \
+  "R96 the fallback writes the pending-restore flag for a hotplug-OFF VM" \
+  'restore-mode-off.$DOMAIN' \
+  "$hook_block"
+assert_contains_text \
+  "R96 the fallback logs the remembered choice" \
+  'action=fallback-remembers-mode-off domain=$DOMAIN' \
+  "$hook_block"
+assert_contains_text \
+  "R96 the stopped phase restores the user's hotplug-off choice" \
+  'action=mode-restoring domain=$DOMAIN' \
+  "$hook_block"
+assert_contains_text \
+  "R96 the prepare phase notifies 'card is alive again' (the requested message)" \
+  'action=card-alive-again domain=$DOMAIN' \
+  "$hook_block"
+assert_contains_text \
+  "R96 the hook defines the liveness probe for the restore logic" \
+  '_gpu_alive_now()' \
+  "$hook_block"
+assert_contains_text \
+  "R96 the hook defines the desktop notifier" \
+  '_notify_desktop()' \
+  "$hook_block"
+_toggle_fn_r96="$(sed -n '/^live_attach_toggle()/,/^}/p' "$VFIO_SCRIPT")"
+assert_contains_text \
+  "R96 a deliberate user toggle clears the pending-restore flag" \
+  'rm -f "/var/lib/vfio-dynamic/restore-mode-off.$_dom"' \
+  "$_toggle_fn_r96"
 
 # --- Static wiring: generated live-attach helper script ---
 helper_block="$(sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT")"

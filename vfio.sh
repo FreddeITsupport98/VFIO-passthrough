@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R95 — bumped on every change; the full history is in changelog.md.
+# Revision: R96 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -722,9 +722,26 @@ SCRIPT_NAME="$(basename "$0")"
 # false stops). After a few cycles, "which shutdown mode (graceful shutdown
 # vs destroyed) and which session lengths wedge the card" becomes hard
 # journal data instead of guesswork — compare the reason/session of stops
-# that zombied vs stops that didn't (journalctl -t vfio-dynamic | grep
+# zombied vs stops that didn't (journalctl -t vfio-dynamic | grep
 # vm-stopped).
-SCRIPT_REVISION="R95"
+# R96 (the accepted proposal, "do it but make it survive the flip... give
+# message to user now you can use hot attach because card is alive now"):
+# the dead-GPU fallback is now MODE-PRESERVING. When the rescue flips a
+# hotplug-OFF VM to hotplug-on (to boot it GPU-less after the card
+# zombied), it first writes a per-domain pending-restore flag
+# (/var/lib/vfio-dynamic/restore-mode-off.<domain>) — the user's OFF
+# choice SURVIVES the flip. The stopped phase then watches for the card
+# to be healthy again (readable vendor + config head — the opposite of
+# the all-0xff zombie): once it is (i.e. after the host reboot), the
+# hook runs vfio --live-attach-off (synchronously, retried at the next
+# stop on failure), clears the flag, and notifies the desktop "GPU is
+# alive again — your hotplug-OFF setting is restored". The prepare
+# phase ALSO notifies the moment the user starts the VM after the
+# reboot ("you can use hot-attach now; this session boots GPU-less once
+# more, your setting returns at its end"). A DELIBERATE user toggle
+# (--live-attach-on/off, tray) always clears the flag first — their
+# explicit action supersedes any pending auto-restore.
+SCRIPT_REVISION="R96"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -12428,6 +12445,40 @@ guest_gpu_on_vfio() {
   [[ "$drv" == "vfio-pci" ]]
 }
 
+# R96: is the guest GPU alive RIGHT NOW (readable vendor + config head)?
+# True whenever the card is on the bus and answering config cycles — the
+# opposite of the zombie state (all 0xff / off the bus). Used by the
+# mode-restore logic: the rescue flip is undone only when the card is
+# genuinely back (i.e. after the host reboot).
+_gpu_alive_now() {
+  local _sys="/sys/bus/pci/devices/$GUEST_GPU_BDF" _v _c
+  [[ -d "$_sys" ]] || return 1
+  _v="$(cat "$_sys/vendor" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$_v" && "$_v" != "0xffff" ]] || return 1
+  _c="$(head -c 4 "$_sys/config" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ -n "$_c" && "$_c" != "ffffffff" ]]
+}
+
+# R96: best-effort desktop notification (the live-attach helper's proven
+# pattern) — broadcast to every active session via runuser + notify-send.
+# Never fatal; a missing notify-send/runuser is a silent no-op. Used for
+# the "GPU is alive again / your hotplug-off is restored" messages.
+_notify_desktop() {
+  local _title="$1" _body="$2" _rt _uid _user
+  command -v notify-send >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  for _rt in /run/user/*; do
+    [[ -d "$_rt" ]] || continue
+    _uid="$(basename "$_rt")"
+    [[ "$_uid" =~ ^[0-9]+$ ]] || continue
+    _user="$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1 || true)"
+    [[ -n "$_user" ]] || continue
+    runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$_rt/bus" \
+      notify-send -u normal -t 10000 "$_title" "$_body" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+
 # Run --bind-now under a bounded timeout so a hung sysfs write cannot hang the
 # libvirt prepare phase indefinitely. Default 20s leaves margin under libvirt's
 # ~30s hook timeout; override with VFIO_HOOK_BIND_TIMEOUT. Falls back to a plain
@@ -12526,10 +12577,25 @@ _dead_gpu_fallback() {
   fi
   say "vfio-libvirt-hook: guest GPU $GUEST_GPU_BDF is DEAD (dropped off the bus; a host reboot is required to revive it)." >&2
   say "vfio-libvirt-hook: starting '$DOMAIN' WITHOUT the GPU instead (GPU-less fallback) — the VM boots on the virtual display and the GPU hot-attaches automatically once it is alive again (after your reboot)." >&2
-  say "vfio-libvirt-hook: save your work and reboot the host when convenient; live-attach mode stays ON until you turn it off (tray icon / vfio --live-attach-off)." >&2
   hook_log "action=dead-gpu-fallback domain=$DOMAIN gpu=$GUEST_GPU_BDF"
   mkdir -p /var/lib/vfio-dynamic 2>/dev/null || true
   date +%s >"/var/lib/vfio-dynamic/dead-gpu-fallback.$DOMAIN" 2>/dev/null || true
+  # R96: remember the user's choice. If this domain was NOT set up for
+  # hotplug (their deliberate hotplug-OFF / cold-attach configuration),
+  # the flip below is a TEMPORARY rescue — write the pending-restore
+  # flag so the off choice survives, and it is restored automatically
+  # once the card is healthy again (the stopped phase checks it). A
+  # deliberate user toggle (--live-attach-on/off, tray) always clears
+  # the flag first: their explicit action supersedes the auto-restore.
+  if ! grep -Fixq "$DOMAIN" /var/lib/vfio-dynamic/live-attach-vms 2>/dev/null \
+    || [[ "$(cat /var/lib/vfio-dynamic/live-attach-mode 2>/dev/null || true)" == "off" ]]; then
+    date +%s >"/var/lib/vfio-dynamic/restore-mode-off.$DOMAIN" 2>/dev/null || true
+    hook_log "action=fallback-remembers-mode-off domain=$DOMAIN (auto-restore pending)"
+    say "vfio-libvirt-hook: your hotplug-OFF choice is REMEMBERED — it is restored automatically once the GPU is healthy again (no action needed; a manual toggle always wins)." >&2
+    say "vfio-libvirt-hook: save your work and reboot the host when convenient — after the reboot this GPU-less session runs once more, then your setting returns on its own." >&2
+  else
+    say "vfio-libvirt-hook: save your work and reboot the host when convenient; live-attach mode stays ON until you turn it off (tray icon / vfio --live-attach-off)." >&2
+  fi
   # Fully-detached worker: flip to live-attach mode=on (strips the GPU from
   # the persistent XML, saves the fragment) and restart the VM GPU-less.
   # sleep 4 first: this hook must be fully gone (and libvirt must finish
@@ -12563,6 +12629,18 @@ case "$PHASE" in
     # parallel VM start can never corrupt another domain's stamp.
     mkdir -p "${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}" 2>/dev/null || true
     printf '%s\n' "$(date +%s)" >"${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.$DOMAIN.ts" 2>/dev/null || true
+    #
+    # R96: after the zombie-recovery reboot — if the fallback put this VM
+    # in a temporary GPU-less state and the card is now ALIVE, tell the
+    # user immediately (the exact requested message): hot-attach works
+    # again, and their hotplug-OFF choice returns at the end of this
+    # session. (The restore itself happens in the stopped phase —
+    # redefining the XML mid-prepare would not affect this start's
+    # already-snapshotted GPU-less XML.)
+    if [[ -f "/var/lib/vfio-dynamic/restore-mode-off.$DOMAIN" ]] && _gpu_alive_now; then
+      hook_log "action=card-alive-again domain=$DOMAIN (rescued session; hot-attach usable)"
+      _notify_desktop "GPU is alive again" "The RX card is back on the bus — you can use hot-attach now. This session boots GPU-less once more; your hotplug-OFF setting is restored automatically when it ends."
+    fi
     #
     # Dynamic hugepages re-reserve BEFORE the GPU bind: ensure the host pool
     # covers this VM's current <memory> (recomputed from DOMAIN_XML) so a RAM
@@ -12677,6 +12755,24 @@ case "$PHASE" in
     # ends, where the VM did NOT stop — gated so those never log false stops).
     if [[ "$PHASE" == "stopped" ]]; then
       _log_vm_stop_forensics "$DOMAIN"
+    fi
+    # R96: restore the user's hotplug-OFF choice. The dead-GPU fallback
+    # flipped this VM to hotplug-on as a temporary rescue; now that the
+    # VM has stopped AND the card is healthy again (the host was
+    # rebooted), put the setting back the way the user chose it. Run
+    # SYNCHRONOUSLY (fast — a define per VM) so the flag is cleared only
+    # on success; a failed restore retries at the next stop. A
+    # deliberate user toggle already cleared the flag (their explicit
+    # action supersedes the auto-restore).
+    if [[ -f "/var/lib/vfio-dynamic/restore-mode-off.$DOMAIN" ]] && _gpu_alive_now; then
+      hook_log "action=mode-restoring domain=$DOMAIN (card healthy; restoring hotplug-off)"
+      _notify_desktop "GPU is alive again" "The RX card is back on the bus. Your hotplug-OFF setting is being restored — the next VM start cold-attaches the GPU as you configured. Hot-attach is also fully usable again."
+      if /usr/local/bin/vfio --live-attach-off </dev/null >>/var/log/vfio-libvirt-hook.log 2>&1; then
+        rm -f "/var/lib/vfio-dynamic/restore-mode-off.$DOMAIN" 2>/dev/null || true
+        hook_log "action=mode-restored domain=$DOMAIN (user choice back: hotplug off)"
+      else
+        hook_log "action=mode-restore-failed domain=$DOMAIN (flag kept; retry at next stop)"
+      fi
     fi
     # VM stopped. If the guest GPU is currently on vfio-pci (we bound it), release
     # it back to the host driver per VFIO_DYNAMIC_REBIND_HOST. No-op otherwise.
@@ -14019,6 +14115,10 @@ live_attach_toggle() {
     if profile_apply_mode "$_dom" "$_target"; then
       _applied=1
       say "  ✔ '$_dom' -> mode=$_target (live XML redefined from current state)"
+      # R96: a DELIBERATE user toggle always supersedes any pending
+      # auto-restore from the dead-GPU fallback — clear this VM's flag so
+      # the stopped phase never re-flips against the user's fresh choice.
+      rm -f "/var/lib/vfio-dynamic/restore-mode-off.$_dom" 2>/dev/null || true
     else
       _skipped=1
     fi

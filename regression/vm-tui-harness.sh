@@ -661,6 +661,25 @@ R82_H="$H" R82_VIRSH_MODE=reason VFIO_DYNAMIC_DIR="$H/out/vfdyn95" \
   bash -c "hook_log() { printf 'hooklog: %s\n' \"\$*\" >>'$H/out/hooklog95'; }; source '$H/forensics95.sh'; _log_vm_stop_forensics GAMING" >/dev/null 2>&1 || true
 ck_grep "20h a missing start stamp logs session=unknown (never fatal)" "session=unknown" "$H/out/hooklog95"
 
+# 21 (R96): the mode-preserving dead-GPU fallback — the user's hotplug-OFF
+# choice SURVIVES the rescue flip (pending-restore flag), the stopped phase
+# restores it once the card is healthy (post-reboot), the prepare phase
+# notifies "you can use hot-attach now", and a deliberate user toggle
+# always clears the flag.
+ck_grep "21a the fallback writes the pending-restore flag" 'restore-mode-off.$DOMAIN' "$REPO/vfio.sh"
+ck_grep "21b the fallback logs the remembered choice" 'action=fallback-remembers-mode-off domain=$DOMAIN' "$REPO/vfio.sh"
+ck_grep "21c the stopped phase restores the user's hotplug-off choice" 'action=mode-restoring domain=$DOMAIN' "$REPO/vfio.sh"
+ck_grep "21d the prepare phase notifies 'card is alive again'" 'action=card-alive-again domain=$DOMAIN' "$REPO/vfio.sh"
+ck_grep "21e the hook defines the liveness probe for the restore logic" '_gpu_alive_now()' "$REPO/vfio.sh"
+_nnd="$(grep -cF '_notify_desktop()' "$REPO/vfio.sh" || true)"
+if [[ "$_nnd" == "3" ]]; then
+  printf 'PASS: 21f the desktop notifier exists in all 3 generated scripts (hook + live-attach helper + bind script)\n'; PASS=$((PASS+1))
+else
+  printf 'FAIL: 21f expected 3 _notify_desktop definitions (hook + helper + bind), saw %s\n' "${_nnd:-0}" >&2; FAIL=$((FAIL+1)); FAILED+=("21f notifier definitions")
+fi
+ck_grep "21g a deliberate user toggle clears the pending-restore flag" 'rm -f "/var/lib/vfio-dynamic/restore-mode-off.$_dom"' "$REPO/vfio.sh"
+ck_grep "21h the alive-again message names hot-attach (the requested wording)" 'you can use hot-attach now' "$REPO/vfio.sh"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 if (( FAIL > 0 )); then

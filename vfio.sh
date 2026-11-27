@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R96 — bumped on every change; the full history is in changelog.md.
+# Revision: R97 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -741,7 +741,23 @@ SCRIPT_NAME="$(basename "$0")"
 # more, your setting returns at its end"). A DELIBERATE user toggle
 # (--live-attach-on/off, tray) always clears the flag first — their
 # explicit action supersedes any pending auto-restore.
-SCRIPT_REVISION="R96"
+# R97 (the LIVE freeze report: "the vm freezes unable to close... virt
+# manager frozen won't quit", root-caused live): EVERY libvirt call the
+# hook makes is now TIMEOUT-BOUNDED. The incident: qemu died mid-reset
+# on the zombie card (vfio_bar_restore loop -> "Device config space
+# inaccessible; unable to save state" -> PCIe link down), virtqemud fell
+# into an I/O-error loop against the dead qemu, and the R95/R96 hook's
+# UNBOUNDED calls (the forensics `virsh domstate --reason`, the R96
+# synchronous `vfio --live-attach-off` restore) hung against the wedged
+# daemon — TWO hung "stopped end" hook processes then blocked libvirt's
+# stop job, so virsh destroy and virt-manager queued forever. Bounded
+# now: the forensics reason (timeout 5 — nice-to-have, never worth a
+# hang), the mode-restore CLI (timeout 25 — the flag survives a timeout
+# and retries at the next stop), and the dead-GPU fallback worker's
+# on/start calls (timeout 30 each). A hook can never again deepen a
+# libvirt wedge; recovery in the live incident was: pkill the hung
+# hooks, systemctl restart virtqemud, kill the frozen client.
+SCRIPT_REVISION="R97"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -12516,7 +12532,13 @@ _release() {
 # a missing start-stamp logs session=unknown. Never fails the caller.
 _log_vm_stop_forensics() {
   local _dom="$1" _reason _ts
-  _reason="$(LC_ALL=C virsh -c qemu:///system domstate --reason "$_dom" 2>/dev/null | head -n1 | tr -d '\n' || true)"
+  # R97: BOUNDED — this runs inside the libvirt stopped hook; against a
+  # wedged daemon (the live freeze) an unbounded call hangs the HOOK and
+  # blocks libvirt's stop job further (two hung "stopped end" hook
+  # processes observed live). 5s: the reason is nice-to-have, never worth
+  # a hang; on timeout the reason logs as 'unknown' (the existing
+  # fallback).
+  _reason="$(LC_ALL=C timeout 5 virsh -c qemu:///system domstate --reason "$_dom" 2>/dev/null | head -n1 | tr -d '\n' || true)"
   _ts=""
   if [[ -r "${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.$_dom.ts" ]]; then
     _ts="$(cat "${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/vm-start.$_dom.ts" 2>/dev/null || true)"
@@ -12600,11 +12622,14 @@ _dead_gpu_fallback() {
   # the persistent XML, saves the fragment) and restart the VM GPU-less.
   # sleep 4 first: this hook must be fully gone (and libvirt must finish
   # aborting THIS start) before the redefinition + restart happen.
+  # R97: both worker calls are BOUNDED too (the worker is detached off the
+  # libvirt pipe so it cannot block a job, but an unbounded CLI/virsh
+  # would linger as a zombie process against a wedged daemon).
   setsid bash -c '
     sleep 4
-    /usr/local/bin/vfio --live-attach-on >>/var/log/vfio-libvirt-hook.log 2>&1 || true
+    timeout 30 /usr/local/bin/vfio --live-attach-on >>/var/log/vfio-libvirt-hook.log 2>&1 || true
     sleep 1
-    virsh -c qemu:///system start "$1" >>/var/log/vfio-libvirt-hook.log 2>&1 || true
+    timeout 30 virsh -c qemu:///system start "$1" >>/var/log/vfio-libvirt-hook.log 2>&1 || true
   ' _ "$DOMAIN" </dev/null >>/var/log/vfio-libvirt-hook.log 2>&1 &
   # Abort THIS start cleanly (rc 42: qemu never gets the dead card); the
   # detached restart brings the VM up GPU-less seconds later.
@@ -12767,7 +12792,11 @@ case "$PHASE" in
     if [[ -f "/var/lib/vfio-dynamic/restore-mode-off.$DOMAIN" ]] && _gpu_alive_now; then
       hook_log "action=mode-restoring domain=$DOMAIN (card healthy; restoring hotplug-off)"
       _notify_desktop "GPU is alive again" "The RX card is back on the bus. Your hotplug-OFF setting is being restored — the next VM start cold-attaches the GPU as you configured. Hot-attach is also fully usable again."
-      if /usr/local/bin/vfio --live-attach-off </dev/null >>/var/log/vfio-libvirt-hook.log 2>&1; then
+      # R97: BOUNDED — the live freeze had this synchronous CLI hang
+      # against a wedged virtqemud (blocking the stop job). 25s is
+      # generous for the per-VM defines it does; on timeout the flag is
+      # KEPT and the restore retries at the next stop.
+      if timeout 25 /usr/local/bin/vfio --live-attach-off </dev/null >>/var/log/vfio-libvirt-hook.log 2>&1; then
         rm -f "/var/lib/vfio-dynamic/restore-mode-off.$DOMAIN" 2>/dev/null || true
         hook_log "action=mode-restored domain=$DOMAIN (user choice back: hotplug off)"
       else

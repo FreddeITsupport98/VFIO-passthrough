@@ -200,6 +200,19 @@ assert_contains_text \
   "R96 a deliberate user toggle clears the pending-restore flag" \
   'rm -f "/var/lib/vfio-dynamic/restore-mode-off.$_dom"' \
   "$_toggle_fn_r96"
+# --- R97: every hook libvirt call is timeout-bounded (the live freeze fix) ---
+assert_contains_text \
+  "R97 the forensics reason call is bounded (timeout 5)" \
+  'timeout 5 virsh -c qemu:///system domstate --reason' \
+  "$hook_block"
+assert_contains_text \
+  "R97 the mode-restore CLI is bounded (timeout 25)" \
+  'timeout 25 /usr/local/bin/vfio --live-attach-off' \
+  "$hook_block"
+assert_contains_text \
+  "R97 the fallback worker's on/start calls are bounded (timeout 30)" \
+  'timeout 30 /usr/local/bin/vfio --live-attach-on' \
+  "$hook_block"
 
 # --- Static wiring: generated live-attach helper script ---
 helper_block="$(sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT")"

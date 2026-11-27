@@ -680,6 +680,24 @@ fi
 ck_grep "21g a deliberate user toggle clears the pending-restore flag" 'rm -f "/var/lib/vfio-dynamic/restore-mode-off.$_dom"' "$REPO/vfio.sh"
 ck_grep "21h the alive-again message names hot-attach (the requested wording)" 'you can use hot-attach now' "$REPO/vfio.sh"
 
+# 22 (R97): every libvirt call the hook makes is TIMEOUT-BOUNDED — the live
+# freeze (qemu died mid-reset on the zombie card, virtqemud in an I/O-error
+# loop) hung the R95/R96 hook's unbounded calls, and the two hung "stopped
+# end" hook processes blocked libvirt's stop job (virsh destroy + virt-manager
+# queued forever). A hook must never deepen a libvirt wedge.
+ck_grep "22a the forensics reason call is bounded (timeout 5)" 'timeout 5 virsh -c qemu:///system domstate --reason' "$REPO/vfio.sh"
+ck_grep "22b the mode-restore CLI is bounded (timeout 25)" 'timeout 25 /usr/local/bin/vfio --live-attach-off' "$REPO/vfio.sh"
+ck_grep "22c the fallback worker's on call is bounded (timeout 30)" 'timeout 30 /usr/local/bin/vfio --live-attach-on' "$REPO/vfio.sh"
+ck_grep "22d the fallback worker's start call is bounded (timeout 30)" 'timeout 30 virsh -c qemu:///system start' "$REPO/vfio.sh"
+# 22e functional: the bounded forensics still logs the reason (the fake virsh
+# returns instantly; the timeout passes through) — re-run the 20f scenario.
+rm -f "$H/out/hooklog95"
+printf '%s\n' "$(( $(date +%s) - 100 ))" > "$H/out/vfdyn95/vm-start.GAMING.ts"
+R82_H="$H" R82_VIRSH_MODE=reason VFIO_DYNAMIC_DIR="$H/out/vfdyn95" \
+  PATH="$H/bin:/usr/bin:/bin" \
+  bash -c "hook_log() { printf 'hooklog: %s\n' \"\$*\" >>'$H/out/hooklog95'; }; source '$H/forensics95.sh'; _log_vm_stop_forensics GAMING" >/dev/null 2>&1 || true
+ck_grep "22e the bounded forensics still logs the reason + session" "reason='shut off (destroyed)'" "$H/out/hooklog95"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 if (( FAIL > 0 )); then

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vm-tui-harness.sh — the consolidated R82-R99 validation suite for the
+# vm-tui-harness.sh — the consolidated R82-R100 validation suite for the
 # built-in VM manager, the Looking Glass integration, and the debug
 # windows (relocated into the repo at R95 after /tmp wiped the scratch
 # harness TWICE in one arc; the scratch dir is now a per-run mktemp).
@@ -49,6 +49,8 @@
 #      notification lands, the cooldown suppresses a second heal).
 #   24. (R99) the heal-history ring + the --unstuck history display + the
 #      doctor watchdog status line (statics + the block-23 sandbox re-drive).
+#   25. (R100) the vBIOS ROM pin in the Modify-VM TUI (apply + revert + the
+#      per-VM state helper, incl. a functional stub-enumerator unit).
 # Scratch: a per-run mktemp dir (cleaned on exit); zero host side effects.
 set -uo pipefail
 
@@ -810,6 +812,37 @@ R82_H="$H" VFIO_DYNAMIC_DIR="$H/out/wdstate" PATH="$H/wdbin:/usr/bin:/bin" \
   bash "$H/wd98.sh" --verbose >/dev/null 2>"$H/out/wd-verbose.err" || true
 ck_grep "24i the --unstuck/verbose run prints the recent-history header" "recent auto-heal events" "$H/out/wd-verbose.err"
 ck_grep "24j the verbose run shows the heal event line itself" "restarting-libvirt-daemon" "$H/out/wd-verbose.err"
+
+# 25 (R100): the vBIOS ROM pin in the TUI — Modify VM -> Apply to VM gained
+# "Pin vBIOS ROM to the guest GPU" (the context-aware wrapper: the WHY + the
+# current per-VM state + the VBIOS/ candidate count + the TechPowerUp
+# guidance, then the proven install_vbios_romfile), and Revert gained
+# "Remove the vBIOS ROM pin" (remove_vbios_romfile under the shared guard).
+ck_grep "25a the apply entry exists (UEFI/TianoCore boot-screen wording)" 'Pin vBIOS ROM to the guest GPU (UEFI/TianoCore boot screen on the physical monitor; works early OR dynamic)' "$REPO/vfio.sh"
+ck_grep "25b the pin wrapper is defined" '_menu_vbios_pin()' "$REPO/vfio.sh"
+ck_grep "25c the per-VM state helper is defined" '_vbios_menu_pin_state()' "$REPO/vfio.sh"
+ck_grep "25d the state line names the romless consequence" 'not pinned (boots romless — no firmware output on the physical monitor)' "$REPO/vfio.sh"
+ck_grep "25e the scope note is honest (hotplug ON can never show firmware)" 'firmware screens can never appear on it (use the SPICE/QEMU console)' "$REPO/vfio.sh"
+ck_grep "25f the apply dispatch guards + runs the wrapper" 'if _menu_vm_guarded "vBIOS ROM pin" ""; then' "$REPO/vfio.sh"
+ck_grep "25g the revert entry exists" 'Remove the vBIOS ROM pin (VM boots from the live ROM read again; works early OR dynamic)' "$REPO/vfio.sh"
+ck_grep "25h the revert dispatch guards + removes the pin" 'if _menu_vm_guarded "Remove vBIOS ROM pin" ""; then' "$REPO/vfio.sh"
+# 25i-25j functional: the state helper VERBATIM, driven with a STUBBED
+# shared enumerator (one pinned VM, one romless VM) — the output must name
+# the pinned rom file and the romless consequence per VM.
+sed -n '/^_vbios_menu_pin_state()/,/^}/p' "$REPO/vfio.sh" > "$H/vbiosfn.sh"
+cat > "$H/out/vbios-run.sh" <<VEOF
+#!/usr/bin/env bash
+say() { printf 'say: %s\n' "\$1"; }
+_list_guest_gpu_vms() {
+  printf '%s\0%s\0' 'GAMING' "<domain><devices><hostdev><rom file='/VBIOS/fake.rom'/></hostdev></devices></domain>"
+  printf '%s\0%s\0' 'LABVM' '<domain><devices><hostdev/></devices></domain>'
+}
+source "\$1"
+_vbios_menu_pin_state
+VEOF
+bash "$H/out/vbios-run.sh" "$H/vbiosfn.sh" > "$H/out/vbios-state.out" 2>&1 || true
+ck_grep "25i the state helper reports a pinned VM with its rom file" "GAMING: pinned (/VBIOS/fake.rom)" "$H/out/vbios-state.out"
+ck_grep "25j the state helper reports a romless VM honestly" "LABVM: not pinned" "$H/out/vbios-state.out"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

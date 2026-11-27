@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R99 — bumped on every change; the full history is in changelog.md.
+# Revision: R100 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -794,7 +794,23 @@ SCRIPT_NAME="$(basename "$0")"
 # status line: timer active / installed-but-inactive / not installed,
 # plus the age of the last heal (derived from the cooldown stamp) and
 # the history-ring size. Read-only, additive, JSON mode untouched.
-SCRIPT_REVISION="R99"
+# R100 (the user request: "it is not available on apply vm section so add it
+# user can add via tui"): the vBIOS ROM pin is now in the TUI. Modify VM ->
+# Apply to VM gained "Pin vBIOS ROM to the guest GPU" — the context-aware
+# wrapper (_menu_vbios_pin) that EXPLAINS why (no pin = OVMF has no GOP
+# video driver for the passthrough GPU, so the physical monitor stays dark
+# until the Windows GPU driver loads; the live ROM read on this card class
+# is the known "Device ROM size is zero" case), shows the CURRENT pin state
+# per guest-GPU VM (_vbios_menu_pin_state — read-only, built on the shared
+# R45 enumerator), counts the candidate .rom files in VBIOS/ with the exact
+# next-step guidance (the TechPowerUp deep-link screen follows), then runs
+# the PROVEN install_vbios_romfile (PCI-ID + live-ROM byte verification +
+# byte-swap auto-repair before anything is pinned). Modify VM -> Revert
+# gained "Remove the vBIOS ROM pin" (remove_vbios_romfile under the same
+# shared guard). Scope note kept honest in the menu: cold attach (hotplug
+# OFF) only — with hotplug ON the card arrives after Windows boots, so
+# firmware screens can never appear on it.
+SCRIPT_REVISION="R100"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -32893,6 +32909,66 @@ _menu_vm_guarded() {
   return 0
 }
 
+# R100: vBIOS ROM pin — the Apply-to-VM menu wrapper around
+# install_vbios_romfile. WHY: without a pinned ROM, qemu's live ROM read is
+# unreliable on this card class (the "Device ROM size is zero" / live-ROM
+# 0xffff case), so OVMF/TianoCore has NO video driver (GOP) for the
+# passthrough GPU — the physical monitor stays dark through firmware AND
+# Windows' early boot, waking only when the full Windows GPU driver loads.
+# Pinning a verified dump gives the firmware its GOP driver: the
+# TianoCore/UEFI screen + early Windows boot then appear on the physical
+# monitor. Scope: cold attach (hotplug OFF) — with hotplug ON the card is
+# attached after Windows boots, so firmware screens can never appear on it
+# (the SPICE/QEMU console is the firmware view there).
+_vbios_menu_pin_state() {
+  # Read-only per-VM pin status for the shared enumerator's guest-GPU VMs.
+  # One line per VM: pinned (<file>) / not pinned. Never fatal.
+  local _dom _xml _rom
+  while IFS= read -r -d '' _dom; do
+    IFS= read -r -d '' _xml || continue
+    _rom="$(grep -o "<rom file='[^']*'" <<<"$_xml" | head -1 | cut -d"'" -f2 || true)"
+    if [[ -n "$_rom" ]]; then
+      say "  $_dom: pinned ($_rom)"
+    else
+      say "  $_dom: not pinned (boots romless — no firmware output on the physical monitor)"
+    fi
+  done < <(_list_guest_gpu_vms)
+  return 0
+}
+
+_menu_vbios_pin() {
+  say
+  hdr "vBIOS ROM pin — firmware output on the physical monitor"
+  note "Without a pinned ROM this card's live ROM read is unreliable, so OVMF/TianoCore has"
+  note "no video driver for the passthrough GPU: the physical monitor stays dark until the"
+  note "Windows GPU driver loads. A verified ROM dump gives the firmware its driver — the"
+  note "TianoCore/UEFI screen + early Windows boot then show on the physical monitor."
+  note "Scope: cold attach (hotplug OFF). With hotplug ON the card arrives after Windows"
+  note "boots, so firmware screens can never appear on it (use the SPICE/QEMU console)."
+  say
+  note "Current pin state (per guest-GPU VM):"
+  _vbios_menu_pin_state
+  local _src_dir _n_rom
+  _src_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)/VBIOS"
+  _n_rom="$(find "$_src_dir" -maxdepth 1 -iname '*.rom' 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$_n_rom" =~ ^[0-9]+$ ]] && (( _n_rom > 0 )); then
+    note "Found ${_n_rom} candidate .rom file(s) in ${_src_dir} — every candidate is verified"
+    note "against your card (PCI ID + live-ROM byte comparison) before anything is pinned."
+  else
+    note "No .rom in ${_src_dir} yet. The next screen prints your exact card's TechPowerUp"
+    note "deep link — download the .rom, save it into VBIOS/ (next to this script), then"
+    note "re-run this entry to scan + pin it."
+  fi
+  say
+  note "Best run as root with the guest GPU parked (VM shut off): the live-ROM byte"
+  note "verification reads the card's sysfs ROM."
+  if prompt_yn "Scan VBIOS/ and pin a verified vBIOS ROM to the guest-GPU VM(s) now?" Y "vBIOS ROM pin"; then
+    install_vbios_romfile
+  else
+    note "Skipping. Drop a .rom into VBIOS/ and re-run: Modify VM -> Apply to VM -> vBIOS ROM pin."
+  fi
+}
+
 # R48k: "Apply to VM" sub-menu — every VM-customization INSTALL action, all in
 # one place. Works in BOTH binding modes (early + dynamic) EXCEPT live-attach /
 # the toggle which are DYNAMIC-only (the libvirt qemu hook is the live-attach
@@ -32908,6 +32984,7 @@ _menu_apply_to_vm() {
     "Attach virtio-win guest-agent ISO (smart handoff via guest-ping; works early OR dynamic)"
     "Set up live-attach / hotswap (VM starts without GPU, then hot-attached; DYNAMIC binding only)"
     "Toggle live-attach hotplug on/off (VM boots with vs without GPU; DYNAMIC binding only)"
+    "Pin vBIOS ROM to the guest GPU (UEFI/TianoCore boot screen on the physical monitor; works early OR dynamic)"
     "Back to main menu"
   )
   while :; do
@@ -32958,6 +33035,12 @@ _menu_apply_to_vm() {
         fi
         ;;
       7)
+        say; note "Pinning a vBIOS ROM dump to the guest GPU..."
+        if _menu_vm_guarded "vBIOS ROM pin" ""; then
+          _menu_vbios_pin
+        fi
+        ;;
+      8)
         say; say "Returning to main menu."
         return 0
         ;;
@@ -32982,6 +33065,7 @@ _menu_revert_on_vm() {
     "Remove Looking Glass host setup (detach shmem + shared-memory node + user config; works early OR dynamic)"
     "Remove looking-glass-client binary (stops running instances first; works early OR dynamic)"
     "Remove live-attach / hotswap (restores GPU to VM XML; DYNAMIC binding only)"
+    "Remove the vBIOS ROM pin (VM boots from the live ROM read again; works early OR dynamic)"
     "Back to main menu"
   )
   while :; do
@@ -33018,6 +33102,12 @@ _menu_revert_on_vm() {
         fi
         ;;
       5)
+        say; note "Removing the vBIOS ROM pin..."
+        if _menu_vm_guarded "Remove vBIOS ROM pin" ""; then
+          remove_vbios_romfile
+        fi
+        ;;
+      6)
         say; say "Returning to main menu."
         return 0
         ;;
@@ -33040,7 +33130,7 @@ _menu_revert_on_vm() {
 _menu_modify_vm() {
   local _mod_opts _mchoice
   _mod_opts=(
-    "Apply to VM (hypervisor hide / stealth / ultimate-perf / Looking Glass / virtio-win / live-attach)"
+    "Apply to VM (hypervisor hide / stealth / ultimate-perf / Looking Glass / virtio-win / live-attach / vBIOS ROM)"
     "Revert changes on VM (undo any of the above)"
     "Show VFIO status (per-VM tuning checklist + ReBAR)"
     "Back to main menu"

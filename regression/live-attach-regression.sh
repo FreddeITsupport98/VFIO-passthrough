@@ -275,6 +275,39 @@ assert_contains_file \
   "R99 the doctor derives the last-heal age from the cooldown stamp" \
   'last heal $(( $(date +%s) - _wd_ts ))s ago' \
   "$VFIO_SCRIPT"
+# --- R100: the vBIOS ROM pin in the Modify-VM TUI (apply + revert) ---
+assert_contains_file \
+  "R100 the Apply-to-VM menu offers the vBIOS ROM pin" \
+  'Pin vBIOS ROM to the guest GPU (UEFI/TianoCore boot screen on the physical monitor; works early OR dynamic)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the pin wrapper is defined" \
+  '_menu_vbios_pin()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the per-VM pin-state helper is defined" \
+  '_vbios_menu_pin_state()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the state line names the romless consequence" \
+  'not pinned (boots romless — no firmware output on the physical monitor)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the menu keeps the hotplug scope honest" \
+  'firmware screens can never appear on it (use the SPICE/QEMU console)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the apply dispatch guards + runs the wrapper" \
+  'if _menu_vm_guarded "vBIOS ROM pin" ""; then' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the Revert menu offers the pin removal" \
+  'Remove the vBIOS ROM pin (VM boots from the live ROM read again; works early OR dynamic)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R100 the revert dispatch guards + removes the pin" \
+  'if _menu_vm_guarded "Remove vBIOS ROM pin" ""; then' \
+  "$VFIO_SCRIPT"
 
 # --- Static wiring: generated live-attach helper script ---
 helper_block="$(sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT")"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vm-tui-harness.sh — the consolidated R82-R95 validation suite for the
+# vm-tui-harness.sh — the consolidated R82-R98 validation suite for the
 # built-in VM manager, the Looking Glass integration, and the debug
 # windows (relocated into the repo at R95 after /tmp wiped the scratch
 # harness TWICE in one arc; the scratch dir is now a per-run mktemp).
@@ -40,6 +40,13 @@
 #      both apply paths) + ends with the Windows-host-app final step.
 #   20. (R95) zombie forensics in the libvirt hook: the per-domain session
 #      start stamp + the stop-reason/session log at every actual VM stop.
+#   21. (R96) the mode-preserving dead-GPU fallback (pending-restore flag +
+#      the liveness probe + the alive-again notification).
+#   22. (R97) every libvirt call the hook makes is timeout-bounded (the
+#      hook must never deepen a libvirt wedge).
+#   23. (R98) the libvirt auto-heal watchdog + --unstuck + menu option 14
+#      (statics + a functional sandbox drive: the heal fires, the
+#      notification lands, the cooldown suppresses a second heal).
 # Scratch: a per-run mktemp dir (cleaned on exit); zero host side effects.
 set -uo pipefail
 
@@ -697,6 +704,85 @@ R82_H="$H" R82_VIRSH_MODE=reason VFIO_DYNAMIC_DIR="$H/out/vfdyn95" \
   PATH="$H/bin:/usr/bin:/bin" \
   bash -c "hook_log() { printf 'hooklog: %s\n' \"\$*\" >>'$H/out/hooklog95'; }; source '$H/forensics95.sh'; _log_vm_stop_forensics GAMING" >/dev/null 2>&1 || true
 ck_grep "22e the bounded forensics still logs the reason + session" "reason='shut off (destroyed)'" "$H/out/hooklog95"
+
+# 23 (R98): the libvirt wedge AUTO-HEAL watchdog — the R97 incident taught
+# the recovery recipe (kill the hung hooks -> restart the wedged daemon);
+# this round the system runs it ITSELF every 2 minutes with a desktop
+# notification, plus --unstuck (run the heal NOW) and main-menu option 14
+# (context-aware install/refresh/remove + the ON/OFF state confirmation).
+ck_grep "23a the watchdog installer is defined" 'install_libvirt_watchdog()' "$REPO/vfio.sh"
+ck_grep "23b the hung-hook kill pattern uses the bracket trick (never self-matches)" '/vfio-libvirt-hoo[k]/' "$REPO/vfio.sh"
+ck_grep "23c the daemon probe is timeout-bounded" 'timeout "$PROBE_SECS" virsh -c qemu:///system list --all' "$REPO/vfio.sh"
+ck_grep "23d the daemon restart is cooldown-gated (no restart-flapping)" 'autoheal-last.ts' "$REPO/vfio.sh"
+ck_grep "23e the timer runs every 2 minutes" 'OnUnitActiveSec=2min' "$REPO/vfio.sh"
+ck_grep "23f the --unstuck CLI maps to the heal-now mode" 'MODE="unstuck"' "$REPO/vfio.sh"
+ck_grep "23g the menu option confirms the watchdog state (ON/OFF, like the LG entry)" 'Libvirt auto-heal watchdog is: $_wd_state' "$REPO/vfio.sh"
+ck_grep "23h the reset sweep removes the watchdog files" 'rm -f "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"' "$REPO/vfio.sh"
+# 23i-23l functional: extract the generated watchdog VERBATIM and drive it
+# in a sandbox — a FAILING fake virsh (the probe must fail) + an ACTIVE fake
+# systemctl (the daemon claims active) + fake logger/notify-send/runuser so
+# nothing touches the real journal or the real desktop. VFIO_DYNAMIC_DIR
+# pins the cooldown stamp to the scratch.
+sed -n '/write_file_atomic "\$WATCHDOG_SCRIPT" 0755 "root:root" <<.WDEOF./,/^WDEOF$/p' "$REPO/vfio.sh" | sed '1d;$d' > "$H/wd98.sh"
+if bash -n "$H/wd98.sh"; then
+  printf 'PASS: 23i the extracted watchdog is valid bash\n'; PASS=$((PASS+1))
+else
+  printf 'FAIL: 23i the extracted watchdog failed bash -n\n' >&2; FAIL=$((FAIL+1)); FAILED+=("23i watchdog syntax")
+fi
+mkdir -p "$H/wdbin" "$H/out/wdstate"
+cat > "$H/wdbin/virsh" <<'EOF'
+#!/usr/bin/env bash
+exit 1   # the probe must FAIL: the wedged-daemon scenario
+EOF
+cat > "$H/wdbin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+H="${R82_H:?}"
+printf 'systemctl-cmd: %s\n' "$*" >> "$H/out/wd-systemctl-calls"
+exit 0   # is-active -> active; restart -> done
+EOF
+cat > "$H/wdbin/logger" <<'EOF'
+#!/usr/bin/env bash
+H="${R82_H:?}"
+printf 'logger-line: %s\n' "$*" >> "$H/out/wd-logger-calls"
+exit 0
+EOF
+cat > "$H/wdbin/notify-send" <<'EOF'
+#!/usr/bin/env bash
+H="${R82_H:?}"
+printf 'notify-args: %s\n' "$*" >> "$H/out/wd-notify-calls"
+exit 0
+EOF
+cat > "$H/wdbin/runuser" <<'EOF'
+#!/usr/bin/env bash
+H="${R82_H:?}"
+printf 'runuser-args: %s\n' "$*" >> "$H/out/wd-runuser-calls"
+while (( $# > 0 )); do
+  [[ "$1" == "--" ]] && { shift; break; }
+  shift
+done
+exec "$@"
+EOF
+chmod +x "$H/wdbin/"*
+rm -f "$H/out/wd-systemctl-calls" "$H/out/wd-logger-calls" "$H/out/wd-notify-calls" "$H/out/wdstate/autoheal-last.ts"
+R82_H="$H" VFIO_DYNAMIC_DIR="$H/out/wdstate" PATH="$H/wdbin:/usr/bin:/bin" \
+  bash "$H/wd98.sh" >/dev/null 2>&1 || true
+ck_grep "23j the heal FIRES: the wedged daemon is restarted" "systemctl-cmd: restart virtqemud" "$H/out/wd-systemctl-calls"
+if [[ -s "$H/out/wdstate/autoheal-last.ts" ]]; then
+  printf 'PASS: 23j2 the cooldown stamp is written before the restart\n'; PASS=$((PASS+1))
+else
+  printf 'FAIL: 23j2 no autoheal-last.ts in the pinned state dir\n' >&2; FAIL=$((FAIL+1)); FAILED+=("23j2 cooldown stamp")
+fi
+ck_grep "23k the still-dead verdict reaches the desktop (reboot-needed notify)" "GPU freeze: reboot needed" "$H/out/wd-notify-calls"
+ck_grep "23k2 the action reaches the journal tag line" "logger-line: -t vfio-dynamic -- autoheal: libvirt probe failed" "$H/out/wd-logger-calls"
+_n_restarts_before="$(grep -c 'systemctl-cmd: restart virtqemud' "$H/out/wd-systemctl-calls" 2>/dev/null || echo 0)"
+R82_H="$H" VFIO_DYNAMIC_DIR="$H/out/wdstate" PATH="$H/wdbin:/usr/bin:/bin" \
+  bash "$H/wd98.sh" >/dev/null 2>&1 || true
+_n_restarts_after="$(grep -c 'systemctl-cmd: restart virtqemud' "$H/out/wd-systemctl-calls" 2>/dev/null || echo 0)"
+if [[ "$_n_restarts_before" == "$_n_restarts_after" ]]; then
+  printf 'PASS: 23l the cooldown suppresses a second heal (no restart-flapping)\n'; PASS=$((PASS+1))
+else
+  printf 'FAIL: 23l the second run restarted again (%s -> %s)\n' "$_n_restarts_before" "$_n_restarts_after" >&2; FAIL=$((FAIL+1)); FAILED+=("23l cooldown")
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

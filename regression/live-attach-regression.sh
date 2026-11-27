@@ -164,7 +164,7 @@ assert_contains_text \
   "$hook_block"
 assert_contains_text \
   "R95 the stop log names the reason + session" \
-  "action=vm-stopped domain=$_dom reason=" \
+  'action=vm-stopped domain=$_dom reason=' \
   "$hook_block"
 assert_contains_text \
   "R95 the stopped phase calls the forensics logger (gated to real stops)" \
@@ -213,6 +213,39 @@ assert_contains_text \
   "R97 the fallback worker's on/start calls are bounded (timeout 30)" \
   'timeout 30 /usr/local/bin/vfio --live-attach-on' \
   "$hook_block"
+# --- R98: the libvirt wedge auto-heal watchdog + --unstuck + menu option 14 ---
+assert_contains_file \
+  "R98 the watchdog installer is defined" \
+  'install_libvirt_watchdog()' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the hung-hook kill pattern never self-matches (bracket trick)" \
+  '/vfio-libvirt-hoo[k]/' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the daemon probe is timeout-bounded (never hangs the timer)" \
+  'timeout "$PROBE_SECS" virsh -c qemu:///system list --all' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the daemon restart is cooldown-gated (no restart-flapping)" \
+  'autoheal-last.ts' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the timer heals every 2 minutes" \
+  'OnUnitActiveSec=2min' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the --unstuck CLI heals NOW (verbose watchdog run)" \
+  'MODE="unstuck"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the menu entry confirms the watchdog state (ON/OFF, the LG pattern)" \
+  'Libvirt auto-heal watchdog is: $_wd_state' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R98 the reset sweep removes the watchdog files" \
+  'rm -f "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"' \
+  "$VFIO_SCRIPT"
 
 # --- Static wiring: generated live-attach helper script ---
 helper_block="$(sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT")"
@@ -1688,7 +1721,7 @@ rm -rf "$_r48g_root"
 
 # --- R94: the LG setup ensures the SPICE USB redirector + the Windows-host-app final step ---
 _lg_fn_r94="$(sed -n '/^install_looking_glass()/,/^}/p' "$VFIO_SCRIPT")"
-assert_contains_text \
+assert_contains_file \
   "R94 LG setup defines the USB-redirector patcher" \
   '_lg_ensure_usb_redir_to_vm()' \
   "$VFIO_SCRIPT"

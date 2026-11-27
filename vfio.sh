@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R97 — bumped on every change; the full history is in changelog.md.
+# Revision: R98 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -757,7 +757,33 @@ SCRIPT_NAME="$(basename "$0")"
 # on/start calls (timeout 30 each). A hook can never again deepen a
 # libvirt wedge; recovery in the live incident was: pkill the hung
 # hooks, systemctl restart virtqemud, kill the frozen client.
-SCRIPT_REVISION="R97"
+# R98 (the accepted follow-up, "add it and make it auto heal with
+# notification so user dont have to do it by self" + "add to tui...
+# confirm on menu if it is off or on"): the libvirt wedge AUTO-HEAL
+# WATCHDOG. New install_libvirt_watchdog writes
+# /usr/local/sbin/vfio-libvirt-watchdog.sh + a oneshot service + a
+# 2-minute systemd timer (installed automatically with dynamic binding;
+# removed by --reset / --install-early-binding; deliberately NOT by
+# --uninstall-self — it is standalone and protects the running system).
+# The watchdog detects the R97 freeze class and heals it AUTOMATICALLY
+# with a desktop notification, so the user never runs the recovery
+# recipe by hand: (1) any vfio-libvirt-hook process older than
+# VFIO_WD_HUNG_SECS (default 90s; R97 bounds the hook to ~50s worst
+# case) is killed — its stuck libvirt job then completes; (2) a
+# VFIO_WD_PROBE_SECS-bounded `virsh list` probe: if it FAILS while the
+# daemon claims active, the daemon is restarted (safe BECAUSE the probe
+# failed). NEVER acts on a healthy system; NEVER restarts a serving
+# daemon; a VFIO_WD_COOLDOWN (default 600s) stamp prevents restart-
+# flapping against a fully dead card (that state needs the host reboot,
+# and the notification says so). Every action journal-logs under the
+# vfio-dynamic tag ("autoheal:") + desktop-notifies. New CLI --unstuck
+# runs the watchdog once with live output; new main-menu option 14
+# "Libvirt auto-heal watchdog" is context-aware like the LG auto-start
+# entry: it CONFIRMS the current state (ON = timer active / OFF =
+# absent / installed-but-inactive) and offers install when OFF,
+# reinstall-vs-remove when ON (Exit moved 14 -> 15, the R55/R69/R80
+# precedent).
+SCRIPT_REVISION="R98"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -955,6 +981,17 @@ PERF_HP_DIRS_FILE="/var/lib/vfio-dynamic/perf-hugepages-dirs"
 DOCTOR_MONITOR_SCRIPT="/usr/local/sbin/vfio-doctor-monitor.sh"
 DOCTOR_SERVICE="/etc/systemd/system/vfio-doctor.service"
 DOCTOR_TIMER="/etc/systemd/system/vfio-doctor.timer"
+# R98: the libvirt wedge AUTO-HEAL watchdog — a systemd timer (every 2 min)
+# that detects the R97 freeze class (hung hook processes / a wedged virtqemud
+# probe) and heals it automatically with a desktop notification, so the user
+# never has to run the recovery recipe by hand. The CLI --unstuck runs the
+# same watchdog once with live output. Installed with dynamic binding (the
+# hook's home); removed by --reset and --install-early-binding. Deliberately
+# NOT removed by --uninstall-self: it is standalone (no vfio CLI dependency)
+# and protects the running system.
+WATCHDOG_SCRIPT="/usr/local/sbin/vfio-libvirt-watchdog.sh"
+WATCHDOG_SERVICE="/etc/systemd/system/vfio-libvirt-watchdog.service"
+WATCHDOG_TIMER="/etc/systemd/system/vfio-libvirt-watchdog.timer"
 DOCTOR_LOG="/var/log/vfio-doctor.log"
 # virtio-win guest-agent support (smart live-attach handoff). The live-attach
 # helper polls the qemu guest agent (guest-ping) so the GPU hot-attaches the
@@ -1125,7 +1162,7 @@ RESET_FULL=0   # 1=--reset also removes the self-installed vfio CLI + completion
 RECOMMENDED_MODE=0   # 1=--recommended: auto-apply vendor-aware recommended answers to every wizard prompt after the GPU pick (R39)
 DEBUG_CMDLINE_TOKENS=0
 DEBUG_CMDLINE_TOKENS_ENTRY_FILTER=""
-MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | reset-systemd-boot-entries | usb-mitigation-status | doctor | install-doctor-timer | remove-doctor-timer | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | vm-tui | install-self | uninstall-self | completion printers | install-lg-autostart | remove-lg-autostart
+MODE="install"   # install | verify | detect | sync-bls-only | debug-cmdline-tokens | verify-bls-sync | verify-bls-nosnapper | create-fallback-entry | self-test | health-check | reset | reset-usb-mitigation | reset-systemd-boot-entries | usb-mitigation-status | doctor | install-doctor-timer | remove-doctor-timer | disable-bootlog | install-bootlog | install-graphics-daemon | install-dynamic-binding | install-early-binding | install-stealth-vm-tuning | install-live-attach | live-attach-on | live-attach-off | live-attach-toggle | live-attach-status | install-virtio-win-guest-agent | install-ultimate-perf-vm-tuning | reset-ultimate-perf-vm-tuning | install-looking-glass | remove-looking-glass | install-looking-glass-client | remove-looking-glass-client | menu | vm-tui | install-self | uninstall-self | completion printers | install-lg-autostart | remove-lg-autostart | unstuck
 BOOT_VGA_POLICY_OVERRIDE=""   # AUTO | STRICT (empty = use script default)
 GRAPHICS_PROTOCOL_OVERRIDE="" # AUTO | X11 | WAYLAND (empty = auto-detect)
 AMD_RUNPM_OVERRIDE=""         # 1=force add, 0=force skip, empty=prompt (install mode only)
@@ -1959,7 +1996,7 @@ print_fish_completion() {
 # fish completion for $cmd (generated by $SCRIPT_NAME)
 complete -c $cmd -f
 # On bare-space TAB (current token has no leading dash) list every flag; once a dash is typed the per-flag -l lines below take over (with descriptions + argument completions).
-complete -c $cmd -n "string match -vq -- '-*' (commandline -ct)" -a "--help --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --install-lg-autostart --remove-lg-autostart --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --recommended --reset-usb-mitigation --reset-systemd-boot-entries --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
+complete -c $cmd -n "string match -vq -- '-*' (commandline -ct)" -a "--help --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --install-lg-autostart --remove-lg-autostart --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --recommended --reset-usb-mitigation --reset-systemd-boot-entries --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --unstuck --print-fish-completion --print-bash-completion --print-zsh-completion"
 complete -c $cmd -s h -l help -d 'Show help'
 complete -c $cmd -l debug -d 'Enable verbose debug logging'
 complete -c $cmd -l dry-run -d 'Show actions without changing the system'
@@ -2048,6 +2085,7 @@ complete -c $cmd -l usb-mitigation-status -d 'Show USB mitigation run counts and
 complete -c $cmd -l doctor -d 'One-shot health report: self-test + verify + live-attach/USB status + kernel audit (read-only)'
 complete -c $cmd -l install-doctor-timer -d 'Install the daily vfio --doctor health-check timer (logs to /var/log/vfio-doctor.log; notifies on ATTENTION)'
 complete -c $cmd -l remove-doctor-timer -d 'Remove the daily doctor timer (monitor + service + timer; log left in place)'
+complete -c $cmd -l unstuck -d 'Detect + heal a wedged libvirt NOW (hung hooks / unresponsive daemon); the watchdog timer does it automatically every 2 minutes'
 complete -c $cmd -l print-fish-completion -d 'Print fish completion script'
 complete -c $cmd -l print-bash-completion -d 'Print bash completion script'
 complete -c $cmd -l print-zsh-completion -d 'Print zsh completion script'
@@ -2063,7 +2101,7 @@ _vfio_sh_complete() {
   COMPREPLY=()
   cur="\${COMP_WORDS[COMP_CWORD]}"
   prev="\${COMP_WORDS[COMP_CWORD-1]}"
-  opts="--help -h --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --install-lg-autostart --remove-lg-autostart --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-systemd-boot-entries --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --print-fish-completion --print-bash-completion --print-zsh-completion"
+  opts="--help -h --debug --dry-run --no-tui --vm-tui --vm-manager --tui --yes --install-lg-autostart --remove-lg-autostart --boot-vga-policy --graphics-protocol --graphics-daemon-interval --no-graphics-daemon --amd-runpm --no-amd-runpm --amd-noretry --no-amd-noretry --amd-disable-idle-d3 --no-amd-disable-idle-d3 --amd-pcie-port-pm-off --no-amd-pcie-port-pm-off --amd-rebar --no-amd-rebar --binding-mode --stealth-vm-tuning --no-stealth-vm-tuning --vbios --no-vbios --live-attach --no-live-attach --verify --detect --sync-bls-only --debug-cmdline-tokens --entry --verify-bls-sync --verify-bls-nosnapper --create-fallback-entry --print-effective-config --json --self-test --health-check --health-check-previous --health-check-all --usb-health-check --reset --full --reset-usb-mitigation --reset-systemd-boot-entries --recommended --reset-stealth-vm-tuning --install-ultimate-perf-vm-tuning --reset-ultimate-perf-vm-tuning --ultimate-perf-hugepages --no-ultimate-perf-hugepages --ultimate-perf-virtio-disk --no-ultimate-perf-virtio-disk --ultimate-perf-virtio-net --no-ultimate-perf-virtio-net --ultimate-perf-vm-tuning --no-ultimate-perf-vm-tuning --disable-bootlog --boot-remove --remove-bootlog --install-bootlog --install-graphics-daemon --install-dynamic-binding --install-early-binding --install-live-attach --live-attach-on --live-attach-off --live-attach-toggle --live-attach-status --install-virtio-win-guest-agent --install-looking-glass --remove-looking-glass --install-looking-glass-client --remove-looking-glass-client --menu --install-self --uninstall-self --install-stealth-vm-tuning --install-usb-bt-mitigation --usb-mitigation-status --doctor --install-doctor-timer --remove-doctor-timer --unstuck --print-fish-completion --print-bash-completion --print-zsh-completion"
 
   if [[ "\$prev" == "--tui" ]]; then
     COMPREPLY=(\$(compgen -W "whiptail dialog" -- "\$cur"))
@@ -2188,6 +2226,7 @@ _vfio_sh_complete() {
     '--doctor[One-shot health report: self-test + verify + live-attach/USB status + kernel audit (read-only)]' \\
     '--install-doctor-timer[Install the daily vfio --doctor health-check timer (logs to /var/log/vfio-doctor.log; notifies on ATTENTION)]' \\
     '--remove-doctor-timer[Remove the daily doctor timer (monitor + service + timer; log left in place)]' \\
+    '--unstuck[Detect + heal a wedged libvirt NOW (hung hooks / unresponsive daemon); the watchdog timer does it automatically every 2 minutes]' \\
     '--print-fish-completion[Print fish completion script]' \\
     '--print-bash-completion[Print bash completion script]' \\
     '--print-zsh-completion[Print zsh completion script]'
@@ -2830,7 +2869,7 @@ prompt_yn() {
 usage() {
   say "Revision: $SCRIPT_REVISION"
   cat <<EOF
-Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [command] [domain]] [--tui whiptail|dialog] [--yes] [--install-lg-autostart] [--remove-lg-autostart] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-virtio-net] [--no-ultimate-perf-virtio-net] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--install-doctor-timer] [--remove-doctor-timer] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
+Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [command] [domain]] [--tui whiptail|dialog] [--yes] [--install-lg-autostart] [--remove-lg-autostart] [--boot-vga-policy auto|strict] [--graphics-protocol auto|x11|wayland] [--graphics-daemon-interval seconds] [--no-graphics-daemon] [--binding-mode early|dynamic] [--stealth-vm-tuning] [--no-stealth-vm-tuning] [--vbios] [--no-vbios] [--live-attach] [--no-live-attach] [--verify] [--detect] [--sync-bls-only] [--debug-cmdline-tokens] [--entry pattern] [--verify-bls-sync] [--verify-bls-nosnapper] [--create-fallback-entry] [--print-effective-config] [--json] [--self-test] [--health-check] [--health-check-previous] [--health-check-all] [--usb-health-check] [--reset] [--full] [--reset-usb-mitigation] [--reset-systemd-boot-entries] [--recommended] [--disable-bootlog] [--boot-remove] [--remove-bootlog] [--install-bootlog] [--install-graphics-daemon] [--install-dynamic-binding] [--install-early-binding] [--install-live-attach] [--live-attach-on] [--live-attach-off] [--live-attach-toggle] [--live-attach-status] [--install-virtio-win-guest-agent] [--install-looking-glass] [--remove-looking-glass] [--install-looking-glass-client] [--remove-looking-glass-client] [--menu] [--install-self] [--uninstall-self] [--install-stealth-vm-tuning] [--install-ultimate-perf-vm-tuning] [--reset-ultimate-perf-vm-tuning] [--ultimate-perf-hugepages] [--no-ultimate-perf-hugepages] [--ultimate-perf-virtio-disk] [--no-ultimate-perf-virtio-disk] [--ultimate-perf-virtio-net] [--no-ultimate-perf-virtio-net] [--ultimate-perf-vm-tuning] [--no-ultimate-perf-vm-tuning] [--install-usb-bt-mitigation] [--usb-mitigation-status] [--doctor] [--install-doctor-timer] [--remove-doctor-timer] [--unstuck] [--print-fish-completion] [--print-bash-completion] [--print-zsh-completion]
 
   With NO arguments: launches the interactive menu (same as --menu) — pick an
   action (full configure, switch binding, live-attach, verify, reset, …).
@@ -2915,6 +2954,11 @@ Usage: $SCRIPT_NAME [--debug] [--dry-run] [--no-tui] [--vm-tui|--vm-manager [com
   --json            With --detect, print machine-readable JSON only (tri-state values: WORKS / NOT_WORK / NOT_PRESENT).
                    With --debug-cmdline-tokens, emit machine-readable JSON debug lines. With --live-attach-status, emit a JSON object (installed + mode + vms[]) instead of the KEY=value lines.
   --self-test       Run automated checks for common issues (awk compatibility, PipeWire access) and exit.
+  --unstuck         Detect + heal a wedged libvirt NOW (the GPU-freeze class: hung hook
+                   processes / an unresponsive virtqemud) — kills hung hooks, restarts the
+                   daemon only when a probe fails, and notifies. The watchdog timer (installed
+                   with dynamic binding) does this automatically every 2 minutes; this runs
+                   it once, live.
   --health-check    Audit the running kernel and logs for VFIO-friendliness (no changes made) and exit.
   --health-check-previous
                      Audit the PREVIOUS boot's kernel logs for VFIO-friendliness (no changes made) and exit.
@@ -3542,6 +3586,9 @@ parse_args() {
         ;;
       --remove-doctor-timer)
         MODE="remove-doctor-timer"
+        ;;
+      --unstuck)
+        MODE="unstuck"
         ;;
       --print-fish-completion)
         MODE="print-fish-completion"
@@ -5372,6 +5419,189 @@ remove_doctor_timer() {
   fi
   run rm -f "$DOCTOR_MONITOR_SCRIPT" "$DOCTOR_SERVICE" "$DOCTOR_TIMER" 2>/dev/null || true
   note "Removed the doctor monitor + service + timer. Log left at $DOCTOR_LOG."
+  return 0
+}
+
+# R98: install the libvirt wedge AUTO-HEAL watchdog (script + oneshot service
+# + 2-minute timer). The watchdog detects the R97 freeze class — hung hook
+# processes (any vfio-libvirt-hook older than 90s; R97 bounds the hook to
+# ~50s worst case) and a failed timeout-bounded `virsh list` probe while the
+# daemon claims active — and heals it: kill the hung hooks (unblocks the
+# stuck libvirt job), and restart virtqemud ONLY when the probe fails (a
+# wedged daemon has a dead monitor connection; the restart is safe BECAUSE
+# the probe failed). NEVER acts on a healthy system; NEVER restarts a serving
+# daemon; a 10-minute cooldown prevents restart-flapping against a fully dead
+# card (that state needs the host reboot, and the notification says so). Every
+# action is journal-logged (vfio-dynamic tag, "autoheal:") + desktop-notified —
+# the user never has to do it themselves. Idempotent; honors DRY_RUN.
+install_libvirt_watchdog() {
+  hdr "Install the libvirt auto-heal watchdog (R98)"
+  note "Writes $WATCHDOG_SCRIPT + $WATCHDOG_SERVICE + $WATCHDOG_TIMER and enables"
+  note "the timer (every 2 minutes). It detects hung hook processes and a wedged"
+  note "virtqemud (the R97 freeze class) and heals them automatically — killing"
+  note "hung hooks and restarting the daemon ONLY when a probe fails — with a"
+  note "desktop notification, so a GPU-freeze never needs manual recovery again."
+  note "NEVER acts on a healthy system; a 10-minute cooldown prevents flapping."
+  note "Run it once live with: sudo $SCRIPT_NAME --unstuck"
+  say
+  backup_file "$WATCHDOG_SCRIPT"
+  backup_file "$WATCHDOG_SERVICE"
+  backup_file "$WATCHDOG_TIMER"
+  write_file_atomic "$WATCHDOG_SCRIPT" 0755 "root:root" <<'WDEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+
+# Managed by vfio.sh (R98) — libvirt wedge AUTO-HEAL watchdog.
+# The freeze class (observed live, R97): the GPU zombies at VM stop → qemu
+# dies mid-reset → virtqemud wedges against the dead qemu → libvirt calls
+# (virsh destroy, virt-manager) queue forever. This watchdog detects that
+# state and heals it AUTOMATICALLY, so the user never has to:
+#   1. HUNG HOOKS: any vfio-libvirt-hook process older than HUNG_SECS
+#      (default 90; R97 bounds the hook to ~50s worst case) is killed —
+#      its stuck libvirt job then completes.
+#   2. WEDGED DAEMON: a timeout-bounded `virsh list --all` probe; if it
+#      FAILS while the daemon claims active, the daemon is restarted (safe
+#      BECAUSE the probe failed = it is not serving anything).
+# NEVER acts on a healthy system (no hung hooks + responsive probe = exit).
+# NEVER restarts the daemon when the probe succeeds. A cooldown (default
+# 600s) prevents restart-flapping against a fully dead card — that state
+# needs a host reboot, and the notification says so (the dead-GPU fallback
+# boots the VM GPU-less meanwhile).
+# Every action: journal (vfio-dynamic tag, "autoheal:") + desktop notify.
+# Usage: vfio-libvirt-watchdog.sh [--verbose]   (vfio --unstuck = --verbose)
+# Removed by: --reset / --install-early-binding. STANDALONE: no vfio CLI.
+
+VERBOSE=0
+[[ "${1:-}" == "--verbose" ]] && VERBOSE=1
+HUNG_SECS="${VFIO_WD_HUNG_SECS:-90}"
+PROBE_SECS="${VFIO_WD_PROBE_SECS:-10}"
+COOLDOWN="${VFIO_WD_COOLDOWN:-600}"
+STATE_DIR="${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}"
+
+wd_log()  { command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "autoheal: $*" 2>/dev/null || true; }
+wd_note() { (( VERBOSE )) && printf 'watchdog: %s\n' "$*" >&2; return 0; }
+wd_notify() {
+  # Best-effort desktop notification to every active session (the doctor
+  # monitor's proven runuser + notify-send pattern). Never fatal.
+  local _rt _uid _user
+  command -v notify-send >/dev/null 2>&1 || return 0
+  command -v runuser >/dev/null 2>&1 || return 0
+  for _rt in /run/user/*; do
+    [[ -d "$_rt" ]] || continue
+    _uid="$(basename "$_rt")"
+    [[ "$_uid" =~ ^[0-9]+$ ]] || continue
+    _user="$(getent passwd "$_uid" 2>/dev/null | cut -d: -f1)"
+    [[ -n "$_user" ]] || continue
+    runuser -u "$_user" -- env XDG_RUNTIME_DIR="$_rt" DBUS_SESSION_BUS_ADDRESS="unix:path=$_rt/bus" \
+      notify-send -u critical -a vfio-watchdog "$1" "$2" >/dev/null 2>&1 || true
+  done
+  return 0
+}
+wd_probe() { timeout "$PROBE_SECS" virsh -c qemu:///system list --all >/dev/null 2>&1; }
+
+ACTED=0
+
+# --- 1. hung hook processes: kill first (unblocks the stuck libvirt job) ---
+# awk pattern uses the [k] bracket so this script's own ps line never matches.
+_hung="$(ps -eo pid=,etimes=,cmd= | awk -v s="$HUNG_SECS" '$2 > s && /vfio-libvirt-hoo[k]/ {print $1}')"
+if [[ -n "$_hung" ]]; then
+  wd_log "hung hook process(es) older than ${HUNG_SECS}s — killing: $(echo "$_hung" | tr '\n' ' ')"
+  wd_note "killing hung hook process(es): $(echo "$_hung" | tr '\n' ' ')"
+  # shellcheck disable=SC2086 # pid list, intentional word-split
+  kill $_hung 2>/dev/null || true
+  sleep 3
+  # shellcheck disable=SC2086
+  kill -9 $_hung 2>/dev/null || true
+  ACTED=1
+fi
+
+# --- 2. probe libvirt; heal a wedged daemon ONLY on a FAILED probe ---
+if wd_probe; then
+  if (( ACTED )); then
+    wd_log "recovered: hung hook(s) killed; libvirt responsive again"
+    wd_notify "GPU freeze auto-healed" "Hung libvirt hook processes were killed and libvirt is responsive again. If the VM misbehaves, check: journalctl -t vfio-dynamic | grep autoheal"
+  else
+    wd_note "healthy: no action"
+  fi
+  exit 0
+fi
+# Probe failed — only our wedge class when a libvirt daemon claims active.
+if ! command -v systemctl >/dev/null 2>&1 \
+  || { ! systemctl is-active --quiet virtqemud 2>/dev/null && ! systemctl is-active --quiet libvirtd 2>/dev/null; }; then
+  wd_note "libvirt not running — not the wedge class; no action"
+  exit 0
+fi
+# Cooldown: never restart-flap (a failed heal leaves the card dead — the
+# next tick within the cooldown only logs, so notifications never spam).
+_last=0
+[[ -r "$STATE_DIR/autoheal-last.ts" ]] && _last="$(cat "$STATE_DIR/autoheal-last.ts" 2>/dev/null || echo 0)"
+if [[ "$_last" =~ ^[0-9]+$ ]] && (( $(date +%s) - _last < COOLDOWN )); then
+  wd_log "libvirt still unresponsive, but a heal ran less than ${COOLDOWN}s ago — waiting (the GPU may be fully dead; a host reboot revives the card)"
+  exit 0
+fi
+wd_log "libvirt probe failed (${PROBE_SECS}s) with the daemon active — restarting the daemon"
+wd_note "restarting the libvirt daemon (probe failed)"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+printf '%s\n' "$(date +%s)" >"$STATE_DIR/autoheal-last.ts" 2>/dev/null || true
+if systemctl is-active --quiet virtqemud 2>/dev/null; then
+  systemctl restart virtqemud 2>/dev/null || true
+else
+  systemctl restart libvirtd 2>/dev/null || true
+fi
+sleep 5
+if wd_probe; then
+  wd_log "daemon restarted; libvirt responsive again"
+  wd_notify "GPU freeze auto-healed" "libvirt had wedged (the GPU freeze class). Hung hooks killed + the daemon restarted — everything is responsive again. Check: journalctl -t vfio-dynamic | grep autoheal"
+else
+  wd_log "WARN: still unresponsive after restart — the GPU is likely fully dead; a host reboot revives the card (the dead-GPU fallback boots the VM GPU-less meanwhile)"
+  wd_notify "GPU freeze: reboot needed" "libvirt auto-recovery ran but the card is still dead (the zombie state). Save your work and reboot the host — the VM boots GPU-less meanwhile (the fallback handles it)."
+fi
+exit 0
+WDEOF
+
+  write_file_atomic "$WATCHDOG_SERVICE" 0644 "root:root" <<'EOF'
+[Unit]
+Description=VFIO libvirt wedge auto-heal watchdog (hung hooks / wedged daemon)
+Documentation=file:///usr/local/sbin/vfio-libvirt-watchdog.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vfio-libvirt-watchdog.sh
+Nice=10
+EOF
+
+  write_file_atomic "$WATCHDOG_TIMER" 0644 "root:root" <<'EOF'
+[Unit]
+Description=Run the VFIO libvirt auto-heal watchdog every 2 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  if have_cmd systemctl; then
+    run systemctl daemon-reload || true
+    run systemctl enable --now vfio-libvirt-watchdog.timer || true
+    note "Timer enabled: vfio-libvirt-watchdog.timer (every 2 minutes)."
+  else
+    note "systemctl not available; the unit files are written but the timer is NOT enabled."
+  fi
+  note "Test once live: sudo $SCRIPT_NAME --unstuck"
+  note "Auto-heal actions log to the vfio-dynamic journal tag (grep autoheal)."
+}
+
+# R98: remove the watchdog (script + service + timer). Called by
+# --install-early-binding and --reset (dynamic-binding-only infrastructure).
+remove_libvirt_watchdog() {
+  if have_cmd systemctl; then
+    run systemctl disable --now vfio-libvirt-watchdog.timer 2>/dev/null || true
+    run systemctl daemon-reload 2>/dev/null || true
+  fi
+  run rm -f "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER" 2>/dev/null || true
+  note "Removed the libvirt auto-heal watchdog (script + service + timer)."
   return 0
 }
 
@@ -12849,6 +13079,9 @@ EOF
   # exactly the broken state found live in R53: hook script present but the
   # /etc/libvirt/hooks/qemu entry missing -> dynamic binding silently dead.
   # We are root here, so the plain tests are authoritative.
+  # R98: install the libvirt auto-heal watchdog (script + 2-minute timer)
+  # with the hook — it heals the R97 freeze class automatically.
+  install_libvirt_watchdog
   if [[ -f "$LIBVIRT_HOOK_ENTRY" && -x "$LIBVIRT_HOOK_ENTRY" && -x "$LIBVIRT_HOOK_SCRIPT" ]]; then
     note "Self-check: libvirt hook entry + script verified on disk."
   else
@@ -25735,6 +25968,9 @@ install_early_binding_from_existing_config() {
   # 3c4. Remove the live-attach (hotplug GPU) workflow (dynamic-binding-only).
   remove_live_attach
 
+  # 3c5. Remove the libvirt auto-heal watchdog (dynamic-binding-only).
+  remove_libvirt_watchdog
+
   # 4. Re-add early-binding tokens to the kernel cmdline.
   local guest_ids
   guest_ids="$(build_vfio_pci_ids_from_conf)"
@@ -30128,6 +30364,8 @@ reset_vfio_all() {
     "$LG_CLIENT_BIN" "$LG_CLIENT_DESKTOP"
     # R56: the daily doctor timer (monitor + service + timer).
     "$DOCTOR_MONITOR_SCRIPT" "$DOCTOR_SERVICE" "$DOCTOR_TIMER"
+    # R98: the libvirt auto-heal watchdog (script + service + timer).
+    "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"
   )
   note "Preview of managed files this reset will remove:"
   _reset_preview_paths "Managed files" "${_rm_paths[@]}"
@@ -30162,6 +30400,8 @@ reset_vfio_all() {
     run systemctl disable --now vfio-gpu-park-keepalive-check.service 2>/dev/null || true
     # R56: the daily doctor timer is script-managed — reset removes it too.
     run systemctl disable --now vfio-doctor.timer 2>/dev/null || true
+    # R98: the libvirt auto-heal watchdog timer is script-managed too.
+    run systemctl disable --now vfio-libvirt-watchdog.timer 2>/dev/null || true
 
     # If we previously masked plymouth units as part of "disable splash",
     # unmask them on reset so the system can return to distro defaults.
@@ -32147,6 +32387,7 @@ uninstall_self() {
   note "  - the built-in VM manager's (vm-tui) runtime artifacts: $VM_TUI_LOG_FILE"
   note "    + the remembered VM state (last-vm + recent-vms; R69/R70)"
   note "It does NOT remove the VFIO config (use --reset) or your repo copy."
+  note "The libvirt auto-heal watchdog timer (R98) stays installed — it is standalone and protects the running system; --reset or --install-early-binding removes it."
 
   if ! prompt_yn "Uninstall the self-installed vfio + completions now?" N "Uninstall self"; then
     note "Uninstall cancelled."
@@ -34763,6 +35004,7 @@ vfio_menu() {
       "Doctor (one-shot health report: self-test + verify + status + kernel audit)"
       "VM manager (start / stop / reset VMs + Looking Glass launch — vm-tui)"
       "Looking Glass auto-start (auto-launch when VM is booted + Ctrl lock + notification)"
+      "Libvirt auto-heal watchdog (auto-heals a wedged libvirt + notification — every 2 minutes)"
       "Exit menu"
     )
     say
@@ -35084,6 +35326,47 @@ vfio_menu() {
         fi
         ;;
       14)
+        # R98 (the accepted follow-up: "add to tui... confirm on menu if
+        # it is off or on"): the libvirt AUTO-HEAL watchdog, in the TUI —
+        # context-aware like the LG auto-start entry above: it CONFIRMS
+        # the current state (ON = the timer is active / OFF = not
+        # installed / installed-but-inactive) and offers install when
+        # OFF, reinstall-vs-remove when ON. Guarded subshell + verdict
+        # popup (the R49/R55 pattern) — a failure just returns to the menu.
+        say
+        local _wd_state="OFF (not installed)"
+        if [[ -x "$WATCHDOG_SCRIPT" ]] && command -v systemctl >/dev/null 2>&1 \
+          && systemctl is-active --quiet vfio-libvirt-watchdog.timer 2>/dev/null; then
+          _wd_state="ON (timer active, healing every 2 minutes)"
+        elif [[ -x "$WATCHDOG_SCRIPT" ]]; then
+          _wd_state="INSTALLED but the timer is INACTIVE"
+        fi
+        note "Libvirt auto-heal watchdog is: $_wd_state"
+        if [[ -x "$WATCHDOG_SCRIPT" ]]; then
+          if prompt_yn "Reinstall (refresh) the watchdog? Answer No to REMOVE it instead." Y "Auto-heal watchdog"; then
+            say
+            note "Reinstalling the libvirt auto-heal watchdog..."
+            local _wd_rc=0
+            ( install_libvirt_watchdog ) || _wd_rc=$?
+          else
+            say
+            note "Removing the libvirt auto-heal watchdog..."
+            local _wd_rc=0
+            ( remove_libvirt_watchdog ) || _wd_rc=$?
+          fi
+        else
+          say
+          note "Installing the libvirt auto-heal watchdog (heals a wedged libvirt automatically, with a notification)..."
+          local _wd_rc=0
+          ( install_libvirt_watchdog ) || _wd_rc=$?
+        fi
+        if (( _wd_rc == 0 )); then
+          _verdict_popup "Libvirt auto-heal watchdog" "OK" "Done. A wedged libvirt (the GPU-freeze class) is healed automatically every 2 minutes with a desktop notification — you never have to run the recovery recipe by hand. Test once live: sudo vfio --unstuck"
+        else
+          _verdict_popup "Libvirt auto-heal watchdog" "WARN" "Cancelled or failed (rc=$_wd_rc) — see the notes above. The menu is still alive."
+        fi
+        ;;
+      15)
         # Exit.
         say
         say "Exiting vfio.sh menu."
@@ -35356,7 +35639,7 @@ main() {
   # kernel modules / bindings. Self-test, detect and health-check
   # variants should be able to run in "thin" environments (containers,
   # chroots) where modprobe may be absent.
-  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" && "$MODE" != "reset-systemd-boot-entries" && "$MODE" != "live-attach-status" && "$MODE" != "vm-tui" ]]; then
+  if [[ "$MODE" != "verify" && "$MODE" != "self-test" && "$MODE" != "detect" && "$MODE" != "print-effective-config" && "$MODE" != "sync-bls-only" && "$MODE" != "debug-cmdline-tokens" && "$MODE" != "verify-bls-sync" && "$MODE" != "verify-bls-nosnapper" && "$MODE" != "create-fallback-entry" && "$MODE" != "health-check" && "$MODE" != "health-check-prev" && "$MODE" != "health-check-all" && "$MODE" != "usb-health-check" && "$MODE" != "install-bootlog" && "$MODE" != "install-usb-bt-mitigation" && "$MODE" != "reset-usb-mitigation" && "$MODE" != "reset-systemd-boot-entries" && "$MODE" != "live-attach-status" && "$MODE" != "vm-tui" && "$MODE" != "unstuck" ]]; then
     need_cmd modprobe
   fi
 
@@ -35439,6 +35722,19 @@ main() {
     require_writable_root_or_die
     remove_doctor_timer
     exit 0
+  fi
+
+  if [[ "$MODE" == "unstuck" ]]; then
+    # R98: run the watchdog once with live output (the timer does it
+    # automatically every 2 minutes; this is the manual/right-now path).
+    require_root "$@"
+    if [[ -x "$WATCHDOG_SCRIPT" ]]; then
+      "$WATCHDOG_SCRIPT" --verbose
+      exit $?
+    fi
+    note "The watchdog script is not installed at $WATCHDOG_SCRIPT."
+    note "Install it with: sudo $SCRIPT_NAME --install-dynamic-binding (or menu option 14)."
+    exit 1
   fi
 
   if [[ "$MODE" == "health-check" ]]; then

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vm-tui-harness.sh — the consolidated R82-R98 validation suite for the
+# vm-tui-harness.sh — the consolidated R82-R99 validation suite for the
 # built-in VM manager, the Looking Glass integration, and the debug
 # windows (relocated into the repo at R95 after /tmp wiped the scratch
 # harness TWICE in one arc; the scratch dir is now a per-run mktemp).
@@ -47,6 +47,8 @@
 #   23. (R98) the libvirt auto-heal watchdog + --unstuck + menu option 14
 #      (statics + a functional sandbox drive: the heal fires, the
 #      notification lands, the cooldown suppresses a second heal).
+#   24. (R99) the heal-history ring + the --unstuck history display + the
+#      doctor watchdog status line (statics + the block-23 sandbox re-drive).
 # Scratch: a per-run mktemp dir (cleaned on exit); zero host side effects.
 set -uo pipefail
 
@@ -783,6 +785,31 @@ if [[ "$_n_restarts_before" == "$_n_restarts_after" ]]; then
 else
   printf 'FAIL: 23l the second run restarted again (%s -> %s)\n' "$_n_restarts_before" "$_n_restarts_after" >&2; FAIL=$((FAIL+1)); FAILED+=("23l cooldown")
 fi
+
+# 24 (R99): the heal-history ring + the --unstuck history display + the
+# doctor watchdog status line. Statics + a functional re-drive of the
+# block-23 sandbox (the heal already ran there — its events must be in
+# the ring, the ring must stay bounded, and a --verbose run must print
+# the recent history before its live pass).
+ck_grep "24a the watchdog keeps the heal-history ring (state dir)" 'autoheal-history.log' "$REPO/vfio.sh"
+ck_grep "24b the ring is trimmed to the last 20 events" 'tail -n 20 "$STATE_DIR/autoheal-history.log"' "$REPO/vfio.sh"
+ck_grep "24c the verbose run shows the recent history up front" 'recent auto-heal events (last 10, oldest first)' "$REPO/vfio.sh"
+ck_grep "24d the doctor reports the watchdog status line" 'Libvirt auto-heal watchdog: $_wd_state' "$REPO/vfio.sh"
+ck_grep "24e the doctor derives the last-heal age from the cooldown stamp" 'last heal $(( $(date +%s) - _wd_ts ))s ago' "$REPO/vfio.sh"
+_wd_ring="$H/out/wdstate/autoheal-history.log"
+ck_grep "24f the heal action lands in the ring" "restarting-libvirt-daemon" "$_wd_ring"
+ck_grep "24g the still-dead verdict lands in the ring" "still-unresponsive-after-restart" "$_wd_ring"
+_wd_ring_n="$(wc -l < "$_wd_ring" 2>/dev/null || echo 0)"
+if [[ "$_wd_ring_n" =~ ^[0-9]+$ ]] && (( _wd_ring_n <= 20 )); then
+  printf 'PASS: 24h the ring is bounded (n=%s <= 20)\n' "$_wd_ring_n"; PASS=$((PASS+1))
+else
+  printf 'FAIL: 24h the ring exceeded the bound (n=%s)\n' "${_wd_ring_n:-?}" >&2; FAIL=$((FAIL+1)); FAILED+=("24h ring bound")
+fi
+rm -f "$H/out/wd-verbose.err"
+R82_H="$H" VFIO_DYNAMIC_DIR="$H/out/wdstate" PATH="$H/wdbin:/usr/bin:/bin" \
+  bash "$H/wd98.sh" --verbose >/dev/null 2>"$H/out/wd-verbose.err" || true
+ck_grep "24i the --unstuck/verbose run prints the recent-history header" "recent auto-heal events" "$H/out/wd-verbose.err"
+ck_grep "24j the verbose run shows the heal event line itself" "restarting-libvirt-daemon" "$H/out/wd-verbose.err"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

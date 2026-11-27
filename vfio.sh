@@ -3,7 +3,7 @@ set -euo pipefail
 
 # vfio-gpu-passthrough-setup.sh
 # Interactive multi-vendor (AMD/NVIDIA/Intel) GPU passthrough helper.
-# Revision: R98 — bumped on every change; the full history is in changelog.md.
+# Revision: R99 — bumped on every change; the full history is in changelog.md.
 #
 # Design goals (safety first):
 # - Bind ONLY the selected guest GPU (and selected associated PCI functions) to vfio-pci.
@@ -783,7 +783,18 @@ SCRIPT_NAME="$(basename "$0")"
 # absent / installed-but-inactive) and offers install when OFF,
 # reinstall-vs-remove when ON (Exit moved 14 -> 15, the R55/R69/R80
 # precedent).
-SCRIPT_REVISION="R98"
+# R99 (the accepted R98 improvement suggestions, "ok do it as last" — the
+# last change of this arc): (1) the watchdog now keeps a HEAL-HISTORY ring
+# log — every real action appends one timestamped line to
+# ${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}/autoheal-history.log
+# (trimmed to the last 20 events), so the heal history survives journal
+# rotation and journal-permission limits; --unstuck (the verbose run)
+# prints the last 10 events up front — the recent auto-heal story without
+# needing journalctl access. (2) --doctor now reports the watchdog's
+# status line: timer active / installed-but-inactive / not installed,
+# plus the age of the last heal (derived from the cooldown stamp) and
+# the history-ring size. Read-only, additive, JSON mode untouched.
+SCRIPT_REVISION="R99"
 
 # R57: PATH hardening for non-root / minimal shells. On Debian-family systems
 # modprobe (and friends: runuser, modinfo, ...) live in /usr/sbin & /sbin,
@@ -5252,6 +5263,26 @@ run_doctor() {
   ( live_attach_status ) || _la_rc=$?
   say
   ( usb_bt_mitigation_status ) || _usb_rc=$?
+  # R99: the libvirt auto-heal watchdog status (dynamic-binding infra) —
+  # the timer state + the age of the last heal + the history-ring size.
+  # Read-only and non-root-safe; informational (never affects the verdict).
+  local _wd_state="not installed" _wd_last="" _wd_hist_n="" _wd_ts=""
+  local _wd_dyn_dir="${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}"
+  if [[ -x "$WATCHDOG_SCRIPT" ]]; then
+    if have_cmd systemctl && systemctl is-active --quiet vfio-libvirt-watchdog.timer 2>/dev/null; then
+      _wd_state="timer ACTIVE (every 2 minutes)"
+    else
+      _wd_state="installed but timer INACTIVE"
+    fi
+    _wd_ts="$(cat "$_wd_dyn_dir/autoheal-last.ts" 2>/dev/null || true)"
+    if [[ "$_wd_ts" =~ ^[0-9]+$ ]]; then
+      _wd_last="; last heal $(( $(date +%s) - _wd_ts ))s ago"
+    fi
+    if [[ -r "$_wd_dyn_dir/autoheal-history.log" ]]; then
+      _wd_hist_n="; history $(wc -l < "$_wd_dyn_dir/autoheal-history.log" 2>/dev/null || echo 0) events"
+    fi
+  fi
+  say "  Libvirt auto-heal watchdog: $_wd_state${_wd_last}${_wd_hist_n}"
 
   say
   hdr "4/4 Kernel/log VFIO health audit"
@@ -5467,7 +5498,9 @@ set -uo pipefail
 # 600s) prevents restart-flapping against a fully dead card — that state
 # needs a host reboot, and the notification says so (the dead-GPU fallback
 # boots the VM GPU-less meanwhile).
-# Every action: journal (vfio-dynamic tag, "autoheal:") + desktop notify.
+# Every action: journal (vfio-dynamic tag, "autoheal:") + desktop notify
+# + one line in the state-dir heal-history ring (autoheal-history.log,
+# last 20 events; a --verbose run prints the last 10 up front).
 # Usage: vfio-libvirt-watchdog.sh [--verbose]   (vfio --unstuck = --verbose)
 # Removed by: --reset / --install-early-binding. STANDALONE: no vfio CLI.
 
@@ -5480,6 +5513,24 @@ STATE_DIR="${VFIO_DYNAMIC_DIR:-/var/lib/vfio-dynamic}"
 
 wd_log()  { command -v logger >/dev/null 2>&1 && logger -t vfio-dynamic -- "autoheal: $*" 2>/dev/null || true; }
 wd_note() { (( VERBOSE )) && printf 'watchdog: %s\n' "$*" >&2; return 0; }
+wd_hist() {
+  # R99: the heal-history ring — one timestamped line per real action,
+  # trimmed to the last 20. Survives journal rotation + journal-permission
+  # limits; the journal keeps the full detail. Best-effort, never fatal.
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$STATE_DIR/autoheal-history.log" 2>/dev/null || true
+  tail -n 20 "$STATE_DIR/autoheal-history.log" >"$STATE_DIR/.autoheal-history.tmp" 2>/dev/null \
+    && mv -f "$STATE_DIR/.autoheal-history.tmp" "$STATE_DIR/autoheal-history.log" 2>/dev/null || true
+}
+# R99: a verbose run (what --unstuck executes) shows the recent heal
+# history up front — the auto-heal story without needing journalctl.
+if (( VERBOSE )); then
+  if [[ -s "$STATE_DIR/autoheal-history.log" ]]; then
+    wd_note "recent auto-heal events (last 10, oldest first):"
+    tail -n 10 "$STATE_DIR/autoheal-history.log" >&2 2>/dev/null || true
+  else
+    wd_note "no auto-heal history yet — nothing has ever wedged"
+  fi
+fi
 wd_notify() {
   # Best-effort desktop notification to every active session (the doctor
   # monitor's proven runuser + notify-send pattern). Never fatal.
@@ -5512,6 +5563,7 @@ if [[ -n "$_hung" ]]; then
   sleep 3
   # shellcheck disable=SC2086
   kill -9 $_hung 2>/dev/null || true
+  wd_hist "killed-hung-hooks older-than=${HUNG_SECS}s pids=$(echo "$_hung" | tr '\n' ' ')"
   ACTED=1
 fi
 
@@ -5519,6 +5571,7 @@ fi
 if wd_probe; then
   if (( ACTED )); then
     wd_log "recovered: hung hook(s) killed; libvirt responsive again"
+    wd_hist "recovered hung-hooks-killed daemon-responsive"
     wd_notify "GPU freeze auto-healed" "Hung libvirt hook processes were killed and libvirt is responsive again. If the VM misbehaves, check: journalctl -t vfio-dynamic | grep autoheal"
   else
     wd_note "healthy: no action"
@@ -5541,6 +5594,7 @@ if [[ "$_last" =~ ^[0-9]+$ ]] && (( $(date +%s) - _last < COOLDOWN )); then
 fi
 wd_log "libvirt probe failed (${PROBE_SECS}s) with the daemon active — restarting the daemon"
 wd_note "restarting the libvirt daemon (probe failed)"
+wd_hist "restarting-libvirt-daemon (probe failed after ${PROBE_SECS}s)"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 printf '%s\n' "$(date +%s)" >"$STATE_DIR/autoheal-last.ts" 2>/dev/null || true
 if systemctl is-active --quiet virtqemud 2>/dev/null; then
@@ -5551,9 +5605,11 @@ fi
 sleep 5
 if wd_probe; then
   wd_log "daemon restarted; libvirt responsive again"
+  wd_hist "recovered daemon-restarted-responsive"
   wd_notify "GPU freeze auto-healed" "libvirt had wedged (the GPU freeze class). Hung hooks killed + the daemon restarted — everything is responsive again. Check: journalctl -t vfio-dynamic | grep autoheal"
 else
   wd_log "WARN: still unresponsive after restart — the GPU is likely fully dead; a host reboot revives the card (the dead-GPU fallback boots the VM GPU-less meanwhile)"
+  wd_hist "still-unresponsive-after-restart reboot-needed"
   wd_notify "GPU freeze: reboot needed" "libvirt auto-recovery ran but the card is still dead (the zombie state). Save your work and reboot the host — the VM boots GPU-less meanwhile (the fallback handles it)."
 fi
 exit 0
@@ -5589,8 +5645,9 @@ EOF
   else
     note "systemctl not available; the unit files are written but the timer is NOT enabled."
   fi
-  note "Test once live: sudo $SCRIPT_NAME --unstuck"
-  note "Auto-heal actions log to the vfio-dynamic journal tag (grep autoheal)."
+  note "Test once live: sudo $SCRIPT_NAME --unstuck (also prints the recent heal history)."
+  note "Auto-heal actions log to the vfio-dynamic journal tag (grep autoheal)"
+  note "+ the state-dir history ring (autoheal-history.log, last 20 events)."
 }
 
 # R98: remove the watchdog (script + service + timer). Called by

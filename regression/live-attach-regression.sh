@@ -246,6 +246,35 @@ assert_contains_file \
   "R98 the reset sweep removes the watchdog files" \
   'rm -f "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"' \
   "$VFIO_SCRIPT"
+# --- R99: the heal-history ring + the --unstuck history display + the doctor line ---
+assert_contains_file \
+  "R99 the watchdog keeps the heal-history ring in the state dir" \
+  'autoheal-history.log' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R99 the ring is trimmed to the last 20 events" \
+  'tail -n 20 "$STATE_DIR/autoheal-history.log"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R99 the restart action is recorded in the ring" \
+  'wd_hist "restarting-libvirt-daemon' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R99 the still-dead verdict is recorded in the ring" \
+  'wd_hist "still-unresponsive-after-restart reboot-needed"' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R99 the verbose run prints the recent history up front" \
+  'recent auto-heal events (last 10, oldest first)' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R99 the doctor reports the watchdog status line" \
+  'Libvirt auto-heal watchdog: $_wd_state' \
+  "$VFIO_SCRIPT"
+assert_contains_file \
+  "R99 the doctor derives the last-heal age from the cooldown stamp" \
+  'last heal $(( $(date +%s) - _wd_ts ))s ago' \
+  "$VFIO_SCRIPT"
 
 # --- Static wiring: generated live-attach helper script ---
 helper_block="$(sed -n '/write_file_atomic "$LIVE_ATTACH_HELPER" 0755 "root:root" <<.HELPEREOF./,/^HELPEREOF$/p' "$VFIO_SCRIPT")"
